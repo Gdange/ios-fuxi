@@ -10,7 +10,7 @@
  bsd/dev/sweet_usb.c			standard
 --- a/bsd/dev/fuxi_touch.c
 +++ b/bsd/dev/fuxi_touch.c
-@@ -0,0 +1,582 @@
+@@ -0,0 +1,597 @@
 +/*
 + * FUXI touch: ST FTS (FTM5) on QUP1 SE4, SPI through QUP1 GPI DMA (polled).
 + * Hardware facts and protocol: research/touch/hw-report.md; first proven in
@@ -467,6 +467,12 @@
 +		if (e[0] == 0) {
 +			break;
 +		}
++		static unsigned logged;
++		if (logged < 16) {
++			logged++;
++			printf("FUXI TOUCH: event %02x %02x %02x %02x %02x %02x %02x %02x\n",
++			    e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7]);
++		}
 +		unsigned id = e[1] >> 4;
 +		if ((e[0] == FT_EV_ENTER || e[0] == FT_EV_MOTION || e[0] == FT_EV_LEAVE) && id < FT_MAX) {
 +			/* Super-resolution coordinates, 10x the 1080x2400 panel. */
@@ -497,6 +503,8 @@
 +	static const uint8_t sense[] = {0xa0, 0x00, 0x01};
 +	uint8_t ev[8] = {0}, chip[2] = {0};
 +	unsigned delay_s = 30, errors = 0;
++	unsigned ticks = 0;
++	bool irq_seen = false;
 +	(void)arg;
 +	(void)result;
 +	(void)PE_parse_boot_argn("fuxitouchdelay", &delay_s, sizeof(delay_s));
@@ -554,8 +562,15 @@
 +	}
 +	printf("FUXI TOUCH: sensing, polling GPIO%u\n", FT_IRQ);
 +	for (;;) {
-+		/* IRQ is level low while the FIFO holds events; poll it every 8 ms. */
-+		if (!(ft_rd(ft.tlmm, FT_GPIO(FT_IRQ) + 4) & 1u) || ft.active) {
++		/* IRQ is level low while the FIFO holds events; poll it every 8 ms,
++		 * and read the FIFO every 32 ms regardless in case the IC does not
++		 * drive the line. */
++		bool irq = !(ft_rd(ft.tlmm, FT_GPIO(FT_IRQ) + 4) & 1u);
++		if (irq && !irq_seen) {
++			irq_seen = true;
++			printf("FUXI TOUCH: IRQ line asserted\n");
++		}
++		if (irq || ft.active || (++ticks & 3u) == 0) {
 +			if (ft_poll()) {
 +				if ((errors++ % 100u) == 0) {
 +					printf("FUXI TOUCH: FIFO read error\n");
