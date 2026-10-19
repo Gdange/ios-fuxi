@@ -482,11 +482,24 @@ static uint32_t ts_cmd(const uint8_t *cmd, unsigned nc)
  uint8_t buf[8];
  return nc>8 ? 3 : ts_xfer(cmd,nc,buf,nc);
 }
+static void ts_clock_regs(unsigned at)
+{
+ static const uint32_t r[]={0x52008,0x184e4,0x2327c,0x23280,0x23284,0x23294,0x184f0};
+ for (unsigned i=0;i<7;i++) touch_report[at+i]=usb_rd(TS_GCC,r[i]);
+}
 static uint32_t ts_clock(void)
 {
  /* Vote wrapper1 core/core2x/m_ahb/s_ahb and SE4 only. */
  ts_wr(TS_GCC,0x52008,usb_rd(TS_GCC,0x52008)|(0xfu<<18)|(1u<<26));
- for (unsigned i=0;i<1000 && !ts_clocks_on();i++) delay(1);
+ for (unsigned i=0;i<10000 && !ts_clocks_on();i++) delay(1);
+ ts_clock_regs(20);
+ if (!ts_clocks_on()) {
+  /* ts-04: the vote alone left S4/s_ahb off; also set each CBCR's own CLK_ENABLE. */
+  static const uint32_t cb[]={0x2327c,0x23280,0x23284,0x23294,0x184e4};
+  for (unsigned i=0;i<5;i++) ts_wr(TS_GCC,cb[i],usb_rd(TS_GCC,cb[i])|1u);
+  for (unsigned i=0;i<10000 && !ts_clocks_on();i++) delay(1);
+  ts_clock_regs(27);
+ }
  if (!ts_clocks_on()) return 0x10;
  /* SE_GENI_CLK_SEL picks a DFS level; use one sourced from XO, undivided
   * (19.2 MHz), and divide by 2 in the SE: 9.6 MHz SCLK (driver max 12). */
