@@ -393,6 +393,7 @@ static uint32_t touch_report[64];
 static uint8_t touch_events[8*32];
 static unsigned ts_depth;
 static uint32_t ts_level;
+static unsigned ts_stage;
 static void ts_wr(uintptr_t base, uint32_t off, uint32_t v)
 {
  __asm__ volatile("dmb oshst" ::: "memory");
@@ -438,6 +439,11 @@ static void touch_snapshot(unsigned group)
  } else if (group==2 && ts_ahb_on()) {
   for (unsigned i=0;i<16;i++) touch_report[n++]=usb_rd(TS_SE,se[i]);
   touch_report[n++]=usb_rd(0x00ac0000,4); /* QUP_HW_VER */
+ } else if (group==4 && ts_ahb_on()) {
+  /* GPII 0 (read-only): CH0, CH1, EV contexts, TYPE_IRQ, ERROR_LOG, CH0 SCRATCH_0. */
+  static const uint32_t r[]={0xa10000,0xa10004,0xa10080,0xa11000,0xa11010,0xa13080,
+   0xa13100,0xa13118,0xa13200,0xa10060};
+  for (unsigned i=0;i<10;i++) touch_report[n++]=usb_rd(r[i],0);
  }
 }
 static void ts_clock_regs(unsigned at)
@@ -498,7 +504,7 @@ static void gpi_diag(void)
 static bool gpi_cmd(uint32_t reg, uint32_t v, uintptr_t ctx, uint32_t want)
 {
  ts_wr(GPI_GPII,reg,v);
- for (unsigned i=0;i<250000;i++) {
+ for (unsigned i=0;i<50000;i++) {
   uint32_t s=gpi_state(ctx);
   if (s==want) {
    ts_wr(GPI_GPII,0xa0,usb_rd(GPI_GPII,0x90)); ts_wr(GPI_GPII,0xa4,usb_rd(GPI_GPII,0x94));
@@ -560,7 +566,7 @@ static void gpi_ring_db(unsigned k)
  * length + 1, 0 on timeout, or ~0 on an error event. */
 static uint32_t gpi_wait(unsigned chid, uint32_t *len)
 {
- for (unsigned us=0;us<20000;us++) {
+ for (unsigned us=0;us<5000;us++) {
   uint32_t hw=usb_rd(GPI_EV,0x10);
   bool found=false, bad=false;
   while (hw!=lo32(&gpi_evr[4*gpi_evrp])) {
@@ -635,12 +641,13 @@ static uint32_t ts_se_init(void)
  ts_wr(TS_SE,0x258,1);
  ts_wr(TS_SE,0xe18,usb_rd(TS_SE,0xe18)|0xf);
  touch_report[39]=usb_rd(TS_SE,0x064);
- return gpi_init();
+ return ts_stage<2 ? 0 : gpi_init();
 }
-static void touch_power(void)
+static void touch_power(unsigned stage)
 {
  static const uint8_t id_cmd[]={0xfb,0x20,0x00,0x00,0x00}, fifo[]={0x87}, sense[]={0xa0,0x00,0x01};
  for (unsigned i=0;i<64;i++) touch_report[i]=0;
+ ts_stage=stage;
  touch_report[0]=1;
  uint32_t id=usb_rd(RH_DRV_PA,0), cfg=usb_rd(RH_DRV_PA,0xc);
  if (((id>>16)&0xff)!=3 || ((cfg>>12)&0x3f)<3) { touch_report[0]=0x100; return; }
@@ -662,6 +669,7 @@ static void touch_power(void)
  if ((touch_report[6]=ts_se_init())) return;
  touch_report[0]=4;
  touch_report[7]=ts_depth;
+ if (ts_stage<3) return;
  /* fts_system_reset: reset low 10 ms, high, then poll the FIFO for 03 (ready). */
  ts_gpio(24,0,3,8,0); delay(10000); ts_gpio(24,0,3,8,1);
  uint8_t ev[8]={0};
@@ -998,7 +1006,7 @@ ud_setup(void)
             n=touch_read_events();
             memcpy(data, touch_events, n);
         } else {
-            if (value == 0x5450) touch_power(); else touch_snapshot(st[4]);
+            if (value == 0x5450) touch_power(st[4]); else touch_snapshot(st[4]);
             memcpy(data, touch_report, sizeof(touch_report)); n=sizeof(touch_report);
         }
     } else if (type == 0xc0 && req == 0x54 && value >= 1 && value <= 60) {

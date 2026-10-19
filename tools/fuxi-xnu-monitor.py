@@ -54,6 +54,7 @@ def main():
     ap.add_argument('--skip-clocks',action='store_true',help='do not take the AHB-ungating clock snapshot before handoff')
     ap.add_argument('--reset-minutes',type=int,help='move the monitor PSCI reset deadline to now + N minutes (1-60)')
     ap.add_argument('--touch-test',type=float,metavar='SECONDS',help='before handoff: touch snapshot, power-up, then poll touch events for SECONDS')
+    ap.add_argument('--touch-stage',type=int,default=9,help='touch power-up: stop after this stage (1 SE GSI mode, 2 GPI init, 9 all)')
     ap.add_argument('--touch-power',action='store_true',help='loader touch power-up (rails, reset, sense on) right before the handoff')
     ap.add_argument('--no-handoff',action='store_true',help='stop after the touch test; the loader resets at its 90 s deadline')
     ap.add_argument('--display-poll',action='store_true',help='sample CTL0 START, INTF1 autorefresh and DSI status/FIFO each poll')
@@ -74,8 +75,8 @@ def main():
     dev = devices[0]
     args.out.mkdir(parents=True, exist_ok=False)
 
-    def request(number, length, value=0, index=0):
-        data = bytes(dev.ctrl_transfer(0xc0, number, value, index, length, timeout=3000))
+    def request(number, length, value=0, index=0, timeout=3000):
+        data = bytes(dev.ctrl_transfer(0xc0, number, value, index, length, timeout=timeout))
         if len(data) != length:
             raise ValueError(f'short USB response: {number:#x}')
         return data
@@ -135,7 +136,7 @@ def main():
     if args.touch_test is not None:
         words=lambda b: list(struct.unpack('<64I',b))
         snap=[]
-        for group,count in ((0,15),(1,12),(2,17)):
+        for group,count in ((0,15),(1,12),(2,17),(4,10)):
             print('touch snapshot group',group,'...',flush=True)
             w=words(request(0x55,256,0x5453,group))
             print('touch snapshot',group,[hex(v) for v in w[:count+1]],flush=True)
@@ -143,7 +144,7 @@ def main():
         if input_stop:
             (args.out/'touch.json').write_text(json.dumps({'snapshot':snap},indent=1)+'\n')
             raise SystemExit('touch snapshot only')
-        power=words(request(0x55,256,0x5450))
+        power=words(request(0x55,256,0x5450,args.touch_stage,timeout=20000))
         print('touch power',[hex(v) for v in power],flush=True)
         events=[]
         until=time.monotonic()+args.touch_test
@@ -157,7 +158,7 @@ def main():
         if args.no_handoff:
             raise SystemExit('touch test done; no handoff')
     if args.touch_power:
-        power=list(struct.unpack('<64I',request(0x55,256,0x5450)))
+        power=list(struct.unpack('<64I',request(0x55,256,0x5450,9,timeout=20000)))
         (args.out/'touch-power.json').write_text(json.dumps(power)+'\n')
         print('touch power',[hex(v) for v in power[:36]],flush=True)
     request(0x49, 88, 0x584e)
