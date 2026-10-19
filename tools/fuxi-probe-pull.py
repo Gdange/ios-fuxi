@@ -22,6 +22,7 @@ def main():
     ap.add_argument('--ufs', action='store_true', help='read a clock-guarded UFS handoff snapshot without issuing storage commands')
     ap.add_argument('--ufs-wake', action='store_true', help='temporarily clear UFS AHB hardware gating, snapshot, then restore it')
     ap.add_argument('--display-clocks', action='store_true', help='read GCC/DispCC clock state, skipping a halted bus')
+    ap.add_argument('--display-clocks-wake',action='store_true',help='temporarily ungate display AHB for a read-only clock snapshot, then restore it')
     args = ap.parse_args()
     deadline = time.monotonic() + args.wait
     dev = None
@@ -117,8 +118,8 @@ def main():
         snapshot=dict(zip(names,struct.unpack('<24I',raw)))
         (args.out / 'ufs.json').write_text(json.dumps(snapshot,indent=2)+'\n')
         print('UFS snapshot:', {k:hex(v) for k,v in snapshot.items()})
-    if args.display_clocks:
-        raw=bytes(dev.ctrl_transfer(0xc0,0x4c,0,0,56,timeout=3000))
+    if args.display_clocks or args.display_clocks_wake:
+        raw=bytes(dev.ctrl_transfer(0xc0,0x4c,1 if args.display_clocks_wake else 0,0,56,timeout=3000))
         names='magic version gcc_ahb gcc_hf_axi valid gdsc ahb mdp byte0 byte0_intf pclk0 esc0 vsync non_gdsc_ahb'.split()
         clocks=dict(zip(names,struct.unpack('<14I',raw)))
         (args.out/'display-clocks.json').write_text(json.dumps(clocks,indent=2)+'\n')

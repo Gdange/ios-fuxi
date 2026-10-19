@@ -165,6 +165,18 @@ static void display_clock_snapshot(void)
   display_clocks[5+i]=usb_rd(0xaf00000,offsets[i]);
  display_clocks[4]=1;
 }
+static void display_clock_snapshot_awake(void)
+{
+ uint32_t old=usb_rd(0x100000,0x27004);
+ if (!(old&1)) { display_clock_snapshot(); return; }
+ /* gcc-kalama.c: GCC_DISP_AHB_CLK has HWCG at bit 1, enable at bit 0. */
+ *(volatile uint32_t *)0x127004UL=old&~2u;
+ __asm__ volatile("dsb sy" ::: "memory");
+ for(unsigned i=0;i<500 && (usb_rd(0x100000,0x27004)&0x80000000);i++) delay(20);
+ display_clock_snapshot();
+ *(volatile uint32_t *)0x127004UL=old;
+ __asm__ volatile("dsb sy" ::: "memory");
+}
 /* SM8550 cpu@100 from the live FDT. CPU_ON is only requested by the host. */
 static volatile uint64_t core_report[10] __attribute__((aligned(64)));
 void probe_secondary_main(void)
@@ -425,7 +437,8 @@ ud_setup(void)
         ufs_snapshot();
         memcpy(data, ufs_report, sizeof(ufs_report)); n=sizeof(ufs_report);
     } else if (type == 0xc0 && req == 0x4c) {
-        display_clock_snapshot();
+        if (value==1 && !monitor_report[MON_LAUNCH]) display_clock_snapshot_awake();
+        else display_clock_snapshot();
         memcpy(data, display_clocks, sizeof(display_clocks)); n=sizeof(display_clocks);
     } else if (type == 0xc0 && req == 0x4d && value == 0x5546 && !monitor_report[MON_LAUNCH]) {
         ufs_snapshot_awake();
