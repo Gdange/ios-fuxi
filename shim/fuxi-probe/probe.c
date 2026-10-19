@@ -187,6 +187,122 @@ static void display_clock_snapshot_awake(void)
  *(volatile uint32_t *)0x127004UL=old;
  __asm__ volatile("dsb sy" ::: "memory");
 }
+
+/*
+ * Apps RSC DRV2 (live FDT: 0x17a20000, tcs-offset 0xd00; ACTIVE 3, SLEEP 2,
+ * WAKE 2, fast-path 1). RSC v3 TCS layout = Linux rpmh_rsc_reg_offset_ver_3_0.
+ * Addresses from OrangeFox cmd-db: mmcx.lvl 0x30080, MC0 0x50000, SH0 0x50004,
+ * MM0 0x50030, MM1 0x50034, ACV 0x50068.
+ */
+#define RH_DRV_PA 0x17a20000UL
+#define RH_TCS_PA 0x17a20d00UL
+#define RH_STRIDE 0x2a0u
+#define RH_CMD    0x14u
+static uint32_t rsc_report[1+8*6];
+static uint32_t rh_rd(uint32_t off) { return usb_rd(RH_TCS_PA, off); }
+static void rh_wr(uint32_t off, uint32_t v)
+{
+ __asm__ volatile("dmb oshst" ::: "memory");
+ *(volatile uint32_t *)(RH_TCS_PA+off)=v;
+ __asm__ volatile("dsb osh" ::: "memory");
+}
+static void rsc_snapshot(void)
+{
+ unsigned n=0;
+ rsc_report[n++]=usb_rd(RH_DRV_PA,0);
+ rsc_report[n++]=usb_rd(RH_DRV_PA,4);
+ rsc_report[n++]=usb_rd(RH_DRV_PA,0xc);
+ rsc_report[n++]=rh_rd(0); rsc_report[n++]=rh_rd(4);
+ for (unsigned t=0;t<8;t++) {
+  uint32_t b=t*RH_STRIDE;
+  rsc_report[n++]=rh_rd(b+0x14); rsc_report[n++]=rh_rd(b+0x18);
+  rsc_report[n++]=rh_rd(b+0x1c); rsc_report[n++]=rh_rd(b+0x10);
+  rsc_report[n++]=rh_rd(b+0x34); rsc_report[n++]=rh_rd(b+0x38);
+ }
+}
+/* One write-with-response command in ACTIVE TCS t; 0 on proven completion. */
+static uint32_t rh_send(unsigned t, uint32_t addr, uint32_t data)
+{
+ uint32_t b=t*RH_STRIDE, bit=1u<<t;
+ if (rh_rd(b+0x18)==0 || rh_rd(b+0x14) || rh_rd(b+0x1c) || rh_rd(b+0x10)) return 1;
+ uint32_t irq_en=rh_rd(0);
+ rh_wr(0,irq_en&~bit);
+ rh_wr(b+0x30,8u|(1u<<8)|(1u<<16));
+ rh_wr(b+0x34,addr); rh_wr(b+0x38,data);
+ rh_wr(b+0x10,1); rh_wr(b+0x1c,1);
+ rh_wr(b+0x14,0); rh_wr(b+0x14,1u<<16);
+ rh_wr(b+0x14,(1u<<16)|(1u<<24));
+ uint32_t st=0;
+ for (unsigned us=0;us<100000;us++) {
+  st=rh_rd(b+0x3c);
+  if (rh_rd(b+0x18) && (st&0x10100)==0x10100) break;
+  delay(1);
+ }
+ if ((st&0x10100)!=0x10100) return 2; /* leave TCS quarantined */
+ rh_wr(b+0x14,1u<<16); rh_wr(b+0x14,0);
+ rh_wr(b+0x1c,0); rh_wr(b+0x10,0);
+ rh_wr(8,bit);
+ rh_wr(0,(rh_rd(0)&~bit)|(irq_en&bit));
+ return 0;
+}
+static uint32_t rcg_set(uint32_t rcgr, uint32_t cfg)
+{
+ *(volatile uint32_t *)(0xaf00000UL+rcgr+4)=cfg;
+ __asm__ volatile("dsb sy" ::: "memory");
+ *(volatile uint32_t *)(0xaf00000UL+rcgr)=usb_rd(0xaf00000,rcgr)|1;
+ __asm__ volatile("dsb sy" ::: "memory");
+ for (unsigned i=0;i<1000;i++) { if (!(usb_rd(0xaf00000,rcgr)&1)) return 0; delay(1); }
+ return 1;
+}
+/* Results: [0] stage, [1..6] RPMh status, [7] PLL mode, [8] L, [9] MDP CFG, [10] latch mode. */
+static uint32_t boost_report[12];
+#define BOOST_CMDS 6
+static void display_boost(void)
+{
+ static const uint32_t cmds[][2]={
+  {0x30080,4},                                /* mmcx.lvl hlvl 4 = NOM (vlvl 256) */
+  {0x50030,(3u<<29)|(0x3fffu<<14)|0x3fff},     /* MM0 commit|valid, max x/y */
+  {0x50034,(3u<<29)|(0x3fffu<<14)|0x3fff},     /* MM1 */
+  {0x50004,(3u<<29)|(0x3fffu<<14)|0x3fff},     /* SH0 */
+  {0x50068,(3u<<29)|(8u<<14)|8u},             /* ACV HLOS enable mask */
+  {0x50000,(3u<<29)|(0x3fffu<<14)|0x3fff}};    /* MC0 */
+ for (unsigned i=0;i<12;i++) boost_report[i]=0;
+ uint32_t id=usb_rd(RH_DRV_PA,0), cfg=usb_rd(RH_DRV_PA,0xc);
+ if (((id>>16)&0xff)!=3 || ((cfg>>12)&0x3f)<3) { boost_report[0]=0x100|((id>>16)&0xff); return; }
+ boost_report[0]=1;
+ for (unsigned i=0;i<BOOST_CMDS;i++) {
+  boost_report[1+i]=rh_send(0,cmds[i][0],cmds[i][1])|(i<<8);
+  if (!(boost_report[1+i]&0xff)) boost_report[1+i]=0;
+  if (boost_report[1+i]) return;
+ }
+ boost_report[0]=2;
+ uint32_t old=usb_rd(0x100000,0x27004);
+ *(volatile uint32_t *)0x127004UL=old&~2u;
+ __asm__ volatile("dsb sy" ::: "memory");
+ for(unsigned i=0;i<500 && (usb_rd(0x100000,0x27004)&0x80000000);i++) delay(20);
+ /* Park MDP on XO, retune PLL0 975 -> 1542 MHz (L 0x50, alpha 0x5000), back to /3. */
+ if (rcg_set(0x80d8,0x0)) { boost_report[0]=0x200; goto out; }
+ *(volatile uint32_t *)0xaf00010UL=(usb_rd(0xaf00000,0x10)&0xffff0000u)|0x50;
+ *(volatile uint32_t *)0xaf00014UL=0x5000;
+ __asm__ volatile("dsb sy" ::: "memory");
+ *(volatile uint32_t *)0xaf00000UL=usb_rd(0xaf00000,0)|(1u<<14);
+ __asm__ volatile("dsb sy" ::: "memory");
+ delay(2);
+ boost_report[10]=usb_rd(0xaf00000,0);
+ *(volatile uint32_t *)0xaf00000UL=usb_rd(0xaf00000,0)&~(1u<<14);
+ __asm__ volatile("dsb sy" ::: "memory");
+ for (unsigned i=0;i<200 && !(usb_rd(0xaf00000,0)&0x80000000u);i++) delay(5);
+ delay(100);
+ boost_report[0]=3;
+ if (!(usb_rd(0xaf00000,0)&0x80000000u) || !(boost_report[10]&(1u<<13))) { boost_report[0]=0x300; goto out; }
+ if (rcg_set(0x80d8,0x105)) { boost_report[0]=0x400; goto out; }
+ boost_report[0]=4;
+out:
+ boost_report[7]=usb_rd(0xaf00000,0); boost_report[8]=usb_rd(0xaf00000,0x10);
+ boost_report[9]=usb_rd(0xaf00000,0x80dc);
+ *(volatile uint32_t *)0x127004UL=old;
+ __asm__ volatile("dsb sy" ::: "memory");
+}
 /* SM8550 cpu@100 from the live FDT. CPU_ON is only requested by the host. */
 static volatile uint64_t core_report[10] __attribute__((aligned(64)));
 void probe_secondary_main(void)
@@ -475,6 +591,12 @@ ud_setup(void)
         if (value==1 && !monitor_report[MON_LAUNCH]) display_clock_snapshot_awake();
         else display_clock_snapshot();
         memcpy(data, display_clocks, sizeof(display_clocks)); n=sizeof(display_clocks);
+    } else if (type == 0xc0 && req == 0x51) {
+        rsc_snapshot();
+        memcpy(data, rsc_report, sizeof(rsc_report)); n=sizeof(rsc_report);
+    } else if (type == 0xc0 && req == 0x52 && value == 0x4253 && !monitor_report[MON_LAUNCH]) {
+        display_boost();
+        memcpy(data, boost_report, sizeof(boost_report)); n=sizeof(boost_report);
     } else if (type == 0xc0 && req == 0x50) {
         display_rcg[0]=0;
         if (!monitor_report[MON_LAUNCH]) display_clock_snapshot_awake();
