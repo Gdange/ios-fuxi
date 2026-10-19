@@ -118,6 +118,37 @@ static void ram_probe(void)
   if (ok) ram_report[4] |= 1ULL << page;
  }
 }
+/* SM8550 cpu@100 from the live FDT. CPU_ON is only requested by the host. */
+static volatile uint64_t core_report[10] __attribute__((aligned(64)));
+void probe_secondary_main(void)
+{
+ core_report[4]=rsr("midr_el1"); core_report[5]=rsr("mpidr_el1");
+ core_report[6]=rsr("CurrentEL"); core_report[7]=rsr("sctlr_el1");
+ core_report[3]=1;
+ __asm__ volatile("dsb sy" ::: "memory");
+ for (;;) {
+  core_report[8]++;
+  core_report[9]=rsr("cntpct_el0");
+  __asm__ volatile("dsb sy" ::: "memory");
+  delay(1000);
+ }
+}
+static void core_probe(void)
+{
+ extern char probe_secondary_entry[];
+ if(core_report[0]) return;
+ core_report[0]=0x3145524f43495846ULL; /* FXICORE1 */
+ core_report[1]=0x100;
+ __asm__ volatile("dsb sy; ic iallu; dsb sy; isb" ::: "memory");
+ register uint64_t fn __asm__("x0")=0xc4000003;
+ register uint64_t target __asm__("x1")=0x100;
+ register uint64_t entry __asm__("x2")=(uintptr_t)probe_secondary_entry;
+ register uint64_t context __asm__("x3")=0;
+ __asm__ volatile("smc #0" : "+r"(fn), "+r"(target), "+r"(entry), "+r"(context) ::
+  "x4","x5","x6","x7","x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","memory");
+ core_report[2]=fn;
+ delay(20000);
+}
 #define GCTL            0xc110
 #define GEVNTADRLO      0xc400
 #define GEVNTADRHI      0xc404
@@ -324,6 +355,9 @@ ud_setup(void)
                st[4] == 0 && st[5] == 0) {
         ram_probe();
         memcpy(data, ram_report, sizeof(ram_report)); n = sizeof(ram_report);
+    } else if (type == 0xc0 && req == 0x45) {
+        core_probe();
+        memcpy(data, (const void *)core_report, sizeof(core_report)); n=sizeof(core_report);
     } else if ((type & 0x60) != 0) {
         ok = false;
 	} else if (req == 6) {          /* GET_DESCRIPTOR */

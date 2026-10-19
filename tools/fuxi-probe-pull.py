@@ -17,6 +17,7 @@ def main():
     ap.add_argument('--display', action='store_true', help='also read the known SM8550 display registers')
     ap.add_argument('--paint', action='store_true', help='draw a diagnostic title using the validated scanout')
     ap.add_argument('--ram', action='store_true', help='sample and restore words in the advertised upper RAM bank')
+    ap.add_argument('--core', action='store_true', help='request isolated cpu@100 diagnostic startup')
     args = ap.parse_args()
     deadline = time.monotonic() + args.wait
     dev = None
@@ -82,6 +83,17 @@ def main():
         if ram['first_error'] or ram['pass_mask'] != (1 << ram['samples']) - 1:
             ap.exit(1, 'Upper RAM sample/restore check failed\n')
         print(f"Upper RAM samples passed at {ram['base']:#x}+{ram['size']:#x}")
+    if args.core:
+        raw = bytes(dev.ctrl_transfer(0xc0, 0x45, 0, 0, 80, timeout=3000))
+        fields = 'magic target result alive midr mpidr current_el sctlr heartbeat timestamp'.split()
+        core = dict(zip(fields, struct.unpack('<10Q', raw)))
+        time.sleep(.1)
+        raw2 = bytes(dev.ctrl_transfer(0xc0, 0x45, 0, 0, 80, timeout=3000))
+        later = dict(zip(fields, struct.unpack('<10Q', raw2)))
+        (args.out / 'core.json').write_text(json.dumps({'first':core, 'later':later}, indent=2)+'\n')
+        if not later['alive'] or later['result'] or later['heartbeat'] <= core['heartbeat']:
+            ap.exit(1, f'CPU diagnostic startup failed: {later}\n')
+        print(f"Secondary CPU alive: MPIDR={later['mpidr']:#x}, MIDR={later['midr']:#x}, heartbeat={later['heartbeat']}")
     print(f"Saved {len(tree)} bytes of live FDT to {args.out}")
     print(f"MIDR={report['midr']:#x}, MPIDR={report['mpidr']:#x}, "
           f"MMFR0={report['mmfr0']:#x}, EL={report['current_el'] >> 2}")

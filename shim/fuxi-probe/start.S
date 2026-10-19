@@ -46,3 +46,16 @@ vectors:
  b fatal
  .balign 0x80
 .endr
+
+/* Optional isolated diagnostic CPU, never handed to XNU's scheduler. */
+.global probe_secondary_entry
+probe_secondary_entry:
+ msr daifset, #0xf
+ msr spsel, #1
+ adr x1, _secondary_stack_top
+ mov sp, x1
+ adr x1, vectors
+ msr vbar_el1, x1
+ isb
+ bl probe_secondary_main
+ b fatal
