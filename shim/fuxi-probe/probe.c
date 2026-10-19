@@ -400,11 +400,10 @@ static void ts_gpio(unsigned n, unsigned func, unsigned pull, unsigned ma, int o
  ts_wr(c,0,(usb_rd(c,0)&~0x3ffu)|pull|(func<<2)|((ma/2-1)<<6)|(out>=0?0x200u:0u));
 }
 /* SE4 and wrapper registers hang the bus (SoC reset) while wrapper1's AHB
- * clocks are gated (ts-01): touch them only with m_ahb/s_ahb/S4 running. */
-static bool ts_clocks_on(void)
-{
- return !((usb_rd(TS_GCC,0x2327c)|usb_rd(TS_GCC,0x23280)|usb_rd(TS_GCC,0x184e4))&0x80000000u);
-}
+ * clocks are gated: touch them only with m_ahb running (s_ahb is under
+ * hardware clock gating, its CLK_OFF bit is not meaningful at idle). */
+static bool ts_ahb_on(void) { return !(usb_rd(TS_GCC,0x2327c)&0x80000000u); }
+static bool ts_s4_on(void) { return !(usb_rd(TS_GCC,0x184e4)&0x80000000u); }
 /* Groups (ts-02 bisect; any abort resets the SoC): 0 GCC, 1 TLMM, 2 SE4 + QUP
  * version (only with the wrapper clocks on), 3 a single GCC word (index). */
 static void touch_snapshot(unsigned group)
@@ -429,7 +428,7 @@ static void touch_snapshot(unsigned group)
    touch_report[n++]=usb_rd(TS_TLMM+0x1000u*g[i],0);
    touch_report[n++]=usb_rd(TS_TLMM+0x1000u*g[i],4);
   }
- } else if (group==2 && ts_clocks_on()) {
+ } else if (group==2 && ts_ahb_on()) {
   for (unsigned i=0;i<16;i++) touch_report[n++]=usb_rd(TS_SE,se[i]);
   touch_report[n++]=usb_rd(0x00ac0000,4); /* QUP_HW_VER */
  }
@@ -491,30 +490,22 @@ static uint32_t ts_clock(void)
 {
  /* Vote wrapper1 core/core2x/m_ahb/s_ahb and SE4 only. */
  ts_wr(TS_GCC,0x52008,usb_rd(TS_GCC,0x52008)|(0xfu<<18)|(1u<<26));
- for (unsigned i=0;i<10000 && !ts_clocks_on();i++) delay(1);
+ for (unsigned i=0;i<10000 && !ts_ahb_on();i++) delay(1);
  ts_clock_regs(20);
- if (!ts_clocks_on()) {
-  /* ts-04: the vote alone left S4/s_ahb off; also set each CBCR's own CLK_ENABLE. */
-  static const uint32_t cb[]={0x2327c,0x23280,0x23284,0x23294,0x184e4};
-  for (unsigned i=0;i<5;i++) ts_wr(TS_GCC,cb[i],usb_rd(TS_GCC,cb[i])|1u);
-  for (unsigned i=0;i<10000 && !ts_clocks_on();i++) delay(1);
-  ts_clock_regs(27);
- }
- if (!ts_clocks_on()) return 0x10;
- /* SE_GENI_CLK_SEL picks a DFS level; use one sourced from XO, undivided
-  * (19.2 MHz), and divide by 2 in the SE: 9.6 MHz SCLK (driver max 12). */
+ if (!ts_ahb_on()) return 0x10;
+ /* S4 is a DFS RCG under hardware control: its root comes up when the SE
+  * requests a level. SE_GENI_CLK_SEL picks one sourced from XO, undivided
+  * (19.2 MHz); the SE divides by 2: 9.6 MHz SCLK (driver max 12). */
+ unsigned level=0;
  if (usb_rd(TS_GCC,0x18504)&1) {
-  for (unsigned l=0;l<8;l++) {
-   uint32_t cfg=usb_rd(TS_GCC,0x1850c+4*l);
-   if ((cfg&0x71fu)<=1u) {
-    ts_wr(TS_SE,0x07c,l); ts_wr(TS_SE,0x048,(2u<<4)|1u); return 0;
-   }
-  }
-  return 0x11;
- }
- if ((usb_rd(TS_GCC,0x184f4)&0x71fu)>1u) return 0x12;
- ts_wr(TS_SE,0x07c,0); ts_wr(TS_SE,0x048,(2u<<4)|1u);
- return 0;
+  for (level=0;level<8 && (usb_rd(TS_GCC,0x1850c+4*level)&0x71fu)>1u;level++);
+  if (level==8) return 0x11;
+ } else if ((usb_rd(TS_GCC,0x184f4)&0x71fu)>1u) return 0x12;
+ ts_wr(TS_SE,0x07c,level); ts_wr(TS_SE,0x048,(2u<<4)|1u);
+ for (unsigned i=0;i<10000 && !ts_s4_on();i++) delay(1);
+ ts_clock_regs(27);
+ touch_report[34]=usb_rd(TS_SE,0x048); touch_report[35]=usb_rd(TS_SE,0x07c);
+ return ts_s4_on() ? 0 : 0x13;
 }
 static uint32_t ts_se_init(void)
 {
