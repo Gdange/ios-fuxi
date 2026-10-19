@@ -2,7 +2,7 @@
 """Collect early XNU progress from Fuxi's isolated native USB monitor.
 
 The image must match --payload and --kernel. Only the selected 1 GiB XNU RAM
-window can be read; no storage writes or unrestricted physical-memory requests.
+window and the validated fixed splash framebuffer can be read; no storage writes or unrestricted physical-memory requests.
 Private output includes native reports, staged progress and console bytes.
 """
 import argparse
@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 import struct
 import time
+import zlib
 
 import usb.core
 import usb.util
@@ -49,6 +50,7 @@ def main():
     ap.add_argument('--payload', type=Path, required=True)
     ap.add_argument('--out', type=Path, required=True)
     ap.add_argument('--seconds', type=float, default=65)
+    ap.add_argument('--framebuffer',action='store_true',help='save the validated inherited framebuffer after collecting logs')
     args = ap.parse_args()
     payload = args.payload.read_bytes()
     if payload[:8] != b'SWEETXNU':
@@ -146,6 +148,24 @@ def main():
             if status['stage'] == 99:
                 break
             time.sleep(.25)
+    (args.out/'display-after.bin').write_bytes(request(0x42,432))
+    if args.framebuffer:
+        raw=bytearray()
+        for off in range(0,1080*2400*4,512):
+            raw.extend(request(0x4e,min(512,1080*2400*4-off),off&0xffff,off>>16))
+        (args.out/'framebuffer.bgra').write_bytes(raw)
+        rows=[]
+        for y in range(2400):
+            line=raw[y*4320:(y+1)*4320]
+            rgb=bytearray(1080*3)
+            rgb[0::3],rgb[1::3],rgb[2::3]=line[2::4],line[1::4],line[0::4]
+            rows.append(b'\0'+rgb)
+        def chunk(kind,data):
+            return struct.pack('>I',len(data))+kind+data+struct.pack('>I',zlib.crc32(kind+data))
+        png=b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',1080,2400,8,2,0,0,0))
+        png+=chunk(b'IDAT',zlib.compress(b''.join(rows),6))+chunk(b'IEND',b'')
+        (args.out/'framebuffer.png').write_bytes(png)
+        print('Saved framebuffer memory; physical panel output still needs confirmation',flush=True)
 
 
 if __name__ == '__main__':

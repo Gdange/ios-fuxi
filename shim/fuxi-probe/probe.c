@@ -433,6 +433,15 @@ ud_setup(void)
         n=length > 512 ? 512 : length;
         if (off > 0x40000000ULL || n > 0x40000000ULL-off) ok=false;
         else memcpy(data, (const void *)(uintptr_t)(0x8c0000000ULL+off), n);
+    } else if (type == 0xc0 && req == 0x4e) {
+        uint32_t index=(uint32_t)st[4] | ((uint32_t)st[5]<<8);
+        uint64_t off=(uint64_t)value | ((uint64_t)index<<16);
+        const uint64_t size=1080ULL*2400*4;
+        n=length > 512 ? 512 : length;
+        if (off>size || n>size-off || usb_rd(0xae05000,0x14)!=0xb8000000 ||
+            usb_rd(0xae05000,0x24)!=4320 || usb_rd(0xae05000,0x30)!=0x237ff)
+            ok=false;
+        else memcpy(data,(const void *)(uintptr_t)(0xb8000000ULL+off),n);
     } else if (type == 0xc0 && req == 0x4b) {
         ufs_snapshot();
         memcpy(data, ufs_report, sizeof(ufs_report)); n=sizeof(ufs_report);
