@@ -7,6 +7,7 @@ explicit option adds the node used by the read-only storage diagnostic.
 """
 import argparse
 import importlib.util
+import json
 import struct
 from pathlib import Path
 
@@ -58,7 +59,24 @@ def validate_live(path, ufs_readonly=False):
         raise ValueError('splash reservation differs from the measured Fuxi map')
 
 
-def build(ufs_readonly=False):
+def root_extent_props(path, root_bytes):
+    """/chosen props for the pinned-file root: u64 {file, partition, count} blocks."""
+    table = json.loads(path.read_text())
+    if root_bytes % 4096 or root_bytes > table['size']:
+        raise ValueError('root size must be 4 KiB aligned and inside the pinned file')
+    words, pos = [], 0
+    for logical, physical, length in table['extents']:
+        if logical != pos or physical % 4096 or length % 4096:
+            raise ValueError('extent table is not contiguous 4 KiB extents')
+        words += [logical // 4096, physical // 4096, length // 4096]
+        pos += length
+    if pos < root_bytes:
+        raise ValueError('extents do not cover the root')
+    return [('fuxi-root-extents', struct.pack(f'<{len(words)}Q', *words)),
+            ('fuxi-root-blocks', struct.pack('<Q', root_bytes // 4096))]
+
+
+def build(ufs_readonly=False, root_props=()):
     mkadt.HIGH_PHYS_BASE, mkadt.HIGH_MEM_SIZE = PHYS_BASE, MEM_SIZE
     mkadt.GICD, mkadt.GICR, mkadt.GICR_SIZE = GICD, GICR, GICR_SIZE
     mkadt.FB, mkadt.FB_SIZE = FB, FB_SIZE
@@ -75,6 +93,7 @@ def build(ufs_readonly=False):
     setprop(chosen, 'firmware-version', b'fuxi-shim\0')
     setprop(chosen, 'system-firmware-version', b'fuxi-shim\0')
     setprop(chosen, 'unique-chip-id', struct.pack('<Q', 0x4655584900000001))
+    chosen.props += [(k, 0, v) for k, v in root_props]
     cpus = next(n for n in root.children if n.name == 'cpus')
     cpus.children = cpus.children[:1]
     setprop(cpus.children[0], 'compatible', b'qcom,sm8550-cpu\0ARM,v8\0')
@@ -87,10 +106,16 @@ def main():
     ap.add_argument('out', type=Path)
     ap.add_argument('--live-fdt', type=Path, required=True)
     ap.add_argument('--ufs-readonly',action='store_true',help='include UFS node for the opt-in, read-only kernel probe')
+    ap.add_argument('--root-extents',type=Path,help='pinned-file extent JSON (bytes, userdata-relative); needs --root-bytes')
+    ap.add_argument('--root-bytes',type=int,help='root image size in bytes')
     args = ap.parse_args()
     try:
+        root_props = ()
+        if args.root_extents:
+            args.ufs_readonly = True  # the extent root needs the UFS node
+            root_props = root_extent_props(args.root_extents, args.root_bytes or 0)
         validate_live(args.live_fdt,args.ufs_readonly)
-        blob = adt.serialize(build(args.ufs_readonly))
+        blob = adt.serialize(build(args.ufs_readonly, root_props))
     except (ValueError, KeyError, struct.error) as error:
         ap.exit(1, str(error) + '\n')
     args.out.parent.mkdir(parents=True, exist_ok=True)
