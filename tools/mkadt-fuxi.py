@@ -76,7 +76,7 @@ def root_extent_props(path, root_bytes):
             ('fuxi-root-blocks', struct.pack('<Q', root_bytes // 4096))]
 
 
-def build(ufs_readonly=False, root_props=()):
+def build(ufs_readonly=False, root_props=(), smp=False):
     mkadt.HIGH_PHYS_BASE, mkadt.HIGH_MEM_SIZE = PHYS_BASE, MEM_SIZE
     mkadt.GICD, mkadt.GICR, mkadt.GICR_SIZE = GICD, GICR, GICR_SIZE
     mkadt.FB, mkadt.FB_SIZE = FB, FB_SIZE
@@ -95,9 +95,12 @@ def build(ufs_readonly=False, root_props=()):
     setprop(chosen, 'unique-chip-id', struct.pack('<Q', 0x4655584900000001))
     chosen.props += [(k, 0, v) for k, v in root_props]
     cpus = next(n for n in root.children if n.name == 'cpus')
-    cpus.children = cpus.children[:1]
-    setprop(cpus.children[0], 'compatible', b'qcom,sm8550-cpu\0ARM,v8\0')
-    setprop(cpus.children[0], 'clock-frequency', struct.pack('<I', 2016000000))
+    # MPIDR Aff1 = core. cpu@100 keeps running the loader's USB monitor, so XNU
+    # gets core 0 and, with smp, cores 2-7 (logical IDs 0-6 in this order).
+    cpus.children = [cpus.children[c] for c in ((0, 2, 3, 4, 5, 6, 7) if smp else (0,))]
+    for cpu in cpus.children:
+        setprop(cpu, 'compatible', b'qcom,sm8550-cpu\0ARM,v8\0')
+        setprop(cpu, 'clock-frequency', struct.pack('<I', 2016000000))
     return root
 
 
@@ -108,6 +111,7 @@ def main():
     ap.add_argument('--ufs-readonly',action='store_true',help='include UFS node for the opt-in, read-only kernel probe')
     ap.add_argument('--root-extents',type=Path,help='pinned-file extent JSON (bytes, userdata-relative); needs --root-bytes')
     ap.add_argument('--root-bytes',type=int,help='root image size in bytes')
+    ap.add_argument('--smp',action='store_true',help='add cores 2-7 (cpu@100 stays with the USB monitor)')
     args = ap.parse_args()
     try:
         root_props = ()
@@ -115,12 +119,12 @@ def main():
             args.ufs_readonly = True  # the extent root needs the UFS node
             root_props = root_extent_props(args.root_extents, args.root_bytes or 0)
         validate_live(args.live_fdt,args.ufs_readonly)
-        blob = adt.serialize(build(args.ufs_readonly, root_props))
+        blob = adt.serialize(build(args.ufs_readonly, root_props, args.smp))
     except (ValueError, KeyError, struct.error) as error:
         ap.exit(1, str(error) + '\n')
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_bytes(blob)
-    print(f'{args.out}: {len(blob)} bytes; RAM {PHYS_BASE:#x}+{MEM_SIZE:#x}; CPU0 only; UFS={"read-only probe" if args.ufs_readonly else "absent"}')
+    print(f'{args.out}: {len(blob)} bytes; RAM {PHYS_BASE:#x}+{MEM_SIZE:#x}; CPUs {"0,2-7" if args.smp else "0"}; UFS={"read-only probe" if args.ufs_readonly else "absent"}')
 
 
 if __name__ == '__main__':
