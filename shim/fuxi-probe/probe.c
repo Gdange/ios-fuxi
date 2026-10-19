@@ -91,6 +91,67 @@ static uint32_t display_paint(void)
  return 1;
 }
 
+/* Autorefresh-collision test (0x53). [0] stage, [1] AR cfg before, [2] AR cfg after,
+ * [3] wr line before, [4] wr line after wait, [5] poll iterations, [6] wr line after START,
+ * [7] DSI status, [8] DSI FIFO status. Mode 'NS' paints with no START (autorefresh
+ * delivers); 'AS' disables autorefresh, waits for the transfer to end, then STARTs;
+ * 'RE' restores the saved autorefresh config. */
+static uint32_t ar_report[10], ar_saved;
+static void ar_paint(uint32_t color)
+{
+ volatile uint32_t *fb = (volatile uint32_t *)0xb8000000UL;
+ for (unsigned i = 0; i < 1080 * 2400; i++) fb[i] = color;
+ const char *text = "FUXI AUTOREFRESH TEST";
+ for (unsigned c = 0; text[c]; c++) {
+  const unsigned char *glyph = font8x16[(unsigned char)text[c] - 32];
+  for (unsigned gy = 0; gy < 16; gy++)
+   for (unsigned gx = 0; gx < 8; gx++)
+    if (glyph[gy] & (0x80u >> gx))
+     for (unsigned sy = 0; sy < 4; sy++)
+      for (unsigned sx = 0; sx < 4; sx++)
+       fb[(1100 + gy * 4 + sy) * 1080 + 48 + c * 32 + gx * 4 + sx] = 0xffffffff;
+ }
+ __asm__ volatile("dsb sy" ::: "memory");
+}
+static void ar_test(uint32_t mode)
+{
+ for (unsigned i = 0; i < 10; i++) ar_report[i] = 0;
+ if (usb_rd(0xae05000, 0x14) != 0xb8000000 || usb_rd(0xae05000, 0x24) != 4320 ||
+     usb_rd(0xae05000, 0x00) != ((2400u << 16) | 1080u) ||
+     usb_rd(0xae05000, 0x30) != 0x237ff) { ar_report[0] = 0x100; return; }
+ ar_report[1] = usb_rd(0xae36000, 0x2b4);
+ ar_report[3] = usb_rd(0xae36000, 0x2a8) & 0xffff;
+ if (mode == 0x4e53) {
+  ar_paint(0xff0040c0);               /* blue, no START */
+  ar_report[0] = 1;
+ } else if (mode == 0x4153) {
+  if (ar_report[1] & 0x80000000u) ar_saved = ar_report[1];
+  *(volatile uint32_t *)0xae362b4UL = ar_report[1] & ~0x80000000u;
+  __asm__ volatile("dsb sy" ::: "memory");
+  /* Linux _dpu_encoder_phys_cmd_is_ongoing_pptx: wait for wr line 0 or >= vdisplay. */
+  unsigned i;
+  for (i = 0; i < 200000; i++) {
+   uint32_t l = usb_rd(0xae36000, 0x2a8) & 0xffff;
+   if (i > 20000 && (l == 0 || l >= 2400)) break;  /* >= 20 ms: one frame past */
+   delay(1);
+  }
+  ar_report[4] = usb_rd(0xae36000, 0x2a8) & 0xffff; ar_report[5] = i;
+  ar_paint(0xffc02000);               /* red, single manual START */
+  *(volatile uint32_t *)0x0ae1601cUL = 1;
+  __asm__ volatile("dsb sy" ::: "memory");
+  delay(40000);
+  ar_report[6] = usb_rd(0xae36000, 0x2a8) & 0xffff;
+  ar_report[0] = 2;
+ } else if (mode == 0x5245 && ar_saved) {
+  *(volatile uint32_t *)0xae362b4UL = ar_saved;
+  __asm__ volatile("dsb sy" ::: "memory");
+  ar_report[0] = 3;
+ }
+ ar_report[2] = usb_rd(0xae36000, 0x2b4);
+ ar_report[7] = usb_rd(0xae94000, 0x4);
+ ar_report[8] = usb_rd(0xae94000, 0xc);
+}
+
 static uint64_t ram_report[8];
 static void ram_probe(void)
 {
@@ -606,6 +667,9 @@ ud_setup(void)
     } else if (type == 0xc0 && req == 0x52 && value == 0x4253 && !monitor_report[MON_LAUNCH]) {
         display_boost();
         memcpy(data, boost_report, sizeof(boost_report)); n=sizeof(boost_report);
+    } else if (type == 0xc0 && req == 0x53 && !monitor_report[MON_LAUNCH]) {
+        ar_test(value);
+        memcpy(data, ar_report, sizeof(ar_report)); n=sizeof(ar_report);
     } else if (type == 0xc0 && req == 0x50) {
         display_rcg[0]=0;
         if (!monitor_report[MON_LAUNCH]) display_clock_snapshot_awake();
