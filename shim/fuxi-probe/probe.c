@@ -382,7 +382,7 @@ out:
  */
 #define TS_SE   0x00a90000UL
 #define TS_GCC  0x00100000UL
-#define TS_TLMM 0x0f000000UL
+#define TS_TLMM 0x0f100000UL /* DT node 0x0f000000 + downstream tile 0x100000 = upstream tlmm@f100000 (ts-03) */
 static uint32_t touch_report[64];
 static uint8_t touch_events[8*32];
 static unsigned ts_depth;
