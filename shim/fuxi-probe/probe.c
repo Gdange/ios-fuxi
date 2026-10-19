@@ -442,6 +442,21 @@ ud_setup(void)
             usb_rd(0xae05000,0x24)!=4320 || usb_rd(0xae05000,0x30)!=0x237ff)
             ok=false;
         else memcpy(data,(const void *)(uintptr_t)(0xb8000000ULL+off),n);
+    } else if (type == 0xc0 && req == 0x4f) {
+        /* Read-only display pipeline windows from live FDT: MDSS top, MDP top,
+         * CTL0, INTF1 (+tear irq), DSC0 enc/ctl, PP0/PP1, DSI0 controller. */
+        static const uint32_t win[][2]={{0xae00000,0x40},{0xae01000,0x400},
+            {0xae16000,0x290},{0xae36000,0x300},{0xae36800,0x10},{0xae81000,0x4},
+            {0xae81100,0x9c},{0xae81f00,0x24},{0xae6a000,0x4},{0xae6b000,0x4},
+            {0xae94000,0x300}};
+        uint32_t index=(uint32_t)st[4] | ((uint32_t)st[5]<<8);
+        n=length > 512 ? 512 : length;
+        if (value >= sizeof(win)/sizeof(win[0]) || (index|n)&3 ||
+            index > win[value][1] || n > win[value][1]-index) ok=false;
+        else for (uint32_t i=0;i<n;i+=4) {
+            uint32_t v=usb_rd(win[value][0],index+i);
+            memcpy(data+i,&v,4);
+        }
     } else if (type == 0xc0 && req == 0x4b) {
         ufs_snapshot();
         memcpy(data, ufs_report, sizeof(ufs_report)); n=sizeof(ufs_report);
