@@ -408,6 +408,10 @@ static void ts_gpio(unsigned n, unsigned func, unsigned pull, unsigned ma, int o
  if (out>=0) ts_wr(c,4,out?2u:0u);
  ts_wr(c,0,(usb_rd(c,0)&~0x3ffu)|pull|(func<<2)|((ma/2-1)<<6)|(out>=0?0x200u:0u));
 }
+/* Lane-gpu (milestone 1): staged A740 power/clock/cmd-db probe on request 0x56.
+ * Kept in its own single-TU file so other lanes' probe.c edits stay separate. */
+#include "gpu.c"
+
 /* SE4 and wrapper registers hang the bus (SoC reset) while wrapper1's AHB
  * clocks are gated: touch them only with m_ahb running (s_ahb is under
  * hardware clock gating, its CLK_OFF bit is not meaningful at idle). */
@@ -1204,6 +1208,10 @@ ud_setup(void)
             if (value == 0x5450) touch_power(st[4]); else touch_snapshot(st[4]);
             memcpy(data, touch_report, sizeof(touch_report)); n=sizeof(touch_report);
         }
+    } else if (type == 0xc0 && req == 0x56 && value == 0x4753 && !monitor_report[MON_LAUNCH]) {
+        /* 'GS': staged GPU power/clock/cmd-db probe; st[4] = last stage (1..7). */
+        gpu_probe(st[4]);
+        memcpy(data, gpu_report, sizeof(gpu_report)); n=sizeof(gpu_report);
     } else if (type == 0xc0 && req == 0x54 && value >= 1 && value <= 60) {
         /* Host-requested reset deadline: now + value minutes (bounded, never disabled). */
         monitor_report[MON_DEADLINE]=rsr("cntpct_el0")+rsr("cntfrq_el0")*60*value;
