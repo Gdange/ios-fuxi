@@ -53,6 +53,7 @@ def main():
     ap.add_argument('--framebuffer',action='store_true',help='save the validated inherited framebuffer after collecting logs')
     ap.add_argument('--skip-clocks',action='store_true',help='do not take the AHB-ungating clock snapshot before handoff')
     ap.add_argument('--reset-minutes',type=int,help='move the monitor PSCI reset deadline to now + N minutes (1-60)')
+    ap.add_argument('--touch-test',type=float,metavar='SECONDS',help='before handoff: touch snapshot, power-up, then poll touch events for SECONDS')
     ap.add_argument('--display-poll',action='store_true',help='sample CTL0 START, INTF1 autorefresh and DSI status/FIFO each poll')
     args = ap.parse_args()
     payload = args.payload.read_bytes()
@@ -128,6 +129,21 @@ def main():
             raise ValueError('--reset-minutes must be 1-60')
         request(0x54, 8, args.reset_minutes)
         print(f'monitor reset deadline: +{args.reset_minutes} min', flush=True)
+    if args.touch_test is not None:
+        words=lambda b: list(struct.unpack('<64I',b))
+        snap=words(request(0x55,256,0x5453))
+        print('touch snapshot',[hex(v) for v in snap[1:44]],flush=True)
+        power=words(request(0x55,256,0x5450))
+        print('touch power',[hex(v) for v in power[:16]],'err',hex(power[60]),hex(power[61]),flush=True)
+        events=[]
+        until=time.monotonic()+args.touch_test
+        while power[0]==6 and time.monotonic()<until:
+            b=bytes(dev.ctrl_transfer(0xc0,0x55,0x5445,0,256,timeout=3000))
+            for i in range(0,len(b),8):
+                events.append((round(time.monotonic(),3),b[i:i+8].hex()))
+                print('touch event',b[i:i+8].hex(),flush=True)
+            time.sleep(.02)
+        (args.out/'touch.json').write_text(json.dumps({'snapshot':snap,'power':power,'events':events},indent=1)+'\n')
     request(0x49, 88, 0x584e)
     last_total = 0
     previous = None

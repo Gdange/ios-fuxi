@@ -373,6 +373,204 @@ out:
  *(volatile uint32_t *)0x127004UL=old;
  __asm__ volatile("dsb sy" ::: "memory");
 }
+/*
+ * Touch: ST FTS (FTM5) on QUP1 SE4 SPI, see research/touch/hw-report.md.
+ * Live FDT: SE4 0xa90000, reset GPIO24, IRQ GPIO25 (active low), SPI pins
+ * 44-47 func 1, supplies ldob12 (vdd 1.8 V) and ldom6 (avdd 3.2 V) on RPMh.
+ * Request 0x55: 'TS' read-only snapshot, 'TP' power + reset + chip ID +
+ * sense on, 'TE' read one FIFO batch (polled; no GIC/PDC interrupt work).
+ */
+#define TS_SE   0x00a90000UL
+#define TS_GCC  0x00100000UL
+#define TS_TLMM 0x0f000000UL
+static uint32_t touch_report[64];
+static uint8_t touch_events[8*32];
+static unsigned ts_depth;
+static void ts_wr(uintptr_t base, uint32_t off, uint32_t v)
+{
+ __asm__ volatile("dmb oshst" ::: "memory");
+ *(volatile uint32_t *)(base+off)=v;
+ __asm__ volatile("dsb osh" ::: "memory");
+}
+/* TLMM CTL: pull [1:0] (1 down, 3 up), func [5:2], drive [8:6] = mA/2-1, OE [9]. */
+static void ts_gpio(unsigned n, unsigned func, unsigned pull, unsigned ma, int out)
+{
+ uintptr_t c=TS_TLMM+0x1000u*n;
+ if (out>=0) ts_wr(c,4,out?2u:0u);
+ ts_wr(c,0,(usb_rd(c,0)&~0x3ffu)|pull|(func<<2)|((ma/2-1)<<6)|(out>=0?0x200u:0u));
+}
+static void touch_snapshot(void)
+{
+ static const uint16_t se[]={0x040,0x048,0x064,0x068,0x07c,0x258,0x25c,0x268,
+  0x260,0x264,0x610,0x614,0x800,0x804,0xe24,0xe28};
+ unsigned n=1;
+ for (unsigned i=0;i<16;i++) touch_report[n++]=usb_rd(TS_SE,se[i]);
+ touch_report[n++]=usb_rd(TS_GCC,0x52008);
+ touch_report[n++]=usb_rd(TS_GCC,0x184e4);
+ touch_report[n++]=usb_rd(TS_GCC,0x2327c);
+ touch_report[n++]=usb_rd(TS_GCC,0x23280);
+ touch_report[n++]=usb_rd(TS_GCC,0x184f0);
+ touch_report[n++]=usb_rd(TS_GCC,0x184f4);
+ touch_report[n++]=usb_rd(TS_GCC,0x18504);
+ for (unsigned l=0;l<8;l++) touch_report[n++]=usb_rd(TS_GCC,0x1850c+4*l);
+ static const uint8_t g[]={24,25,44,45,46,47};
+ for (unsigned i=0;i<6;i++) {
+  touch_report[n++]=usb_rd(TS_TLMM+0x1000u*g[i],0);
+  touch_report[n++]=usb_rd(TS_TLMM+0x1000u*g[i],4);
+ }
+ touch_report[n++]=usb_rd(0x00ac0000,4); /* QUP_HW_VER */
+}
+/* One full-duplex FIFO command, CS held for its duration. Bytes are sent
+ * from tx (zero padding after nt) and the first len received bytes kept. */
+static uint32_t ts_xfer(const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned len)
+{
+ if (usb_rd(TS_SE,0x040)&1) return 1;
+ ts_wr(TS_SE,0x618,0xffffffffu);
+ ts_wr(TS_SE,0x26c,len); ts_wr(TS_SE,0x270,len);
+ ts_wr(TS_SE,0x600,3u<<27);
+ unsigned sent=0, got=0;
+ for (unsigned us=0;us<20000;us++) {
+  while (sent<len && (usb_rd(TS_SE,0x800)&0xfffffffu)+1<ts_depth) {
+   uint32_t w=0;
+   for (unsigned j=0;j<4 && sent<len;j++,sent++) w|=(uint32_t)(sent<nt?tx[sent]:0)<<(8*j);
+   ts_wr(TS_SE,0x700,w);
+  }
+  uint32_t cnt=usb_rd(TS_SE,0x804)&0x1ffffffu;
+  while (cnt--) {
+   uint32_t w=usb_rd(TS_SE,0x780);
+   for (unsigned j=0;j<4 && got<len;j++) rx[got++]=(uint8_t)(w>>(8*j));
+  }
+  uint32_t irq=usb_rd(TS_SE,0x610);
+  if ((irq&1) && got>=len && !(usb_rd(TS_SE,0x804)&0x1ffffffu)) {
+   ts_wr(TS_SE,0x618,irq); return 0;
+  }
+  if (irq&0x3eu) break;
+  delay(1);
+ }
+ touch_report[60]=usb_rd(TS_SE,0x610); touch_report[61]=(sent<<16)|got;
+ ts_wr(TS_SE,0x604,2);
+ for (unsigned i=0;i<5000 && !(usb_rd(TS_SE,0x610)&(1u<<5));i++) delay(1);
+ for (unsigned i=0;i<64 && (usb_rd(TS_SE,0x804)&0x1ffffffu);i++) (void)usb_rd(TS_SE,0x780);
+ ts_wr(TS_SE,0x618,0xffffffffu);
+ return 2;
+}
+/* FTS read: opcode + address, one dummy byte, then n data bytes. */
+static uint32_t ts_read(const uint8_t *cmd, unsigned nc, uint8_t *out, unsigned n)
+{
+ uint8_t buf[8+1+8*32];
+ if (nc>8 || n>8*32) return 3;
+ uint32_t e=ts_xfer(cmd,nc,buf,nc+1+n);
+ if (!e) memcpy(out,buf+nc+1,n);
+ return e;
+}
+static uint32_t ts_cmd(const uint8_t *cmd, unsigned nc)
+{
+ uint8_t buf[8];
+ return nc>8 ? 3 : ts_xfer(cmd,nc,buf,nc);
+}
+static uint32_t ts_clock(void)
+{
+ /* Vote wrapper1 core/core2x/m_ahb/s_ahb and SE4 only. */
+ ts_wr(TS_GCC,0x52008,usb_rd(TS_GCC,0x52008)|(0xfu<<18)|(1u<<26));
+ for (unsigned i=0;i<1000 && (usb_rd(TS_GCC,0x184e4)&0x80000000u);i++) delay(1);
+ if (usb_rd(TS_GCC,0x184e4)&0x80000000u) return 0x10;
+ /* SE_GENI_CLK_SEL picks a DFS level; use one sourced from XO, undivided
+  * (19.2 MHz), and divide by 2 in the SE: 9.6 MHz SCLK (driver max 12). */
+ if (usb_rd(TS_GCC,0x18504)&1) {
+  for (unsigned l=0;l<8;l++) {
+   uint32_t cfg=usb_rd(TS_GCC,0x1850c+4*l);
+   if ((cfg&0x71fu)<=1u) {
+    ts_wr(TS_SE,0x07c,l); ts_wr(TS_SE,0x048,(2u<<4)|1u); return 0;
+   }
+  }
+  return 0x11;
+ }
+ if ((usb_rd(TS_GCC,0x184f4)&0x71fu)>1u) return 0x12;
+ ts_wr(TS_SE,0x07c,0); ts_wr(TS_SE,0x048,(2u<<4)|1u);
+ return 0;
+}
+static uint32_t ts_se_init(void)
+{
+ uint32_t fw=usb_rd(TS_SE,0x068), hw=usb_rd(TS_SE,0xe24);
+ if (((fw>>8)&0xff)!=1) return 0x20;            /* not SPI firmware */
+ if (usb_rd(TS_SE,0x064)&1) return 0x21;        /* FIFO interface disabled */
+ if (usb_rd(TS_SE,0x040)&1) return 0x22;
+ ts_depth=(hw>>16)&0x3f;
+ if (ts_depth<4 || ((hw>>24)&0x3f)!=32) return 0x23;
+ ts_wr(TS_SE,0xe18,0); ts_wr(TS_SE,0xe1c,0);
+ ts_wr(TS_SE,0x618,0xffffffffu); ts_wr(TS_SE,0x648,0xffffffffu);
+ ts_wr(TS_SE,0x028,usb_rd(TS_SE,0x028)|0x7f);
+ ts_wr(TS_SE,0xe30,usb_rd(TS_SE,0xe30)|0xf);
+ ts_wr(TS_SE,0x024,0x7f); ts_wr(TS_SE,0x020,1);
+ ts_wr(TS_SE,0x258,0);
+ ts_wr(TS_SE,0x810,ts_depth-3); ts_wr(TS_SE,0x814,ts_depth-2); ts_wr(TS_SE,0x80c,0);
+ ts_wr(TS_SE,0x260,0x0007f8feu); ts_wr(TS_SE,0x264,0x000ffefeu);
+ ts_wr(TS_SE,0x284,0x0007f8feu); ts_wr(TS_SE,0x288,0x000ffefeu);
+ ts_wr(TS_SE,0x254,0); ts_wr(TS_SE,0x268,4);
+ ts_wr(TS_SE,0x224,0); ts_wr(TS_SE,0x22c,0); ts_wr(TS_SE,0x230,0);
+ ts_wr(TS_SE,0x24c,0); ts_wr(TS_SE,0x250,0);
+ ts_wr(TS_SE,0x25c,usb_rd(TS_SE,0x25c)&~3u);   /* CS_TOGGLE is bit 0 or 1 by kernel version */
+ ts_wr(TS_SE,0x614,0xffffffffu);
+ return 0;
+}
+static void touch_power(void)
+{
+ static const uint8_t id_cmd[]={0xfb,0x20,0x00,0x00,0x00}, fifo[]={0x87}, sense[]={0xa0,0x00,0x01};
+ for (unsigned i=0;i<64;i++) touch_report[i]=0;
+ touch_report[0]=1;
+ uint32_t id=usb_rd(RH_DRV_PA,0), cfg=usb_rd(RH_DRV_PA,0xc);
+ if (((id>>16)&0xff)!=3 || ((cfg>>12)&0x3f)<3) { touch_report[0]=0x100; return; }
+ /* Hold the IC in reset (and IRQ low, as the vendor driver does) while the rails come up. */
+ ts_gpio(24,0,3,8,0); ts_gpio(25,0,3,8,0);
+ /* VRM: +0 voltage mV, +4 enable. vdd first, then avdd. */
+ static const uint32_t cmds[][2]={{0x40900,1800},{0x40904,1},{0x41b00,3200},{0x41b04,1}};
+ for (unsigned i=0;i<4;i++) {
+  touch_report[1+i]=rh_send(0,cmds[i][0],cmds[i][1]);
+  if (touch_report[1+i]) { touch_report[0]=0x200|i; return; }
+ }
+ delay(3000);
+ ts_gpio(25,0,3,8,-1);
+ ts_gpio(24,0,3,8,1);
+ ts_gpio(44,1,1,6,-1); ts_gpio(45,1,1,6,-1); ts_gpio(46,1,1,6,-1); ts_gpio(47,1,3,6,-1);
+ touch_report[0]=2;
+ if ((touch_report[5]=ts_clock())) return;
+ touch_report[0]=3;
+ if ((touch_report[6]=ts_se_init())) return;
+ touch_report[0]=4;
+ touch_report[7]=ts_depth;
+ /* fts_system_reset: reset low 10 ms, high, then poll the FIFO for 03 (ready). */
+ ts_gpio(24,0,3,8,0); delay(10000); ts_gpio(24,0,3,8,1);
+ uint8_t ev[8]={0};
+ for (unsigned t=0;t<100;t++) {
+  delay(2000);
+  touch_report[8]=ts_read(fifo,1,ev,8);
+  if (touch_report[8]) break;
+  if (ev[0]==0x03) break;
+ }
+ memcpy(&touch_report[9],ev,8);
+ uint8_t chip[2]={0};
+ touch_report[11]=ts_read(id_cmd,5,chip,2);
+ touch_report[12]=((uint32_t)chip[0]<<8)|chip[1];
+ if (touch_report[8] || touch_report[11]) return;
+ touch_report[0]=5;
+ touch_report[13]=ts_cmd(sense,3);
+ if (!touch_report[13]) touch_report[0]=6;
+ touch_report[14]=usb_rd(TS_TLMM+0x19000,4);
+}
+/* One FIFO batch: first event, then the remaining count from byte 7. */
+static unsigned touch_read_events(void)
+{
+ static const uint8_t fifo[]={0x87};
+ if (touch_report[0]!=6) return 0;
+ unsigned n=0;
+ for (unsigned i=0;i<32;) {
+  uint8_t *e=touch_events+8*i;
+  if (ts_read(fifo,1,e,8) || e[0]==0) break;
+  i++; n=i;
+  if (!(e[7]&0x1f)) break;
+ }
+ return n*8;
+}
 /* SM8550 cpu@100 from the live FDT. CPU_ON is only requested by the host. */
 static volatile uint64_t core_report[10] __attribute__((aligned(64)));
 void probe_secondary_main(void)
@@ -670,6 +868,15 @@ ud_setup(void)
     } else if (type == 0xc0 && req == 0x53 && !monitor_report[MON_LAUNCH]) {
         ar_test(value);
         memcpy(data, ar_report, sizeof(ar_report)); n=sizeof(ar_report);
+    } else if (type == 0xc0 && req == 0x55 && !monitor_report[MON_LAUNCH] &&
+               (value == 0x5453 || value == 0x5450 || value == 0x5445)) {
+        if (value == 0x5445) {
+            n=touch_read_events();
+            memcpy(data, touch_events, n);
+        } else {
+            if (value == 0x5450) touch_power(); else { touch_report[0]=0; touch_snapshot(); }
+            memcpy(data, touch_report, sizeof(touch_report)); n=sizeof(touch_report);
+        }
     } else if (type == 0xc0 && req == 0x54 && value >= 1 && value <= 60) {
         /* Host-requested reset deadline: now + value minutes (bounded, never disabled). */
         monitor_report[MON_DEADLINE]=rsr("cntpct_el0")+rsr("cntfrq_el0")*60*value;
