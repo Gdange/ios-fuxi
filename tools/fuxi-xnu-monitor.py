@@ -167,6 +167,7 @@ def main():
     last_total = 0
     previous = None
     until = time.monotonic() + args.seconds
+    renew = time.monotonic() + 600
     with (args.out / 'progress.jsonl').open('w') as progress, (args.out / 'boot.log').open('wb') as log:
         while time.monotonic() < until:
             status = monitor()
@@ -200,6 +201,9 @@ def main():
                 previous = brief
             if status['stage'] == 99:
                 break
+            if args.reset_minutes and time.monotonic() > renew:
+                request(0x54, 8, args.reset_minutes)
+                renew = time.monotonic() + 600
             time.sleep(.25)
     (args.out/'display-after.bin').write_bytes(request(0x42,432))
     if args.framebuffer:
