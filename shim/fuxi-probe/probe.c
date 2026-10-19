@@ -405,27 +405,34 @@ static bool ts_clocks_on(void)
 {
  return !((usb_rd(TS_GCC,0x2327c)|usb_rd(TS_GCC,0x23280)|usb_rd(TS_GCC,0x184e4))&0x80000000u);
 }
-static void touch_snapshot(void)
+/* Groups (ts-02 bisect; any abort resets the SoC): 0 GCC, 1 TLMM, 2 SE4 + QUP
+ * version (only with the wrapper clocks on), 3 a single GCC word (index). */
+static void touch_snapshot(unsigned group)
 {
  static const uint16_t se[]={0x040,0x048,0x064,0x068,0x07c,0x258,0x25c,0x268,
   0x260,0x264,0x610,0x614,0x800,0x804,0xe24,0xe28};
- unsigned n=1;
- bool on=ts_clocks_on();
- for (unsigned i=0;i<16;i++) touch_report[n++]=on ? usb_rd(TS_SE,se[i]) : 0xdeadu;
- touch_report[n++]=usb_rd(TS_GCC,0x52008);
- touch_report[n++]=usb_rd(TS_GCC,0x184e4);
- touch_report[n++]=usb_rd(TS_GCC,0x2327c);
- touch_report[n++]=usb_rd(TS_GCC,0x23280);
- touch_report[n++]=usb_rd(TS_GCC,0x184f0);
- touch_report[n++]=usb_rd(TS_GCC,0x184f4);
- touch_report[n++]=usb_rd(TS_GCC,0x18504);
- for (unsigned l=0;l<8;l++) touch_report[n++]=usb_rd(TS_GCC,0x1850c+4*l);
  static const uint8_t g[]={24,25,44,45,46,47};
- for (unsigned i=0;i<6;i++) {
-  touch_report[n++]=usb_rd(TS_TLMM+0x1000u*g[i],0);
-  touch_report[n++]=usb_rd(TS_TLMM+0x1000u*g[i],4);
+ unsigned n=1;
+ for (unsigned i=0;i<64;i++) touch_report[i]=0;
+ touch_report[0]=0x100|group;
+ if (group==0) {
+  touch_report[n++]=usb_rd(TS_GCC,0x52008);
+  touch_report[n++]=usb_rd(TS_GCC,0x184e4);
+  touch_report[n++]=usb_rd(TS_GCC,0x2327c);
+  touch_report[n++]=usb_rd(TS_GCC,0x23280);
+  touch_report[n++]=usb_rd(TS_GCC,0x184f0);
+  touch_report[n++]=usb_rd(TS_GCC,0x184f4);
+  touch_report[n++]=usb_rd(TS_GCC,0x18504);
+  for (unsigned l=0;l<8;l++) touch_report[n++]=usb_rd(TS_GCC,0x1850c+4*l);
+ } else if (group==1) {
+  for (unsigned i=0;i<6;i++) {
+   touch_report[n++]=usb_rd(TS_TLMM+0x1000u*g[i],0);
+   touch_report[n++]=usb_rd(TS_TLMM+0x1000u*g[i],4);
+  }
+ } else if (group==2 && ts_clocks_on()) {
+  for (unsigned i=0;i<16;i++) touch_report[n++]=usb_rd(TS_SE,se[i]);
+  touch_report[n++]=usb_rd(0x00ac0000,4); /* QUP_HW_VER */
  }
- touch_report[n++]=on ? usb_rd(0x00ac0000,4) : 0xdeadu; /* QUP_HW_VER */
 }
 /* One full-duplex FIFO command, CS held for its duration. Bytes are sent
  * from tx (zero padding after nt) and the first len received bytes kept. */
@@ -881,7 +888,7 @@ ud_setup(void)
             n=touch_read_events();
             memcpy(data, touch_events, n);
         } else {
-            if (value == 0x5450) touch_power(); else { touch_report[0]=0; touch_snapshot(); }
+            if (value == 0x5450) touch_power(); else touch_snapshot(st[4]);
             memcpy(data, touch_report, sizeof(touch_report)); n=sizeof(touch_report);
         }
     } else if (type == 0xc0 && req == 0x54 && value >= 1 && value <= 60) {

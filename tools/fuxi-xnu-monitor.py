@@ -129,10 +129,17 @@ def main():
             raise ValueError('--reset-minutes must be 1-60')
         request(0x54, 8, args.reset_minutes)
         print(f'monitor reset deadline: +{args.reset_minutes} min', flush=True)
+    input_stop = args.touch_test == 0
     if args.touch_test is not None:
         words=lambda b: list(struct.unpack('<64I',b))
-        snap=words(request(0x55,256,0x5453))
-        print('touch snapshot',[hex(v) for v in snap[1:44]],flush=True)
+        snap=[]
+        for group,count in ((0,15),(1,12),(2,17)):
+            print('touch snapshot group',group,'...',flush=True)
+            w=words(request(0x55,256,0x5453,group))
+            print('touch snapshot',group,[hex(v) for v in w[:count+1]],flush=True)
+            snap.append(w)
+        if input_stop:
+            raise SystemExit('touch snapshot only')
         power=words(request(0x55,256,0x5450))
         print('touch power',[hex(v) for v in power[:16]],'err',hex(power[60]),hex(power[61]),flush=True)
         events=[]
