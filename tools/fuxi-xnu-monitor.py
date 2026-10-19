@@ -51,6 +51,8 @@ def main():
     ap.add_argument('--out', type=Path, required=True)
     ap.add_argument('--seconds', type=float, default=65)
     ap.add_argument('--framebuffer',action='store_true',help='save the validated inherited framebuffer after collecting logs')
+    ap.add_argument('--skip-clocks',action='store_true',help='do not take the AHB-ungating clock snapshot before handoff')
+    ap.add_argument('--display-poll',action='store_true',help='sample CTL0 START, INTF1 autorefresh and DSI status/FIFO each poll')
     args = ap.parse_args()
     payload = args.payload.read_bytes()
     if payload[:8] != b'SWEETXNU':
@@ -110,8 +112,16 @@ def main():
     (args.out / 'ufs-before.json').write_text(json.dumps(dict(zip(names,struct.unpack('<24I',ufs))),indent=2)+'\n')
     (args.out / 'display-before.bin').write_bytes(request(0x42,432))
     clock_names='magic version gcc_ahb gcc_hf_axi valid gdsc ahb mdp byte0 byte0_intf pclk0 esc0 vsync non_gdsc_ahb'.split()
-    clock_raw=request(0x4c,56,1)
-    (args.out / 'display-clocks-before.json').write_text(json.dumps(dict(zip(clock_names,struct.unpack('<14I',clock_raw))),indent=2)+'\n')
+    if not args.skip_clocks:
+        clock_raw=request(0x4c,56,1)
+        (args.out / 'display-clocks-before.json').write_text(json.dumps(dict(zip(clock_names,struct.unpack('<14I',clock_raw))),indent=2)+'\n')
+    def display_poll():
+        # Read-only 0x4f windows: 1 CTL0, 2 INTF1, 9 DSI0 (never window 0).
+        word=lambda w,o: struct.unpack('<I',request(0x4f,4,w,o))[0]
+        return {'ctl_start':word(1,0x1c),'autorefresh':word(2,0x2b4),
+                'dsi_status':word(9,0x4),'dsi_fifo':word(9,0xc)}
+    if args.display_poll:
+        print('display before handoff', display_poll(), flush=True)
     request(0x49, 88, 0x584e)
     last_total = 0
     previous = None
@@ -139,6 +149,8 @@ def main():
                     start += length
                 log.flush()
                 last_total = total
+            if args.display_poll:
+                status['display'] = display_poll()
             progress.write(json.dumps(status)+'\n')
             progress.flush()
             brief = {k: status[k] for k in ('stage','kernel_stage','kernel_label','console_total','error') if k in status}
