@@ -66,7 +66,7 @@ DTB) read with `tools/fuxi-inspect-dtb.py`. Register maths: pinned Linux
 
 ### Power levels (FACT, live DT `gpu-pwrlevels-0`, initial level 8 = 220 MHz)
 9 levels, freq/level(ARC): 719.6 MHz/0xe0, 680/0xc0, 615/0x90, 550/0x80,
-475/0x50, 401/0x40, 366/0x3c, 338/0x38, 220/0x34. GMU opp table: 500 MHz/SVS,
+475/0x50, 401/0x40, 348/0x3c, 295/0x38 (corrected 2026-10-20 from live DT; bin not yet confirmed), 220/0x34. GMU opp table: 500 MHz/SVS,
 200 MHz/LOW_SVS. gmu-freq-table: 220 MHz vote 0x40, 550 MHz vote 0x80.
 (Upstream sm8550.dtsi GPU opp table differs slightly in top bins; Fuxi's own
 `gpu-pwrlevels-0` above is authoritative and is what the perf table must use.)
@@ -82,7 +82,7 @@ DTB) read with `tools/fuxi-inspect-dtb.py`. Register maths: pinned Linux
 - SQE is copied into the ring's SQE BO **without its first dword**
   (`adreno_fw_create_bo`). GMU fw is the block format `{addr,size,type,value}`
   + payload: ITCM `{0,0x4000}`, icache `{0x4000,0xffc000}`, DTCM
-  `{0x10004000,0x4000}`; expect 15 non-empty blocks.
+  `{0x10004000,0x4000}`; the file is 11 zero-size prealloc headers + 4 data blocks (ITCM 0x0 0x1dc, icache 0x4000 0x10210, DTCM 0x10007f98 0x28, 0x10007fdc 0x18); prealloc needs the whole icache window backed (corrected 2026-10-20).
 - Fuxi's own vendor blobs (`a740_sqe.fw`, `gmu_gen70200.bin`, and the signed
   `a740_zap.*`) are **not available locally** — no Fuxi vendor image was
   extracted. The zap step (milestone 2) needs a **Fuxi-signed** zap; sheng
