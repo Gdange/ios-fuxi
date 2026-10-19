@@ -528,17 +528,22 @@ static uint32_t gpi_init(void)
  if (gpi_state(GPI_EV)) { gpi_cmd(0x10,9u<<24,GPI_EV,1); ts_wr(GPI_GPII,0x10,10u<<24); delay(1000); }
  memset(gpi_ring,0,sizeof(gpi_ring)); memset(gpi_evr,0,sizeof(gpi_evr));
  /* Interrupt masks as gpi_config_interrupts(DEFAULT); the GIC line stays off. */
+ if (ts_stage<3) return 0;
  ts_wr(GPI_GPII,0x88,0x4f); ts_wr(GPI_GPII,0xb8,1); ts_wr(GPI_GPII,0x98,3);
  ts_wr(GPI_GPII,0x9c,1); ts_wr(GPI_GPII,0x108,1); ts_wr(GPI_GPII,0x120,0xf);
  ts_wr(GPI_GPII,0x188,0); ts_wr(GPI_GPII,0x18c,0);
  ts_wr(GPI_GPII,0x400,0); ts_wr(GPI_GPII,0x404,0);
  ts_wr(GPI_GPII,0x180,1); ts_wr(GPI_GPII,0x200,0);
+ if (ts_stage<4) return 0;
  if (!gpi_cmd(0x10,0,GPI_EV,1)) return 0x31;
+ if (ts_stage<5) return 0;
  ts_wr(GPI_EV,0x00,0x10010002u); ts_wr(GPI_EV,0x04,sizeof(gpi_evr));
  ts_wr(GPI_EV,0x08,lo32(gpi_evr)); ts_wr(GPI_EV,0x0c,0); ts_wr(GPI_EVDB,4,0);
  for (unsigned o=0x20;o<=0x34;o+=4) ts_wr(GPI_EV,o,0);
  gpi_evrp=0; gpi_nev=0;
+ if (ts_stage<6) return 0;
  ts_wr(GPI_EVDB,0,lo32(gpi_evr)+sizeof(gpi_evr)-16);
+ if (ts_stage<7) return 0;
  for (unsigned k=0;k<2;k++) {
   if (!gpi_cmd(0x08,k,GPI_CH(k),1)) return 0x32+k;
   ts_wr(GPI_CH(k),0x00,k?0x10000002u:0x1000000au); ts_wr(GPI_CH(k),0x04,sizeof(gpi_ring[k]));
@@ -548,6 +553,7 @@ static uint32_t gpi_init(void)
   ts_wr(GPI_CH(k),0x5c,1);
   gpi_wp[k]=0;
  }
+ if (ts_stage<8) return 0;
  for (unsigned k=0;k<2;k++) if (!gpi_cmd(0x08,(1u<<24)|k,GPI_CH(k),2)) return 0x34+k;
  return 0;
 }
@@ -669,7 +675,7 @@ static void touch_power(unsigned stage)
  if ((touch_report[6]=ts_se_init())) return;
  touch_report[0]=4;
  touch_report[7]=ts_depth;
- if (ts_stage<3) return;
+ if (ts_stage<9) { gpi_diag(); return; }
  /* fts_system_reset: reset low 10 ms, high, then poll the FIFO for 03 (ready). */
  ts_gpio(24,0,3,8,0); delay(10000); ts_gpio(24,0,3,8,1);
  uint8_t ev[8]={0};

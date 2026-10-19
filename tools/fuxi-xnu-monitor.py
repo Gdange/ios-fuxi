@@ -54,7 +54,7 @@ def main():
     ap.add_argument('--skip-clocks',action='store_true',help='do not take the AHB-ungating clock snapshot before handoff')
     ap.add_argument('--reset-minutes',type=int,help='move the monitor PSCI reset deadline to now + N minutes (1-60)')
     ap.add_argument('--touch-test',type=float,metavar='SECONDS',help='before handoff: touch snapshot, power-up, then poll touch events for SECONDS')
-    ap.add_argument('--touch-stage',type=int,default=9,help='touch power-up: stop after this stage (1 SE GSI mode, 2 GPI init, 9 all)')
+    ap.add_argument('--touch-stage',default='9',help='touch power-up: stop after this stage (1 SE GSI mode, 2 GPI init, 9 all)')
     ap.add_argument('--touch-power',action='store_true',help='loader touch power-up (rails, reset, sense on) right before the handoff')
     ap.add_argument('--no-handoff',action='store_true',help='stop after the touch test; the loader resets at its 90 s deadline')
     ap.add_argument('--display-poll',action='store_true',help='sample CTL0 START, INTF1 autorefresh and DSI status/FIFO each poll')
@@ -144,8 +144,10 @@ def main():
         if input_stop:
             (args.out/'touch.json').write_text(json.dumps({'snapshot':snap},indent=1)+'\n')
             raise SystemExit('touch snapshot only')
-        power=words(request(0x55,256,0x5450,args.touch_stage,timeout=20000))
-        print('touch power',[hex(v) for v in power],flush=True)
+        for stage in [int(x) for x in args.touch_stage.split(',')]:
+            print('touch power stage',stage,'...',flush=True)
+            power=words(request(0x55,256,0x5450,stage,timeout=20000))
+            print('touch power',stage,[hex(v) for v in power],flush=True)
         events=[]
         until=time.monotonic()+args.touch_test
         while power[0]==6 and time.monotonic()<until:
