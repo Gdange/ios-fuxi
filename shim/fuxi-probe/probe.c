@@ -542,7 +542,9 @@ static bool gpi_cmd(uint32_t reg, uint32_t v, uintptr_t ctx, uint32_t want)
  return false;
 }
 /* apps-smmu faults unmatched streams (sCR0.USFCFG, ts-10) and has no SMR
- * for GPI (0xb6) or the QUP1 wrapper (0xa3): add bypass entries for both. */
+ * for GPI (0xb6) or the QUP1 wrapper (0xa3). The hypervisor turns an S2CR
+ * bypass into fault (ts-11), so route both to context bank 4, which DWC3
+ * uses with stage 1 disabled (SCTLR.M=0). */
 static uint32_t ts_smmu(void)
 {
  static const uint16_t sid[]={0xb6,0xa3};
@@ -557,7 +559,7 @@ static uint32_t ts_smmu(void)
   }
   if (i<nsmr) { touch_report[16+j]=0x1000|i; continue; }
   if (freei==~0u) return 0x38;
-  ts_wr(sm,0xc00+4*freei,0x00010000u);           /* S2CR TYPE=bypass */
+  ts_wr(sm,0xc00+4*freei,4);                     /* S2CR translate, CB4 */
   ts_wr(sm,0x800+4*freei,0x80000000u|sid[j]);
   touch_report[16+j]=freei|usb_rd(sm,0x800+4*freei)<<8;
   touch_report[18+j]=usb_rd(sm,0xc00+4*freei);
