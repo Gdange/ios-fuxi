@@ -48,7 +48,7 @@ def main():
     ap.add_argument('--kernel', type=Path, required=True)
     ap.add_argument('--payload', type=Path, required=True)
     ap.add_argument('--out', type=Path, required=True)
-    ap.add_argument('--seconds', type=float, default=25)
+    ap.add_argument('--seconds', type=float, default=65)
     args = ap.parse_args()
     payload = args.payload.read_bytes()
     if payload[:8] != b'SWEETXNU':

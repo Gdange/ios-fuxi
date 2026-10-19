@@ -2,7 +2,8 @@
 """Build the single-CPU, RAM-root Fuxi ADT after validating a live FDT.
 
 Uses the same iPhone X userland identity and generic providers as ios-sweet.
-Hardware values come from Fuxi probe-02/03, not from Sweet. No UFS node is emitted.
+Hardware values come from measured Fuxi probes. UFS is absent by default; an
+explicit option adds the node used by the read-only storage diagnostic.
 """
 import argparse
 import importlib.util
@@ -21,7 +22,7 @@ def setprop(node, name, value):
     node.props = [(k, f, value if k == name else v) for k, f, v in node.props]
 
 
-def validate_live(path):
+def validate_live(path, ufs_readonly=False):
     spec = importlib.util.spec_from_file_location('fuxi_fdt', Path(__file__).with_name('fuxi-inspect-dtb.py'))
     fdt = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(fdt)
@@ -48,19 +49,28 @@ def validate_live(path):
     gic = nodes.get('/soc/interrupt-controller@17100000', {})
     if gic.get('reg') != struct.pack('>4I', GICD, 0x10000, GICR, GICR_SIZE):
         raise ValueError('GIC layout differs from the validated Fuxi map')
+    if ufs_readonly:
+        ufs=nodes.get('/soc/ufshc@1d84000',{})
+        if ufs.get('reg',b'')[:8] != struct.pack('>II',0x1d84000,0x3000):
+            raise ValueError('UFS host layout differs from the measured Fuxi map')
     splash = nodes.get('/reserved-memory/splash_region', {}).get('reg')
     if splash != struct.pack('>QQ', FB, FB_SIZE):
         raise ValueError('splash reservation differs from the measured Fuxi map')
 
 
-def build():
+def build(ufs_readonly=False):
     mkadt.HIGH_PHYS_BASE, mkadt.HIGH_MEM_SIZE = PHYS_BASE, MEM_SIZE
     mkadt.GICD, mkadt.GICR, mkadt.GICR_SIZE = GICD, GICR, GICR_SIZE
     mkadt.FB, mkadt.FB_SIZE = FB, FB_SIZE
     mkadt.VTIMER_INTID = 27
     root = mkadt.build(highmem=True)
     setprop(root, 'compatible', b'D22AP\0iPhone10,3\0xiaomi,fuxi\0qcom,sm8550\0AppleARM\0')
-    root.children = [n for n in root.children if n.name != 'sweet-ufs']
+    if ufs_readonly:
+        ufs=next(n for n in root.children if n.name=='sweet-ufs')
+        setprop(ufs,'name',b'fuxi-ufs\0')
+        setprop(ufs,'compatible',b'qcom,sm8550-ufshc\0')
+    else:
+        root.children = [n for n in root.children if n.name != 'sweet-ufs']
     chosen = next(n for n in root.children if n.name == 'chosen')
     setprop(chosen, 'firmware-version', b'fuxi-shim\0')
     setprop(chosen, 'system-firmware-version', b'fuxi-shim\0')
@@ -76,15 +86,16 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('out', type=Path)
     ap.add_argument('--live-fdt', type=Path, required=True)
+    ap.add_argument('--ufs-readonly',action='store_true',help='include UFS node for the opt-in, read-only kernel probe')
     args = ap.parse_args()
     try:
-        validate_live(args.live_fdt)
-        blob = adt.serialize(build())
+        validate_live(args.live_fdt,args.ufs_readonly)
+        blob = adt.serialize(build(args.ufs_readonly))
     except (ValueError, KeyError, struct.error) as error:
         ap.exit(1, str(error) + '\n')
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_bytes(blob)
-    print(f'{args.out}: {len(blob)} bytes; RAM {PHYS_BASE:#x}+{MEM_SIZE:#x}; CPU0 only; no UFS')
+    print(f'{args.out}: {len(blob)} bytes; RAM {PHYS_BASE:#x}+{MEM_SIZE:#x}; CPU0 only; UFS={"read-only probe" if args.ufs_readonly else "absent"}')
 
 
 if __name__ == '__main__':

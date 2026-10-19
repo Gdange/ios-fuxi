@@ -19,6 +19,9 @@ def main():
     ap.add_argument('--ram', action='store_true', help='sample and restore words in the advertised upper RAM bank')
     ap.add_argument('--core', action='store_true', help='request isolated cpu@100 diagnostic startup')
     ap.add_argument('--delegate', action='store_true', help='hand USB polling to the isolated diagnostic CPU')
+    ap.add_argument('--ufs', action='store_true', help='read a clock-guarded UFS handoff snapshot without issuing storage commands')
+    ap.add_argument('--ufs-wake', action='store_true', help='temporarily clear UFS AHB hardware gating, snapshot, then restore it')
+    ap.add_argument('--display-clocks', action='store_true', help='read GCC/DispCC clock state, skipping a halted bus')
     args = ap.parse_args()
     deadline = time.monotonic() + args.wait
     dev = None
@@ -108,6 +111,18 @@ def main():
             ap.exit(1, 'USB delegation did not complete on cpu@100\n')
         (args.out / 'monitor.json').write_text(json.dumps(monitor, indent=2)+'\n')
         print(f"USB requests now serviced by CPU MPIDR={monitor['usb_mpidr']:#x}")
+    if args.ufs or args.ufs_wake:
+        raw = bytes(dev.ctrl_transfer(0xc0,0x4d if args.ufs_wake else 0x4b,0x5546 if args.ufs_wake else 0,0,96,timeout=3000))
+        names='magic version ahb axi unipro gdsc valid reserved cap hci_version ahit interrupt_status interrupt_enable host_status host_enable list_lo list_hi doorbell list_running task_list_lo task_list_hi task_doorbell task_running uic_command'.split()
+        snapshot=dict(zip(names,struct.unpack('<24I',raw)))
+        (args.out / 'ufs.json').write_text(json.dumps(snapshot,indent=2)+'\n')
+        print('UFS snapshot:', {k:hex(v) for k,v in snapshot.items()})
+    if args.display_clocks:
+        raw=bytes(dev.ctrl_transfer(0xc0,0x4c,0,0,56,timeout=3000))
+        names='magic version gcc_ahb gcc_hf_axi valid gdsc ahb mdp byte0 byte0_intf pclk0 esc0 vsync non_gdsc_ahb'.split()
+        clocks=dict(zip(names,struct.unpack('<14I',raw)))
+        (args.out/'display-clocks.json').write_text(json.dumps(clocks,indent=2)+'\n')
+        print('Display clocks:',{k:hex(v) for k,v in clocks.items()})
     print(f"Saved {len(tree)} bytes of live FDT to {args.out}")
     print(f"MIDR={report['midr']:#x}, MPIDR={report['mpidr']:#x}, "
           f"MMFR0={report['mmfr0']:#x}, EL={report['current_el'] >> 2}")

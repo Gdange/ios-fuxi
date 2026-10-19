@@ -135,10 +135,35 @@ static void ufs_snapshot(void)
  ufs_report[4]=usb_rd(0x100000,0x77068); /* UniPro */
  ufs_report[5]=usb_rd(0x100000,0x77004); /* GDSC */
  ufs_report[6]=0;
- if ((ufs_report[2]|ufs_report[3]|ufs_report[4]) & 0x80000000) return;
+ if (!(ufs_report[5]&0x80000000) || ((ufs_report[2]|ufs_report[3]|ufs_report[4]) & 0x80000000)) return;
  for (unsigned i=0;i<sizeof(offsets)/sizeof(offsets[0]);i++)
   ufs_report[8+i]=usb_rd(0x1d84000,offsets[i]);
  ufs_report[6]=1;
+}
+/* Clear only the documented hardware-gate bit for a temporary AHB read. */
+static void ufs_snapshot_awake(void)
+{
+ uint32_t old=usb_rd(0x100000,0x77024);
+ if (!(old&1) || !(usb_rd(0x100000,0x77004)&0x80000000)) { ufs_snapshot(); return; }
+ *(volatile uint32_t *)0x177024UL=old&~2u;
+ __asm__ volatile("dsb sy" ::: "memory");
+ for(unsigned i=0;i<500 && (usb_rd(0x100000,0x77024)&0x80000000);i++) delay(20);
+ ufs_snapshot();
+ *(volatile uint32_t *)0x177024UL=old;
+ __asm__ volatile("dsb sy" ::: "memory");
+}
+static uint32_t display_clocks[14];
+static void display_clock_snapshot(void)
+{
+ static const uint32_t offsets[]={0x9000,0x80a4,0x800c,0x8028,0x802c,0x8004,0x8038,0x8024,0xc004};
+ display_clocks[0]=0x43445846; display_clocks[1]=1;
+ display_clocks[2]=usb_rd(0x100000,0x27004);
+ display_clocks[3]=usb_rd(0x100000,0x2700c);
+ display_clocks[4]=0;
+ if (display_clocks[2]&0x80000000) return;
+ for(unsigned i=0;i<sizeof(offsets)/sizeof(offsets[0]);i++)
+  display_clocks[5+i]=usb_rd(0xaf00000,offsets[i]);
+ display_clocks[4]=1;
 }
 /* SM8550 cpu@100 from the live FDT. CPU_ON is only requested by the host. */
 static volatile uint64_t core_report[10] __attribute__((aligned(64)));
@@ -398,6 +423,12 @@ ud_setup(void)
         else memcpy(data, (const void *)(uintptr_t)(0x8c0000000ULL+off), n);
     } else if (type == 0xc0 && req == 0x4b) {
         ufs_snapshot();
+        memcpy(data, ufs_report, sizeof(ufs_report)); n=sizeof(ufs_report);
+    } else if (type == 0xc0 && req == 0x4c) {
+        display_clock_snapshot();
+        memcpy(data, display_clocks, sizeof(display_clocks)); n=sizeof(display_clocks);
+    } else if (type == 0xc0 && req == 0x4d && value == 0x5546 && !monitor_report[MON_LAUNCH]) {
+        ufs_snapshot_awake();
         memcpy(data, ufs_report, sizeof(ufs_report)); n=sizeof(ufs_report);
     } else if (type == 0xc0 && req == 0x48) {
         memcpy(data, monitor_error, sizeof(monitor_error)); n=sizeof(monitor_error);
