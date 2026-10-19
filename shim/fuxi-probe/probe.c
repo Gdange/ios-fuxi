@@ -187,6 +187,7 @@ static void ram_probe(void)
  }
 }
 static void usb_poll(void);
+static void thermal_monitor_idle(void); /* thermal lane */
 static __attribute__((noreturn)) void reboot(void);
 volatile uint64_t monitor_report[MON_FIELDS] __attribute__((aligned(64)));
 char monitor_error[128];
@@ -778,6 +779,7 @@ void probe_secondary_main(void)
    monitor_report[MON_ACTIVE]=1;
    __asm__ volatile("dsb sy" ::: "memory");
    usb_poll();
+   thermal_monitor_idle(); /* thermal lane: no-op unless 0x57 'MI' selected a mode */
   } else delay(1000);
   if (monitor_report[MON_DEADLINE] && rsr("cntpct_el0") >= monitor_report[MON_DEADLINE]) reboot();
  }
@@ -877,6 +879,140 @@ dwc_rd(uint32_t off)
 {
 	return usb_rd(ud.dwc, off);
 }
+
+/* ===== Thermal lane (request 0x57): TSENS readout, EPSS CPU level, monitor idle =====
+ * Addresses from the live FDT (probe-09 live.dtb):
+ *  tsens0/1/2 (qcom,tsens-v2): TM 0xc271000/0xc272000/0xc273000, SROT 0xc222000/
+ *  0xc223000/0xc224000 (0x1ff each), 16/16/9 sensors. Linux tsens-v2 layout:
+ *  TM_Sn_STATUS 0xa0+4n (bits 11:0 signed deci-degC, bit 21 VALID), TM_TRDY 0xe4,
+ *  SROT 0x0 HW version, 0x4 CTRL (bit 0 enable, bits 18:3 sensor enable).
+ *  qcom,cpufreq-epss freq-domain0/1/2 at 0x17d91000/0x17d92000/0x17d93000 (0x1000):
+ *  domain 0 = cpu@0-200 (A510), 1 = cpu@300-600 (A715/A710), 2 = cpu@700 (X3).
+ *  Linux epss_soc_data: 0x0 enable, 0x20 domain state (bits 7:0 L value),
+ *  0xb0 DCVS ctrl (bit 0 per-core votes), 0x100 freq LUT, 0x200 volt LUT,
+ *  0x320 perf state (+4*core with per-core votes). LUT row: 31:30 src, 18:16 core
+ *  count (1 = turbo), 7:0 L (x 19.2 MHz); src 0 = GPLL0/2 300 MHz.
+ * Read-only except 'CL' (perf-state index write, the same register Linux writes) and
+ * 'MI' (monitor-idle mode of cpu@100). Nothing here touches state XNU uses.
+ *  'TH' (0x5448) wIndex mask: 1/2/4 TM of tsens0/1/2, 8 SROT of all three, 0x10 EPSS state.
+ *  'LU' (0x4c55) wIndex domain: 40 freq + 40 volt LUT rows.
+ *  'CL' (0x434c) wIndex = domain | level<<8 (level 0xff: report only).
+ *  'MI' (0x4d49) wIndex mode: 0 busy poll (default), 1 delay 500 us, 2 WFE + event stream.
+ */
+static const uintptr_t th_tm[3]={0xc271000,0xc272000,0xc273000};
+static const uintptr_t th_srot[3]={0xc222000,0xc223000,0xc224000};
+static const uint32_t th_nsens[3]={16,16,9};
+static const uintptr_t th_epss[3]={0x17d91000,0x17d92000,0x17d93000};
+static const uint32_t th_ncpu[3]={3,4,1};
+static uint32_t th_report[128];
+static volatile uint32_t th_idle_mode, th_idle_evnt;
+static uint32_t th_idle_events;
+static uint64_t th_idle_busy_until;
+/* Number of distinct LUT rows (Linux: two equal frequencies end the table). */
+static uint32_t th_lut_count(uintptr_t b)
+{
+ uint32_t prev=0, i;
+ for (i=0;i<40;i++) {
+  uint32_t row=usb_rd(b,0x100+4*i);
+  uint32_t khz=(row>>30) ? 19200*(row&0xff) : 300000;
+  if (i && khz==prev) break;
+  prev=khz;
+ }
+ return i;
+}
+static uint32_t thermal_request(uint16_t value, uint16_t index)
+{
+ uint32_t n=0;
+ memset(th_report,0,sizeof(th_report));
+ if (value==0x5448) {
+  uint64_t t=rsr("cntpct_el0");
+  th_report[n++]=0x31524854; /* THR1 */
+  th_report[n++]=index; th_report[n++]=(uint32_t)t; th_report[n++]=(uint32_t)(t>>32);
+  for (unsigned c=0;c<3;c++) {          /* 3 x 20 words */
+   uint32_t *w=&th_report[n]; n+=20;
+   if (index&(8u)) { w[0]=usb_rd(th_srot[c],0x0); w[1]=usb_rd(th_srot[c],0x4); }
+   if (index&(1u<<c)) {
+    w[2]=usb_rd(th_tm[c],0x4); w[3]=usb_rd(th_tm[c],0xe4);
+    for (unsigned s=0;s<th_nsens[c];s++) w[4+s]=usb_rd(th_tm[c],0xa0+4*s);
+   }
+  }
+  for (unsigned d=0;d<3;d++) {          /* 3 x 8 words */
+   uint32_t *w=&th_report[n]; n+=8;
+   if (index&0x10) {
+    w[0]=usb_rd(th_epss[d],0x0); w[1]=usb_rd(th_epss[d],0x20); w[2]=usb_rd(th_epss[d],0xb0);
+    for (unsigned c=0;c<((w[2]&1) ? th_ncpu[d] : 1);c++) w[3+c]=usb_rd(th_epss[d],0x320+4*c);
+   }
+  }
+  th_report[n++]=th_idle_mode; th_report[n++]=th_idle_evnt;
+  return n*4;                           /* 4+60+24+2 = 90 words */
+ }
+ if (value==0x4c55 && index<3) {
+  th_report[n++]=0x3155554c; /* LUU1 */
+  th_report[n++]=index; th_report[n++]=th_lut_count(th_epss[index]); th_report[n++]=0;
+  for (unsigned i=0;i<40;i++) th_report[n++]=usb_rd(th_epss[index],0x100+4*i);
+  for (unsigned i=0;i<40;i++) th_report[n++]=usb_rd(th_epss[index],0x200+4*i);
+  return n*4;                           /* 84 words */
+ }
+ if (value==0x434c && (index&0xff)<3) {
+  uintptr_t b=th_epss[index&0xff];
+  uint32_t level=index>>8, en=usb_rd(b,0x0), dcvs=usb_rd(b,0xb0), count=th_lut_count(b);
+  th_report[n++]=0x314c5043; /* CPL1 */
+  th_report[n++]=index&0xff; th_report[n++]=level; th_report[n++]=count;
+  th_report[n++]=en; th_report[n++]=dcvs;
+  th_report[n++]=usb_rd(b,0x20); th_report[n++]=usb_rd(b,0x320);
+  uint32_t rc=0;
+  if (level!=0xff) {
+   if (!(en&1)) rc=1;
+   else if (level>=count) rc=2;
+   else {
+    *(volatile uint32_t *)(b+0x320)=level;
+    if (dcvs&1)
+     for (unsigned c=1;c<th_ncpu[index&0xff];c++) *(volatile uint32_t *)(b+0x320+4*c)=level;
+    __asm__ volatile("dsb sy" ::: "memory");
+    delay(2000);
+   }
+  }
+  th_report[n++]=rc;
+  th_report[n++]=usb_rd(b,0x20);
+  for (unsigned c=0;c<4;c++) th_report[n++]=c<((dcvs&1) ? th_ncpu[index&0xff] : 1) ? usb_rd(b,0x320+4*c) : 0;
+  return n*4;                           /* 14 words */
+ }
+ if (value==0x4d49 && index<=2) {
+  th_idle_mode=index;
+  __asm__ volatile("dsb sy" ::: "memory");
+  th_report[n++]=0x31444d49; /* IMD1 */
+  th_report[n++]=th_idle_mode; th_report[n++]=th_idle_evnt;
+  th_report[n++]=(uint32_t)rsr("mpidr_el1");
+  th_report[n++]=(uint32_t)rsr("clidr_el1"); /* LoUIS 23:21: cost of XNU idle FlushPoU */
+  return n*4;
+ }
+ return 0;
+}
+/* Called by cpu@100 after each usb_poll. Stays busy for 20 ms after any USB event so
+ * console pulls (many 512-byte reads back to back) keep full speed; otherwise waits
+ * ~0.43 ms (WFE woken by the generic-timer event stream, bit 12 of CNTVCT) or 0.5 ms. */
+static void thermal_monitor_idle(void)
+{
+ uint32_t mode=th_idle_mode;
+ if (!mode) return;
+ uint64_t now=rsr("cntpct_el0");
+ if (ud.events!=th_idle_events) {
+  th_idle_events=ud.events;
+  th_idle_busy_until=now+rsr("cntfrq_el0")/50;
+  return;
+ }
+ if (now<th_idle_busy_until) return;
+ if (mode==2) {
+  if (!th_idle_evnt) {
+   uint64_t k=rsr("cntkctl_el1");
+   k=(k&~0xf8ULL)|(12ULL<<4)|(1ULL<<2);   /* EVNTI 12, EVNTDIR 0: every 2^13 ticks */
+   __asm__ volatile("msr cntkctl_el1, %0; isb" :: "r"(k));
+   th_idle_evnt=(uint32_t)rsr("cntkctl_el1")|0x80000000u;
+  }
+  __asm__ volatile("wfe" ::: "memory");
+ } else delay(500);
+}
+/* ===== end thermal lane ===== */
 
 static void ud_sync(uint32_t off, uint32_t len)
 {
@@ -1081,6 +1217,9 @@ ud_setup(void)
     } else if (type == 0xc0 && req == 0x4d && value == 0x5546 && !monitor_report[MON_LAUNCH]) {
         ufs_snapshot_awake();
         memcpy(data, ufs_report, sizeof(ufs_report)); n=sizeof(ufs_report);
+    } else if (type == 0xc0 && req == 0x57 && (n = thermal_request(value, (uint16_t)(st[4] | st[5] << 8))) != 0) {
+        /* thermal lane: TSENS / EPSS / monitor idle (see thermal_request) */
+        memcpy(data, th_report, n);
     } else if (type == 0xc0 && req == 0x48) {
         memcpy(data, monitor_error, sizeof(monitor_error)); n=sizeof(monitor_error);
 #if defined(FUXI_XNU_LOADER)
