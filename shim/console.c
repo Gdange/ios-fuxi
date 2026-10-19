@@ -14,6 +14,15 @@
 volatile uint32_t *con_fb = (volatile uint32_t *)FB_BASE;
 static uint32_t con_bg;
 static int row;
+static void kick(void)
+{
+#if defined(FUXI)
+ volatile uint32_t *start=(volatile uint32_t *)0xae1601c;
+ __asm__ volatile("dsb sy" ::: "memory");
+ if (!(*start & 1)) *start=1;
+ __asm__ volatile("dsb sy" ::: "memory");
+#endif
+}
 
 void con_clear(uint32_t bg)
 {
@@ -64,6 +73,7 @@ static void fmt_hex(char *buf, uint64_t v, int digits)
 void con_skip(void)
 {
 	row++;
+	kick();
 }
 
 void con_str(const char *label, const char *s)
@@ -71,6 +81,7 @@ void con_str(const char *label, const char *s)
 	put_str(0, label, YELLOW);
 	put_str(LABEL_COLS, s, WHITE);
 	row++;
+	kick();
 }
 
 void con_hex(const char *label, uint64_t v)
@@ -94,4 +105,5 @@ void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint
 		put_str(col, buf, WHITE);
 	}
 	row++;
+	kick();
 }
