@@ -39,12 +39,13 @@
  #endif
  	DTEntry node;
  	uintptr_t const *reg = NULL;
-@@ -597,7 +616,12 @@
+@@ -597,7 +616,13 @@
  	char want[64] = "userdata";
  	int error;
  
 -	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
-+	#if defined(FUXI)
++
++#if defined(FUXI)
 +    const char *ufs_node="/fuxi-ufs";
 +#else
 +    const char *ufs_node="/sweet-ufs";
@@ -53,7 +54,7 @@
  	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
  	    size < 2 * sizeof(uintptr_t)) {
  		printf("SWEET UFS: no /sweet-ufs node in the device tree\n");
-@@ -606,6 +630,9 @@
+@@ -606,6 +631,9 @@
  	PE_parse_boot_argn("ufsroot", want, sizeof(want));
  	uint32_t rw = 0;
  	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
@@ -63,11 +64,12 @@
  	uint32_t cache = 0, wait = 0;
  	PE_parse_boot_argn("ufscache", &cache, sizeof(cache));
  	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));
-@@ -627,7 +654,10 @@
+@@ -627,7 +655,11 @@
  	su.secsize = DEV_BSIZE;
  
  	lck_mtx_lock(&sweet_ufs_lock);
 -	error = ufs_take_over_host();
++#if defined(FUXI)
 +	printf("FUXI UFS diagnostic: CAP=0x%x HCS=0x%x HCE=0x%x DMA=0x%llx\n",
 +        ufs_rd(REG_CAP),ufs_rd(REG_HCS),ufs_rd(REG_HCE),su.dma_pa);
 +#endif
@@ -75,7 +77,7 @@
  	if (!error) {
  		static const uint8_t tur[6] = { 0x00 };
  		/* The first command after the bootloader may report a unit attention. */
-@@ -659,15 +689,30 @@
+@@ -659,15 +691,30 @@
  	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
  	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
  	    su.writable ? "read-write" : "read-only", su.dma_pa);
