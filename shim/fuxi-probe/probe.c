@@ -443,9 +443,10 @@ ud_setup(void)
             ok=false;
         else memcpy(data,(const void *)(uintptr_t)(0xb8000000ULL+off),n);
     } else if (type == 0xc0 && req == 0x4f) {
-        /* Read-only display pipeline windows from live FDT: MDSS top, MDP top,
-         * CTL0, INTF1 (+tear irq), DSC0 enc/ctl, PP0/PP1, DSI0 controller. */
-        static const uint32_t win[][2]={{0xae00000,0x40},{0xae01000,0x400},
+        /* Read-only display pipeline windows from live FDT: MDP top, CTL0,
+         * INTF1 (+tear irq), DSC0 enc/ctl, PP0/PP1, DSI0 controller. MDSS top
+         * (0xae00000) is excluded: reading it with non-GDSC AHB off reset the SoC. */
+        static const uint32_t win[][2]={{0xae01000,0x400},
             {0xae16000,0x290},{0xae36000,0x300},{0xae36800,0x10},{0xae81000,0x4},
             {0xae81100,0x9c},{0xae81f00,0x24},{0xae6a000,0x4},{0xae6b000,0x4},
             {0xae94000,0x300}};
