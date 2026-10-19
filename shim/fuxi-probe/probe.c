@@ -399,12 +399,19 @@ static void ts_gpio(unsigned n, unsigned func, unsigned pull, unsigned ma, int o
  if (out>=0) ts_wr(c,4,out?2u:0u);
  ts_wr(c,0,(usb_rd(c,0)&~0x3ffu)|pull|(func<<2)|((ma/2-1)<<6)|(out>=0?0x200u:0u));
 }
+/* SE4 and wrapper registers hang the bus (SoC reset) while wrapper1's AHB
+ * clocks are gated (ts-01): touch them only with m_ahb/s_ahb/S4 running. */
+static bool ts_clocks_on(void)
+{
+ return !((usb_rd(TS_GCC,0x2327c)|usb_rd(TS_GCC,0x23280)|usb_rd(TS_GCC,0x184e4))&0x80000000u);
+}
 static void touch_snapshot(void)
 {
  static const uint16_t se[]={0x040,0x048,0x064,0x068,0x07c,0x258,0x25c,0x268,
   0x260,0x264,0x610,0x614,0x800,0x804,0xe24,0xe28};
  unsigned n=1;
- for (unsigned i=0;i<16;i++) touch_report[n++]=usb_rd(TS_SE,se[i]);
+ bool on=ts_clocks_on();
+ for (unsigned i=0;i<16;i++) touch_report[n++]=on ? usb_rd(TS_SE,se[i]) : 0xdeadu;
  touch_report[n++]=usb_rd(TS_GCC,0x52008);
  touch_report[n++]=usb_rd(TS_GCC,0x184e4);
  touch_report[n++]=usb_rd(TS_GCC,0x2327c);
@@ -418,7 +425,7 @@ static void touch_snapshot(void)
   touch_report[n++]=usb_rd(TS_TLMM+0x1000u*g[i],0);
   touch_report[n++]=usb_rd(TS_TLMM+0x1000u*g[i],4);
  }
- touch_report[n++]=usb_rd(0x00ac0000,4); /* QUP_HW_VER */
+ touch_report[n++]=on ? usb_rd(0x00ac0000,4) : 0xdeadu; /* QUP_HW_VER */
 }
 /* One full-duplex FIFO command, CS held for its duration. Bytes are sent
  * from tx (zero padding after nt) and the first len received bytes kept. */
@@ -472,8 +479,8 @@ static uint32_t ts_clock(void)
 {
  /* Vote wrapper1 core/core2x/m_ahb/s_ahb and SE4 only. */
  ts_wr(TS_GCC,0x52008,usb_rd(TS_GCC,0x52008)|(0xfu<<18)|(1u<<26));
- for (unsigned i=0;i<1000 && (usb_rd(TS_GCC,0x184e4)&0x80000000u);i++) delay(1);
- if (usb_rd(TS_GCC,0x184e4)&0x80000000u) return 0x10;
+ for (unsigned i=0;i<1000 && !ts_clocks_on();i++) delay(1);
+ if (!ts_clocks_on()) return 0x10;
  /* SE_GENI_CLK_SEL picks a DFS level; use one sourced from XO, undivided
   * (19.2 MHz), and divide by 2 in the SE: 9.6 MHz SCLK (driver max 12). */
  if (usb_rd(TS_GCC,0x18504)&1) {
