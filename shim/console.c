@@ -18,6 +18,9 @@ static void kick(void)
 {
 #if defined(FUXI)
  if (!con_fb) return;
+ /* ABL's INTF1 autorefresh already sends every frame; a START on top of it
+  * corrupts the DSC stream (ar-01). Kick only when autorefresh is off. */
+ if (*(volatile uint32_t *)0xae362b4 & 0x80000000u) return;
  volatile uint32_t *start=(volatile uint32_t *)0xae1601c;
  __asm__ volatile("dsb sy" ::: "memory");
  if (!(*start & 1)) *start=1;
