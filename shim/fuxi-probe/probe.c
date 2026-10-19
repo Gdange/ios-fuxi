@@ -153,6 +153,9 @@ static void ufs_snapshot_awake(void)
  __asm__ volatile("dsb sy" ::: "memory");
 }
 static uint32_t display_clocks[14];
+/* dispcc-kalama.c RCGs (CMD, CFG, M, N, D): mdp, pclk0, byte0, esc0, ahb;
+ * then PLL0 and PLL1 register words 0x00-0x4c. Valid only if word 0 = 1. */
+static uint32_t display_rcg[1+25+40];
 static void display_clock_snapshot(void)
 {
  static const uint32_t offsets[]={0x9000,0x80a4,0x800c,0x8028,0x802c,0x8004,0x8038,0x8024,0xc004};
@@ -164,6 +167,13 @@ static void display_clock_snapshot(void)
  for(unsigned i=0;i<sizeof(offsets)/sizeof(offsets[0]);i++)
   display_clocks[5+i]=usb_rd(0xaf00000,offsets[i]);
  display_clocks[4]=1;
+ static const uint32_t rcg[]={0x80d8,0x80a8,0x8108,0x8140,0x82e8};
+ unsigned n=1;
+ for(unsigned i=0;i<5;i++)
+  for(unsigned j=0;j<5;j++) display_rcg[n++]=usb_rd(0xaf00000,rcg[i]+4*j);
+ for(unsigned pll=0;pll<2;pll++)
+  for(unsigned j=0;j<20;j++) display_rcg[n++]=usb_rd(0xaf00000,pll*0x1000+4*j);
+ display_rcg[0]=1;
 }
 static void display_clock_snapshot_awake(void)
 {
@@ -465,6 +475,11 @@ ud_setup(void)
         if (value==1 && !monitor_report[MON_LAUNCH]) display_clock_snapshot_awake();
         else display_clock_snapshot();
         memcpy(data, display_clocks, sizeof(display_clocks)); n=sizeof(display_clocks);
+    } else if (type == 0xc0 && req == 0x50) {
+        display_rcg[0]=0;
+        if (!monitor_report[MON_LAUNCH]) display_clock_snapshot_awake();
+        else display_clock_snapshot();
+        memcpy(data, display_rcg, sizeof(display_rcg)); n=sizeof(display_rcg);
     } else if (type == 0xc0 && req == 0x4d && value == 0x5546 && !monitor_report[MON_LAUNCH]) {
         ufs_snapshot_awake();
         memcpy(data, ufs_report, sizeof(ufs_report)); n=sizeof(ufs_report);
