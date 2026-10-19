@@ -464,6 +464,12 @@ static void touch_snapshot(unsigned group)
    }
   }
   touch_report[7]=valid|n<<16;
+  /* Context banks used by UFS (0) and DWC3 (4): CBAR, SCTLR, TTBR0 lo. */
+  const uintptr_t cb=sm+((uintptr_t)1<<((((usb_rd(sm,0x24)>>28)&7)+1)))*((usb_rd(sm,0x24)>>31)?0x10000:0x1000);
+  for (unsigned k=0;k<5;k+=4) if (n<61) {
+   touch_report[n++]=usb_rd(sm,0x1000+4*k);
+   touch_report[n++]=usb_rd(cb+0x1000*k,0); touch_report[n++]=usb_rd(cb+0x1000*k,0x20);
+  }
  }
 }
 static void ts_clock_regs(unsigned at)
@@ -535,8 +541,33 @@ static bool gpi_cmd(uint32_t reg, uint32_t v, uintptr_t ctx, uint32_t want)
  }
  return false;
 }
+/* apps-smmu faults unmatched streams (sCR0.USFCFG, ts-10) and has no SMR
+ * for GPI (0xb6) or the QUP1 wrapper (0xa3): add bypass entries for both. */
+static uint32_t ts_smmu(void)
+{
+ static const uint16_t sid[]={0xb6,0xa3};
+ const uintptr_t sm=0x15000000UL;
+ uint32_t nsmr=usb_rd(sm,0x20)&0xff;
+ for (unsigned j=0;j<2;j++) {
+  unsigned i, freei=~0u;
+  for (i=0;i<nsmr;i++) {
+   uint32_t smr=usb_rd(sm,0x800+4*i);
+   if (!(smr&0x80000000u)) { if (freei==~0u) freei=i; continue; }
+   if (((sid[j]^smr)&~(smr>>16)&0x7fff)==0) break;
+  }
+  if (i<nsmr) { touch_report[16+j]=0x1000|i; continue; }
+  if (freei==~0u) return 0x38;
+  ts_wr(sm,0xc00+4*freei,0x00010000u);           /* S2CR TYPE=bypass */
+  ts_wr(sm,0x800+4*freei,0x80000000u|sid[j]);
+  touch_report[16+j]=freei|usb_rd(sm,0x800+4*freei)<<8;
+  touch_report[18+j]=usb_rd(sm,0xc00+4*freei);
+ }
+ touch_report[15]=usb_rd(sm,0x48);
+ return 0;
+}
 static uint32_t gpi_init(void)
 {
+ if (ts_stage>=2) { uint32_t e=ts_smmu(); if (e) return e; }
  touch_report[36]=gpi_state(GPI_CH(0))|gpi_state(GPI_CH(1))<<4|gpi_state(GPI_EV)<<8;
  touch_report[37]=lo32(gpi_ring[0]); touch_report[38]=lo32(gpi_evr);
  if ((uintptr_t)gpi_ring[0]>>32 || (uintptr_t)gpi_evr>>32) return 0x30;
