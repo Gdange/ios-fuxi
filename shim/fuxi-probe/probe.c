@@ -444,6 +444,26 @@ static void touch_snapshot(unsigned group)
   static const uint32_t r[]={0xa10000,0xa10004,0xa10080,0xa11000,0xa11010,0xa13080,
    0xa13100,0xa13118,0xa13200,0xa10060};
   for (unsigned i=0;i<10;i++) touch_report[n++]=usb_rd(r[i],0);
+ } else if (group==5) {
+  /* apps-smmu@15000000 GR0, read-only: sCR0, sIDR0/1, sGFSR, sGFSYNR0/1, then
+   * the SMR/S2CR pairs that match the GPI (0xb6), QUP1 wrapper (0xa3), UFS
+   * (0x60) and DWC3 (0x40) streams: (index | sid<<16), SMR, S2CR. */
+  static const uint16_t sid[]={0xb6,0xa3,0x60,0x40};
+  const uintptr_t sm=0x15000000UL;
+  uint32_t idr0=usb_rd(sm,0x20), nsmr=idr0&0xff, valid=0;
+  touch_report[n++]=usb_rd(sm,0); touch_report[n++]=idr0; touch_report[n++]=usb_rd(sm,0x24);
+  touch_report[n++]=usb_rd(sm,0x48); touch_report[n++]=usb_rd(sm,0x50); touch_report[n++]=usb_rd(sm,0x54);
+  n++;
+  for (unsigned i=0;i<nsmr && i<256;i++) {
+   uint32_t smr=usb_rd(sm,0x800+4*i);
+   if (!(smr&0x80000000u)) continue;
+   valid++;
+   uint32_t id=smr&0x7fff, mask=(smr>>16)&0x7fff;
+   for (unsigned j=0;j<4 && n<61;j++) if (((sid[j]^id)&~mask&0x7fff)==0) {
+    touch_report[n++]=i|(uint32_t)sid[j]<<16; touch_report[n++]=smr; touch_report[n++]=usb_rd(sm,0xc00+4*i);
+   }
+  }
+  touch_report[7]=valid|n<<16;
  }
 }
 static void ts_clock_regs(unsigned at)

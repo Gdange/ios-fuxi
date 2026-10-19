@@ -136,7 +136,7 @@ def main():
     if args.touch_test is not None:
         words=lambda b: list(struct.unpack('<64I',b))
         snap=[]
-        for group,count in ((0,15),(1,12),(2,17),(4,10)):
+        for group,count in ((0,15),(1,12),(2,17),(4,10),(5,60)):
             print('touch snapshot group',group,'...',flush=True)
             w=words(request(0x55,256,0x5453,group))
             print('touch snapshot',group,[hex(v) for v in w[:count+1]],flush=True)
