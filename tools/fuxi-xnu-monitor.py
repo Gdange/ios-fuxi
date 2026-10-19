@@ -107,6 +107,9 @@ def main():
     names='magic version ahb axi unipro gdsc valid reserved cap hci_version ahit interrupt_status interrupt_enable host_status host_enable list_lo list_hi doorbell list_running task_list_lo task_list_hi task_doorbell task_running uic_command'.split()
     (args.out / 'ufs-before.json').write_text(json.dumps(dict(zip(names,struct.unpack('<24I',ufs))),indent=2)+'\n')
     (args.out / 'display-before.bin').write_bytes(request(0x42,432))
+    clock_names='magic version gcc_ahb gcc_hf_axi valid gdsc ahb mdp byte0 byte0_intf pclk0 esc0 vsync non_gdsc_ahb'.split()
+    clock_raw=request(0x4c,56,1)
+    (args.out / 'display-clocks-before.json').write_text(json.dumps(dict(zip(clock_names,struct.unpack('<14I',clock_raw))),indent=2)+'\n')
     request(0x49, 88, 0x584e)
     last_total = 0
     previous = None
