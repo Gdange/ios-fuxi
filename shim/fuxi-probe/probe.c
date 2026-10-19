@@ -10,6 +10,12 @@
 #include "monitor.h"
 #define printf(...) ((void)0)
 #define rsr(r) ({ uint64_t v; __asm__ volatile("mrs %0, " r : "=r"(v)); v; })
+static void *memset(void *dst, int c, size_t n)
+{
+ volatile uint8_t *d=dst;
+ while (n--) *d++=(uint8_t)c;
+ return dst;
+}
 static void *memcpy(void *dst, const void *src, size_t n)
 {
  volatile uint8_t *d=dst; const volatile uint8_t *s=src;
@@ -386,6 +392,7 @@ out:
 static uint32_t touch_report[64];
 static uint8_t touch_events[8*32];
 static unsigned ts_depth;
+static uint32_t ts_level;
 static void ts_wr(uintptr_t base, uint32_t off, uint32_t v)
 {
  __asm__ volatile("dmb oshst" ::: "memory");
@@ -433,54 +440,6 @@ static void touch_snapshot(unsigned group)
   touch_report[n++]=usb_rd(0x00ac0000,4); /* QUP_HW_VER */
  }
 }
-/* One full-duplex FIFO command, CS held for its duration. Bytes are sent
- * from tx (zero padding after nt) and the first len received bytes kept. */
-static uint32_t ts_xfer(const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned len)
-{
- if (usb_rd(TS_SE,0x040)&1) return 1;
- ts_wr(TS_SE,0x618,0xffffffffu);
- ts_wr(TS_SE,0x26c,len); ts_wr(TS_SE,0x270,len);
- ts_wr(TS_SE,0x600,3u<<27);
- unsigned sent=0, got=0;
- for (unsigned us=0;us<20000;us++) {
-  while (sent<len && (usb_rd(TS_SE,0x800)&0xfffffffu)+1<ts_depth) {
-   uint32_t w=0;
-   for (unsigned j=0;j<4 && sent<len;j++,sent++) w|=(uint32_t)(sent<nt?tx[sent]:0)<<(8*j);
-   ts_wr(TS_SE,0x700,w);
-  }
-  uint32_t cnt=usb_rd(TS_SE,0x804)&0x1ffffffu;
-  while (cnt--) {
-   uint32_t w=usb_rd(TS_SE,0x780);
-   for (unsigned j=0;j<4 && got<len;j++) rx[got++]=(uint8_t)(w>>(8*j));
-  }
-  uint32_t irq=usb_rd(TS_SE,0x610);
-  if ((irq&1) && got>=len && !(usb_rd(TS_SE,0x804)&0x1ffffffu)) {
-   ts_wr(TS_SE,0x618,irq); return 0;
-  }
-  if (irq&0x3eu) break;
-  delay(1);
- }
- touch_report[60]=usb_rd(TS_SE,0x610); touch_report[61]=(sent<<16)|got;
- ts_wr(TS_SE,0x604,2);
- for (unsigned i=0;i<5000 && !(usb_rd(TS_SE,0x610)&(1u<<5));i++) delay(1);
- for (unsigned i=0;i<64 && (usb_rd(TS_SE,0x804)&0x1ffffffu);i++) (void)usb_rd(TS_SE,0x780);
- ts_wr(TS_SE,0x618,0xffffffffu);
- return 2;
-}
-/* FTS read: opcode + address, one dummy byte, then n data bytes. */
-static uint32_t ts_read(const uint8_t *cmd, unsigned nc, uint8_t *out, unsigned n)
-{
- uint8_t buf[8+1+8*32];
- if (nc>8 || n>8*32) return 3;
- uint32_t e=ts_xfer(cmd,nc,buf,nc+1+n);
- if (!e) memcpy(out,buf+nc+1,n);
- return e;
-}
-static uint32_t ts_cmd(const uint8_t *cmd, unsigned nc)
-{
- uint8_t buf[8];
- return nc>8 ? 3 : ts_xfer(cmd,nc,buf,nc);
-}
 static void ts_clock_regs(unsigned at)
 {
  static const uint32_t r[]={0x52008,0x184e4,0x2327c,0x23280,0x23284,0x23294,0x184f0};
@@ -501,35 +460,182 @@ static uint32_t ts_clock(void)
   for (level=0;level<8 && (usb_rd(TS_GCC,0x1850c+4*level)&0x71fu)>1u;level++);
   if (level==8) return 0x11;
  } else if ((usb_rd(TS_GCC,0x184f4)&0x71fu)>1u) return 0x12;
+ ts_level=level;
  ts_wr(TS_SE,0x07c,level); ts_wr(TS_SE,0x048,(2u<<4)|1u);
  for (unsigned i=0;i<10000 && !ts_s4_on();i++) delay(1);
  ts_clock_regs(27);
  touch_report[34]=usb_rd(TS_SE,0x048); touch_report[35]=usb_rd(TS_SE,0x07c);
  return ts_s4_on() ? 0 : 0x13;
 }
+/* SE4 is GSI-only (GENI_IF_DISABLE_RO=1, ts-05): SPI goes through QUP1 GPI
+ * DMA, static GPII 0, TX channel 0, RX channel 1, one event ring
+ * (research/touch/gpi-recipe.md). Polled; with the MMU off the rings and
+ * buffers are uncached and VA == PA. */
+#define GPI_EE      0x009f0000UL
+#define GPI_CH(k)   (GPI_EE+0x20000UL+0x80UL*(k))
+#define GPI_EV      (GPI_EE+0x21000UL)
+#define GPI_CHDB(k) (GPI_EE+0x22000UL+8UL*(k))
+#define GPI_EVDB    (GPI_EE+0x22100UL)
+#define GPI_GPII    (GPI_EE+0x23000UL)
+#define GPI_RING    64u
+#define GPI_EVRING  256u
+static uint32_t gpi_ring[2][GPI_RING*4] __attribute__((aligned(1024)));
+static uint32_t gpi_evr[GPI_EVRING*4] __attribute__((aligned(4096)));
+static uint8_t gpi_txb[64] __attribute__((aligned(64)));
+static uint8_t gpi_rxb[8+1+8*32] __attribute__((aligned(64)));
+static unsigned gpi_wp[2], gpi_evrp, gpi_nev;
+static uint32_t lo32(const void *p) { return (uint32_t)(uintptr_t)p; }
+static uint32_t gpi_state(uintptr_t ctx) { return (usb_rd(ctx,0)>>20)&0xf; }
+static void gpi_diag(void)
+{
+ touch_report[40]=usb_rd(GPI_CH(0),0); touch_report[41]=usb_rd(GPI_CH(1),0);
+ touch_report[42]=usb_rd(GPI_EV,0); touch_report[43]=usb_rd(GPI_GPII,0x80);
+ touch_report[44]=usb_rd(GPI_GPII,0x200); touch_report[45]=usb_rd(GPI_GPII,0x100);
+ touch_report[46]=usb_rd(GPI_GPII,0x118); touch_report[47]=gpi_nev;
+ touch_report[53]=usb_rd(GPI_CH(0),0x10); touch_report[54]=usb_rd(GPI_CH(1),0x10);
+ touch_report[55]=usb_rd(GPI_EV,0x10);
+}
+static bool gpi_cmd(uint32_t reg, uint32_t v, uintptr_t ctx, uint32_t want)
+{
+ ts_wr(GPI_GPII,reg,v);
+ for (unsigned i=0;i<250000;i++) {
+  uint32_t s=gpi_state(ctx);
+  if (s==want) {
+   ts_wr(GPI_GPII,0xa0,usb_rd(GPI_GPII,0x90)); ts_wr(GPI_GPII,0xa4,usb_rd(GPI_GPII,0x94));
+   return true;
+  }
+  if (s==0xf) break;
+  delay(1);
+ }
+ return false;
+}
+static uint32_t gpi_init(void)
+{
+ touch_report[36]=gpi_state(GPI_CH(0))|gpi_state(GPI_CH(1))<<4|gpi_state(GPI_EV)<<8;
+ touch_report[37]=lo32(gpi_ring[0]); touch_report[38]=lo32(gpi_evr);
+ if ((uintptr_t)gpi_ring[0]>>32 || (uintptr_t)gpi_evr>>32) return 0x30;
+ /* A channel left over from an earlier stage: stop, reset, free. */
+ for (unsigned k=0;k<2;k++) {
+  if (gpi_state(GPI_CH(k))==2) gpi_cmd(0x08,(2u<<24)|k,GPI_CH(k),3);
+  if (gpi_state(GPI_CH(k))) { gpi_cmd(0x08,(9u<<24)|k,GPI_CH(k),1); ts_wr(GPI_GPII,0x08,(10u<<24)|k); delay(1000); }
+ }
+ if (gpi_state(GPI_EV)) { gpi_cmd(0x10,9u<<24,GPI_EV,1); ts_wr(GPI_GPII,0x10,10u<<24); delay(1000); }
+ memset(gpi_ring,0,sizeof(gpi_ring)); memset(gpi_evr,0,sizeof(gpi_evr));
+ /* Interrupt masks as gpi_config_interrupts(DEFAULT); the GIC line stays off. */
+ ts_wr(GPI_GPII,0x88,0x4f); ts_wr(GPI_GPII,0xb8,1); ts_wr(GPI_GPII,0x98,3);
+ ts_wr(GPI_GPII,0x9c,1); ts_wr(GPI_GPII,0x108,1); ts_wr(GPI_GPII,0x120,0xf);
+ ts_wr(GPI_GPII,0x188,0); ts_wr(GPI_GPII,0x18c,0);
+ ts_wr(GPI_GPII,0x400,0); ts_wr(GPI_GPII,0x404,0);
+ ts_wr(GPI_GPII,0x180,1); ts_wr(GPI_GPII,0x200,0);
+ if (!gpi_cmd(0x10,0,GPI_EV,1)) return 0x31;
+ ts_wr(GPI_EV,0x00,0x10010002u); ts_wr(GPI_EV,0x04,sizeof(gpi_evr));
+ ts_wr(GPI_EV,0x08,lo32(gpi_evr)); ts_wr(GPI_EV,0x0c,0); ts_wr(GPI_EVDB,4,0);
+ for (unsigned o=0x20;o<=0x34;o+=4) ts_wr(GPI_EV,o,0);
+ gpi_evrp=0; gpi_nev=0;
+ ts_wr(GPI_EVDB,0,lo32(gpi_evr)+sizeof(gpi_evr)-16);
+ for (unsigned k=0;k<2;k++) {
+  if (!gpi_cmd(0x08,k,GPI_CH(k),1)) return 0x32+k;
+  ts_wr(GPI_CH(k),0x00,k?0x10000002u:0x1000000au); ts_wr(GPI_CH(k),0x04,sizeof(gpi_ring[k]));
+  ts_wr(GPI_CH(k),0x08,lo32(gpi_ring[k])); ts_wr(GPI_CH(k),0x0c,0); ts_wr(GPI_CHDB(k),4,0);
+  ts_wr(GPI_CH(k),0x60,k?0x00000014u:0x00010014u);
+  ts_wr(GPI_CH(k),0x64,0); ts_wr(GPI_CH(k),0x68,0); ts_wr(GPI_CH(k),0x6c,0);
+  ts_wr(GPI_CH(k),0x5c,1);
+  gpi_wp[k]=0;
+ }
+ for (unsigned k=0;k<2;k++) if (!gpi_cmd(0x08,(1u<<24)|k,GPI_CH(k),2)) return 0x34+k;
+ return 0;
+}
+static void gpi_tre(unsigned k, uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3)
+{
+ volatile uint32_t *t=&gpi_ring[k][4*gpi_wp[k]];
+ t[0]=d0; t[1]=d1; t[2]=d2; t[3]=d3;
+ gpi_wp[k]=(gpi_wp[k]+1)%GPI_RING;
+}
+static void gpi_ring_db(unsigned k)
+{
+ __asm__ volatile("dsb sy" ::: "memory");
+ ts_wr(GPI_CHDB(k),0,lo32(&gpi_ring[k][4*gpi_wp[k]]));
+}
+/* Drain events until one from chid with code (2 EOT) arrives. Returns its
+ * length + 1, 0 on timeout, or ~0 on an error event. */
+static uint32_t gpi_wait(unsigned chid, uint32_t *len)
+{
+ for (unsigned us=0;us<20000;us++) {
+  uint32_t hw=usb_rd(GPI_EV,0x10);
+  bool found=false, bad=false;
+  while (hw!=lo32(&gpi_evr[4*gpi_evrp])) {
+   volatile uint32_t *e=&gpi_evr[4*gpi_evrp];
+   uint32_t d[4]={e[0],e[1],e[2],e[3]};
+   if (!gpi_nev) memcpy(&touch_report[56],d,16);
+   memcpy(&touch_report[48],d,16);
+   gpi_nev++;
+   gpi_evrp=(gpi_evrp+1)%GPI_EVRING;
+   unsigned code=d[2]>>24, type=(d[3]>>16)&0xff, ch=d[3]>>24;
+   if (code==16 || type==0xff || ch>=2) bad=true;
+   else if (type==0x22 && ch==chid && code==2) { found=true; *len=d[2]&0xffffff; }
+  }
+  ts_wr(GPI_EVDB,0,lo32(&gpi_evr[4*((gpi_evrp+GPI_EVRING-1)%GPI_EVRING)]));
+  ts_wr(GPI_GPII,0xc0,1);
+  if (bad) return 2;
+  if (found) return 0;
+  delay(1);
+ }
+ return 1;
+}
+#define GPI_C0()        gpi_tre(0,0x03000004u,0,(ts_level<<16)|2u,0x00220001u)
+#define GPI_GO(cmd,frag,rxl,d3) gpi_tre(0,((frag)?(1u<<26):0)|(cmd),0,(rxl),(d3))
+#define GPI_DMA(k,buf,n,d3)     gpi_tre((k),lo32(buf),0,(n),(d3))
+static uint32_t gpi_tx_only(const uint8_t *tx, unsigned nt, bool frag)
+{
+ uint32_t len=0, e;
+ memcpy(gpi_txb,tx,nt);
+ GPI_C0(); GPI_GO(1,frag,0,0x00200001u); GPI_DMA(0,gpi_txb,nt,0x00100200u);
+ gpi_ring_db(0);
+ if ((e=gpi_wait(0,&len))) return 0x40|e;
+ return len==nt ? 0 : 0x48;
+}
+/* FTS read: opcode + address (CS held), then one dummy byte and n data bytes. */
+static uint32_t ts_read(const uint8_t *cmd, unsigned nc, uint8_t *out, unsigned n)
+{
+ uint32_t len=0, e;
+ if (nc>8 || n>8*32) return 3;
+ if ((e=gpi_tx_only(cmd,nc,true))) { gpi_diag(); return e; }
+ memset(gpi_rxb,0,n+1);
+ GPI_DMA(1,gpi_rxb,n+1,0x00100200u);
+ GPI_GO(2,false,n+1,0x00200900u);
+ gpi_ring_db(1); gpi_ring_db(0);
+ if ((e=gpi_wait(1,&len))) { gpi_diag(); return 0x50|e; }
+ touch_report[52]=len;
+ memcpy(out,gpi_rxb+1,n);
+ return 0;
+}
+static uint32_t ts_cmd(const uint8_t *cmd, unsigned nc)
+{
+ uint32_t e=nc>8 ? 3 : gpi_tx_only(cmd,nc,false);
+ if (e) gpi_diag();
+ return e;
+}
 static uint32_t ts_se_init(void)
 {
  uint32_t fw=usb_rd(TS_SE,0x068), hw=usb_rd(TS_SE,0xe24);
  if (((fw>>8)&0xff)!=1) return 0x20;            /* not SPI firmware */
- if (usb_rd(TS_SE,0x064)&1) return 0x21;        /* FIFO interface disabled */
  if (usb_rd(TS_SE,0x040)&1) return 0x22;
  ts_depth=(hw>>16)&0x3f;
- if (ts_depth<4 || ((hw>>24)&0x3f)!=32) return 0x23;
- ts_wr(TS_SE,0xe18,0); ts_wr(TS_SE,0xe1c,0);
+ /* geni_se_select_mode(GENI_GPI_DMA): mode, word size, packing and clock
+  * then come from the CONFIG0 TRE. */
+ ts_wr(TS_SE,0xe18,0);
  ts_wr(TS_SE,0x618,0xffffffffu); ts_wr(TS_SE,0x648,0xffffffffu);
+ ts_wr(TS_SE,0xc44,0xffffffffu); ts_wr(TS_SE,0xd44,0xffffffffu);
  ts_wr(TS_SE,0x028,usb_rd(TS_SE,0x028)|0x7f);
  ts_wr(TS_SE,0xe30,usb_rd(TS_SE,0xe30)|0xf);
  ts_wr(TS_SE,0x024,0x7f); ts_wr(TS_SE,0x020,1);
- ts_wr(TS_SE,0x258,0);
- ts_wr(TS_SE,0x810,ts_depth-3); ts_wr(TS_SE,0x814,ts_depth-2); ts_wr(TS_SE,0x80c,0);
- ts_wr(TS_SE,0x260,0x0007f8feu); ts_wr(TS_SE,0x264,0x000ffefeu);
- ts_wr(TS_SE,0x284,0x0007f8feu); ts_wr(TS_SE,0x288,0x000ffefeu);
- ts_wr(TS_SE,0x254,0); ts_wr(TS_SE,0x268,4);
- ts_wr(TS_SE,0x224,0); ts_wr(TS_SE,0x22c,0); ts_wr(TS_SE,0x230,0);
- ts_wr(TS_SE,0x24c,0); ts_wr(TS_SE,0x250,0);
- ts_wr(TS_SE,0x25c,usb_rd(TS_SE,0x25c)&~3u);   /* CS_TOGGLE is bit 0 or 1 by kernel version */
- ts_wr(TS_SE,0x614,0xffffffffu);
- return 0;
+ ts_wr(TS_SE,0xe1c,0);
+ ts_wr(TS_SE,0x614,usb_rd(TS_SE,0x614)&~((1u<<0)|(1u<<26)|(1u<<27)|(1u<<30)));
+ ts_wr(TS_SE,0x644,usb_rd(TS_SE,0x644)&~1u);
+ ts_wr(TS_SE,0x258,1);
+ ts_wr(TS_SE,0xe18,usb_rd(TS_SE,0xe18)|0xf);
+ touch_report[39]=usb_rd(TS_SE,0x064);
+ return gpi_init();
 }
 static void touch_power(void)
 {

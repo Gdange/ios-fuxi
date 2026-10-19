@@ -144,7 +144,7 @@ def main():
             (args.out/'touch.json').write_text(json.dumps({'snapshot':snap},indent=1)+'\n')
             raise SystemExit('touch snapshot only')
         power=words(request(0x55,256,0x5450))
-        print('touch power',[hex(v) for v in power[:36]],'err',hex(power[60]),hex(power[61]),flush=True)
+        print('touch power',[hex(v) for v in power],flush=True)
         events=[]
         until=time.monotonic()+args.touch_test
         while power[0]==6 and time.monotonic()<until:
