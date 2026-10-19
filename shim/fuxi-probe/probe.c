@@ -197,8 +197,16 @@ static void display_clock_snapshot_awake(void)
 #define RH_DRV_PA 0x17a20000UL
 #define RH_TCS_PA 0x17a20d00UL
 #define RH_STRIDE 0x2a0u
-#define RH_CMD    0x14u
-static uint32_t rsc_report[1+8*6];
+/* ver_3_0: WAIT 0x20, CONTROL 0x24, STATUS 0x28, ENABLE 0x2c; cmd n at 0x34+0x18*n. */
+#define RH_WAIT   0x20u
+#define RH_CTRL   0x24u
+#define RH_IDLE   0x28u
+#define RH_EN     0x2cu
+#define RH_MSGID  0x34u
+#define RH_ADDR   0x38u
+#define RH_DATA   0x3cu
+#define RH_CSTAT  0x40u
+static uint32_t rsc_report[5+8*8];
 static uint32_t rh_rd(uint32_t off) { return usb_rd(RH_TCS_PA, off); }
 static void rh_wr(uint32_t off, uint32_t v)
 {
@@ -215,32 +223,34 @@ static void rsc_snapshot(void)
  rsc_report[n++]=rh_rd(0); rsc_report[n++]=rh_rd(4);
  for (unsigned t=0;t<8;t++) {
   uint32_t b=t*RH_STRIDE;
-  rsc_report[n++]=rh_rd(b+0x14); rsc_report[n++]=rh_rd(b+0x18);
-  rsc_report[n++]=rh_rd(b+0x1c); rsc_report[n++]=rh_rd(b+0x10);
-  rsc_report[n++]=rh_rd(b+0x34); rsc_report[n++]=rh_rd(b+0x38);
+  rsc_report[n++]=rh_rd(b+RH_CTRL); rsc_report[n++]=rh_rd(b+RH_IDLE);
+  rsc_report[n++]=rh_rd(b+RH_EN); rsc_report[n++]=rh_rd(b+RH_WAIT);
+  rsc_report[n++]=rh_rd(b+RH_MSGID); rsc_report[n++]=rh_rd(b+RH_ADDR);
+  rsc_report[n++]=rh_rd(b+RH_DATA); rsc_report[n++]=rh_rd(b+RH_CSTAT);
  }
 }
 /* One write-with-response command in ACTIVE TCS t; 0 on proven completion. */
 static uint32_t rh_send(unsigned t, uint32_t addr, uint32_t data)
 {
  uint32_t b=t*RH_STRIDE, bit=1u<<t;
- if (rh_rd(b+0x18)==0 || rh_rd(b+0x14) || rh_rd(b+0x1c) || rh_rd(b+0x10)) return 1;
+ if (rh_rd(b+RH_IDLE)==0 || rh_rd(b+RH_CTRL) || rh_rd(b+RH_EN) || rh_rd(b+RH_WAIT) ||
+     (rh_rd(4)&bit)) return 1;
  uint32_t irq_en=rh_rd(0);
  rh_wr(0,irq_en&~bit);
- rh_wr(b+0x30,8u|(1u<<8)|(1u<<16));
- rh_wr(b+0x34,addr); rh_wr(b+0x38,data);
- rh_wr(b+0x10,1); rh_wr(b+0x1c,1);
- rh_wr(b+0x14,0); rh_wr(b+0x14,1u<<16);
- rh_wr(b+0x14,(1u<<16)|(1u<<24));
+ rh_wr(b+RH_MSGID,8u|(1u<<8)|(1u<<16));
+ rh_wr(b+RH_ADDR,addr); rh_wr(b+RH_DATA,data);
+ rh_wr(b+RH_WAIT,1); rh_wr(b+RH_EN,1);
+ rh_wr(b+RH_CTRL,0); rh_wr(b+RH_CTRL,1u<<16);
+ rh_wr(b+RH_CTRL,(1u<<16)|(1u<<24));
  uint32_t st=0;
  for (unsigned us=0;us<100000;us++) {
-  st=rh_rd(b+0x3c);
-  if (rh_rd(b+0x18) && (st&0x10100)==0x10100) break;
+  st=rh_rd(b+RH_CSTAT);
+  if (rh_rd(b+RH_IDLE) && (st&0x10100)==0x10100) break;
   delay(1);
  }
- if ((st&0x10100)!=0x10100) return 2; /* leave TCS quarantined */
- rh_wr(b+0x14,1u<<16); rh_wr(b+0x14,0);
- rh_wr(b+0x1c,0); rh_wr(b+0x10,0);
+ if ((st&0x10100)!=0x10100) return 2|(st<<12); /* leave TCS quarantined */
+ rh_wr(b+RH_CTRL,1u<<16); rh_wr(b+RH_CTRL,0);
+ rh_wr(b+RH_EN,0); rh_wr(b+RH_WAIT,0);
  rh_wr(8,bit);
  rh_wr(0,(rh_rd(0)&~bit)|(irq_en&bit));
  return 0;
@@ -271,8 +281,7 @@ static void display_boost(void)
  if (((id>>16)&0xff)!=3 || ((cfg>>12)&0x3f)<3) { boost_report[0]=0x100|((id>>16)&0xff); return; }
  boost_report[0]=1;
  for (unsigned i=0;i<BOOST_CMDS;i++) {
-  boost_report[1+i]=rh_send(0,cmds[i][0],cmds[i][1])|(i<<8);
-  if (!(boost_report[1+i]&0xff)) boost_report[1+i]=0;
+  boost_report[1+i]=rh_send(0,cmds[i][0],cmds[i][1]);
   if (boost_report[1+i]) return;
  }
  boost_report[0]=2;
