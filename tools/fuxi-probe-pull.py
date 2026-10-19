@@ -14,6 +14,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('out', type=Path, help='private output directory (use research/)')
     ap.add_argument('--wait', type=float, default=30)
+    ap.add_argument('--display', action='store_true', help='also read the known SM8550 display registers')
+    ap.add_argument('--paint', action='store_true', help='draw a diagnostic title using the validated scanout')
+    ap.add_argument('--ram', action='store_true', help='sample and restore words in the advertised upper RAM bank')
     args = ap.parse_args()
     deadline = time.monotonic() + args.wait
     dev = None
@@ -55,6 +58,30 @@ def main():
     if tree[:4] != b'\xd0\x0d\xfe\xed' or struct.unpack_from('>I', tree, 4)[0] != len(tree):
         ap.exit(1, 'Invalid live FDT header\n')
     (args.out / 'live.dtb').write_bytes(tree)
+    if args.display:
+        raw = bytes(dev.ctrl_transfer(0xc0, 0x42, 0, 0, 432, timeout=3000))
+        if len(raw) != 432:
+            ap.exit(1, 'Short display register snapshot\n')
+        values = struct.unpack('<108I', raw)
+        fields = ('base', 'source_size', 'output_size', 'address', 'stride',
+                  'format', 'unpack', 'op_mode', 'multirect')
+        display = {'sspp': [dict(zip(fields, values[i:i + 9])) for i in range(0, 90, 9)],
+                   'ctl': [dict(zip(('base', 'top', 'start'), values[i:i + 3]))
+                           for i in range(90, 108, 3)]}
+        (args.out / 'display.json').write_text(json.dumps(display, indent=2) + '\n')
+    if args.paint:
+        raw = bytes(dev.ctrl_transfer(0xc0, 0x43, 0, 0, 4, timeout=3000))
+        if raw != b'\x01\0\0\0':
+            ap.exit(1, 'Display geometry did not match the validated layout; paint refused\n')
+        print('Diagnostic title written and CTL0 START issued; visual confirmation needed')
+    if args.ram:
+        raw = bytes(dev.ctrl_transfer(0xc0, 0x44, 0, 0, 64, timeout=3000))
+        names = ('base', 'size', 'stride', 'samples', 'pass_mask', 'first_error', 'image_base', 'image_end')
+        ram = dict(zip(names, struct.unpack('<8Q', raw)))
+        (args.out / 'ram.json').write_text(json.dumps(ram, indent=2) + '\n')
+        if ram['first_error'] or ram['pass_mask'] != (1 << ram['samples']) - 1:
+            ap.exit(1, 'Upper RAM sample/restore check failed\n')
+        print(f"Upper RAM samples passed at {ram['base']:#x}+{ram['size']:#x}")
     print(f"Saved {len(tree)} bytes of live FDT to {args.out}")
     print(f"MIDR={report['midr']:#x}, MPIDR={report['mpidr']:#x}, "
           f"MMFR0={report['mmfr0']:#x}, EL={report['current_el'] >> 2}")

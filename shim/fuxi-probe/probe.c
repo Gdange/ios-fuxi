@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include "../font.h"
 #define printf(...) ((void)0)
 #define rsr(r) ({ uint64_t v; __asm__ volatile("mrs %0, " r : "=r"(v)); v; })
 static void *memcpy(void *dst, const void *src, size_t n)
@@ -34,6 +35,89 @@ static struct {
  uint64_t gcc_master, gcc_cfg, configured, speed;
 } probe_info;
 _Static_assert(sizeof(probe_info)==19*8, "USB report format");
+
+/* Read-only display snapshot, requested after basic USB/FDT capture. */
+static uint32_t display_regs[10 * 9 + 6 * 3];
+static uint32_t display_snapshot(void)
+{
+ static const uint32_t sspp[] = {0x5000,0x7000,0x9000,0xb000,
+     0x25000,0x27000,0x29000,0x2b000,0x2d000,0x2f000};
+ unsigned n = 0;
+ for (unsigned i = 0; i < 10; i++) {
+  uint32_t off = sspp[i];
+  display_regs[n++] = 0x0ae00000 + off;
+  display_regs[n++] = usb_rd(0x0ae00000, off + 0x00); /* source size */
+  display_regs[n++] = usb_rd(0x0ae00000, off + 0x0c); /* output size */
+  display_regs[n++] = usb_rd(0x0ae00000, off + 0x14); /* source address */
+  display_regs[n++] = usb_rd(0x0ae00000, off + 0x24); /* stride */
+  display_regs[n++] = usb_rd(0x0ae00000, off + 0x30); /* format */
+  display_regs[n++] = usb_rd(0x0ae00000, off + 0x34); /* unpack pattern */
+  display_regs[n++] = usb_rd(0x0ae00000, off + 0x38); /* operation mode */
+  display_regs[n++] = usb_rd(0x0ae00000, off + 0x170); /* multirect */
+ }
+ for (unsigned i = 0; i < 6; i++) {
+  uint32_t off = 0x16000 + i * 0x1000;
+  display_regs[n++] = 0x0ae00000 + off;
+  display_regs[n++] = usb_rd(0x0ae00000, off + 0x14); /* top */
+  display_regs[n++] = usb_rd(0x0ae00000, off + 0x1c); /* start */
+ }
+ return n * sizeof(uint32_t);
+}
+
+static uint32_t display_paint(void)
+{
+ /* Only touch the exact linear scanout geometry observed in probe-03. */
+ if (usb_rd(0xae05000, 0x14) != 0xb8000000 ||
+     usb_rd(0xae05000, 0x24) != 4320 ||
+     usb_rd(0xae05000, 0x00) != ((2400u << 16) | 1080u) ||
+     usb_rd(0xae05000, 0x30) != 0x237ff) return 0;
+ volatile uint32_t *fb = (volatile uint32_t *)0xb8000000UL;
+ for (unsigned y = 0; y < 160; y++)
+  for (unsigned x = 0; x < 1080; x++) fb[y * 1080 + x] = 0xff102040;
+ const char *text = "FUXI NATIVE PROBE";
+ for (unsigned c = 0; text[c]; c++) {
+  const unsigned char *glyph = font8x16[(unsigned char)text[c] - 32];
+  for (unsigned gy = 0; gy < 16; gy++)
+   for (unsigned gx = 0; gx < 8; gx++)
+    if (glyph[gy] & (0x80u >> gx))
+     for (unsigned sy = 0; sy < 3; sy++)
+      for (unsigned sx = 0; sx < 3; sx++)
+       fb[(48 + gy * 3 + sy) * 1080 + 48 + c * 24 + gx * 3 + sx] = 0xffffffff;
+ }
+ __asm__ volatile("dsb sy" ::: "memory");
+ *(volatile uint32_t *)0x0ae1601cUL = 1; /* CTL0 START: command-mode frame */
+ __asm__ volatile("dsb sy" ::: "memory");
+ return 1;
+}
+
+static uint64_t ram_report[8];
+static void ram_probe(void)
+{
+ extern char _head[], _end[];
+ const uint64_t first = 0x8c0000000ULL, size = 0x40000000;
+ const uint64_t stride = 0x4000000;
+ ram_report[0] = first; ram_report[1] = size;
+ ram_report[2] = stride; ram_report[3] = size / stride;
+ ram_report[4] = 0; ram_report[5] = 0;
+ ram_report[6] = (uintptr_t)_head; ram_report[7] = (uintptr_t)_end;
+ /* Only sample the advertised upper bank, restoring each original word. */
+ for (unsigned page = 0; page < size / stride; page++) {
+  bool ok = true;
+  for (unsigned word = 0; word < 8; word++) {
+   uint64_t pa = first + page * stride + 0x200000 + word * 8;
+   volatile uint64_t *p = (volatile uint64_t *)(uintptr_t)pa;
+   uint64_t saved = *p, pattern = 0x55aa33cc77ee9911ULL ^ pa;
+   *p = pattern;
+   __asm__ volatile("dsb sy" ::: "memory");
+   if (*p != pattern) ok = false;
+   *p = saved;
+   __asm__ volatile("dsb sy" ::: "memory");
+   if (*p != saved) ok = false;
+   if (!ok && !ram_report[5]) ram_report[5] = pa;
+  }
+  if (ok) ram_report[4] |= 1ULL << page;
+ }
+}
 #define GCTL            0xc110
 #define GEVNTADRLO      0xc400
 #define GEVNTADRHI      0xc404
@@ -228,6 +312,18 @@ ud_setup(void)
         n = length > 512 ? 512 : length;
         if (offset > size || n > size - offset) ok = false;
         else memcpy(data, src + offset, n);
+    } else if (type == 0xc0 && req == 0x42 && value == 0 &&
+               st[4] == 0 && st[5] == 0) {
+        n = display_snapshot();
+        memcpy(data, display_regs, n);
+    } else if (type == 0xc0 && req == 0x43 && value == 0 &&
+               st[4] == 0 && st[5] == 0) {
+        uint32_t painted = display_paint();
+        memcpy(data, &painted, sizeof(painted)); n = sizeof(painted);
+    } else if (type == 0xc0 && req == 0x44 && value == 0 &&
+               st[4] == 0 && st[5] == 0) {
+        ram_probe();
+        memcpy(data, ram_report, sizeof(ram_report)); n = sizeof(ram_report);
     } else if ((type & 0x60) != 0) {
         ok = false;
 	} else if (req == 6) {          /* GET_DESCRIPTOR */
