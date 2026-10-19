@@ -52,6 +52,7 @@ def main():
     ap.add_argument('--seconds', type=float, default=65)
     ap.add_argument('--framebuffer',action='store_true',help='save the validated inherited framebuffer after collecting logs')
     ap.add_argument('--skip-clocks',action='store_true',help='do not take the AHB-ungating clock snapshot before handoff')
+    ap.add_argument('--reset-minutes',type=int,help='move the monitor PSCI reset deadline to now + N minutes (1-60)')
     ap.add_argument('--display-poll',action='store_true',help='sample CTL0 START, INTF1 autorefresh and DSI status/FIFO each poll')
     args = ap.parse_args()
     payload = args.payload.read_bytes()
@@ -122,6 +123,11 @@ def main():
                 'dsi_status':word(9,0x4),'dsi_fifo':word(9,0xc)}
     if args.display_poll:
         print('display before handoff', display_poll(), flush=True)
+    if args.reset_minutes:
+        if not 1 <= args.reset_minutes <= 60:
+            raise ValueError('--reset-minutes must be 1-60')
+        request(0x54, 8, args.reset_minutes)
+        print(f'monitor reset deadline: +{args.reset_minutes} min', flush=True)
     request(0x49, 88, 0x584e)
     last_total = 0
     previous = None

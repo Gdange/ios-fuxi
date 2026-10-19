@@ -670,6 +670,11 @@ ud_setup(void)
     } else if (type == 0xc0 && req == 0x53 && !monitor_report[MON_LAUNCH]) {
         ar_test(value);
         memcpy(data, ar_report, sizeof(ar_report)); n=sizeof(ar_report);
+    } else if (type == 0xc0 && req == 0x54 && value >= 1 && value <= 60) {
+        /* Host-requested reset deadline: now + value minutes (bounded, never disabled). */
+        monitor_report[MON_DEADLINE]=rsr("cntpct_el0")+rsr("cntfrq_el0")*60*value;
+        __asm__ volatile("dsb sy" ::: "memory");
+        memcpy(data, (const void *)&monitor_report[MON_DEADLINE], 8); n=8;
     } else if (type == 0xc0 && req == 0x50) {
         display_rcg[0]=0;
         if (!monitor_report[MON_LAUNCH]) display_clock_snapshot_awake();
