@@ -25,8 +25,8 @@ PY
 # incbin avoids C absolute pointers in an Image loaded at an arbitrary PA.
 printf '.section .payload,"a"\n.incbin "%s"\n' "$payload" > "$out/payload.S"
 flags=(--target=aarch64-none-elf -O2 -ffreestanding -fno-builtin -nostdlib
-       -fno-pic -fno-stack-protector -mgeneral-regs-only -mstrict-align -Wall -Wextra -DFUXI=1 -I..)
-for source in start.S loader.c ../console.c; do
+       -fno-pic -fno-stack-protector -mgeneral-regs-only -mstrict-align -Wall -Wextra -DFUXI=1 -DFUXI_XNU_LOADER=1 -I..)
+for source in start.S loader.c ../console.c ../fuxi-probe/probe.c; do
  name=$(basename "${source%.*}")
  "$CLANG" "${flags[@]}" -c "$source" -o "$out/$name.o"
  if [[ $source == *.c ]] && "$READELF" -r "$out/$name.o" | grep -q R_AARCH64_ABS; then
@@ -34,7 +34,7 @@ for source in start.S loader.c ../console.c; do
  fi
 done
 "$CLANG" "${flags[@]}" -c "$out/payload.S" -o "$out/payload.o"
-"$LLD" -T loader.ld --build-id=none "$out/start.o" "$out/loader.o" "$out/console.o" "$out/payload.o" -o "$out/loader.elf"
+"$LLD" -T loader.ld --build-id=none "$out/start.o" "$out/loader.o" "$out/console.o" "$out/probe.o" "$out/payload.o" -o "$out/loader.elf"
 "$OBJCOPY" -O binary "$out/loader.elf" "$out/Image"
 python3 - "$out/Image" <<'PY'
 import struct,sys

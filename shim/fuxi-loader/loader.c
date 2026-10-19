@@ -3,6 +3,8 @@
  */
 #include <stdint.h>
 #include "console.h"
+#include "../fuxi-probe/monitor.h"
+void probe_main(uintptr_t fdt);
 
 #define BOOT_LINE_LENGTH	608
 #define PAGE_16K		0x4000UL
@@ -106,6 +108,7 @@ static const char *loader_boot(void)
  }
  if (!entry_found) return "entry outside kernel segments";
 
+ monitor_report[MON_STAGE]=5;
 	uint64_t pa_of_va_base = p->phys_base - p->virt_base;	/* pa = va + this */
 	con_hex2("PHYS", "base=", p->phys_base, "size=", p->mem_size);
 	con_hex("VIRT", p->virt_base);
@@ -125,6 +128,7 @@ static const char *loader_boot(void)
 	}
 	con_hex2("SEGS", "n=", p->nsegs, "end=", p->kernel_end + pa_of_va_base);
 
+ monitor_report[MON_STAGE]=6;
 	/* ADT, then boot_args, behind the kernel; everything below topOfKernelData is ours. */
 	uintptr_t adt_pa = p->kernel_end + pa_of_va_base;
 	copy64(adt_pa, rd_start + p->adt_off, p->adt_size);
@@ -152,27 +156,36 @@ static const char *loader_boot(void)
 	ba->memSizeActual = p->mem_size;
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
 
+ monitor_report[MON_BOOT_ARGS]=ba_pa;
+ monitor_report[MON_STAGE]=7;
 	uintptr_t entry_pa = p->entry_va + pa_of_va_base;
+ monitor_report[MON_ENTRY]=entry_pa;
 	con_hex("JUMP", entry_pa);
 	con_str("XNU", "jumping (fbcon clears screen)");
 
 	/* Everything was written with the MMU and caches off; drop any stale I-cache lines too. */
 	__asm__ volatile("dsb sy; ic iallu; dsb sy; isb" ::: "memory");
+ monitor_report[MON_STAGE]=8;
+ __asm__ volatile("dsb sy" ::: "memory");
 	((xnu_entry_t)entry_pa)(ba_pa);
 	return "xnu returned";
 }
 
 void loader_main(uintptr_t fdt)
 {
- (void)fdt;
+ probe_main(fdt);
+ monitor_report[MON_STAGE]=4;
  /* Refuse to draw unless ABL left the measured SSPP0/CTL0 splash active. */
  volatile uint32_t *sspp=(volatile uint32_t *)0xae05000;
  if (sspp[0x14/4] != 0xb8000000 || sspp[0x24/4] != 4320 ||
      sspp[0] != ((2400u<<16)|1080u) || sspp[0x30/4] != 0x237ff)
-  return;
+  con_fb=0; /* USB diagnostics also work without a usable inherited scanout. */
  con_clear(BLUE);
- con_str("FUXI", "XNU loader 0082");
+ con_str("FUXI", "XNU loader + USB monitor");
  const char *error=loader_boot();
  con_str("ERROR", error);
+ for (unsigned i=0;i<sizeof(monitor_error)-1 && error[i];i++) monitor_error[i]=error[i];
+ monitor_report[MON_STAGE]=99;
+ __asm__ volatile("dsb sy" ::: "memory");
  for (;;) __asm__ volatile("wfe");
 }

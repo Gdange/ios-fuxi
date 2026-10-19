@@ -7,6 +7,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include "../font.h"
+#include "monitor.h"
 #define printf(...) ((void)0)
 #define rsr(r) ({ uint64_t v; __asm__ volatile("mrs %0, " r : "=r"(v)); v; })
 static void *memcpy(void *dst, const void *src, size_t n)
@@ -118,6 +119,27 @@ static void ram_probe(void)
   if (ok) ram_report[4] |= 1ULL << page;
  }
 }
+static void usb_poll(void);
+static __attribute__((noreturn)) void reboot(void);
+volatile uint64_t monitor_report[MON_FIELDS] __attribute__((aligned(64)));
+char monitor_error[128];
+/* Fixed read-only UFS handoff snapshot; never probe a halted bus. */
+static uint32_t ufs_report[24];
+static void ufs_snapshot(void)
+{
+ static const uint32_t offsets[]={0x00,0x08,0x18,0x20,0x24,0x30,0x34,
+  0x50,0x54,0x58,0x60,0x70,0x74,0x78,0x80,0x90};
+ ufs_report[0]=0x55465846; ufs_report[1]=1;
+ ufs_report[2]=usb_rd(0x100000,0x77024); /* AHB */
+ ufs_report[3]=usb_rd(0x100000,0x77018); /* AXI */
+ ufs_report[4]=usb_rd(0x100000,0x77068); /* UniPro */
+ ufs_report[5]=usb_rd(0x100000,0x77004); /* GDSC */
+ ufs_report[6]=0;
+ if ((ufs_report[2]|ufs_report[3]|ufs_report[4]) & 0x80000000) return;
+ for (unsigned i=0;i<sizeof(offsets)/sizeof(offsets[0]);i++)
+  ufs_report[8+i]=usb_rd(0x1d84000,offsets[i]);
+ ufs_report[6]=1;
+}
 /* SM8550 cpu@100 from the live FDT. CPU_ON is only requested by the host. */
 static volatile uint64_t core_report[10] __attribute__((aligned(64)));
 void probe_secondary_main(void)
@@ -130,7 +152,12 @@ void probe_secondary_main(void)
   core_report[8]++;
   core_report[9]=rsr("cntpct_el0");
   __asm__ volatile("dsb sy" ::: "memory");
-  delay(1000);
+  if (monitor_report[MON_DELEGATE] == 2) {
+   monitor_report[MON_ACTIVE]=1;
+   __asm__ volatile("dsb sy" ::: "memory");
+   usb_poll();
+  } else delay(1000);
+  if (monitor_report[MON_DEADLINE] && rsr("cntpct_el0") >= monitor_report[MON_DEADLINE]) reboot();
  }
 }
 static void core_probe(void)
@@ -347,17 +374,38 @@ ud_setup(void)
                st[4] == 0 && st[5] == 0) {
         n = display_snapshot();
         memcpy(data, display_regs, n);
-    } else if (type == 0xc0 && req == 0x43 && value == 0 &&
+    } else if (type == 0xc0 && req == 0x43 && !monitor_report[MON_LAUNCH] && value == 0 &&
                st[4] == 0 && st[5] == 0) {
         uint32_t painted = display_paint();
         memcpy(data, &painted, sizeof(painted)); n = sizeof(painted);
-    } else if (type == 0xc0 && req == 0x44 && value == 0 &&
+    } else if (type == 0xc0 && req == 0x44 && !monitor_report[MON_LAUNCH] && value == 0 &&
                st[4] == 0 && st[5] == 0) {
         ram_probe();
         memcpy(data, ram_report, sizeof(ram_report)); n = sizeof(ram_report);
     } else if (type == 0xc0 && req == 0x45) {
         core_probe();
         memcpy(data, (const void *)core_report, sizeof(core_report)); n=sizeof(core_report);
+    } else if (type == 0xc0 && req == 0x46) {
+        if (value == 1 && core_report[3] && !core_report[2] && !monitor_report[MON_DELEGATE])
+            monitor_report[MON_DELEGATE]=1;
+        monitor_report[MON_USB_MPIDR]=rsr("mpidr_el1");
+        memcpy(data, (const void *)monitor_report, sizeof(monitor_report)); n=sizeof(monitor_report);
+    } else if (type == 0xc0 && req == 0x47) {
+        uint32_t index=(uint32_t)st[4] | ((uint32_t)st[5]<<8);
+        uint64_t off=(uint64_t)value | ((uint64_t)index<<16);
+        n=length > 512 ? 512 : length;
+        if (off > 0x40000000ULL || n > 0x40000000ULL-off) ok=false;
+        else memcpy(data, (const void *)(uintptr_t)(0x8c0000000ULL+off), n);
+    } else if (type == 0xc0 && req == 0x4b) {
+        ufs_snapshot();
+        memcpy(data, ufs_report, sizeof(ufs_report)); n=sizeof(ufs_report);
+    } else if (type == 0xc0 && req == 0x48) {
+        memcpy(data, monitor_error, sizeof(monitor_error)); n=sizeof(monitor_error);
+#if defined(FUXI_XNU_LOADER)
+    } else if (type == 0xc0 && req == 0x49 && value == 0x584e && monitor_report[MON_ACTIVE]) {
+        monitor_report[MON_LAUNCH]=1;
+        memcpy(data, (const void *)monitor_report, sizeof(monitor_report)); n=sizeof(monitor_report);
+#endif
     } else if ((type & 0x60) != 0) {
         ok = false;
 	} else if (req == 6) {          /* GET_DESCRIPTOR */
@@ -545,6 +593,10 @@ static __attribute__((noreturn)) void reboot(void)
 }
 void probe_main(uintptr_t fdt)
 {
+ extern char _head[], _end[];
+ monitor_report[MON_MAGIC]=0x31304e4f4d495846ULL; /* FXIMON01 */
+ monitor_report[MON_IMAGE]=(uintptr_t)_head; monitor_report[MON_END]=(uintptr_t)_end;
+ monitor_report[MON_DEADLINE]=rsr("cntpct_el0")+rsr("cntfrq_el0")*90;
  probe_info.magic=0x45424f5250495846ULL; /* little-endian FXIPROBE */
  probe_info.version=1;
  probe_info.midr=rsr("midr_el1"); probe_info.mpidr=rsr("mpidr_el1");
@@ -568,7 +620,19 @@ void probe_main(uintptr_t fdt)
  probe_info.dctl_before=usb_rd(0xa600000,DCTL);
  probe_info.dsts_before=usb_rd(0xa600000,DSTS);
  usb_start(0xa600000);
- uint64_t until=rsr("cntpct_el0")+rsr("cntfrq_el0")*90;
- while(rsr("cntpct_el0")<until) usb_poll();
+ monitor_report[MON_STAGE]=1;
+ while(rsr("cntpct_el0")<monitor_report[MON_DEADLINE]) {
+  if (!monitor_report[MON_ACTIVE] && monitor_report[MON_DELEGATE]!=2) {
+   usb_poll();
+   if (monitor_report[MON_DELEGATE]==1 && ud.state==EP0_SETUP) {
+    __asm__ volatile("dsb sy" ::: "memory");
+    monitor_report[MON_DELEGATE]=2;
+   }
+  }
+#if defined(FUXI_XNU_LOADER)
+  if (monitor_report[MON_ACTIVE] && monitor_report[MON_LAUNCH]) return;
+#endif
+ }
+
  reboot();
 }

@@ -11,9 +11,12 @@ SECTIONS {
  _bss_end = .;
  . += 0x8000;
  _stack_top = .;
+ . += 0x8000;
+ _secondary_stack_top = .;
  _payload_start = .;
  .payload : { *(.payload) }
  _payload_end = .;
  _image_end = .;
+ _end = .;
  /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }
 }

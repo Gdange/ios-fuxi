@@ -18,6 +18,7 @@ def main():
     ap.add_argument('--paint', action='store_true', help='draw a diagnostic title using the validated scanout')
     ap.add_argument('--ram', action='store_true', help='sample and restore words in the advertised upper RAM bank')
     ap.add_argument('--core', action='store_true', help='request isolated cpu@100 diagnostic startup')
+    ap.add_argument('--delegate', action='store_true', help='hand USB polling to the isolated diagnostic CPU')
     args = ap.parse_args()
     deadline = time.monotonic() + args.wait
     dev = None
@@ -83,7 +84,7 @@ def main():
         if ram['first_error'] or ram['pass_mask'] != (1 << ram['samples']) - 1:
             ap.exit(1, 'Upper RAM sample/restore check failed\n')
         print(f"Upper RAM samples passed at {ram['base']:#x}+{ram['size']:#x}")
-    if args.core:
+    if args.core or args.delegate:
         raw = bytes(dev.ctrl_transfer(0xc0, 0x45, 0, 0, 80, timeout=3000))
         fields = 'magic target result alive midr mpidr current_el sctlr heartbeat timestamp'.split()
         core = dict(zip(fields, struct.unpack('<10Q', raw)))
@@ -94,6 +95,19 @@ def main():
         if not later['alive'] or later['result'] or later['heartbeat'] <= core['heartbeat']:
             ap.exit(1, f'CPU diagnostic startup failed: {later}\n')
         print(f"Secondary CPU alive: MPIDR={later['mpidr']:#x}, MIDR={later['midr']:#x}, heartbeat={later['heartbeat']}")
+    if args.delegate:
+        fields = 'magic delegate active usb_mpidr launch stage boot_args entry deadline image end'.split()
+        dev.ctrl_transfer(0xc0, 0x46, 1, 0, 88, timeout=3000)
+        for _ in range(50):
+            time.sleep(.02)
+            raw = bytes(dev.ctrl_transfer(0xc0, 0x46, 0, 0, 88, timeout=3000))
+            monitor = dict(zip(fields, struct.unpack('<11Q', raw)))
+            if monitor['active'] and monitor['usb_mpidr'] & 0xffffff == 0x100:
+                break
+        else:
+            ap.exit(1, 'USB delegation did not complete on cpu@100\n')
+        (args.out / 'monitor.json').write_text(json.dumps(monitor, indent=2)+'\n')
+        print(f"USB requests now serviced by CPU MPIDR={monitor['usb_mpidr']:#x}")
     print(f"Saved {len(tree)} bytes of live FDT to {args.out}")
     print(f"MIDR={report['midr']:#x}, MPIDR={report['mpidr']:#x}, "
           f"MMFR0={report['mmfr0']:#x}, EL={report['current_el'] >> 2}")
