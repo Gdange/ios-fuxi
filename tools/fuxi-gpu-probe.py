@@ -14,6 +14,35 @@ import sys
 from pathlib import Path
 
 
+def bit_names(value, names):
+    return '|'.join(name for bit, name in names.items() if value & (1 << bit)) or 'none'
+
+
+CP_BITS = {0: 'BR_OPCODE', 1: 'BR_UCODE', 2: 'BR_HW_FAULT', 4: 'BR_PROTECT',
+           5: 'AHB', 6: 'VSD_PARITY', 7: 'BR_ILLEGAL_INSTR', 8: 'LPAC_OPCODE',
+           9: 'LPAC_UCODE', 10: 'LPAC_HW_FAULT', 11: 'LPAC_PROTECT',
+           12: 'LPAC_ILLEGAL_INSTR', 13: 'BV_OPCODE', 14: 'BV_UCODE',
+           15: 'BV_HW_FAULT', 16: 'BV_PROTECT', 17: 'BV_ILLEGAL_INSTR'}
+RBBM_BITS = {i: name for i, name in enumerate([
+    'AHB_CX', 'AHB_CP', 'CP', 'GFX_DBGC', 'VBIF', 'TSE', 'RAS', 'RB', 'CCU',
+    'A2D', 'LRZ', 'COM_DCOM', 'PC_DCALL', 'PC_VSD', 'TESS', 'VFD', 'VPC',
+    'UCHE', 'SP', 'TPL1', 'VSC', 'HLSQ', 'GPU_IGN_AHB_CP', 'GPU_IGN_AHB'])}
+
+
+def fault_client(fsynr1, uche):
+    """Linux a6xx_fault_block / a6xx_uche_fault_block, A7xx paths."""
+    mid = fsynr1 & 0xff
+    if mid in (0, 4, 5, 6, 7):
+        return {0: 'CP', 4: 'CCU', 5: 'Flag cache', 6: 'CDP Prefetch', 7: 'GMU'}[mid]
+    client = uche & 0x7f
+    blocks = ['VFD', 'SP', 'VSC', 'VPC', 'HLSQ', 'PC', 'LRZ', 'TP']
+    if mid == 3 and client < 16:
+        return ('BR_' if client < 8 else 'BV_') + blocks[client % 8]
+    if mid == 8 and client in (1, 4, 7):
+        return 'LPAC_' + blocks[client]
+    return {1: 'UCHE', 2: 'UCHE_LPAC', 3: 'UCHE', 8: 'UCHE_LPAC'}.get(mid, 'UNKNOWN')
+
+
 def decode(r, pages=None):
     """r: list of 128 uint32. Prints a human-readable stage-by-stage report."""
     def on(cbcr):
@@ -61,7 +90,7 @@ def decode(r, pages=None):
     out.append(f'  version={r[80]:#x} magic={r[81]:#010x} (want 0x0c0330db) slaves={r[82]}')
     for i, nm in enumerate(NAMES):
         out.append(f'  {nm:<9} addr={r[83 + i]:#x}')
-    if pages and pages[0][0] in (0xa7400002, 0xa7400003):
+    if pages and pages[0][0] in (0xa7400002, 0xa7400003, 0xa7400004):
         e = pages[0]
         errors = {
             0: 'not-run', 1: 'PASS',
@@ -88,6 +117,7 @@ def decode(r, pages=None):
             0xc06: 'CP/RBBM/SMMU fault', 0xc07: 'CP init rptr/idle timeout',
             0xc08: 'CP ring not in reset state', 0xc09: 'SECVID access fault',
             0xc0a: 'SECVID_TRUST_CNTL did not clear',
+            0xc0b: 'critical CP pointer/control readback mismatch (before SQE start)',
             0xd01: 'fence MMIO fault', 0xd02: 'fence CP/RBBM/SMMU fault',
             0xd03: 'fence/rptr/idle timeout', 0xd04: 'ring/fence precondition lost',
             0xd05: 'fence guard overwritten',
@@ -120,7 +150,7 @@ def decode(r, pages=None):
         out.append(f'  result={result(e[60])} OOB_intr={e[61]:#x} SPTPRAC={e[62]:#x} GX_GDSCR={e[63]:#x} RBBM_read={e[65]} RBBM_STATUS={e[64]:#x}')
         out.append(f'  live: intr={e[84]:#x} AOirq={e[85]:#x} fence={e[86]:#x} GFSR={e[87]:#x} CB_FSR={e[88]:#x} FAR={e[90]:08x}{e[89]:08x} FSYNR={e[91]:#x}/{e[92]:#x}')
         out.append(f'  queues: command r/w={e[93]}/{e[94]} response r/w={e[95]}/{e[96]}')
-        if len(pages) >= 7 and e[0] == 0xa7400003:
+        if len(pages) >= 7 and e[0] in (0xa7400003, 0xa7400004):
             m = pages[5]
             out.append('-- stage 11 GPU SID0/1 context --')
             out.append(f'  result={result(m[2])} slots={m[10]}/{m[34]} CB={m[11]} ASID={m[12]} GMU_CB/ASID={m[8]}/{m[9]} tables={m[33]} PT={(m[14]<<32)|m[13]:#x}')
@@ -135,7 +165,10 @@ def decode(r, pages=None):
             out.append('-- stage 13 CP_MEM_WRITE fence --')
             out.append(f'  result={result(m[4])} fence before/after={m[52]:#x}/{m[53]:#x} expected={m[54]:#x} CP rptr before/after={m[55]}/{m[56]} wptr={m[57]} polls={m[58]}')
             out.append(f'  safe MMIO faults={m[116]} first_PA={m[118]:08x}{m[117]:08x} last_PA={m[111]:08x}{m[110]:08x} op={m[115]} ESR={m[112]:#x} FAR={m[114]:08x}{m[113]:08x}')
-            out.append('  init packet: ' + ' '.join(f'{v:08x}' for v in m[80:90]))
+            if e[0] == 0xa7400004:
+                out.append(f'  halt-clear readbacks: GBIF={m[95]:#x} RBBM_GBIF={m[96]:#x}')
+            init_words = 7 if e[0] == 0xa7400004 else 10
+            out.append('  init packet: ' + ' '.join(f'{v:08x}' for v in m[80:80+init_words]))
             out.append('  fence packet: ' + ' '.join(f'{v:08x}' for v in m[90:94]))
             for start in (0, 64):
                 d = pages[6][start:start+64]
@@ -143,9 +176,33 @@ def decode(r, pages=None):
                     continue
                 out.append(f'  stage{d[0]} frozen diagnostics: rptr/wptr={d[1]}/{d[2]} shadows={d[3]}/{d[4]} fence={d[5]:#x} RBBM={d[6]:#x} SQE_CNTL={d[7]:#x} SQE_STAT[1]={d[8]:#x}')
                 out.append(f'    CP_HW_FAULT={d[9]:#x} CP_INT={d[10]:#x} PROTECT={d[11]:#x} RBBM_INT={d[12]:#x} TRUST={d[13]:#x} TSB={d[15]:08x}{d[14]:08x} GFSR={d[16]:#x}')
+                out.append(f'    CP_INT bits: {bit_names(d[10], CP_BITS)}; RBBM busy bits (Linux XML): {bit_names(d[6], RBBM_BITS)}')
                 for at, name in ((17, 'GPU'), (23, 'GMU')):
                     out.append(f'    {name} CB{d[at]} FSR={d[at+1]:#x} FAR={d[at+3]:08x}{d[at+2]:08x} FSYNR={d[at+4]:#x}/{d[at+5]:#x}')
+                    if d[at+1] & 0xc00001fe:
+                        syn = d[at+4]
+                        out.append(f'      fault attributes: {"write" if syn & 16 else "read"} level={syn & 3} IND={bool(syn & 64)} PNU={bool(syn & 32)} PTWF={bool(syn & 1024)} MID={d[at+5] & 255} ({fault_client(d[at+5], 0x7f)})')
                 out.append(f'    fence guards={d[32]:#x}/{d[33]:#x} MMIO_faults={d[31]}')
+                if e[0] == 0xa7400004 and len(pages) >= 9:
+                    x = pages[8 if start else 7]
+                    out.append(f'    extended: stage={x[1]} step={x[2]} phase={x[3]} (1=verify,2=SQE/wptr0,3=doorbell) bad_pointer_index={m[94]}')
+                    out.append(f'      before doorbell: polls={x[4]} CP_INT={x[5]:#x} GPU_FSR={x[6]:#x} RBBM={x[7]:#x}')
+                    names = ['SQElo', 'SQEhi', 'RBlo', 'RBhi', 'RB_CNTL', 'RPTRlo', 'RPTRhi',
+                             'BV_RPTRlo', 'BV_RPTRhi', 'BR_APRIV', 'BV_APRIV', 'LPAC_APRIV',
+                             'APERTURE_HOST', 'LPAC_SQE_CNTL', 'LPAC_SQElo', 'LPAC_SQEhi']
+                    for i, name in enumerate(names):
+                        out.append(f'      {name}: before_RUN={x[8+i]:#x} frozen={x[24+i]:#x}')
+                    for at, word, name in ((17, 40, 'GPU'), (23, 41, 'GMU')):
+                        valid = bool(d[at+1] & 0xc00001fe)
+                        out.append(f'      {name} CBFRSYNRA={x[word]:#x} SID={x[word] & 0xffff} valid_fault={valid}' +
+                                   (f' client={fault_client(d[at+5], x[42])}' if valid else ''))
+                    out.append(f'      UCHE_CLIENT_PF={x[42]:#x} RBBM_STATUS1/2/3={x[43]:#x}/{x[44]:#x}/{x[45]:#x} SMMU_stalled={bool(x[45] & (1 << 24))}')
+                    out.append(f'      CP_STATUS1={x[46]:#x} CP2GMU={x[47]:#x} IB1={x[49]:08x}{x[48]:08x}/{x[50]} IB2={x[52]:08x}{x[51]:08x}/{x[53]}')
+                    out.append(f'      ROQ_RB/MRB={x[54]:#x}/{x[55]:#x} MRB={x[57]:08x}{x[56]:08x}/{x[58]} BV_HW/PROTECT={x[59]:#x}/{x[60]:#x} MMIO_faults={x[61]}')
+                    out.append(f'      SQE PC/header: BR={x[64]:#x}/{x[65]:08x} BV={x[115]:#x}/{x[116]:08x} LPAC={x[117]:#x}/{x[118]:08x}')
+                    out.append(f'      BR SQE_STAT count={x[63]} [0..50]: ' + ' '.join(f'{v:08x}' for v in x[64:115]))
+                    out.append('      raw UCODE_DBG[0..3]: ' + ' '.join(f'{v:08x}' for v in x[120:124]))
+                    out.append('      CPU SQE[0..3]:       ' + ' '.join(f'{v:08x}' for v in x[124:128]))
     return '\n'.join(out)
 
 
@@ -161,8 +218,8 @@ def main():
     args = ap.parse_args()
     if args.decode:
         blob = args.decode.read_bytes()
-        if len(blob) not in (512, 3072, 4096):
-            ap.error('report must be 512 (legacy), 3072 (v2), or 4096 (v3) bytes')
+        if len(blob) not in (512, 3072, 4096, 5120):
+            ap.error('report must be 512 (legacy), 3072 (v2), 4096 (v3), or 5120 (v4) bytes')
     else:
         import usb.core
         import usb.util
@@ -183,7 +240,9 @@ def main():
         if args.read_reports or stage >= 8:
             extra = read(0x101)
             version = struct.unpack_from('<I', extra)[0]
-            page_count = 8 if version == 0xa7400003 else 6
+            page_count = {0xa7400002: 6, 0xa7400003: 8, 0xa7400004: 10}.get(version)
+            if page_count is None:
+                ap.error(f'unsupported report version {version:#x}')
             blob += extra + b''.join(read(0x100 + i) for i in range(2, page_count))
     pages = [list(struct.unpack('<128I', blob[i:i+512])) for i in range(0, len(blob), 512)]
     if pages[0][0] != 0xa740:

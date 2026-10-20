@@ -1,12 +1,184 @@
-# Lane: GPU A740 — milestone 3 implementation, 2026-10-20
+# Lane: GPU A740 — milestone 3b, 2026-10-20
 
-Branch `codex-gpu-m3`, base `fuxi-bringup` `09fa2b8`. Stages 1–10 are
-**device-verified by the coordinator** (see Device results). Stages 11–13 are
-implemented and validated offline, **not booted or executed on the phone**.
-The coordinator owns all device tests. This lane used no phone, USB, adb or
-fastboot access and no CI run. `NOTES.md` is untouched by explicit task
-instruction; this file is the active handoff. Commit: the commit containing
-this handoff (`git log -1` on `codex-gpu-m3`).
+Branch `codex-gpu-m3b`, based on published main containing M3 `7ed3102`.
+This lane uses no phone, USB, adb, fastboot or CI. The coordinator owns device
+runs. `NOTES.md`, `FUXI.md` and `AGENTS.md` are untouched by explicit instruction.
+The M3b handoff below supersedes M3 packet sizes, report version and test targets;
+the remaining M2/M3 material is retained as implementation history.
+
+## M3b evidence and diagnosis
+
+**Observed on the coordinator's original M3 image**
+(`12b193ecf2ae55f26fe9ca553dca496528a8abcfb9ab047f41207baa856a4cdd`):
+stages1–10 PASS, fresh stage11 PASS, fresh stage12 `c06` at step4, stage13 not
+run. Offline decode of the supplied private `gpu-m2/stage-12m3.bin` confirms:
+GPU CB2 FSR `402`, FAR `0`, FSYNR0/1 `b0041/0`; CP rptr/wptr `0/10`,
+CP_INTERRUPT_STATUS `80`, CP_HW_FAULT/protection/global FSR zero,
+RBBM_STATUS `800005`, no CPU MMIO aborts. SQE CPU copy/readback completed;
+this does **not** prove successful SQE instruction fetching/execution.
+
+Source-backed interpretation (`a6xx_gpu.c`, `a6xx.xml`, `arm-smmu.h`):
+
+- FSYNR1 low byte 0 identifies **CP**. FSYNR0: read, level1, IND=1,
+  PNU=0, PTWF=0. IND is the reported instruction attribute; it does not alone
+  distinguish every internal CP DMA path. CBFRSYNRA (SID) was missing in M3.
+- CP_INT bit7 is **BR illegal instruction**, not the opcode/HW-fault interrupt.
+  SQE_STAT[1]=0 is a sampled packet/header field, not a successful firmware PC.
+- RBBM `800005` reports GPU_BUSY_IGN_AHB, CP_BUSY and CP_AHB_BUSY_CX_MASTER
+  under Linux's shared XML bit definitions. It does not identify UCHE activity.
+- The M3 capture has no instruction/ring base register readbacks or SQE PC;
+  it cannot establish whether the first failing read preceded the doorbell.
+
+**Ranked hypotheses, not a confirmed hardware root cause:**
+
+1. SQE instruction fetch/startup uses a zero/stale base or stale instruction
+   state. FAR0 + BR illegal instruction + IND + no rptr progress makes this
+   the leading hypothesis. No incorrect instruction-base offset or reversed
+   word order was found: Linux uses low word then high word at `830/831` too.
+   M3b verifies both base words before RUN and captures raw UCODE debug words
+   alongside the CPU firmware words. Step7 with wptr0 isolates startup faults.
+2. CP_ME_INIT's enabled ordinal8 register list dereferences the supplied null
+   pointer. M3 copied Linux's `TODO` sequence: mask `14b`, pointer0, length0.
+   The SQE may special-case length0; the source comparison cannot prove that
+   for this external firmware. M3b removes ordinal8 **and its three payload
+   words**, since the probe implements no IFPC/preemption list. This is the
+   candidate fix being tested, not a claim that the capture proves this reader.
+   Qualcomm's [Gen7 CP init](https://github.com/qualcomm-linux/kgsl/blob/master/adreno_gen7.c)
+   labels bit8 REGISTER_INIT_LIST_WITH_SPINLOCK and supplies an allocated list;
+   the supplied drm/msm source instead sends zeros. No IOVA0 mapping is added.
+3. Another CP path (BV/LPAC, context restore, MRB/IB) starts unexpectedly.
+   Linux A740 hw_init does not supply BV/LPAC instruction/ring bases or write
+   CP_CONTEXT_SWITCH_SMMU_INFO. Inventing these pointers would hide the cause.
+   M3b records LPAC enable/base, BR/BV/LPAC APRIV, aperture, MRB/IB state and
+   BV/LPAC PCs/headers. A fault's MID/SID plus SQE PC/header narrows the path.
+4. Omitted render/performance setup or firmware/platform mismatch. Lower rank:
+   no graphics work was submitted, SQE bytes match the reference blob, and no
+   matching missing pointer write appears in the supplied Linux A740 path.
+
+### Complete Linux A740 hw_init / cp_init comparison
+
+Reference is the supplied `kernel-guest-3a7d1771d492` tree, chip `43050a01`,
+ADRENO_7XX_GEN2. This tree contains XML and generated snapshot range headers,
+but no generated `a6xx.xml.h`/Gen7 register define header. XML is the offset
+source; A6xx-only branches must not be added to A740. The companion current
+[Mesa register XML](https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa/+/61b01302910401cbb4ad25555fd4c23e88d23272/src/freedreno/registers/adreno/a6xx.xml)
+also retains the same A6xx–A7xx SQE/base offsets.
+
+| Linux writes on this A740 path | Probe comparison / disposition |
+|---|---|
+| GPU_SET OOB | Held through stage12/13, including failure |
+| GBIF_HALT `3c45`, RBBM_GBIF_HALT `16` =0; TSB control/base/size `f803/f800/f802` =0 | Same writes; safe reads in M3b flush both halt clears |
+| GMU CGC `9309..930b`; all 54 A740 HWCG entries | Same offsets/values; automated source audit PASS |
+| GBIF QSB `3c03..3c06` =71620, client QoS `11` =2120212 | Same |
+| UCHE GX config `e3a`=10240e0; TRAP/WRITE_THRU `e09/e07`; GMEM `e0b/e0d`=16MiB..19MiB-1; CACHE_WAYS `e17`=BIT23 | Same; 64-bit writes low then high |
+| PERFCTR_GPU_BUSY_MASKED, PERFCTR_CNTL, IFPC counter select, CP_PERFCTR_CP_SEL0; GMU busy mask/power counter select/enable | Omitted performance accounting; no pointer registers |
+| ROQ thresholds / MEM_POOL_SIZE / LPAC FIFO size / CP_ADDR_MODE_CNTL | **Not written by Linux on A740**; A6xx branches are excluded |
+| PC_DBG_ECO_CNTL primitive FIFO threshold | A740 catalog has no prim_fifo_threshold; not written |
+| CP_AHB_CNTL `98d`=1; hang `1f`=40cfffff; UCHE_CLIENT_PF `e19`=81 | Same |
+| RB/TPL1/SP/GRAS UBWC NC controls; UCHE/RBBM NC `e01/534` | UCHE/RBBM same; render pipeline controls omitted (no rendering) |
+| CP_PROTECT_CNTL `84f`=b; 48 A730 slots starting850, skipping45/46 | Same; automated source audit checks every encoded slot |
+| UCHE_CMDQ_CONFIG `e3c`=6690e | Same |
+| BR/BV/LPAC APRIV `844/ad0/b31`=6f/f/f | Same; programming/readback gate before RUN |
+| RB_CMP_DBG_ECO_CNTL bit11 | Omitted rendering optimization |
+| RBBM_INT_0_MASK | Probe writes0 (poll raw status, no GIC handler) |
+| adreno_hw_init | Linux resets software ring pointers/shadows; probe zeroes its fixed buffers and requires reset hardware pointers |
+| SQE base `830/831`, RB base `800/801`, RB_CNTL `802`=20c | Same; new pre-RUN readback gate and frozen readbacks |
+| BR RPTR `804/805`, BV RPTR `a98/a99` | Same register pairs, own mapped shadow words; no separate BV ring required |
+| SQE_CNTL `808`=1 | Same; probe first halts with3 as Linux recovery does; new 32x10us wptr0 fault check before submission |
+| THREAD_CONTROL BIT27; ME_INIT ordinals0/1/3/6/8 with seven payload words | M3b retains0/1/3/6, omits absent list ordinal8; four payload words |
+| Zap then fallback TRUST_CNTL `f400`=0 | Same no-zap fallback after CP init; no secure SID2 or SCM calls |
+
+Reproduce the register/table audit and native UBSan model with:
+```
+python3 tools/test-fuxi-gpu-probe.py --linux-msm "$MSM" \
+  --firmware "$FW/gmu_gen70200.bin" --sqe "$FW/a740_sqe.fw"
+```
+`$MSM` denotes `drivers/gpu/drm/msm` in the supplied Linux tree. This checks
+54 HWCG offset/value pairs, all48 protection slots and15 critical CP offsets.
+It does not execute firmware or validate GPU DMA.
+
+### M3b behavior and report additions (v4)
+
+Stages and one-shot/OOB/handoff locking remain unchanged. Stage12 now validates
+critical pointer/control readbacks before starting SQE (`c0b`, page6[94] is
+1-based failed index). After starting SQE it enters **step7**, holds wptr0 for
+32 polls x10us and checks CP/RBBM/both-bank/global faults before the doorbell.
+A step7 failure proves that CP_ME_INIT has not been submitted. A successful
+320us startup sample does not prove no later asynchronous startup fault.
+Then step4 submits **7 dwords**, expects rptr/wptr7, and the trust fallback is
+still step5. Stage13 adds4 dwords and expects **11**, fence `a740f00d`, intact
+guards. New init packet (no null list):
+```
+70970001 08000000 70c80004 0000004b 00000003 20000000 00000002
+```
+
+Reports are now **10 pages /5120 B**, selectors `100..109`.
+Page1[0] and page6[0] are `a7400004`. Existing v3 fields retain their positions;
+page6[80..86] contains the7 init words, [87..89] remain0; [94] is the readback
+failure index, [95:96] retain GBIF_HALT/RBBM_GBIF_HALT clear readbacks.
+Legacy v2/v3 saved reports still decode (including the original
+M3 capture). Pages8/9 are frozen extended stage12/stage13 snapshots; stage13
+copies the original pre-RUN samples from page8. Each is128 little-endian u32:
+```
+[0] a7400004 [1] stage [2] substep at capture
+[3] phase: 1 pointer verification, 2 SQE RUN/wptr0, 3 doorbell attempted
+[4] completed startup sample polls [5] last pre-doorbell CP_INT
+[6] last pre-doorbell GPU FSR [7] last pre-doorbell RBBM_STATUS
+[8:23] pointers/controls before RUN (indices below)
+[24:39] same registers at frozen capture
+[40:41] GPU/GMU GR1 CBFRSYNRA (SID in bits15:0)
+[42] UCHE_CLIENT_PF [43:45] RBBM_STATUS1/2/3
+[46] CP_STATUS_1 [47] CP_CP2GMU_STATUS
+[48:50] IB1 base low/high, remaining [51:53] IB2 same
+[54] ROQ_RB_STAT [55] ROQ_MRB_STAT [56:58] MRB base low/high, remaining
+[59] BV_HW_FAULT [60] BV_PROTECT_STATUS [61] cumulative safe MMIO abort count
+[62] reserved0 [63] SQE_STAT words sampled
+[64:114] BR SQE_STAT indices0..50 (Linux a7xx_indexed_reglist length33 hex)
+[115:116] BV SQE_STAT indices0/1 [117:118] LPAC indices0/1 [119] reserved0
+[120:123] raw CP_SQE_UCODE_DBG words0..3 (interpretation not assumed)
+[124:127] CPU SQE buffer words0..3
+```
+Pointer/control indices0..15 (page6[94] uses index+1):
+`SQElo, SQEhi, RBlo, RBhi, RB_CNTL, RPTRlo, RPTRhi, BV_RPTRlo, BV_RPTRhi,
+BR_APRIV, BV_APRIV, LPAC_APRIV, APERTURE_HOST, LPAC_SQE_CNTL, LPAC_SQElo,
+LPAC_SQEhi`. Only indices0..12 are compared to programmed/reset expectations;
+LPAC state is evidence, not an invented enable/reset requirement.
+
+All added MMIO uses safe read/write wrappers. SQE index sweeps are bounded;
+selectors return to known indices afterwards. No fault is cleared/resumed by
+diagnostics and page fetches still copy frozen RAM only. On error, first/last
+CPU abort addresses remain in page6; the extended count includes the entire
+snapshot. A diagnostic abort after an otherwise successful stage still fails
+that stage. No IOVA0 mapping or diagnostic dummy page is enabled or added.
+FSYNR1 low-byte MID follows Linux's A7xx client decoder (CP, CCU, flag cache,
+CDP, GMU, UCHE BR/BV/LPAC using UCHE_CLIENT_PF); stale bank syndromes without a
+defined FSR fault are not treated as a valid fault client. RBBM bit names use
+Linux's shared XML definition; raw words remain authoritative.
+
+### M3b verification and coordinator test order
+
+Build results, exact image hash and geometry are recorded at the end of this
+file. No M3b device result exists. Model additions cover dropped SQE-base
+programming (RUN/doorbell refused), the exact observed fault signature injected
+at SQE start (step7, no doorbell), all51 SQE indices, and existing fence,
+timeout, ownership, abort and one-shot failure paths. These are CPU-side model
+checks, not confirmation of the candidate CP_INIT fix.
+
+1. Fresh boots: stage7, stage8a (review ownership), stage10 regression.
+2. Fresh stage11: unchanged expected context/mappings,3 tables, defined faults0.
+3. Fresh stage12: save all10 pages. If `c0b`, use page6[94] and page8[8..23].
+   If step7/phase2, the fault precedes PM4: inspect MID/SID, base readbacks,
+   BR SQE PC/header, UCODE debug and CPU words. Do not blame the init list.
+   If step4/phase3, inspect BR PC/header/MRB/IB and fault attributes; compare
+   against this exact SQE blob. PASS requires rptr/wptr7, step6, trust0, no faults.
+4. Fresh stage13 only after12 passes: expect fence magic, rptr/wptr11, guards
+   intact, both frozen records. Stop climbing on any failure/reset.
+5. Same boot11->12->13 with report fetches and a delay before13; repeat13 and
+   `--read-reports` must preserve frozen results without new hardware access.
+   Keep the permanent request0x49 refusal check. Coordinator performs temporary
+   boots only; this lane performs no device operation.
+
+## M2/M3 implementation history
 
 Stages 1–7 passed on Fuxi (coordinator runs gpu-01, gpu-03..07): CX on,
 PLL1 locked after 6 polls, GMU reset=1, TCM retention=0, RSC idle, HFI not ready.
@@ -651,3 +823,33 @@ ELF `_gpu_fw_start/end=0x1028c/0x207a8` (66844 B),
 `_payload_start=0x74000`, `_image_end=0x13e4050`.
 No firmware bytes or dumps are committed. Next concrete action: coordinator
 stage7/8a/10 regression with this image, then fresh-boot stage11.
+
+### M3b build handoff (current artifact)
+
+Offline firmware-enabled loader, explicitly empty-firmware loader and standalone
+probe builds: **PASS, zero warnings** with clang-r547379. Loader `-Werror`,
+relocation checks, Image size/header checks and link: PASS. Final native UBSan
+model with the exact external sheng GMU/SQE inputs: PASS. Linux source register/
+table audit: PASS. Ten-page decoder and client/interrupt labels: PASS; original
+private M3 eight-page report still decodes offline. These checks do not execute
+SQE code or prove the CP_INIT candidate fix. No phone access or M3b boot test.
+
+Artifact in this worktree (gitignored):
+`shim/out/lane-gpu/fuxi-gpu-m3b-boot.img`, **20,865,024 B**.
+SHA256: `c645f6d7ffb8740aaead35699adc9c2ea7c5d2721d39db88ff364acd80768a53`.
+Kernel Image: 20,856,912 B. Payload unchanged:
+`800b9ea17ce18f1872c0533d5ef13f916c490eb7b1524e677fc2555378f00d66`.
+Firmware hashes unchanged from the sheng table above. Build uses `$FW`, `$LLVM`,
+`$MKBOOTIMG_DIR` and the supplied integ1 payload, per section6. The absolute
+input payload can be passed as the build script argument; it need not be copied
+into this worktree. No firmware, dump, boot image or local path is committed.
+
+Firmware build ELF geometry: `_gpu_fw_start/end=0x10ec4/0x213e0` (66844 B),
+`_sqe_fw_start/end=0x213e0/0x33a54` (75380 B),
+`_bss_start/end=0x34000/0x64000`, `_payload_start=0x74000`,
+`_image_end=0x13e4050`. Both extra report pages fit existing BSS alignment.
+The lane image was copied before the empty-firmware verification build, so the
+lane artifact contains **both** blobs. Commit: the commit containing this
+handoff (`git log -1` on `codex-gpu-m3b`). Next action: coordinator fresh stage12
+after regressions/stage11, using the new phase/PC/SID fields before further
+pointer changes. The hardware root cause remains unconfirmed.

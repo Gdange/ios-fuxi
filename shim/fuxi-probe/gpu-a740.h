@@ -1,6 +1,23 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* A740 values from the supplied Linux msm a6xx_catalog.c / a6xx.xml.
  * Dword offsets, not byte addresses. No firmware data. */
+#define G3_RB_BASE       0x0800
+#define G3_RB_CNTL       0x0802
+#define G3_RPTR_ADDR     0x0804
+#define G3_SQE_CNTL      0x0808
+#define G3_SQE_BASE      0x0830
+#define G3_APRIV         0x0844
+#define G3_STAT_ADDR     0x0908
+#define G3_STAT_DATA     0x0909
+#define G3_APERTURE_HOST 0x0a00
+#define G3_BV_STAT_ADDR  0x0a87
+#define G3_BV_STAT_DATA  0x0a88
+#define G3_BV_RPTR_ADDR  0x0a98
+#define G3_AC_STAT_ADDR  0x0b29
+#define G3_AC_STAT_DATA  0x0b2a
+#define G3_LPAC_CNTL     0x0b81
+#define G3_INIT_DWORDS   7u
+#define G3_FENCE_DWORDS  (G3_INIT_DWORDS + 4u)
 static const uint32_t g3_hwcg[][2] = {
  {0x00b0, 0x02222222}, /* RBBM_CLOCK_CNTL_SP0 */
  {0x00b4, 0x22022222}, /* RBBM_CLOCK_CNTL2_SP0 */

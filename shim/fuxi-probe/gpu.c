@@ -174,7 +174,7 @@ static uint32_t cdb32(const uint8_t *p) { return cdb16(p) | (uint32_t)cdb16(p + 
 #define G_HFI_PA    (G_DATA_PA + 0x6000)
 #define G_DEBUG_PA  (G_DATA_PA + 0xa000)
 #define G_IC_SIZE   0xffc000u
-#define G_PAGES     8
+#define G_PAGES     10
 #define G_STAGE_8A  0x8au
 static uint32_t gpu_extra[G_PAGES - 1][GPU_REPORT_WORDS];
 static unsigned gpu_gmu_started; /* monotonic: also covers failed init/ACK */
@@ -649,6 +649,7 @@ static void g_gx(void)
 #define G3_FSR_MASK 0xc00001feu /* SMMUv2 defined faults; keep reserved bit10 in report */
 #define G3_CP_ERRORS 0x3fff7u
 #define G3_RBBM_ERRORS 0x33c002c2u
+#include "gpu-a740.h"
 _Static_assert(G3_PT >= G_DEBUG_PA + 0x7000, "GPU tables overlap GMU buffers");
 _Static_assert(G3_PT + 0x100000 == G3_SQE_PA, "GPU table pool limit");
 _Static_assert(G3_FENCE_PA + 0x1000 <= G_MEM + G_MEM_SIZE, "GPU scratch overflow");
@@ -775,7 +776,7 @@ static int g3_context(void)
 }
 static int g3_memory(void)
 {
- uint32_t *e = gpu_extra[5]; e[0] = 0xa7400003;
+ uint32_t *e = gpu_extra[5]; e[0] = 0xa7400004;
  e[37] = G3_SQE_VA; e[38] = G3_RING_VA; e[39] = G3_PTR_VA; e[40] = G3_FENCE_VA;
  e[41] = 0x8000; e[13] = (uint32_t)G3_PT; e[14] = G3_PT >> 32;
  const uint64_t pa[] = {G3_SQE_PA,G3_RING_PA,G3_PTR_PA,G3_FENCE_PA};
@@ -811,7 +812,7 @@ static unsigned g3_parity(unsigned x)
 static uint32_t g3_pkt7(unsigned op, unsigned count)
 { return 0x70000000u | count | g3_parity(count)<<15 | op<<16 | g3_parity(op)<<23; }
 static void g3_emit(uint32_t word)
-{ g_wr(G3_RING_PA, g3_wptr++ * 4, word); } /* only 14 dwords, no wrap/reuse */
+{ g_wr(G3_RING_PA, g3_wptr++ * 4, word); } /* only 11 dwords, no wrap/reuse */
 static int g3_sqe(void)
 {
  uint32_t *e = gpu_extra[5];
@@ -858,15 +859,42 @@ static int g3_hold_gx(void)
  return (!e[116] && (e[63] & (1u<<31))) ? 0 : 0xc04;
 }
 
-/* See docs-lanes/gpu.md for the two frozen diagnostic snapshots. */
+/* The same critical pointers are sampled before RUN and after completion.
+ * Keep the register list shared so failed readbacks are identifiable by index.
+ * These offsets are from Linux a6xx.xml (A7XX), not guessed BV/LPAC rings. */
+static const unsigned g3_pointer_regs[16] = {
+ G3_SQE_BASE,G3_SQE_BASE+1,G3_RB_BASE,G3_RB_BASE+1,G3_RB_CNTL,
+ G3_RPTR_ADDR,G3_RPTR_ADDR+1,G3_BV_RPTR_ADDR,G3_BV_RPTR_ADDR+1,
+ G3_APRIV,0xad0,0xb31,G3_APERTURE_HOST,G3_LPAC_CNTL,0xb82,0xb83,
+};
+static int g3_verify_pointers(void)
+{
+ uint32_t *x = gpu_extra[7];
+ const uint32_t expected[13] = {
+  G3_SQE_VA,0,G3_RING_VA,0,0x20c,G3_PTR_VA,0,G3_PTR_VA+4,0,0x6f,0xf,0xf,0,
+ };
+ x[0] = 0xa7400004; x[1] = 12; x[3] = 1;
+ for (unsigned i = 0; i < 16; i++) x[8+i] = g3_gr(g3_pointer_regs[i]);
+ if (gpu_extra[5][116]) return 0xc05;
+ for (unsigned i = 0; i < 13; i++)
+  if (x[8+i] != expected[i]) { gpu_extra[5][94] = i+1; return 0xc0b; }
+ /* Linux starts neither LPAC nor a separate BV ring in hw_init. Their
+  * instruction/ring bases must not be invented to hide a null read. */
+ return 0;
+}
+/* See docs-lanes/gpu.md for the frozen diagnostic snapshots. */
 static void g3_diagnostics(unsigned stage)
 {
  uint32_t *d = &gpu_extra[6][stage == 13 ? 64 : 0];
+ uint32_t *x = gpu_extra[stage == 13 ? 8 : 7];
+ if (stage == 13)
+  for (unsigned i = 0; i < 24; i++) x[i] = gpu_extra[7][i];
+ x[0] = 0xa7400004; x[1] = stage; x[2] = gpu_extra[5][60];
  d[0] = stage;
  static const unsigned regs[] = {0x806,0x807,0x210,0x808,0x821,0x823,0x824,0x201,0xf400,0xfc00,0xfc01};
  static const unsigned words[] = {1,2,6,7,9,10,11,12,13,14,15};
  for (unsigned i = 0; i < sizeof regs / sizeof regs[0]; i++) d[words[i]] = g3_gr(regs[i]);
- if (g3_gw(0x908, 1)) d[8] = g3_gr(0x909); /* Linux CP HW fault decoder */
+ if (g3_gw(G3_STAT_ADDR, 1)) d[8] = g3_gr(G3_STAT_DATA);
  d[3] = g_rd(G3_PTR_PA, 0); d[4] = g_rd(G3_PTR_PA, 4); d[5] = g_rd(G3_FENCE_PA, 0);
  d[16] = g3_sr(SMMU_GFSR);
  for (unsigned j = 0; j < 2; j++) {
@@ -877,8 +905,37 @@ static void g3_diagnostics(unsigned stage)
  }
  d[29] = g3_read(GPU_GMU_CORE+0x5192*4);
  d[30] = g3_read(GPU_GMU_CORE+0x9305*4);
- d[31] = gpu_extra[5][116];
  d[32] = g_rd(G3_FENCE_PA, 4); d[33] = g_rd(G3_FENCE_PA, 0xffc);
+ for (unsigned i = 0; i < 16; i++) x[24+i] = g3_gr(g3_pointer_regs[i]);
+ /* GR1 CBFRSYNRA supplies SID; FSYNR1 supplies the Qualcomm master ID.
+  * Both are meaningful only when that bank has a defined FSR fault. */
+ x[40] = g3_sr(g_stride+0x400+g3_bank*4);
+ x[41] = g3_sr(g_stride+0x400+g_bank*4);
+ static const unsigned regs2[] = {
+  0xe19,0x211,0x212,0x213,0x825,0x812,0x928,0x929,0x92a,
+  0x92b,0x92c,0x92d,0x939,0x93d,0x931,0x932,0x933,0xa64,0xa61,
+ };
+ for (unsigned i = 0; i < sizeof regs2 / sizeof regs2[0]; i++) x[42+i] = g3_gr(regs2[i]);
+ /* a7xx_indexed_reglist: exactly 0x33 BR SQE words. Re-select every
+  * index rather than depending on the data port's auto-increment state. */
+ for (unsigned i = 0; i < 0x33; i++) {
+  if (!g3_gw(G3_STAT_ADDR, i)) break;
+  x[64+i] = g3_gr(G3_STAT_DATA); x[63] = i+1;
+ }
+ const unsigned ports[2][2] = {{G3_BV_STAT_ADDR,G3_BV_STAT_DATA},{G3_AC_STAT_ADDR,G3_AC_STAT_DATA}};
+ for (unsigned j = 0; j < 2; j++)
+  for (unsigned i = 0; i < 2; i++)
+   if (g3_gw(ports[j][0], i)) x[115+j*2+i] = g3_gr(ports[j][1]);
+ /* Linux dumps this indexed window too. Keep raw instruction-port words:
+  * their interpretation is firmware/hardware dependent, so never gate on
+  * them or claim a successful CPU copy proves instruction-cache contents. */
+ for (unsigned i = 0; i < 4; i++) {
+  if (g3_gw(0x910, i)) x[120+i] = g3_gr(0x911);
+  x[124+i] = g_rd(G3_SQE_PA, i*4);
+ }
+ /* Restore known selector values; never clear/resume a stalled SMMU. */
+ g3_gw(G3_STAT_ADDR, 1); g3_gw(G3_BV_STAT_ADDR, 0); g3_gw(G3_AC_STAT_ADDR, 0); g3_gw(0x910, 0);
+ x[61] = gpu_extra[5][116]; d[31] = x[61];
 }
 /* No interrupt delivery is enabled: inspect raw status, both FSRs and ring.
  * Reserved FSR bit10 was observed on GMU CB1 in m2; retain but don't gate on it. */
@@ -904,13 +961,15 @@ static int g3_wait(unsigned fence)
  }
  return fence ? 0xd03 : 0xc07;
 }
-#include "gpu-a740.h"
 static int g3_hw_init(void)
 {
  /* CP/GBIF/UCHE subset of Linux hw_init. No render pipeline or preemption,
   * no concurrent binning/LPAC start, no IFPC register restore list. */
  if (!g3_gw(0x3c45, 0) || !g3_gw(0x16, 0) ||
      !g3_gw(0xf803, 0) || !g3_gw64(0xf800, 0) || !g3_gw(0xf802, 0)) return 0;
+ /* Flush both halt clears, as Linux does; retain the readbacks. */
+ gpu_extra[5][95] = g3_gr(0x3c45); gpu_extra[5][96] = g3_gr(0x16);
+ if (gpu_extra[5][116]) return 0;
  /* a6xx_set_hwcg(A740), with all sourced A740 register values. */
  if (!g3_write(GPU_GMU_CORE+0x9309*4, 0x20202) ||
      !g3_write(GPU_GMU_CORE+0x930a*4, 0x10111) ||
@@ -938,9 +997,9 @@ static int g3_hw_init(void)
   if (g3_protect[i] && !g3_gw(0x850+i, g3_protect[i])) return 0;
  /* 32K ring: BUFSZ=log2(32768/8)=12, BLKSZ=log2(32/8)=2.
   * Expanded APRIV permits the privileged RPTR shadow (NO_UPDATE unset). */
- return g3_gw64(0x830, G3_SQE_VA) && g3_gw64(0x800, G3_RING_VA) &&
-        g3_gw(0x802, 0x20c) && g3_gw64(0x804, G3_PTR_VA) &&
-        g3_gw64(0xa98, G3_PTR_VA+4);
+ return g3_gw64(G3_SQE_BASE, G3_SQE_VA) && g3_gw64(G3_RB_BASE, G3_RING_VA) &&
+        g3_gw(G3_RB_CNTL, 0x20c) && g3_gw64(G3_RPTR_ADDR, G3_PTR_VA) &&
+        g3_gw64(G3_BV_RPTR_ADDR, G3_PTR_VA+4);
 }
 static int g3_cp_start(void)
 {
@@ -950,19 +1009,32 @@ static int g3_cp_start(void)
  /* OOB is deliberately retained until reset, on success AND failure. This
   * avoids an IFPC collapse losing CP state between USB stages12 and13. */
  e[60] = 3;
- if (!g3_gw(0x808, 3) || !g3_hw_init()) return 0xc05;
+ if (!g3_gw(G3_SQE_CNTL, 3) || !g3_hw_init()) return 0xc05;
+ err = g3_verify_pointers(); if (err) return err;
  e[48] = g3_gr(0x806); e[42] = g3_gr(0x807);
  if (e[116]) return 0xc05;
  if (e[48] || e[42]) return 0xc08; /* require reset ring, don't steal a live CP */
  g3_wptr = 0;
  g3_emit(g3_pkt7(0x17, 1)); g3_emit(1u<<27); /* disable concurrent binning */
- g3_emit(g3_pkt7(0x48, 7));
- g3_emit(0x14b); g3_emit(3); g3_emit(0x20000000); g3_emit(2);
- g3_emit(0); g3_emit(0); g3_emit(0); /* no power-up list, matches Linux */
- for (unsigned i = 0; i < 10; i++) e[80+i] = g_rd(G3_RING_PA, i*4);
- e[50] = g3_wptr; e[60] = 4;
- if (!g3_gw(0x807, 0) || !g3_gw(0x808, 1)) return 0xc05;
+ /* No IFPC/preemption list exists in this probe. Do not advertise ordinal8
+  * REGISTER_INIT_LIST_WITH_SPINLOCK with a null pointer (Linux's TODO).
+  * Keep ordinals0/1/3/6 and their four payload words, omit the list ordinal
+  * and its three words together. This is a candidate for the FAR=0 read;
+  * the pre-doorbell phase below can rule it out on the next device run. */
+ g3_emit(g3_pkt7(0x48, 4));
+ g3_emit(0x4b); g3_emit(3); g3_emit(0x20000000); g3_emit(2);
+ for (unsigned i = 0; i < G3_INIT_DWORDS; i++) e[80+i] = g_rd(G3_RING_PA, i*4);
+ e[60] = 7; /* SQE running, wptr=0: isolate instruction fetch from PM4 */
+ if (g3_faulted()) return 0xc06;
+ if (!g3_gw(0x807, 0) || !g3_gw(G3_SQE_CNTL, 1)) return 0xc05;
  e[59] = 1;
+ uint32_t *x = gpu_extra[7]; x[3] = 2;
+ for (unsigned i = 0; i < 32; i++) {
+  x[4] = i+1; x[5] = g3_gr(0x823); x[6] = g3_sr(g_cb(g3_bank)+0x58); x[7] = g3_gr(0x210);
+  if (g3_faulted()) return e[116] ? 0xc05 : 0xc06;
+  delay(10);
+ }
+ e[50] = g3_wptr; e[60] = 4; x[3] = 3;
  __asm__ volatile("dsb sy" ::: "memory");
  if (!g3_gw(0x807, g3_wptr)) return 0xc05;
  err = g3_wait(0); if (err) return err;
@@ -983,10 +1055,10 @@ static int g3_fence(void)
  uint32_t *e = gpu_extra[5]; e[54] = G3_MAGIC;
  e[55] = g3_gr(0x806); e[52] = g_rd(G3_FENCE_PA, 0);
  if (g3_faulted()) return 0xd02;
- if (e[55] != 10 || g3_wptr != 10 || g3_gr(0x807) != 10 || e[52]) return 0xd04;
+ if (e[55] != G3_INIT_DWORDS || g3_wptr != G3_INIT_DWORDS || g3_gr(0x807) != G3_INIT_DWORDS || e[52]) return 0xd04;
  g_wr(G3_FENCE_PA, 4, G3_GUARD); g_wr(G3_FENCE_PA, 0xffc, G3_GUARD);
  g3_emit(g3_pkt7(0x3d, 3)); g3_emit(G3_FENCE_VA); g3_emit(0); g3_emit(G3_MAGIC);
- for (unsigned i = 0; i < 4; i++) e[90+i] = g_rd(G3_RING_PA, (10+i)*4);
+ for (unsigned i = 0; i < 4; i++) e[90+i] = g_rd(G3_RING_PA, (G3_INIT_DWORDS+i)*4);
  e[57] = g3_wptr;
  __asm__ volatile("dsb sy" ::: "memory");
  if (!g3_gw(0x807, g3_wptr)) return 0xd01;
@@ -1039,7 +1111,7 @@ static void gpu_probe(unsigned limit)
  if (limit != G_STAGE_8A && limit > 13) limit = 13;
  r[0] = 0xa740;          /* magic */
  r[1] = limit;
- gpu_extra[0][0] = 0xa7400003;
+ gpu_extra[0][0] = 0xa7400004;
 
  /* ---- Stage 1: read-only snapshot (always safe: same GCC family the UFS /
   * touch probes already read; GPUCC/SMMU/GPU reads are each gated). ---- */
