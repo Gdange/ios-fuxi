@@ -49,6 +49,211 @@ metal2h intentionally still exec-swaps the raw ABI test. Expect the same two
 successful rounds as metal2g, without `IOMemoryDescriptor physical with managed
 page`. The M2 Vulkan probe needs a separate coordinator-selected invocation.
 
+## M2: iOS 16 Turnip cross-build (offline complete)
+
+**Built, not run on device.** `tools/build-fuxi-turnip.py` builds/signs the real
+Turnip ICD against this tree's `xnu/fuxi-adreno/NativeAdrenoABI.h`, then builds
+`tools/fuxi-vk-probe.cpp` using Mesa's Vulkan headers. The probe directly dlopens
+the ICD, creates an instance, enumerates physical properties/heaps, creates one
+logical device/queue, and destroys them. It never resolves or calls a submit
+entrypoint, allocates application GPU resources, creates a surface, or presents.
+Source review of the pinned CreateDevice/queue-init path found BO/command-stream
+initialization but no hardware submission. No Vulkan success on Fuxi is claimed.
+
+### Exact inputs and patch order
+
+- Mesa commit `85fda3b36405bcaea8bffc64aa4f2651dc90770d`, base tree
+  `b72ff1eb2138026ed6aba524770899faabf7d7c8` (Mesa `26.2.0-devel`).
+- UniXNU commit `7b52e7968c76453cdc18b5aa174fc368d5293b91`,
+  [build recipe](https://github.com/UniXNU/UniXNU/blob/7b52e7968c76453cdc18b5aa174fc368d5293b91/scripts/build-turnip-darwin.py)
+  and its `scripts/data/adreno-compiler-inputs.json`. Keep its MIT notices in
+  the external patched source. No upstream checkout or large patch is vendored.
+- NativeAdrenoABI.h SHA256
+  `c37a965ce521f57bd201b61ee0578d72b809b3d1c3697fd572ee1f3753af2e89`.
+  Direct unsandboxed root service: `NativeAdrenoGpuPublished`, open type **0**;
+  ABI v1, 31-bit IOVA / 36-bit PA, 256 MiB per-client wired limit, no HostImport.
+
+Apply the following in order (the build script verifies upstream patch hashes,
+then checks the entire patched worktree against an independently built Git index):
+
+| Patch | SHA256 |
+| --- | --- |
+| `freedreno-tools-nir.patch` | `77e966b6e9a725892d10889a4d8deeefb03a32ae3a007904868132e56350191f` |
+| `ir3-darwin-build-id.patch` | `be3ca7840a16cb7696d8d7e67195c8d097cf0e38a3b5011edc674a5aed9c6975` |
+| `ir3-portable-asm-roundtrip.patch` | `bfc5552bc2bd6e1668d75773cce7bf62fd19065e6281bf7da49f9ddfc2e79339` |
+| `offline-adreno-compiler-probe.patch` | `b7d7a113beb5ef99edea24858d906194d4b4755c987520545ad2f7f3136bb4fb` |
+| `turnip-darwin-kmd.patch` | `dcf6a88890995243516f5fd06a41b4ff91117f25ca08e7dc4fc7b90836b11e37` |
+| `tools/patches/mesa-fuxi-ios16.patch` (local, last) | `e7879df64e66442c015ca25f6484bad6ba57b56bed9bb10ac357aa46e1b40306` |
+
+The local patch adds the missing `tu_physical_device::has_host_import` boolean:
+the upstream patch references/sets it but omits its declaration. This is a
+reproduced compile failure, independent of target OS. It stays false because our
+Query flags are zero. No HostImport support is added.
+
+**iOS 16 derivation:** C/C++/ObjC compile and link flags all use
+`-target arm64-apple-ios16.0`, the real iPhoneOS SDK and
+`-Werror=unguarded-availability-new`. No macOS SDK fallback. The upstream Darwin
+condition-variable workaround and 64-byte cache-line substitution apply to iOS
+16 as well. None of the iOS 17 IOGPU/Metal object-size assumptions are used.
+`platforms=macos` selects Mesa's Darwin/Metal WSI sources; it does not change the
+Mach-O platform to macOS. The probe enables no WSI extensions. The WSI path that
+calls `MTLCreateSystemDefaultDevice` is reached when creating a swapchain, which
+this probe never does; this does not provide a Metal frontend or presentation.
+
+### Build procedure
+
+Observed toolchain: Apple clang `21.0.0 (clang-2100.3.34.2)`, iPhoneOS SDK
+**27.1**, Meson **1.12.1**, Ninja **1.13.2**, native glslangValidator **16.6.0**,
+Python **3.14.8**, Bison **3.8.2**. The installed newer SDK was used with a 16.0
+minimum; required imports were also checked against the supplied iOS 16.7 cache.
+Apple Bison 2.3 fails IR3 parser generation (`-Wcounterexamples` unsupported).
+The pinned GNU tarball SHA256 is
+`9bba0214ccf7f1079c5d59210045227bcf619519840ebfa80cd3849cff5a5bf2`.
+
+Use absolute environment paths for an external/ignored cache, checkouts and
+build directory. Only the assigned Mac lane and its own dependency cache were
+written. Example setup, with native Ninja/glslang already on PATH:
+
+```sh
+mkdir -p "$CACHE"
+python3 -m venv "$CACHE/venv"
+"$CACHE/venv/bin/pip" install meson==1.12.1 mako==1.4.3 MarkupSafe==3.0.4 \
+  pyyaml==6.0.3 packaging==26.3
+curl -fL https://ftp.gnu.org/gnu/bison/bison-3.8.2.tar.xz -o "$CACHE/bison-3.8.2.tar.xz"
+# Verify the SHA256 above before unpacking/building.
+tar -C "$CACHE" -xf "$CACHE/bison-3.8.2.tar.xz"
+(cd "$CACHE/bison-3.8.2" && ./configure --prefix="$CACHE/native" && make -j6 && make install)
+export PATH="$CACHE/native/bin:$CACHE/venv/bin:$PATH"
+
+git init "$MESA_SRC"
+git -C "$MESA_SRC" remote add origin https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa
+git -C "$MESA_SRC" fetch --depth 1 origin 85fda3b36405bcaea8bffc64aa4f2651dc90770d
+git -C "$MESA_SRC" checkout --detach FETCH_HEAD
+git init "$UNIXNU_SRC"
+git -C "$UNIXNU_SRC" remote add origin https://github.com/UniXNU/UniXNU.git
+git -C "$UNIXNU_SRC" fetch --depth 1 origin 7b52e7968c76453cdc18b5aa174fc368d5293b91
+git -C "$UNIXNU_SRC" checkout --detach FETCH_HEAD
+python3 tools/build-fuxi-turnip.py --mesa "$MESA_SRC" \
+  --patches "$UNIXNU_SRC/patches/mesa" --build "$MESA_BUILD"
+```
+
+The script uses the manifest's options: `vulkan-drivers=freedreno`,
+`freedreno-kmds=darwin`, `tu-darwin-abi-dir` set to our ABI directory,
+`platforms=macos`; Gallium, GL/GLX/GLES/EGL/GBM, LLVM, shared-glapi, XML config,
+shader cache, tools/tests/codecs/layers, unwind/sensors/valgrind/expat/zstd are
+disabled; `--wrap-mode=nodownload`, native glslang/build generators. It writes a
+cross file to the ignored build directory. If resuming a cache configured with
+the wrong native Bison, use a fresh build directory. `--verify-inputs-only`
+checks source/patch state without configuring or rebuilding.
+
+The ICD install ID becomes `/usr/local/lib/libvulkan_freedreno.dylib` before
+`codesign -f -s -`, exactly the raw test's ad-hoc signing method, with no added
+entitlements. `codesign --verify --strict` passes for both outputs.
+
+### Artifact/load-command audit
+
+| Artifact | SHA256 |
+| --- | --- |
+| `tools/out/libvulkan_freedreno.dylib` | `fe2bb259cb173762aa902754f5ec0ee9b567fb5ce97351d9a8c2ba32339c2928` |
+| `tools/out/fuxi-vk-probe` | `ca7851eb7f0051ccb57927971d67570c34b4b2f07695f8209c8bbfd564124a52` |
+
+Both are thin plain arm64 (not arm64e), `LC_BUILD_VERSION platform IOS`,
+`minos 16.0`, `sdk 27.1`, embedded ad-hoc signatures, no LC_RPATH. The ICD exports
+`vk_icdGetInstanceProcAddr` (also `vkGetInstanceProcAddr`). Instruction-word scans
+of every executable section and independent LLVM disassembly found **no
+`MRS CTR_EL0`**. The upstream Darwin helper substitutes 64 bytes.
+
+Exact ICD `LC_LOAD_DYLIB` paths:
+
+```text
+/usr/lib/libSystem.B.dylib
+/usr/lib/libz.1.dylib
+/System/Library/Frameworks/IOKit.framework/Versions/A/IOKit
+/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics
+/System/Library/Frameworks/QuartzCore.framework/QuartzCore
+/System/Library/Frameworks/Metal.framework/Metal
+/usr/lib/libc++.1.dylib
+/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation
+/usr/lib/libobjc.A.dylib
+```
+
+The probe loads only libc++ and libSystem. These are iOS 16 system libraries;
+the IOKit versioned path is present in the supplied cache. All **262 distinct
+strong imports** (251 ICD, 29 probe, with overlap) were found defined in their
+expected system providers/reexports in the supplied 20H392 cache (hash recorded
+in the discovery section below). No required import is a dynamic lookup. The
+ICD has **5571 weak dynamic references** from generated optional Turnip/WSI
+entrypoint tables. The upstream `-undefined dynamic_lookup` is retained; ld
+warns that it is deprecated on iOS, plus a duplicate `-lz` warning. These weak
+references and actual dyld/signing policy still require the root load gate.
+
+Reproduce audit on the Mac, then use the supplied cache offline:
+
+```sh
+python3 tools/audit-fuxi-vulkan.py tools/out/libvulkan_freedreno.dylib tools/out/fuxi-vk-probe
+"$IPSW" dyld symaddr "$DSC" --in tools/out/M2-required-symbols.json \
+  --output tools/out/M2-ios16-symbols.json
+python3 tools/audit-fuxi-vulkan.py --cache-symbols tools/out/M2-ios16-symbols.json \
+  --required tools/out/M2-required-symbol-libs.json
+python3 tools/test-fuxi-vulkan.py --headers "$MESA_SRC/include"
+```
+
+Host tests run the actual probe against a fake ICD that rejects unexpected
+entrypoint lookups, including submit calls; they cover successful lifetime,
+cleanup after enumeration/device-creation failure, exec-swap host argv, and
+idempotent stage modes/ownership. They do not execute Turnip or an iOS dyld.
+
+### Later root edit and device acceptance
+
+Run `tools/stage-fuxi-vulkan.py ROOT tools/out/libvulkan_freedreno.dylib
+tools/out/fuxi-vk-probe` as the root-image editor, against an already mounted
+writable iOS root. It copies only:
+
+| Root path | Owner | Mode |
+| --- | --- | --- |
+| `/usr/local/lib/libvulkan_freedreno.dylib` | `0:0` (root:wheel on iOS) | `0755` |
+| `/usr/local/bin/fuxi-vk-probe` | `0:0` | `0755` |
+
+No launchd job is installed and no root was edited in this lane. No Vulkan
+loader or ICD JSON is required because the probe dlopens the ICD directly.
+Invoke once as unsandboxed root, after the raw test has closed its exclusive
+connection. The probe forces `TU_DARWIN_SERVICE=NativeAdrenoGpuPublished` and
+`TU_DARWIN_OPEN_TYPE=0`. Direct invocation optionally accepts an absolute ICD
+path; an exec-swap host basename causes all host arguments to be ignored.
+metal2h's unchanged command line still selects the raw test; a coordinator must
+choose a separate root invocation or a later probe-specific exec-swap image.
+
+Expected, **not observed**, output includes:
+
+```text
+FUXI VK: create-instance rc 0
+FUXI VK: physical-device-count rc 0
+FUXI VK: physical-devices rc 0
+FUXI VK: physical-devices 1
+FUXI VK: device 0 vendor 0x5143 device 0x43050a01 name Turnip Adreno (TM) 740... driver turnip Mesa driver (Mesa 26.2.0-devel...)
+FUXI VK: heap 0 bytes N flags 0x1
+FUXI VK: create-device rc 0
+FUXI VK: queue family 0 index 0 PASS
+FUXI VK: destroy-device PASS; no work submitted
+FUXI VK: done PASS
+```
+
+`N` is queried, not hardcoded: this pin uses a RAM heuristic capped by the
+`0x60000000` (1.5 GiB) IOVA window. This is larger than our 256 MiB wired quota;
+it must not be interpreted as a tested allocation budget. The device name may
+include `(raytracing disabled)`; no features/extensions are enabled by the probe.
+Expected kernel calls include open/query/device-info/close for enumeration,
+reopen/query/device-info, internal BO alloc/map/cpu-map/free and close for device
+lifetime. **No Submit/WaitFence calls or GPU results are expected.**
+
+Remaining risks: warning removal and iOS dyld/device creation are untested;
+weak optional entrypoints, signing/runtime library policy, advertised heap vs
+kernel quota, single-client/global backend state, and existing A7xx
+cache/TTBR/submit assumptions. First require this no-submit gate and no panic;
+then M3 separately qualifies fill/compute/triangle/readback. No shader submission,
+Metal discovery/frontend, IOSurface import or CoreAnimation integration is
+qualified by this build.
+
 ---
 
 # Metal lane, milestone 2g: full-width cache sync and bounded NC access
@@ -692,7 +897,8 @@ not establish Turnip or Metal success. Its documented Turnip IBs still hang CP.
 1. **M1 device qualification:** normal raw IB/readback/reopen, present coexistence
    and watchdog containment above. Current status: raw IB/readback/reopen qualified on metal2g as recorded above;
    no new watchdog-containment or presentation qualification is claimed here.
-2. **M2 Turnip cross-build for iOS 16:** follow UniXNU
+2. **M2 Turnip cross-build for iOS 16:** offline build/audits complete;
+   root load/enumeration/device lifetime remains untested (see M2 above). Follow UniXNU
    `scripts/build-turnip-darwin.py` and `scripts/data/adreno-compiler-inputs.json`.
    The actual build pin is Mesa **85fda3b36405bcaea8bffc64aa4f2651dc90770d**;
    `gpu-metal-vulkan-inputs.json` also records **c823a83e...** as a reference
@@ -741,9 +947,9 @@ not establish Turnip or Metal success. Its documented Turnip IBs still hang CP.
 
 ## Risks and delivery
 
-Real idle TTBR switching, CP context reset and BR/BV fences remain unbooted.
-The raw solid fill is deliberately small; success will not prove shader or
-Turnip execution. Raw PM4 is privileged and not validated as a security
+metal2g qualified the raw IB, readback and reopen path. Broader TTBR/coherence,
+CP recovery and shader/fence behavior still require M3 execution. The raw solid
+fill is deliberately small; it does not prove shader or Turnip execution. Raw PM4 is privileged and not validated as a security
 boundary; only an unsandboxed root diagnostic client is supported. Arbitrary
 root IBs can access privileged GPU state. Failed bus drain leaks/quarantines
 memory until reboot; wedged interconnect/MMIO can exceed software containment.
