@@ -1,3 +1,273 @@
+# Milestone 5 — Fuxi-signed zap through TrustZone PAS
+
+Branch `codex-gpu-m5`, based on `3633e99` (M4b). This section supersedes the
+hardware-pending statements and artifact in the historical M4 sections below.
+No phone/USB/adb/fastboot access, no push, no XNU handoff. Hardware acceptance
+of **M5 remains pending**. `AGENTS.md`, `NOTES.md`, `FUXI.md` are unchanged.
+
+## M4b device result and M5 hypothesis
+
+**Fact, coordinator fresh boot:** M4b image
+`d5807c0de62c50359e5453814e5ee8ca835eba4f2b4e91c2b367ad35633be397`
+passed stages7..13. Stage14's source-free solid clear and patterned copy both
+left all65536 destination pixels at `deadbeef`. Both fences landed; the ring
+was fully consumed (`rptr=wptr=156`). After100us RBBM_STATUS=1; CP_INT,
+HW_FAULT, PROTECT, GFSR and defined SMMU faults were0. TRUST_CNTL remained1.
+Private decoded evidence: `research-log/stage-14m4b.log`; do not commit it.
+
+**Guess to test:** secure-mode retention explains CP memory writes succeeding
+while RB/2D writes do not reach non-secure memory. TRUST1 plus absent zap is
+consistent with this explanation; these observations do not prove the render
+engines' access policy or rule out additional cold graphics state omissions.
+A successful PAS call alone does not prove secure exit or working rendering.
+M5 requires the secure packet to retire, idle, TRUST0, then both pixel tests.
+
+## Stage16 ordering and retained gates
+
+Stage16 is an alternate branch from13, **after stage12 CP init and the proven
+stage13 fence, before any2D**. It runs 7→…→13 as needed, then PAS/secure exit,
+then the existing stage14 source-free clear and independent patterned copy.
+It never runs15. The stage14 report remains on page12, with its original
+clear/copy/per-pixel/source/guard/CPU-comparator meaning. Direct14 remains the
+M4b baseline. Direct15 keeps the14 acceptance gate and scanout semantics.
+For the zap path, request **16 then15 in the same boot**, only after inspecting
+16/14 acceptance. A fresh direct15 does not implicitly opt into zap.
+
+If14 or15 was already attempted,16 refuses with `f0f`, before any SCM call or
+zap-memory write. Every16 attempt, success or failure, freezes its result;
+repeating16 or fetching pages issues no SCM/PM4. Any16 failure also blocks
+subsequent14/15 submissions. Never try a baseline14 and16 in one boot.
+The existing permanent `gpu_gmu_started` latch still refuses request`49`.
+GPU_SET, power, mappings and partial authenticated state remain until reset;
+there is no shutdown, collapse, recovery, retry or secure SID2 mapping.
+
+## Source-derived sequence and memory
+
+References are the supplied Linux6.12 tree:
+`drivers/gpu/drm/msm/adreno/{adreno_gpu,a6xx_gpu,a5xx_gpu}.c`,
+`drivers/soc/qcom/mdt_loader.c`, `drivers/firmware/qcom/{qcom_scm.c,`
+`qcom_scm.h,qcom_scm-smc.c}`, `include/linux/soc/qcom/mdt_loader.h`,
+`arch/arm64/boot/dts/qcom/sm8550.dtsi`, and the PM4 XML. Public cross-check:
+[Linux6.12 SCM SMC transport](https://github.com/torvalds/linux/blob/v6.12/drivers/firmware/qcom/qcom_scm-smc.c).
+
+The optional external `FUXI_GPU_ZAP_MBN` input is a **single-file**
+`a740_zap.mbn` (12088 bytes), SHA256
+`86e4c3f61d4ddbe581405f4cc496182cf385bee39aaefec61639a31d3619fd35`.
+It has ELF32 LE/QDSP6 headers: first non-LOAD header segment size`94`, one
+relocatable LOAD at file`1000`, p_paddr`1000`, filesz=memsz`430`, and a hash
+segment at file`2000`, size`f38`. No firmware is tracked or copied into tracked
+paths. The build only emits `.incbin` data into ignored `shim/out`.
+
+| Reservation | Physical range | Use |
+|---|---|---|
+| PAS metadata, dedicated GPU scratch | `0x8f1600000..0x8f1601fff` | Two contiguous4KiB pages, aligned4KiB, MMU/cache off, outside .bss and all existing GPU buffers/guards |
+| Fuxi zap no-map region | `0x9b09a000..0x9b09bfff` | Exact live-DT and SM8550 DTS reservation; no substitute RAM |
+
+The scratch reservation was already checked against the loader/FDT before
+GMU setup; compile-time assertions place metadata after the2D guard and inside
+the32MiB scratch window. Copy/readback uses abort-contained32-bit accesses.
+The parser accepts at most64 program headers/64KiB MBN, checks every file,
+metadata and physical bound in64-bit arithmetic, rejects overlapping LOADs,
+split/truncated inputs, sections and unaligned LOAD sizes/addresses. All parsing
+and segment placement checks precede the first SMC/reserved-region write.
+
+1. Require13 PASS, retained GPU_SET, idle rptr=wptr=11, intact fence guards,
+   no safe-access or defined CP/RBBM/SMMU faults. Read TRUST and TSB status.
+2. Compute Linux's `min(p_paddr)` and `ALIGN(max(p_paddr+p_memsz),4KiB)`
+   over non-hash PT_LOADs; here `1000..2000`, span`1000`. Relocation is set
+   if any valid LOAD has flag bit27. For relocatable images use `paddr-min`;
+   for fixed images use `paddr-reserved_base`. Bound each segment against the
+   computed span as `adreno_gpu.c` does, and against the reserved region.
+3. Query support-call availability, then PAS13 `is_supported`. Require x0=0
+   and x1!=0 for both. There is no ARM32/legacy fallback or guessed convention.
+4. Zero the dedicated metadata scratch and pack **header bytes`0..93`, then
+   hash bytes`2000..2f37` with no padding**: metadata size`fcc` (4044 bytes).
+   Full readback precedes `init_image(13, metadata_PA)`. Keep metadata untouched
+   after init because TZ/hypervisor can protect its pages. No SHM bridge calls.
+5. Because this image is relocatable, `mem_setup(13,9b09a000,1000)` follows
+   successful init. Fixed-address images skip this call, as Linux does.
+6. Copy the LOAD to `9b09a000`, not `9b09b000`; zero only any memsz-filesz tail
+   (none in this MBN), and verify every written word before auth.
+7. `auth_and_reset(13)`; latch loaded only on both transport/service success.
+   Never infer an existing authenticated image from TRUST or support queries.
+8. Emit `CP_SET_SECURE_MODE,0` (two words), `dsb sy`, doorbell, then bounded
+   rptr=wptr/idle polling with fault checks (5000×10us maximum delay budget).
+   Linux's `a6xx_flush` means publish the ring and write WPTR; it does not add a
+   cache-flush event or WFI packet. Read TRUST and A7xx TSB low/high after idle;
+   require TRUST0 and intact guards before running14.
+9. Run unchanged clear+copy and full pixel/source/guard verification. Stage16
+   returns the stage14 failure code if either fails; only all acceptance checks
+   and the CPU comparator make16 PASS.
+
+PAS ID13 is decimal (`0xd`). ARM64 non-atomic SMCCC uses STD_CALL + SMC64 + owner SIP: base`42000000`,
+function `(service<<8)|command`, x1=arginfo, arguments in x2..x4 (x5..x7 zero,
+including QCOM_A6 initial state). Raw x0 is transport status; x1 is the service
+result; x2/x3 are retained even when unused. Arginfo count occupies bits0..3;
+argument types use2-bit fields starting at bit4. Init's second arg is RW=2,
+so arginfo=`2|(2<<6)=82`, with **no metadata-size register argument**.
+
+| Call | Full SMC fn ID | Arginfo | Arguments | Successful x1 |
+|---|---:|---:|---|---|
+| INFO is_call_available(PIL is_supported) | `42000601` | `1` | `02000207` (SIP owner included) | nonzero |
+| PIL is_supported | `42000207` | `1` | `0xd` | nonzero |
+| PIL init_image | `42000201` | `82` | `0xd,0x8f1600000` | 0 |
+| PIL mem_setup, relocatable only | `42000202` | `3` | `0xd,0x9b09a000,0x1000` | 0 |
+| PIL auth_and_reset | `42000205` | `1` | `0xd` | 0 |
+| BOOT set_remote_state, owned loaded path | `4200010a` | `2` | `0,0xd` | 0 |
+
+**Source detail:** the supplied A6xx init uses a static loaded latch and simply
+returns success on later calls. The explicit `SCM_GPU_ZAP_SHADER_RESUME=0`
+remote-state path is in **A5xx** in this6.12 tree. M5 retains that ABI for an
+already authenticated image owned by this loader, with offline coverage;
+normal16/report replays never re-enter it because GX is retained and16 is
+one-shot. No automatic cold-load fallback or resume follows an SCM error.
+
+Unlike Linux's transport retry/continuation handling, **every nonzero x0 stops**
+here: `-1` generic, `-2` argument, `-3` address, `-4` unsupported, `-5` memory,
+`-12` busy, `1` interrupted, `2` WAITQ_SLEEP. Linux maps the negatives to
+EIO/EINVAL/EOPNOTSUPP/ENOMEM/EBUSY; M5 reports raw64-bit returns. Nonzero service
+x1 on init/setup/auth/resume also stops. Software loops and call count are
+bounded; EL1 cannot time out a non-returning SMC. TZ denial, XPU/interconnect
+SError, a reset or a stalled call remain hardware risks. SCM clock/bandwidth setup is a platform assumption to verify: the supplied
+SM8550 SCM node has no clocks but does have a crypto→DDR interconnect path;
+Linux votes peak UINT_MAX during PAS. This loader retains ABL's interconnect
+state and the proven GPU/GMU votes, and does not add a crypto ICC driver or
+invent RPMh votes. Whether inherited crypto bandwidth suffices is unverified.
+
+## Report v8: fifteen512-byte pages, selectors100..10e
+
+Total7680 bytes. Signatures become`a7400008`; pages0..13 keep v7 field meanings.
+Decoder still accepts legacy512-byte and v2..v7 captures. Stage16 is page14
+(selector`10e`), local little-endian u32 words:
+
+| Words | Meaning |
+|---|---|
+| 0..5 | signature, stage16 attempted marker, result, substep, successful cold-auth latch, issued SMC count |
+| 6..11 | MBN bytes, packed metadata bytes, metadata PA low/high, zap PA, reservation bytes |
+| 12..18 | min paddr, aligned max end, relocatable, LOAD count, computed span, copied bytes, zero-tail bytes |
+| 19/20 | TRUST before/after (after valid at step≥11) |
+| 21..24 | TSB before low/high, after low/high (after valid at step≥11) |
+| 25..32 | pre rptr/wptr, secure-packet target, post rptr/wptr, idle polls, last RBBM_STATUS, frozen CP_INT after a submitted secure packet |
+| 33..36 | cumulative safe-access faults, last fault PA low/high, ESR |
+| 37/38 | stage14 aggregate result, path1 cold /2 owned resume |
+| 39/40 | actual two secure-packet ring words |
+| 41/42 | original fence guards before PAS (also verified after packet) |
+| 43/44 | secure packet doorbell issued, failed SMC slot (1-based;0 none) |
+| 45 | frozen CP_PROTECT_STATUS after a submitted secure packet |
+| 46/47 | frozen CP_HW_FAULT / RBBM_INT_0_STATUS after a submitted secure packet |
+| 48..127 | five16-word SCM records, below |
+
+Each SCM record at `48+16*i`: local0 step,1 full fn ID,2 arginfo,3 returned
+marker,4/5 arg0 low/high,6/7 arg1 low/high,8/9 raw x0 low/high,10/11 x1,
+12/13 x2,14/15 x3. Mem_setup arg2 is page word16. Count/step/args are stored
+and a DSB completes before entering TZ. Returned0 means in flight, so zero
+return words are not mistaken for success. Records never wrap or overwrite.
+On a non-returning SMC the monitor may not be able to service a report request.
+
+Substeps:1 preconditions;2 parse;3 availability;4 PAS support;5 metadata/init;
+6 mem_setup;7 LOAD/zero/readback;8 auth;9 secure packet;10 idle;11 SECVID and
+guards;12 stage14;13 complete. Stage16 result0=not finished,1=PASS; its auth
+latch can be1 even if a later gate fails. If CP stalls, post SECVID is unrun.
+
+| Failure | Meaning |
+|---|---|
+| `f01` | idle/ring/GPU_SET/guard precondition lost |
+| `f02` | zap omitted from build |
+| `f03` | ELF32 header/program-header format rejected |
+| `f04` | metadata/LOAD bounds, overlap, relocation or single-file check failed |
+| `f05` / `f06` | support call unavailable / PAS13 unsupported, or corresponding SCM error |
+| `f07` / `f08` | init_image / mem_setup SCM error |
+| `f09` | metadata/LOAD/zero safe-access failure or readback mismatch |
+| `f0a` | auth_and_reset SCM error |
+| `f0b` / `f0c` | safe-access fault / defined CP/RBBM/SMMU fault |
+| `f0d` / `f0e` | secure-packet idle timeout / TRUST still nonzero |
+| `f0f` / `f10` | prior2D attempt refusal / owned resume SCM error |
+| `e01..e0b` | existing stage14 failures; consult both clear/copy and final faults |
+
+Expected zap-path rings: stage12 **0→7**, stage13 **7→11**, secure exit
+**11→13**, clear **13→84**, copy **84→158**, optional15 **158→1681**.
+Tables remain3→5→10; fence addresses/magics and v7 timing-validity bits stay
+unchanged. Stage16 is entered after13 even though its stage14 subtest has a
+lower number; base report's actual stage is restored to16 afterwards.
+
+## Build, offline validation, artifact and coordinator order
+
+Use section6's compiler/binutils/mkbootimg environment and unchanged integ1
+payload, adding the external zap input (all paths below are placeholders):
+
+```sh
+FUXI_GMU_FIRMWARE=$FW/gmu_gen70200.bin \
+FUXI_SQE_FIRMWARE=$FW/a740_sqe.fw \
+FUXI_GPU_ZAP_MBN=$ZAP/a740_zap.mbn \
+CLANG=$LLVM/clang LLD=$LLVM/ld.lld \
+OBJCOPY=/usr/bin/llvm-objcopy-18 READELF=/usr/bin/llvm-readelf-18 \
+NM=/usr/bin/llvm-nm-18 MKBOOTIMG=$MKBOOTIMG_DIR/mkbootimg.py \
+bash shim/fuxi-loader/build.sh "$PAYLOAD"
+
+python3 tools/test-fuxi-gpu-probe.py
+python3 tools/test-fuxi-gpu-probe.py --mesa "$MESA" --linux-msm "$MSM" \
+  --firmware "$FW/gmu_gen70200.bin" --sqe "$FW/a740_sqe.fw" \
+  --zap "$ZAP/a740_zap.mbn"
+```
+
+Firmware-enabled loader, explicitly empty-firmware loader, and standalone
+probe: **PASS, zero warnings**, clang r547379 / LLVM source `b718bcaf8c19`.
+Loader `-Werror`, C relocation checks, link and Image guards pass. Saved ELF
+has no relocations. Inspection verifies boot v4, empty ramdisk/zero padding,
+exact GMU/SQE/zap bytes and unchanged integ1 payload SHA256
+`800b9ea17ce18f1872c0533d5ef13f916c490eb7b1524e677fc2555378f00d66`.
+Compiled SMC disassembly confirms x0..x3 are retained at full64-bit width,
+arguments/arginfo reach the expected registers, and x5..x7 start at zero.
+
+Native UBSan model (`-Wall -Wextra -Werror`) passes synthetic and exact external
+GMU/SQE/Fuxi zap inputs. Coverage includes contiguous metadata packing,
+relocatable and fixed-address loading (mem_setup skipped for fixed), zero-tail
+copy, malformed/truncated/oversized ELF spans, support/transport/service errors
+at every call, interrupted/WAITQ/busy stop behavior, abort-contained metadata/
+LOAD failures, packet stall/fault/TRUST retention, prior2D refusal, missing zap,
+clear/copy failure preventing15, successful16→15, frozen16 replays and owned
+resume ABI. Mesa/Linux register audits and new Linux PAS ID/RW-arginfo/PM4/DT
+audit pass. Fifteen-page decoding retains full return high halves and in-flight
+markers; legacy v7/v6/v5 decoding and CPU=N/A validity checks pass. The model
+substitutes SMC/MMIO and does not authenticate or execute any firmware.
+
+Ignored artifact: `shim/out/lane-gpu/fuxi-gpu-m5-boot.img`, **20,897,792 bytes**.
+SHA256: `ec9f0953f9a479fe91b94ec7cd5f8464c9e2636719294cbe22b77b5651b4d46e`.
+Saved Image (20,889,680 bytes), ELF and SHA256 file are alongside it. Firmware
+ranges in the saved ELF: GMU`16070..2658c`, SQE`2658c..38c00`,
+zap`38c00..3bb38`, BSS`3c000..6c000`, payload`7c000`, end`13ec050`.
+The image was saved **before** empty-firmware validation; the lane artifact
+contains all three blobs. Commit: the commit containing this section.
+
+Coordinator device test order (lane does not execute these):
+
+1. Regress7, fresh8a ownership review,10, then fresh11→12→13. Expect the proven
+   init/fence7/11, TRUST1 and no new defined faults. Preserve reserved FSR400.
+2. **Fresh boot16**, or advance the successful fresh13 to16 with no14/15 in
+   between. Save all15 pages with updated decoder `--stage 16 --raw --save
+   <private-report>`. Require five returned SMC records, x0=0 throughout,
+   support x1 nonzero and init/setup/auth x1=0; metadatafcc, span1000,
+   copied430, auth1; secure packet target/rptr/wptr13, TRUST0, no faults.
+   Require16 result1/step13, page12 stage14 result1/step8, validity3f,
+   clear/copy rings84/158, both fences, all pixels/source/guards correct and
+   CPU timing valid. Stop immediately on any failure or reset; no recovery.
+3. After acceptance, **same-boot15** only; require its14 gate stays frozen and
+   passing, end1681, validity39, expected geometry and GPU/CPU/border checks,
+   and visual panel bars. For another cold scanout test repeat **16→15** in
+   a fresh boot. Do not use a fresh direct15 as a zap-path test.
+4. Repeat16/report reads after successful16; require frozen page14 and no
+   additional SMC/ring work. Keep request49 refusal. On any failure retain all
+   available15 pages, exact image hash/reset outcome, and stop that boot.
+
+Risks: no M5 device result; signed firmware/TZ acceptance and high-PA metadata
+protection are untested under this hypervisor. PAS/secure-mode transitions can
+reset or hang the SoC. TRUST0 may still expose additional2D state/writeback
+problems; clear+copy acceptance is required before scanout. Offline simulation
+checks software sequencing and failure gates, not real TZ, signed code, DMA,
+cache behavior, secure-SID routing or physical display output.
+
+---
+
 # Milestone 4b — A7xx render-thread selection and blit-cache writeback
 
 Branch `codex-gpu-m4b`, based on `fuxi-bringup` / M4 commit `1302cee`.

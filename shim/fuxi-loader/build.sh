@@ -24,11 +24,11 @@ for i in range(n):
 PY
 # Optional local firmware input; only the ignored build directory receives bytes.
 # An empty section gives non-GPU builds the same symbols with size zero.
-python3 - "${FUXI_GMU_FIRMWARE:-}" "${FUXI_SQE_FIRMWARE:-}" "$out/gpu-fw.S" <<'FWPY'
+python3 - "${FUXI_GMU_FIRMWARE:-}" "${FUXI_SQE_FIRMWARE:-}" "${FUXI_GPU_ZAP_MBN:-}" "$out/gpu-fw.S" <<'FWPY'
 import json, pathlib, sys
-gmu, sqe, dst = sys.argv[1:]
+gmu, sqe, zap, dst = sys.argv[1:]
 lines = ['.section .gpu_fw,"a"']
-for src, name in ((gmu, 'gpu'), (sqe, 'sqe')):
+for src, name in ((gmu, 'gpu'), (sqe, 'sqe'), (zap, 'zap')):
     lines += ['.balign 4', f'.global _{name}_fw_start', f'_{name}_fw_start:']
     if src:
         path = pathlib.Path(src).resolve(strict=True)
@@ -36,6 +36,8 @@ for src, name in ((gmu, 'gpu'), (sqe, 'sqe')):
         assert path.is_file() and 4 < size <= 0x100000 and size % 4 == 0, 'invalid firmware size'
         if name == 'sqe':
             assert size - 4 <= 0x20000, 'SQE exceeds reserved buffer'
+        if name == 'zap':
+            assert size <= 0x10000, 'zap MBN exceeds parser bound'
         lines.append('.incbin ' + json.dumps(str(path)))
     lines += [f'.global _{name}_fw_end', f'_{name}_fw_end:']
 pathlib.Path(dst).write_text('\n'.join(lines) + '\n')

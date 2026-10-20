@@ -24,14 +24,19 @@ PREFIX = r'''
 static uintptr_t probe_fdt;
 static uint32_t probe_fdt_size;
 char _head[1], _end[1];
-extern uint8_t _gpu_fw_start[], _sqe_fw_start[], _sqe_fw_end[];
+extern uint8_t _gpu_fw_start[], _sqe_fw_start[], _sqe_fw_end[], _zap_fw_start[], _zap_fw_end[];
 static uint64_t ticks;
+static size_t test_zap_bytes;
 #define rsr(reg) (strcmp(reg,"cntfrq_el0") ? ++ticks : 1000000ull)
 static void delay(unsigned us) { ticks += us; }
 static void mock_write(uint64_t at, uint32_t val);
+static void mock_smc(uint64_t ret[4], uint32_t fn, uint32_t info, uint64_t a, uint64_t b, uint64_t c);
 '''
 SUFFIX = r'''
 static int firmware_success = 1, ack_mode, corrupt_readback, tlb_busy;
+static unsigned scm_calls, scm_fail_call, scm_service_fail, secure_mode, require_zap;
+static uint64_t scm_transport;
+
 static unsigned firmware_releases, mmio_writes;
 static int cp_mode; /* 1 stalled, 2 fault, 3 missing fence, 4 corrupt fence guard */
 static uint64_t abort_read, abort_write;
@@ -56,6 +61,38 @@ unsigned probe_safe_wr32(uint64_t pa, uint32_t v)
  g_wr(pa, 0, v); return 0;
 }
 static uint32_t *ptr(uint64_t at) { return (uint32_t *)(uintptr_t)at; }
+static void mock_smc(uint64_t ret[4], uint32_t fn, uint32_t info, uint64_t a, uint64_t b, uint64_t c)
+{
+ scm_calls++;
+ assert(gpu_extra[5][3]==1 && gpu_extra[5][4]==1);
+ assert(*ptr(GPU_REG_BASE+0x806*4)==G3_FENCE_DWORDS);
+ if (fn==0x4200010a) { assert(info==2 && a==0 && b==13 && c==0 && g5_zap_loaded); }
+ else {
+  const unsigned fns[]={0x42000601,0x42000207,0x42000201,0x42000202,0x42000205};
+  unsigned relocated=!!(cdb32(_zap_fw_start+108)&(1u<<27));
+  unsigned index=scm_calls==4 && !relocated ? 4 : scm_calls-1;
+  assert(scm_calls<=5 && fn==fns[index]);
+  if(scm_calls==1) assert(info==1 && a==0x02000207 && !b && !c);
+  else if(scm_calls==2) assert(info==1 && a==13 && !b && !c);
+  else if(scm_calls==3) {
+   assert(info==0x82 && a==13 && b==G5_META_PA && !c);
+   assert(memcmp((void *)(uintptr_t)G5_META_PA,_zap_fw_start,0x94)==0);
+   assert(memcmp((void *)(uintptr_t)(G5_META_PA+0x94),_zap_fw_start+0x2000,0xf38)==0);
+   assert(*ptr(G5_ZAP_PA)==0x6b6b6b6b); /* init before LOAD copy */
+  } else if(fn==0x42000202) assert(info==3 && a==13 && b==G5_ZAP_PA && c==0x1000);
+  else {
+   assert(info==1 && a==13 && !b && !c);
+   assert(memcmp((void *)(uintptr_t)G5_ZAP_PA,_zap_fw_start+0x1000,0x430)==0);
+  }
+ }
+ ret[0]=0; ret[1]=(fn==0x42000601 || fn==0x42000207);
+ ret[2]=0x123456789abcdef0ull; ret[3]=0xfedcba9876543210ull;
+ if (scm_calls==scm_fail_call) {
+  ret[0]=scm_transport;
+  if(scm_service_fail) ret[1]=fn==0x42000601 || fn==0x42000207 ? 0 : (uint64_t)-7;
+ }
+}
+
 static void mock_write(uint64_t at, uint32_t val)
 {
  mmio_writes++;
@@ -81,7 +118,14 @@ static void mock_write(uint64_t at, uint32_t val)
   assert(*ptr(G3_RING_PA+8)==0x70c80004 && *ptr(G3_RING_PA+12)==0x4b);
   if (cp_mode == 1) return;
   if (cp_mode == 2) { *ptr(GPU_REG_BASE+0x823*4)=4; return; }
-  if (val > G3_FENCE_DWORDS) { model_blit_stream(val); if (blit_mode == 1 || blit_mode == 4) return; }
+  unsigned secure_packet = val==G3_FENCE_DWORDS+2 && *ptr(G3_RING_PA+G3_FENCE_DWORDS*4)==g3_pkt7(0x66,1);
+  if (secure_packet) {
+   assert(g5_zap_loaded && !*ptr(G3_RING_PA+(G3_FENCE_DWORDS+1)*4));
+   if(secure_mode==1) return;
+   if(secure_mode==2) { *ptr(GPU_REG_BASE+0x823*4)=4; return; }
+   if(secure_mode!=3) *ptr(GPU_REG_BASE+0xf400*4)=0;
+  }
+  if (val > G3_FENCE_DWORDS && !secure_packet) { model_blit_stream(val); if (blit_mode == 1 || blit_mode == 4) return; }
   *ptr(GPU_REG_BASE+0x806*4)=val; *ptr(G3_PTR_PA)=val;
   if (val==G3_FENCE_DWORDS) {
    assert(*ptr(G3_RING_PA+G3_INIT_DWORDS*4)==0x703d8003);
@@ -122,6 +166,9 @@ static void mock_write(uint64_t at, uint32_t val)
 static void reset_model(void)
 {
  drop_sqe_base=start_fault=doorbells=sqe_controls=0;
+ test_zap_bytes=(uintptr_t)_zap_fw_end-(uintptr_t)_zap_fw_start;
+ scm_calls=scm_fail_call=scm_service_fail=secure_mode=require_zap=g5_zap_loaded=0; scm_transport=0;
+ memset((void *)(uintptr_t)G5_ZAP_PA,0x6b,G5_ZAP_BYTES);
  memset((void *)(uintptr_t)GPU_REG_BASE, 0, 0x100000);
  memset((void *)(uintptr_t)G_MEM, 0, G_MEM_SIZE);
  memset(gpu_report, 0, sizeof(gpu_report)); memset(gpu_extra, 0, sizeof(gpu_extra));
@@ -137,7 +184,7 @@ static void reset_model(void)
  *ptr(GPU_SMMU_BASE) = 0x2f0406;
  *ptr(GPU_GMU_CORE+0x5000*4) = 1;
  *ptr(GPU_GMU_CORE+(0x1c00+0xff8)*4) = 0x20010005;
- gpu_extra[0][0] = 0xa7400007;
+ gpu_extra[0][0] = 0xa7400008;
  assert(g_snapshot());
 }
 static void aux_fixture(void)
@@ -228,7 +275,7 @@ static void model_blit_stream(unsigned end)
                          : *ptr(model_gpu_pa(src,0));
      /* Independent model: A7xx writes remain in a separate blit cache until
       * resolve-clean. Color/depth clean and UCHE fence don't drain it. */
-     if(br && !(blit_mode==8 && solid) && !(blit_mode==9 && !solid)) {
+     if(br && (!require_zap || !*ptr(GPU_REG_BASE+0xf400*4)) && !(blit_mode==8 && solid) && !(blit_mode==9 && !solid)) {
       assert(pending<65536); cache[pending][0]=dst; cache[pending++][1]=pixel;
      }
     }
@@ -270,6 +317,8 @@ int main(int argc, char **argv)
  assert(mmap((void *)(uintptr_t)GPU_REG_BASE, 0x100000, PROT_READ|PROT_WRITE,
   MAP_ANONYMOUS|MAP_PRIVATE|MAP_FIXED_NOREPLACE,-1,0) != MAP_FAILED);
  assert(mmap((void *)(uintptr_t)0x0b280000, 0x10000, PROT_READ|PROT_WRITE,
+  MAP_ANONYMOUS|MAP_PRIVATE|MAP_FIXED_NOREPLACE,-1,0) != MAP_FAILED);
+ assert(mmap((void *)(uintptr_t)G5_ZAP_PA, G5_ZAP_BYTES, PROT_READ|PROT_WRITE,
   MAP_ANONYMOUS|MAP_PRIVATE|MAP_FIXED_NOREPLACE,-1,0) != MAP_FAILED);
  assert(mmap((void *)(uintptr_t)G_MEM, G_MEM_SIZE, PROT_READ|PROT_WRITE,
   MAP_ANONYMOUS|MAP_PRIVATE|MAP_FIXED_NOREPLACE,-1,0) != MAP_FAILED);
@@ -506,6 +555,83 @@ int main(int argc, char **argv)
  gpu_m2(15); assert(gpu_extra[11][2]==0xe01 && !gpu_extra[12][1]);
  reset_model(); aux_fixture(); gpu_m2(13); g3_wptr=8190;
  before=doorbells; gpu_m2(15); assert(gpu_extra[11][2]==0xe04 && before==doorbells);
+ /* M5: exact metadata packing/relocation + full-word SCM returns and no retry. */
+ reset_model(); aux_fixture(); require_zap=1; gpu_m2(16);
+ uint32_t *z=gpu_extra[13];
+ assert(z[2]==1 && z[3]==13 && z[4] && scm_calls==5 && z[5]==5);
+ assert(z[7]==0xfcc && z[12]==0x1000 && z[13]==0x2000 && z[16]==0x1000);
+ assert(z[17]==0x430 && !z[18] && z[19]==1 && !z[20]);
+ assert(z[25]==11 && z[27]==13 && z[28]==13 && z[39]==g3_pkt7(0x66,1));
+ assert(z[37]==1 && gpu_extra[11][54]==84 && gpu_extra[11][32]==158 && !gpu_extra[12][1]);
+ assert(z[48+13]==0x12345678 && z[48+15]==0xfedcba98 && gpu_stage==16);
+ uint32_t frozen16[128]; memcpy(frozen16,z,sizeof(frozen16));
+ before=doorbells; gpu_m2(16); gpu_m2(14);
+ assert(doorbells==before && scm_calls==5 && !memcmp(z,frozen16,sizeof(frozen16)));
+ FILE *m5=fopen("report-m5.bin","wb"); assert(m5); gpu_report[0]=0xa740;
+ fwrite(gpu_report,sizeof(gpu_report),1,m5); fwrite(gpu_extra,sizeof(gpu_extra),1,m5); fclose(m5);
+ panel_fixture(); gpu_m2(15); assert(gpu_extra[12][2]==1 && gpu_extra[12][32]==1681);
+ /* A fixed-address image skips mem_setup just as Linux does. The embedded
+  * host fixture is writable; restore every altered header byte afterwards. */
+ uint8_t saved_pa[4]; memcpy(saved_pa,_zap_fw_start+96,4);
+ uint8_t saved_flags=_zap_fw_start[111]; _zap_fw_start[111]&=~8;
+ for(unsigned i=0;i<4;i++) _zap_fw_start[96+i]=(G5_ZAP_PA>>(i*8))&255;
+ reset_model(); aux_fixture(); gpu_m2(16); z=gpu_extra[13];
+ assert(z[2]==1 && z[5]==4 && !z[14] && z[97]==0x42000205);
+ memcpy(_zap_fw_start+96,saved_pa,4); _zap_fw_start[111]=saved_flags;
+ reset_model(); assert(g5_copy(G5_ZAP_PA,0,32));
+ for(unsigned i=0;i<8;i++) assert(!*ptr(G5_ZAP_PA+i*4));
+ assert(*ptr(G5_ZAP_PA+32)==0x6b6b6b6b);
+ /* Only a positively owned loaded image may use set_remote_state(0,13).
+  * Stage/report replays above never take this path. */
+ reset_model(); aux_fixture(); gpu_m2(13); g5_zap_loaded=1;
+ struct g5_plan zp={0}; z=gpu_extra[13]; z[3]=3;
+ assert(g5_pas(z,_zap_fw_start,&zp)==1 && z[38]==2 && scm_calls==1);
+ assert(z[49]==0x4200010a && z[52]==0 && z[54]==13);
+ for(unsigned failed=1;failed<=5;failed++) for(unsigned kind=0;kind<2;kind++) {
+  reset_model(); aux_fixture(); scm_fail_call=failed;
+  scm_transport=kind ? 0 : (uint64_t)-12; scm_service_fail=kind;
+  gpu_m2(16); z=gpu_extra[13];
+  unsigned errors[]={0,0xf05,0xf06,0xf07,0xf08,0xf0a};
+  assert(z[2]==errors[failed] && scm_calls==failed && z[44]==failed);
+  assert(!z[4] && !z[43] && !gpu_extra[11][1] && !gpu_extra[12][1]);
+  before=doorbells; gpu_m2(16); gpu_m2(15); gpu_m2(14);
+  assert(scm_calls==failed && doorbells==before && !gpu_extra[11][1]);
+ }
+ const int transport_errors[]={-1,-2,-3,-4,-5,-12,1,2};
+ for(unsigned i=0;i<sizeof(transport_errors)/sizeof(transport_errors[0]);i++) {
+  reset_model(); aux_fixture(); scm_fail_call=3; scm_transport=(uint64_t)(int64_t)transport_errors[i];
+  gpu_m2(16); z=gpu_extra[13]; assert(z[2]==0xf07 && scm_calls==3 && !z[43]);
+ }
+ for(unsigned mode=1;mode<=3;mode++) {
+  reset_model(); aux_fixture(); secure_mode=mode; gpu_m2(16); z=gpu_extra[13];
+  unsigned errors[]={0,0xf0d,0xf0c,0xf0e};
+  assert(z[2]==errors[mode] && z[4] && z[43] && !gpu_extra[11][1]);
+  before=doorbells; gpu_m2(15); gpu_m2(16); assert(before==doorbells && scm_calls==5);
+ }
+ reset_model(); aux_fixture(); gpu_m2(14); before=doorbells; gpu_m2(16);
+ assert(gpu_extra[13][2]==0xf0f && !scm_calls && before==doorbells);
+ reset_model(); aux_fixture(); gpu_m2(13); abort_write=G5_META_PA; gpu_m2(16);
+ assert(gpu_extra[13][2]==0xf09 && scm_calls==2 && !gpu_extra[11][1]);
+ reset_model(); aux_fixture(); gpu_m2(13); abort_write=G5_ZAP_PA; gpu_m2(16);
+ assert(gpu_extra[13][2]==0xf09 && scm_calls==4 && !gpu_extra[13][4]);
+ reset_model(); aux_fixture(); gpu_m2(13); abort_read=G5_META_PA; gpu_m2(16);
+ assert(gpu_extra[13][2]==0xf09 && scm_calls==2);
+ reset_model(); aux_fixture(); gpu_m2(13); blit_mode=9; gpu_m2(16);
+ assert(gpu_extra[13][2]==0xe06 && gpu_extra[13][37]==0xe06 && !gpu_extra[12][1]);
+ before=doorbells; gpu_m2(15); assert(before==doorbells && !gpu_extra[12][1]);
+ reset_model(); aux_fixture(); gpu_m2(13); test_zap_bytes=0; gpu_m2(16);
+ assert(gpu_extra[13][2]==0xf02 && !scm_calls && !gpu_extra[11][1]);
+ before=doorbells; gpu_m2(15); gpu_m2(16); assert(before==doorbells && !scm_calls);
+ /* Untrusted ELF bounds/relocation tests operate on an isolated local copy. */
+ uint8_t mbn[0x10000]; size_t zb=(uintptr_t)_zap_fw_end-(uintptr_t)_zap_fw_start;
+ memcpy(mbn,_zap_fw_start,zb); assert(!g5_plan_mbn(mbn,zb,&zp));
+ assert(g5_plan_mbn(mbn,51,&zp)==0xf03);
+ mbn[44]=255; assert(g5_plan_mbn(mbn,zb,&zp)==0xf03); memcpy(mbn,_zap_fw_start,zb);
+ mbn[52+32+16]=0xff; mbn[52+32+17]=0xff;
+ assert(g5_plan_mbn(mbn,zb,&zp)==0xf04); memcpy(mbn,_zap_fw_start,zb);
+ mbn[52+32+27]&=~8; assert(g5_plan_mbn(mbn,zb,&zp)==0xf04); memcpy(mbn,_zap_fw_start,zb);
+ mbn[52+64+24]=0; mbn[52+64+27]=0; assert(g5_plan_mbn(mbn,zb,&zp)==0xf04);
+ puts("PASS: M5 PAS metadata/relocation, ABI, all SCM errors/no-retry, packet/idle/trust/2D gates and frozen reports");
  puts("PASS: M4 pixels/row pitches/fences/guards/faults/no-retry; SMMU snapshot/ownership/readback, all icache PTEs, firmware load, HFI order/ACK/wrap/errors/timeouts, m3 mappings/CP packets/fence/abort/timeouts, one-shot GMU/handoff latch");
  return 0;
 }
@@ -574,6 +700,24 @@ def audit_linux(msm):
     print('PASS: Linux source audit: 54 HWCG pairs, 48 protection slots, 39 CP/2D offsets; cold SQE order and firmware copy')
 
 
+def audit_linux_pas(msm):
+    kernel = msm.parents[3]
+    defs = (kernel / 'drivers/firmware/qcom/qcom_scm.h').read_text()
+    expected = {'SVC_PIL': 2, 'PIL_PAS_INIT_IMAGE': 1, 'PIL_PAS_MEM_SETUP': 2,
+                'PIL_PAS_AUTH_AND_RESET': 5, 'PIL_PAS_IS_SUPPORTED': 7,
+                'SVC_BOOT': 1, 'BOOT_SET_REMOTE_STATE': 10,
+                'SVC_INFO': 6, 'INFO_IS_CALL_AVAIL': 1}
+    for name, value in expected.items():
+        assert int(re.search(r'#define QCOM_SCM_' + name + r'\s+(0x[0-9a-f]+)', defs)[1], 16) == value
+    scm = (kernel / 'drivers/firmware/qcom/qcom_scm.c').read_text()
+    assert 'QCOM_SCM_ARGS(2, QCOM_SCM_VAL, QCOM_SCM_RW)' in scm
+    xml = (msm / 'registers/adreno/adreno_pm4.xml').read_text()
+    assert re.search(r'name="CP_SET_SECURE_MODE" value="0x66"', xml)
+    dts = (kernel / 'arch/arm64/boot/dts/qcom/sm8550.dtsi').read_text()
+    assert re.search(r'gpu_micro_code_mem:.*?reg = <0 0x9b09a000 0 0x2000>;.*?no-map;', dts, re.S)
+    print('PASS: Linux PAS service IDs, init_image RW arginfo, secure packet and SM8550 zap reservation')
+
+
 def audit_mesa(mesa):
     """Independent A7xx bit-field/event checks against the supplied Mesa XML."""
     import xml.etree.ElementTree as ET
@@ -619,20 +763,30 @@ def audit_mesa(mesa):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--zap', type=Path, help='external local single-file a740_zap.mbn')
     ap.add_argument('--sqe', type=Path, help='external local a740_sqe.fw')
     ap.add_argument('--firmware', type=Path, help='external local gmu_gen70200.bin; never copied into git')
     ap.add_argument('--linux-msm', type=Path, help='supplied drivers/gpu/drm/msm source directory for register/table audit')
     ap.add_argument('--mesa', type=Path, help='local Mesa source for A7xx field/event audit')
     args = ap.parse_args()
+    usb = (ROOT / 'shim/fuxi-probe/probe.c').read_text()
+    assert 'index >= 1 && index <= 16' in usb
+    assert 'index < 0x100 + G_PAGES' in usb
+    assert 'monitor_report[MON_ACTIVE] && !gpu_gmu_started' in usb
     if args.mesa:
         audit_mesa(args.mesa)
     if args.linux_msm:
         audit_linux(args.linux_msm)
+        audit_linux_pas(args.linux_msm)
     source = (ROOT / 'shim/fuxi-probe/gpu.c').read_text()
+    source = source.replace('#include \"gpu-zap.h\"', (ROOT / 'shim/fuxi-probe/gpu-zap.h').read_text())
+    source = re.sub(r'static void g5_smc_raw\(.*?\n\}', 'static void g5_smc_raw(uint64_t ret[4], uint32_t fn, uint32_t info, uint64_t a, uint64_t b, uint64_t c) { mock_smc(ret, fn, info, a, b, c); }', source, flags=re.S)
     source = source.replace('extern const uint8_t _gpu_fw_start[], _gpu_fw_end[];',
                             'extern uint8_t _gpu_fw_start[], _gpu_fw_end[];')
     source = source.replace('extern const uint8_t _sqe_fw_start[], _sqe_fw_end[];',
                             'extern uint8_t _sqe_fw_start[], _sqe_fw_end[];')
+    source = source.replace('extern const uint8_t _zap_fw_start[], _zap_fw_end[];', 'extern uint8_t _zap_fw_start[], _zap_fw_end[];')
+    source = source.replace('size_t bytes = (uintptr_t)_zap_fw_end-(uintptr_t)_zap_fw_start;', 'size_t bytes = test_zap_bytes;')
     source = re.sub(r'__asm__ volatile\([^;]+;', '', source)
     needle = '*(volatile uint32_t *)(uintptr_t)(base + off) = v;'
     assert source.count(needle) == 1
@@ -648,11 +802,23 @@ def main():
         sqe = args.sqe.resolve() if args.sqe else tmp / 'sqe.bin'
         if not args.sqe:
             sqe.write_bytes(bytes.fromhex('000000000102030405060708'))
+        zap = args.zap.resolve() if args.zap else tmp / 'zap.mbn'
+        if not args.zap:
+            import struct
+            b = bytearray(12088)
+            struct.pack_into('<16sHHIIIIIHHHHHH', b, 0, b'\x7fELF\x01\x01\x01'+b'\0'*9, 2, 164, 1, 0x1000, 52, 0, 3, 52, 32, 3, 0, 0, 0)
+            for i, ph in enumerate(((0, 0, 0, 0, 0x94, 0, 0x07000000, 0),
+                                     (1, 0x1000, 0x1000, 0x1000, 0x430, 0x430, 0x08000007, 0x100000),
+                                     (0, 0x2000, 0, 0, 0xf38, 0xf38, 0x02000000, 0x1000))):
+                struct.pack_into('<8I', b, 52+i*32, *ph)
+            b[0x1000:0x1430] = bytes(i & 255 for i in range(0x430))
+            b[0x2000:] = b'\x5a'*0xf38
+            zap.write_bytes(b)
         asm = tmp / 'fw.S'
         import json
         asm.write_text('.section .data\n.global _gpu_fw_start, _gpu_fw_end\n_gpu_fw_start:\n.incbin ' +
                        json.dumps(str(fw)) + '\n_gpu_fw_end:\n.global _sqe_fw_start, _sqe_fw_end\n_sqe_fw_start:\n.incbin ' +
-                       json.dumps(str(sqe)) + '\n_sqe_fw_end:\n.section .note.GNU-stack,"",@progbits\n')
+                       json.dumps(str(sqe)) + '\n_sqe_fw_end:\n.global _zap_fw_start, _zap_fw_end\n_zap_fw_start:\n.incbin ' + json.dumps(str(zap)) + '\n_zap_fw_end:\n.section .note.GNU-stack,"",@progbits\n')
         cfile = tmp / 'test.c'
         cfile.write_text(PREFIX + source + SUFFIX)
         exe = tmp / 'test'
@@ -681,6 +847,28 @@ def main():
         assert 'mismatch=0' in m4report and 'CPU_mismatch=0' in m4report
         assert 'solid_clear=0x1 (PASS)' in m4report and 'validity=0x3f' in m4report
         assert 'CCU_CNTL2=' in m4report and 'copy after 100us' in m4report
+        m5report = subprocess.run(['python3', str(ROOT / 'tools/fuxi-gpu-probe.py'), '--decode', str(tmp / 'report-m5.bin')],
+                                  check=True, capture_output=True, text=True).stdout
+        assert 'stage 16 PAS13' in m5report and 'authenticated=1' in m5report
+        assert 'fn=0x42000201 arginfo=0x82 returned=1' in m5report
+        assert 'x2=0x123456789abcdef0 x3=0xfedcba9876543210' in m5report
+        assert 'target=13 after=13/13' in m5report and 'TRUST before/after=0x1/0x0' in m5report
+        # v7 has fourteen pages; retain its clear validity and timing decoding.
+        import struct
+        old7 = bytearray((tmp / 'report-m4.bin').read_bytes()[:7168])
+        for page in (1, 6, 8, 9, 10, 11, 12, 13):
+            struct.pack_into('<I', old7, page*512, 0xa7400007)
+        legacy7 = tmp / 'v7.bin'; legacy7.write_bytes(old7)
+        decoded7 = subprocess.run(['python3', str(ROOT / 'tools/fuxi-gpu-probe.py'), '--decode', str(legacy7)],
+                                  check=True, capture_output=True, text=True).stdout
+        assert 'solid_clear=0x1 (PASS)' in decoded7 and 'validity=0x3f' in decoded7
+        # Failed and in-flight SCM slots must not look like returned zeros.
+        words = [list(struct.unpack('<128I', (tmp / 'report-m5.bin').read_bytes()[i:i+512])) for i in range(0, 7680, 512)]
+        z = words[14]; z[2] = 0xf07; z[5] = 3; z[3] = 5; z[83] = 0
+        text = decoder['decode'](words[0], words[1:])
+        assert 'PAS init_image SCM error' in text and 'in flight (no returned registers)' in text
+        z[83] = 1; z[88] = 0xfffffff4; z[89] = 0xffffffff
+        assert 'x0=0xfffffffffffffff4' in decoder['decode'](words[0], words[1:])
         # Reproduce v6's failed-stage14 reporting: zero CPU ticks mean unrun.
         old6 = bytearray((tmp / 'report-m4.bin').read_bytes())
         import struct
@@ -696,7 +884,7 @@ def main():
         struct.pack_into('<I', legacy, 512, 0xa7400005)
         old = tmp / 'v5.bin'; old.write_bytes(legacy)
         subprocess.run(['python3', str(ROOT / 'tools/fuxi-gpu-probe.py'), '--decode', str(old)], check=True, stdout=subprocess.DEVNULL)
-        print('PASS: fourteen-page M4b/v6 and legacy v5 offline Python decoder')
+        print('PASS: fifteen-page M5, M4/v6 and legacy v5 offline Python decoder')
 
 
 if __name__ == '__main__':

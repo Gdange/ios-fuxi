@@ -1,4 +1,4 @@
-/* Fuxi A740 staged GPU/GMU probe (lane-gpu, milestones 1–4).
+/* Fuxi A740 staged GPU/GMU probe (lane-gpu, milestones 1–5).
  *
  * Single translation unit #included by probe.c before ud_setup(), so these
  * statics share probe.c's helpers (delay(), the volatile memcpy) and the USB
@@ -174,7 +174,7 @@ static uint32_t cdb32(const uint8_t *p) { return cdb16(p) | (uint32_t)cdb16(p + 
 #define G_HFI_PA    (G_DATA_PA + 0x6000)
 #define G_DEBUG_PA  (G_DATA_PA + 0xa000)
 #define G_IC_SIZE   0xffc000u
-#define G_PAGES     14
+#define G_PAGES     15
 #define G_STAGE_8A  0x8au
 static uint32_t gpu_extra[G_PAGES - 1][GPU_REPORT_WORDS];
 static unsigned gpu_gmu_started; /* monotonic: also covers failed init/ACK */
@@ -776,7 +776,7 @@ static int g3_context(void)
 }
 static int g3_memory(void)
 {
- uint32_t *e = gpu_extra[5]; e[0] = 0xa7400007;
+ uint32_t *e = gpu_extra[5]; e[0] = 0xa7400008;
  e[37] = G3_SQE_VA; e[38] = G3_RING_VA; e[39] = G3_PTR_VA; e[40] = G3_FENCE_VA;
  e[41] = 0x8000; e[13] = (uint32_t)G3_PT; e[14] = G3_PT >> 32;
  const uint64_t pa[] = {G3_SQE_PA,G3_RING_PA,G3_PTR_PA,G3_FENCE_PA};
@@ -877,7 +877,7 @@ static int g3_verify_pointers(void)
  const uint32_t expected[13] = {
   G3_SQE_VA,0,G3_RING_VA,0,0x20c,G3_PTR_VA,0,G3_PTR_VA+4,0,0x6f,0xf,0xf,0,
  };
- x[0] = 0xa7400007; x[1] = 12; x[3] = 1;
+ x[0] = 0xa7400008; x[1] = 12; x[3] = 1;
  for (unsigned i = 0; i < 16; i++) x[8+i] = g3_gr(g3_pointer_regs[i]);
  if (gpu_extra[5][116]) return 0xc05;
  for (unsigned i = 0; i < 13; i++)
@@ -904,10 +904,10 @@ static void g3_diagnostics(unsigned stage)
  uint32_t *d = &gpu_extra[6][stage == 13 ? 64 : 0];
  uint32_t *x = gpu_extra[stage == 13 ? 8 : 7];
  uint32_t *y = gpu_extra[stage == 13 ? 10 : 9];
- y[0] = 0xa7400007; y[1] = stage;
+ y[0] = 0xa7400008; y[1] = stage;
  if (stage == 13)
   for (unsigned i = 0; i < 24; i++) x[i] = gpu_extra[7][i];
- x[0] = 0xa7400007; x[1] = stage; x[2] = gpu_extra[5][60];
+ x[0] = 0xa7400008; x[1] = stage; x[2] = gpu_extra[5][60];
  d[0] = stage;
  static const unsigned regs[] = {0x806,0x807,0x210,0x808,0x821,0x823,0x824,0x201,0xf400,0xfc00,0xfc01};
  static const unsigned words[] = {1,2,6,7,9,10,11,12,13,14,15};
@@ -1050,7 +1050,7 @@ static int g3_cp_start(void)
  /* OOB is deliberately retained until reset, on success AND failure. This
   * avoids an IFPC collapse losing CP state between USB stages12 and13. */
  e[60] = 3;
- uint32_t *x = gpu_extra[7]; x[0] = 0xa7400007; x[1] = 12; x[3] = 4;
+ uint32_t *x = gpu_extra[7]; x[0] = 0xa7400008; x[1] = 12; x[3] = 4;
  g3_checkpoint(0);
  if (e[116]) return 0xc05;
  if (g3_faulted()) return 0xc06;
@@ -1501,7 +1501,7 @@ static void gpu_m4(unsigned limit)
  for (unsigned stage = 14; stage <= 15 && stage <= limit; stage++) {
   uint32_t *d = gpu_extra[stage-3];
   if (!d[1]) {
-   g_enter(stage); d[0] = 0xa7400007; d[1] = stage;
+   g_enter(stage); d[0] = 0xa7400008; d[1] = stage;
    d[2] = g4_copy(stage == 15, d); g4_snapshot(d);
    if (d[2] == 1 && gpu_extra[5][116]) d[2] = 0xe01;
    if (d[2] == 1 && g3_faulted()) d[2] = 0xe02;
@@ -1509,6 +1509,8 @@ static void gpu_m4(unsigned limit)
   if (d[2] != 1) return;
  }
 }
+
+#include "gpu-zap.h"
 
 static void gpu_m3(unsigned limit)
 {
@@ -1525,7 +1527,11 @@ static void gpu_m3(unsigned limit)
   g_enter(13); e[6] = 1; e[4] = g3_fence(); g3_diagnostics(13);
   if (e[4] == 1 && e[116]) e[4] = 0xd01;
  }
- if (e[4] == 1 && limit >= 14) gpu_m4(limit);
+ if (e[4] != 1) return;
+ if (limit == 16) { gpu_m5(); return; }
+ /* A failed zap attempt permanently blocks all later 2D work this boot. */
+ if (gpu_extra[13][1] && gpu_extra[13][2] != 1) return;
+ if (limit >= 14) gpu_m4(limit);
 }
 
 static void gpu_m2(unsigned limit)
@@ -1545,7 +1551,7 @@ static void gpu_probe(unsigned limit)
 {
  uint32_t *r = gpu_report;
  /* Once stage8 has touched tables or retention, never replay power/fw setup.
-  * Stages8->15 may advance once; reads of old stages return the frozen report. */
+  * Stages8->16 may advance once; reads of old stages return the frozen report. */
  if (gpu_snapshot_valid) {
   if (limit >= 8) gpu_m2(limit);
   r[1] = limit; r[2] = gpu_stage; r[3] = gpu_gmu_started;
@@ -1553,10 +1559,10 @@ static void gpu_probe(unsigned limit)
  }
  for (int i = 0; i < GPU_REPORT_WORDS; i++) r[i] = 0;
  if (!limit) return;
- if (limit != G_STAGE_8A && limit > 15) limit = 15;
+ if (limit != G_STAGE_8A && limit > 16) limit = 16;
  r[0] = 0xa740;          /* magic */
  r[1] = limit;
- gpu_extra[0][0] = 0xa7400007;
+ gpu_extra[0][0] = 0xa7400008;
 
  /* ---- Stage 1: read-only snapshot (always safe: same GCC family the UFS /
   * touch probes already read; GPUCC/SMMU/GPU reads are each gated). ---- */
