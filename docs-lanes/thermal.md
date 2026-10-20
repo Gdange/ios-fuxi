@@ -1,3 +1,78 @@
+# Milestone 7b — init diagnostics and fresh-sensor quorum
+
+**OBSERVED on 0097 (coordinator device results, 2026-10-20):** SpringBoard runs
+without a panic, but touch boost never starts: `FUXI PERF: disabled, EPSS/LUT
+mapping or access failed`, before the GPU driver's first line. Loader 0x57
+reads with the MMU off in the same boot succeed: all domain enables are `0x3`,
+DCVS is readable (for example `0x9b30`), and perf-state registers are readable.
+Individual CPU TSENS sensors sporadically lack VALID, affecting about 10% of
+10-second samples, with varying sensors (example cpu-1-4 status `0x2400221`).
+These are observations of 0097, not validation of 0097b.
+
+**Fact versus hypothesis:** the old initializer unconditionally read all 40
+LUT slots before the policy checked for repeated frequencies. An abort in an
+unused tail slot therefore disabled an otherwise usable domain. 0097b stops
+MMIO reads immediately at the first repeated decoded frequency and passes the
+explicit row count into selection. The regression model injects faults at
+every unused tail slot. **That a tail access caused the device failure remains
+a hypothesis**: the old log does not name a failing register, and loader MMU-off
+success does not establish the outcome of XNU's MMU-on accesses. The captured
+LUTs themselves select successfully, without changing core-count eligibility.
+
+| Domain | Observed rows / core-count bits 18:16 | Cool level / MHz | High level / MHz |
+| --- | --- | --- | --- |
+| silver | 16, all count 3, 307.2..2016.0 MHz | 8 / 1228.8 | 8 / 1228.8 |
+| gold | 20, count 5 through 2707.2, final 2803.2 count 4 | 8 / 1401.6 | 19 / 2803.2 |
+| prime | 21, count 5 through 2956.8, final 3187.2 count 1 (turbo) | 6 / 1363.2 | 19 / 2956.8 |
+
+`tools/fixtures/fuxi-epss-0097.h` contains the observed frequency words. Its
+repeated last word is a modeled terminator; later slots are fault-injected.
+The model verifies every required row failure, map/enable/DCVS/selection/TSENS
+map failures, all 40 distinct rows, both vote modes and all sensor positions.
+Init failure now emits one line, for example:
+
+```text
+FUXI PERF: disabled, step=LUT domain=silver(0) PA=0x17d91000 offset=0x140 value=0xffffffff access=0 row=16
+```
+
+Steps are `map`, `enable`, `dcvs`, `LUT` (with row index), `level selection`,
+and `tsens map`. `access=0` means no register value was returned; `0xffffffff`
+is the read-failure sentinel, not an observed value. Mapping failures report
+zero. Cool indices/frequencies are published only after both selections succeed.
+
+The exact native `osfmk/arm64/machine_routines.c` calls `io_map`, which computes
+`start_offset = PA - trunc_page(PA)`, maps `round_page(size + start_offset)` and
+returns `start + start_offset`. On 16 KiB pages, EPSS windows at
+`0x17d91000/0x17d92000/0x17d93000` map the `0x17d90000` page and return offsets
+`0x1000/0x2000/0x3000`; TSENS `0xc271000/0xc272000` similarly use `0xc270000`.
+The successful display mapping at `0x0ae36000` uses offset `0x2000` by the same
+contract. No extra offset or change to those mappings is required. The offline
+test can compile the supplied tree's actual `io_map` with VM stubs, exercising
+both early and VM-running paths for all six addresses. `ml_io_map` is NOFAIL:
+its null check cannot diagnose allocation exhaustion, which would panic.
+
+The `fuxi_gpu_access` read/write instructions and barrier are covered by linked
+copyio recovery records. `handle_kernel_abort` in `osfmk/arm64/sleh.c` looks up
+the faulting PC, restricts the Fuxi fixup to that primitive's range, saves fault
+state on the current thread and redirects to its failure return. There is no
+GPU-ready check or driver-owned recovery context. A sleepable thread-call can
+use it before GPU startup and with `fuxigpu=0`; interrupt-stack aborts still
+panic. The linked records are verified in the 0097b kernel. This audit does not
+prove bus accessibility or containment of asynchronous/interconnect hangs.
+
+0097b takes the hottest **fresh valid CPU sensor** if at least **14 of 18**
+(75%, rounded up) are ready, VALID and plausible (-40..150 C). A sensor read
+failure/invalid bit or implausible value removes only that sensor. A controller
+without TRDY contributes no valid sensors. Thus one missing silver controller
+still leaves 15/18; missing TM0 leaves 3/18 and forces cool. No old temperature
+is reused. One invalid sensor cannot deny or cancel a boost; fewer than 14
+valid forces cool. The <=60 C entry and <=68 C continuation rules are unchanged.
+
+0097b builds natively in **ci-lane-gpu6 only**. Both images keep full RAM,
+seven CPUs, pinned root identity and `fuxiperf=1`, differing only in `fuxigpu`.
+No phone access or push; 0097b init success and thermal behavior await a device
+run. See [GPU build handoff](gpu.md) for artifacts, hashes and offline checks.
+
 # Milestone 7 — opt-in XNU touch boost
 
 Patch `0097-fuxi-touch-boost.patch` adds `fuxiperf=1` (default **off**).
@@ -8,7 +83,7 @@ sleep. Only the worker owns EPSS/TSENS accesses; repeated input coalesces on
 that one thread-call. A 100 ms worker sample bounds thermal/expiry response.
 
 All three EPSS domains use their measured addresses below. The worker reads
-up to 40 frequency LUT rows, terminates at a repeated frequency, excludes
+up to 40 frequency LUT rows, stops MMIO at a repeated frequency, excludes
 one-core turbo rows, and chooses indices by decoded frequency, not assumed
 index order. Cool votes are the highest eligible rows at or below silver
 1228.8, gold 1401.6 and prime 1363.2 MHz. High votes for gold/prime are the
@@ -24,9 +99,9 @@ Only recent input can start boosting. Once high, either input or frame swaps
 extend it; after **1500 ms without either**, the next sample requests cool.
 Swaps alone cannot start a boost. Every decision uses fresh TSENS data from
 TM0 sensors 1..15 (cpuss and gold/prime) and TM1 sensors 1..3 (silver), matching
-the thermal lane's CPU sensor inventory. Both TRDY bits and every CPU sensor's
-VALID bit must be set; signed deci-C values must be plausible (-40..150 C).
-Missing/invalid data forces cool. A new boost requires hottest CPU <=60 C;
+the thermal lane's CPU sensor inventory. At least 14 of 18 CPU sensors must
+be ready, VALID and plausible in the current sample (-40..150 C); the hottest of these is used. A smaller quorum
+forces cool. A new boost requires hottest CPU <=60 C;
 an existing boost can continue through 68 C, but **above 68 C forces cool**.
 It cannot restart above 60 C. These are software votes sampled at 100 ms,
 not new hardware trips or a guarantee about package/skin temperature.
@@ -56,7 +131,8 @@ acceptance are separate: no phone test or thermal improvement is claimed.
 
 # Thermal lane (Fuxi, SM8550): measuring temperature and cooling iOS down
 
-Status 2026-10-20: offline work only. Nothing in this lane has run on the device yet.
+Historical thermal-lane design notes follow. For device observations and current
+0097b behavior, see the milestone section above.
 Tags used below: **[DT]** read from the live FDT `research/device/probe-09/live.dtb`;
 **[src]** read from the XNU tree `research/ci-0081/xnu` or our patches; **[Linux]**
 the mainline `qcom-cpufreq-hw` / `tsens-v2` register layout, which I recalled and

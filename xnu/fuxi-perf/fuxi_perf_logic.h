@@ -7,11 +7,11 @@ static unsigned fp_khz(uint32_t row)
 }
 /* Exclude one-core turbo rows. Duplicate frequencies terminate the table.
  * Pick the fastest eligible row at/below cap; never infer level ordering. */
-static int fp_level(const uint32_t *rows, unsigned cap, unsigned *khz)
+static int fp_level(const uint32_t *rows, unsigned count, unsigned cap, unsigned *khz)
 {
  int best = -1;
  unsigned freq = 0, prev = 0;
- for (unsigned i = 0; i < 40; i++) {
+ for (unsigned i = 0; i < count; i++) {
   unsigned f = fp_khz(rows[i]);
   if (i && f == prev) break;
   prev = f;

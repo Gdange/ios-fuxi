@@ -1,4 +1,10 @@
-# Fuxi RAM layout (milestone 7)
+# Fuxi RAM layout (milestones 7 / 7b)
+
+**OBSERVED on 0097 (coordinator, 2026-10-20):**
+`vm_page_bootstrap: 321917 free pages, 3715 wired pages` (about 5.0 GiB free,
+16 KiB pages; 0096e had 46558 free pages). SpringBoard runs without a panic.
+The full-RAM boot and async GPU presents work. 0097b preserves this exact ADT
+and reservation layout; it has been built offline and has not been booted.
 
 The coordinator's saved live FDT advertises `0x8c0000000 + 0x140000000`
 (5 GiB), with no reserve-map entries or reserved-memory overlap in this bank.
@@ -36,9 +42,9 @@ the entire selected bank. No 1 GiB constant in `mkadt.py` is inherited: its
 highmem globals are explicitly replaced by the Fuxi builder. The old 1 GiB
 loader RAM **sampling probe** remains a bounded diagnostic, not a VM limit.
 
-These facts support all 5 GiB minus the required 32 MiB scratch; they do not
-prove upper-bank hardware coherency or runtime stability. No device test is
-claimed. XNU allocation metadata overhead will consume part of the 5088 MiB.
+These facts and the observed 0097 boot support all 5 GiB minus the required
+32 MiB scratch. The boot is not an exhaustive upper-bank coherency or long-term
+stability test. XNU allocation metadata consumes part of the 5088 MiB.
 
 Use `--ram-layout 1g` to reproduce the original 1 GiB XNU window. With
 `--gpu-reserve` it uses the new top-of-bank scratch, so a newly built GPU kernel

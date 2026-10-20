@@ -1,9 +1,66 @@
+# Milestone 7b — observed 0097 results and rebuild
+
+**OBSERVED on fuxi-0097-boot.img (coordinator, 2026-10-20):** full RAM works,
+SpringBoard runs, no panic. GPU reports `async one-in-flight, no timer sleep`.
+One recorded window:
+
+```text
+SWEET FB: stats 600 frames in 132086 ms, copy avg 656 us max 1730 us, 608 swaps, 8 not shown
+FUXI GPU: presents GPU 594 CPU 2, GPU retire avg 16055 us CPU avg 963 us
+split: clean 619 submit 30 wait 16028 us; GPU CPU-time 685 us
+cache hit 593 miss 2, sleeps 0, busy ticks 0 failed 0
+```
+
+The ~16 ms retire/wait value is submission-to-next-tick observation, not GPU
+execution latency. These results confirm full-RAM boot and async presentation,
+not improved subjective smoothness. Touch boost failed during init before the
+GPU's first line; [thermal notes](thermal.md) distinguish the confirmed LUT-tail
+read defect from the unproven cause of that particular device failure.
+
+0097b changes the governor's LUT reads, failure diagnostics and CPU-sensor
+quorum. It retains the 0097 RAM layout and async GPU backend. Native build exit
+0 in **ci-lane-gpu6 only**; all sixteen clean-patch source inputs match the
+native tree. GPU/CPU loader builds pass with the existing pinned external
+GMU/SQE/zap blobs. No firmware or binaries are tracked. Both payloads use the
+same kernel/ADT, seven CPUs and pinned root, with `fuxiperf=1`; they differ in
+exactly the one byte selecting `fuxigpu=1` or `fuxigpu=0`. No phone access or push.
+
+Offline checks: shared-source sync; clean 0096/0097 patch application and native
+input hashes; ASan/UBSan GPU submit/poll/cache/mapping and governor models;
+full/1g RAM and >4 GiB USB offsets; external-firmware probe models; SCM native
+instruction/register audit; linked read/write abort recovery; boot-v4/Image,
+payload/ADT memory bounds, root/CPU identity and exact embedded firmware.
+The governor model also compiles the actual XNU `io_map` from the supplied tree
+and checks 16 KiB page offsets in both allocation paths. No 0097b device result
+is claimed.
+
+```sh
+python3 tools/sync-fuxi-adreno-shared.py --check
+python3 tools/test-fuxi-adreno.py
+python3 tools/test-fuxi-memory.py
+python3 tools/test-fuxi-perf.py --xnu-tree "$XNU_SOURCE"
+python3 tools/test-fuxi-scm.py --kernel xnu/out-fuxi-0097b/kernel.development.fuxi.unstripped
+# Use the existing private firmware paths for --firmware / --sqe / --zap:
+python3 tools/test-fuxi-gpu-probe.py --firmware "$GMU" --sqe "$SQE" --zap "$ZAP"
+```
+
+| Artifact | SHA256 |
+| --- | --- |
+| `xnu/out-fuxi-0097b/kernel.development.fuxi` | `f3968b0138e7e224c834b220c5655d5f96eff6c57cc496ce45b4b9d8263cb8eb` |
+| `xnu/out-fuxi-0097b/kernel.development.fuxi.unstripped` | `1db45880370d21aa92f2a67ef07caca11f6fba1ec655e74dfa150c8bdc251957` |
+| `xnu/out-fuxi-0097b/fuxi.adt` | `39aacea4d7db372314bdc7928a66271b3b5cc2bd878bec4d9cfe2f5191e83533` |
+| `shim/out/fuxi-0097b-boot.img` | `4873e5a9c0d8e8d9d8953accfb8195e75ed75bd1322a748b3450def995e47bb4` |
+| `shim/out/fuxi-0097b-payload.bin` | `93c9677da8d2ccca619ecbf726f8cf048bfd9b6b6ff993ce9018adb436ebf2dd` |
+| `shim/out/fuxi-0097b-cpu-boot.img` | `0fafacfaa34101ddbc19b1124ba2344bce09f17775f1d2c1de35e872e7fcc4d0` |
+| `shim/out/fuxi-0097b-cpu-payload.bin` | `ef23ac4e04512f865f7971fa7ff1ff6fba6b3ce897a3090eae501bf24f26bf93` |
+
 # Milestone 7 — full RAM and asynchronous present
 
 XNU now gets **5088 MiB**, with the last 32 MiB of the observed 5 GiB bank
 reserved for GPU scratch and the cold handoff. See [memory layout](memory.md)
 for addresses, XNU limit audit, USB offset extension and the `--ram-layout 1g`
-compatibility option. No device access or boot is claimed.
+compatibility option. The coordinator has now booted 0097 successfully; see
+the observed results above. 0097b remains unbooted.
 
 Coordinator evidence for 0096e: GPU presents work at 1.58–1.61 ms wall and
 0.72–0.74 ms CPU time, with nearly all cache hits. The user reports worse
@@ -43,7 +100,8 @@ pixel copies, duplicate-submit/unmap refusal, busy ticks, writer exclusion,
 retained-source lifetime, late fence, timeout/fault/isolation and quarantine.
 Offline tests do not establish producer compliance, real DMA coherency, tearing
 or smoothness. Failure containment can spend bounded time polling GBIF; normal
-completion has no poll loop. No device run is claimed.
+completion has no poll loop. The observations above cover 0097; they do
+not establish IOSurface writer compliance or improved subjective smoothness.
 
 ## 0097 offline build handoff
 
