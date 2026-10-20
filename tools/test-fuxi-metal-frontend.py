@@ -23,8 +23,17 @@ def main():
         gate=subprocess.run([str(d/'gate'),'daemon-argv'],env=env,text=True,capture_output=True,check=True,timeout=10)
         assert gate.stderr.count('FUXI MTL: gate deny gate-test')==1,gate.stderr
         print(gate.stdout,end='')
+        allowed=subprocess.run([str(d/'gate'),'daemon-argv'],env=dict(env,FUXI_TEST_GATE_ALLOW='1'),text=True,capture_output=True,check=True,timeout=10)
+        assert allowed.stderr.count('FUXI MTL: gate allow gate-test')==1,allowed.stderr
         call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/ClientGateTests.cpp'),'-o',str(d/'policy')])
         subprocess.run([str(d/'policy')],env=env,check=True,timeout=10)
+        call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/CensusTests.mm'),*frameworks,'-o',str(d/'census')])
+        census=subprocess.run([str(d/'census')],env=env,text=True,capture_output=True,check=True,timeout=15)
+        assert census.stderr.count(' supportsFamily: implemented')==1,census.stderr
+        assert census.stderr.count('FUXI MTL: census census-test ')==256,census.stderr
+        assert census.stderr.count('FUXI MTL: census limit census-test 256')==1,census.stderr
+        assert 'AddressSanitizer' not in census.stderr and 'runtime error:' not in census.stderr,census.stderr
+        print(census.stdout,end='')
         subprocess.run([str(d/'frontend')],env=env,check=True,timeout=15)
         call(['xcrun','clang',*flags,'-DMTLCreateSystemDefaultDevice=FuxiTestCreateDevice','-Dobjc_getClass=FuxiTestGetClass',
             '-Dgeteuid=FuxiTestGeteuid','-Dalarm=FuxiTestAlarm','-DFUXI_MTL_CONF="'+str(conf)+'"',

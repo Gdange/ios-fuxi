@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Validate Metal staging on a temporary root with real signed artifacts."""
 import argparse
+import os
+import subprocess
 import importlib.util
 from pathlib import Path
 import shutil
@@ -20,6 +22,8 @@ def main():
         def stage():m.stage(root,icd,bundle,smoke,conf,clients)
         with patch.object(m.os,'geteuid',return_value=0),patch.object(m.os,'chown') as chown:
             stage();stage()
+            if os.uname().sysname=='Darwin':
+                subprocess.run(['codesign','--verify','--strict',str(root/'System/Library/Extensions/FuxiMetal.bundle')],check=True)
             for src,rel,mode in ((icd,'usr/local/lib/libvulkan_freedreno.dylib',0o755),(smoke,'usr/local/bin/fuxi-metal-smoke',0o755),
                 (conf,'usr/local/share/fuxi/metal-smoke.conf',0o644),(clients,'usr/local/share/fuxi/metal-clients.conf',0o644),(bundle/'FuxiMetal','System/Library/Extensions/FuxiMetal.bundle/FuxiMetal',0o755),
                 (bundle/'Info.plist','System/Library/Extensions/FuxiMetal.bundle/Info.plist',0o644),

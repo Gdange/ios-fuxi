@@ -13,7 +13,8 @@ struct Operation {Buffer *src,*dst;size_t from,to,size;uint8_t value;};
 class Backend {
 public:
  static constexpr size_t maxBufferLength=16*1024*1024;
- static inline int live=0,submissions=0;bool poisoned=false;
+ static inline int live=0,submissions=0,constructed=0;bool poisoned=false;
+ Backend() {++constructed;}
  Buffer *allocate(size_t n) {
   if(!n || n>maxBufferLength)throw std::runtime_error("length");
   auto *b=new Buffer{calloc(1,n),n,n};++live;return b;

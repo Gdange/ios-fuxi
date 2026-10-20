@@ -1,9 +1,10 @@
 /* Test policy injection only. Production always reads the protected file. */
 #include "ClientGate.hpp"
 #include <cassert>
+#include <cstdlib>
 static unsigned policyReads;
 static fuxi::ClientMode testPolicy(const char *,const char *process) {
- ++policyReads;assert(!strcmp(process,"gate-test"));return fuxi::ClientMode::deny;
+ ++policyReads;assert(!strcmp(process,"gate-test"));return getenv("FUXI_TEST_GATE_ALLOW")?fuxi::ClientMode::allow:fuxi::ClientMode::deny;
 }
 #define FUXI_MTL_READ_CLIENTS testPolicy
 #define _NSGetExecutablePath testExecutablePath
@@ -23,9 +24,9 @@ int main() {
   for(unsigned i=0;i<64;++i) {
    // An invalid port would fail after policy evaluation as well; no IOKit or
    // backend constructor is reachable through the denied branch.
-   assert(![[cls alloc] initWithAcceleratorPort:1]);
+   assert(![[cls alloc] initWithAcceleratorPort:(getenv("FUXI_TEST_GATE_ALLOW")?0:1)]);
   }
-  assert(policyReads==1 && fuxi::Backend::live==0 && fuxi::Backend::submissions==0);
+  assert(policyReads==1 && fuxi::Backend::constructed==0 && fuxi::Backend::live==0 && fuxi::Backend::submissions==0);
  }
- puts("PASS: denied init nil, 64 attempts one policy read/log, executable identity independent of argv");
+ puts("PASS: gated init, 64 attempts one policy read/log, executable identity independent of argv");
 }

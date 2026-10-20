@@ -31,6 +31,249 @@ and symlinks fail closed. Existing frontend and smoke tests passed. The arm64
 iOS 16.0 plugin and smoke were built, ad-hoc signed, signature-verified and
 audited. No kernel changes, phone access, mounted-root edit or push.
 
+## M5a census and the CA stop point
+
+Add `census backboardd` to the same policy file for an **explicit diagnostic
+run**, then restart the process/reboot; the shipped file does not enable this.
+A census entry grants a device even to a nonroot process, but **never constructs
+Turnip, opens a native GPU client, allocates GPU memory or submits work**.
+It uses registryID 0, conservative M4 capabilities and associated state with no
+backend. Normal allow entries retain M4's root requirement and transfers.
+
+Every implemented Metal API entry logs its first call. Unsupported messages on
+the device and resource classes enter Objective-C forwarding with encodings from
+the private superclass/public protocols; private protocols loaded in the process
+also supply signatures. NSInvocation returns zero bytes for the actual return
+size, covering nil, integer, float, structures (including indirect returns), and
+void no-op. Inherited private device implementations cannot execute against the
+uninitialized base. A mutex protects a fixed **256 (class, selector)** table
+shared across all frontend objects; the logger allocates nothing and duplicate
+calls produce no further lines, and reaching capacity prints one limit line. Lifetime and
+forwarding machinery itself is excluded from API logging.
+
+An entirely untyped private selector uses the conventional object/word nil
+signature and is logged. Objective-C supplies no ABI for such a selector:
+arbitrary unknown floating/structure returns cannot be guaranteed by guessing.
+The typed Metal/public and discovered private protocol cases are covered by the
+host tests; this is not a universal substitute for an unknown private ABI.
+Unimplemented textures, libraries and pipelines return nil; census does not
+fabricate successful resources. No texture/render/compute object is vended yet;
+forwarding applies to such protocol methods when a diagnostic object exposes
+them. M4 buffer/queue/command-buffer/blit classes have the same instrumentation.
+
+**Safety takes priority over depth:** census `newCommandQueue` returns nil.
+The cache's `new_metal_context` handles this by returning null
+(`0x188487ef0..0x188488108`). Allowing a queue would advance into loading
+QuartzCore's metallib; returning nil there **aborts the client**, rather than
+selecting software. Consequently M5a learns the safe first blocker dynamically;
+the deeper census below is static cache evidence, not an observed backboardd
+trace or a claim that all CA shaders form a small fixed set. Advance the stop
+point only as each real requirement is implemented and independently tested.
+The generic forwarding tests can exercise queue/command/encoder/texture protocol
+messages without opening a GPU; these do not qualify CA runtime behavior.
+
+Expected new lines (examples, not an M5a phone observation):
+
+```text
+FUXI MTL: gate allow fuxi-metal-smoke
+FUXI MTL: gate deny backboardd
+FUXI MTL: gate deny SpringBoard
+```
+
+With an explicitly staged census entry, replace backboardd's deny with:
+
+```text
+FUXI MTL: gate allow backboardd
+FUXI MTL: census enabled backboardd (no GPU)
+FUXI MTL: census backboardd FuxiMTLDevice initWithAcceleratorPort: implemented
+FUXI MTL: census backboardd FuxiMTLDevice newCommandQueue implemented
+```
+
+The queue line occurs only if CA actually asks for one. Registration may log
+other selectors first. The existing smoke stages should still end `done PASS`
+for the default allowlisted executable. No new on-device run was performed.
+
+## Repeated matching investigation
+
+The supplied M4 report shows many **matching1** requests. In the existing XNU
+source that diagnostic is in `internal_io_service_get_matching_service`, i.e.
+**IOServiceGetMatchingService**, not notification delivery or the iterator used
+by Metal registration. `IOTaskRegistryCompatibilityMatching` adds
+`IOServiceNotificationUser=true` to ordinary requests unconditionally; that key
+is not proof of a notification re-arm. The service publishes once and does not
+re-register/change matching properties after publication.
+
+In this cache, Metal's `_MTLRegisterDevices` uses
+**IOServiceGetMatchingServices**, enumerates once and is reached through the
+device-array `dispatch_once` (`_MTLCreateSystemDefaultDevice`,
+`0x181a37770..0x181a37828`). Initializer failure does not schedule a retry.
+QuartzCore's accelerator wait (`0x18853e664..0x18853e6d4`) retries only while
+**no service exists**, in 100 ms steps with a bounded counter; finding our
+service exits that wait. It cannot explain repeated successful matching1 calls.
+
+OpenGLES `_eagl_init` performs a single-service IOAcceleratorES probe at
+`0x1d3f525d4..0x1d3f525e4`; `_EAGLMemoryNotificationRecycling` does another at
+`0x1d3f528b4..0x1d3f528c4`. These are concrete alternative call sites for the
+observed request shape. EAGL init can fail to establish its GL renderer and be
+called again by clients; this service implements no GL renderer. Neither lookup
+contains a property-wait or notification retry loop. The report has no caller
+stacks, so attributing all requests to one function would be speculation.
+**No kernel/property change is justified.** Do not add fictitious Apple/GL
+plugin properties to suppress legitimate failed GL probes. The safety gate
+removes our Metal device from those processes without changing service matching.
+
+## CoreAnimation requirements from the iOS 16.7 cache
+
+Same iPhone10,3 / 20H392 arm64 cache and SHA256 as below. Addresses are unslid.
+These are call-site findings; branches depend on renderer flags, device limits
+and workload, and are not evidence that every listed path runs on fuxi.
+
+| Requirement | Cache evidence and consequence |
+| --- | --- |
+| Device/queue selection | `CAMetalContextCreate` (`0x18838421c`) calls the system default-device API. `CA::OGL::new_metal_context` (`0x188487e28`) creates a queue, checks queue/device identity, labels it, and conditionally sets GPU/background priorities and submission/completion queues. Queue failure returns null; a non-nil MTLDevice is not proof of CA compatibility. |
+| Init state | `0x188488078..0x18848809c`: render-pass and depth/stencil descriptor/state creation. `0x18848822c..0x188488364`: `supportsMemorylessRenderTargets`, optional `CA_ENABLE_MEMORYLESS`, and `minConstantBufferAlignmentBytes`. These private queries need honest values, not inherited Apple implementations. |
+| Feature/family/limits | `0x1884886d4..0x188488adc`: `supportsFamily:` includes Apple1/2/3/5 (1001/1002/1003/1005), vendorName, maxFragmentTextures/Samplers, maxTextureWidth2D/Height2D, maxColorAttachments, supportsRasterOrderGroups, supportsYCBCRFormats12/packed variants, supportsNativeHardwareFP16, supportsTileShaders, supportsSIMDGroup and iosurfaceReadOnlyTextureAlignmentBytes. `supportsFeatureSet:` gates offline pipeline variants at `0x1883758b8/0x1883758e0` and `0x18847eb30..0x18847ebac`. `readWriteTextureSupport` has **no direct call found** in this QuartzCore image; retain its conservative zero answer and census it if another framework asks. |
+| Its own libraries | `0x1884883e0..0x188488424`: NSBundle for com.apple.QuartzCore resolves **default.metallib**, then calls **newLibraryWithURL:error:**. No direct `newLibraryWithData:` or `newDefaultLibrary` call was found here; supporting those alone would miss this entry. The frontend ultimately needs a URL-to-metallib/AIR path with checked lengths and errors, without invoking Apple's GPU compiler. |
+| Function specialization | `load_shader_function` (`0x188482774`), especially `0x1884829bc..0x1884829e8`, uses MTLFunctionDescriptor, name, constant values and `newFunctionWithDescriptor:error:`. The vertex path at `0x1884862b0` uses precision suffixes and constants including fc_generic, fc_vertex_layout, fc_texcoord_count and fc_base_color; the fragment path starts at `0x18848566c`. Translation must include specialization and binding/vertex-layout metadata. |
+| Pipelines | `create_pipeline_state` (`0x188380b94`) configures vertex/fragment functions, attachments, formats and blend/write state, then calls **newRenderPipelineStateWithDescriptor:error:** at `0x188381b9c/0x188381bf4`. Tile pipelines at `0x18848214c` and compute pipelines at `0x188482e20` are additional workload paths. Optional **default.pipelinelib**, newPipelineLibraryWithFilePath:error: (`0x188488534`), and lookup by pipeline name (`0x188375908`) are Apple precompiled-pipeline optimizations, not portable Vulkan binaries. |
+| Pixel formats | `four_cc_to_mtl_format` (`0x1882d69f4..0x1882d7084`) converts IOSurface FourCCs using MetalLimits. Concrete cases include BGRA -> 80/BGRA8Unorm (`0x1882d6c1c..0x1882d6c3c`), A8 -> 1, L8 -> 10/R8Unorm, L16 -> 20/R16Unorm. Other paths include wide/half-float and YCbCr formats gated by limits. Unsupported combinations return format 0. First target BGRA8Unorm, then sampling/sRGB/plane formats actually requested; do not advertise the whole conversion table. |
+| IOSurface textures | `create_surface_from_iosurface` (`0x188366dd0`): validates dimensions/format/limits, makes a texture descriptor with usage 5 (shader read + render target), applies protection options, calls **newTextureWithDescriptor:iosurface:plane:** at `0x18836702c` (plane 0 in this path), and cleans up if texture creation returns nil. Other multi-plane/import paths exist at `0x18830afc8`, `0x18831ee5c`, `0x1883471a4`. Real import requires HostImport/page lifetime/coherence and synchronization, absent from the current ABI. |
+| Events/fences | CAMetalDrawable's **sharedEvent** is consumed at `0x18829e0c8`; `-[CAMetalDrawable sharedEvent]` is at `0x18829e240`. No direct **newSharedEvent** factory call was found in this QuartzCore image. This distinguishes drawable-supplied event consumption from a device-init requirement. Event ownership, wait/signal and cross-process lifetime still need census/implementation before CAMetalLayer presentation. |
+| Software fallback | `CA::CG::AccelRenderer` selection at `0x188507960..0x188507af8`: nil device, disabled Metal route, or null Metal-context result goes to software creation when the caller's surface/backend policy permits it; another branch returns null. The window-server get_ctx block (`0x18853bfe8`) skips Metal-context construction for nil device. These branches do not establish universal fallback for every CA client. |
+| Fatal failures after selection | Missing bundle/metallib URL hits assertions; nil library follows `0x188488424 -> 0x188488c80..0x188488d68` into **abort_with_payload**. Render-pipeline failure has a similar fatal diagnostic. Returning nil for every unsupported API is ABI-safe forwarding but is **not** sufficient to keep an already-selected CA Metal renderer alive. Deny by default, and retain the early census queue stop. |
+
+Minimal shader candidates identified **statically**, not from a live census:
+`std_vert0`/`std_vert1` in the vertex type table (`0x1d5b48050`), their
+`_lph`/`_lpf` precision variants, and the fallback fixed vertex/fragment families
+(`0x18848634c`, `0x188485724`), including `fixed_vert_lpf_spc`,
+`fixed_vert_lph_spc`, `fixed_frag_lpf_cpf` and `fixed_frag_lph_cph`. Many blur/path/image/compositing variants and
+function constants also exist. Do not infer a small complete shader set from
+a first solid-background test.
+
+Reproduce using external tools/Apple inputs, saving all output only in an
+ignored analysis directory; no disassembly, cache, metallib or Apple source
+belongs in git:
+
+```sh
+"$IPSW" dyld disass "$DSC" --symbol _MTLRegisterDevices --symbol-image Metal
+"$IPSW" dyld disass "$DSC" --symbol _MTLCreateSystemDefaultDevice --symbol-image Metal
+"$IPSW" dyld macho "$DSC" QuartzCore --symbols
+"$IPSW" dyld disass "$DSC" --image QuartzCore > "$ANALYSIS/QuartzCore.disass"
+"$IPSW" dyld disass "$DSC" --vaddr 0x188487e28 --count 1100
+"$IPSW" dyld disass "$DSC" --vaddr 0x188380b94 --count 1150
+"$IPSW" dyld disass "$DSC" --vaddr 0x188366dd0 --count 200
+"$IPSW" dyld disass "$DSC" --vaddr 0x188507950 --count 110
+"$IPSW" dyld dump "$DSC" 0x1d5b48050 --count 54 --addr
+"$IPSW" dyld disass "$DSC" --symbol _eagl_init --symbol-image OpenGLES
+"$IPSW" dyld disass "$DSC" --symbol _EAGLMemoryNotificationRecycling --symbol-image OpenGLES
+```
+
+## Shader translation decision
+
+**Recommend (a), an external dynamically loaded metal2vulkan adapter, for M5b's
+isolated offscreen experiment.** M5a links none of it. Reviewed the actual pin
+`720ef1ce9ae2a2068999a8675717418b9416283e`, including Cargo manifests, API,
+AIR front end and cache documentation. The repository identifies itself as
+alpha; this is a candidate, not an established CA/A740 translator. No CA
+metallib was translated or benchmarked in M5a.
+
+Effort below is an engineering estimate, excluding IOSurface/kernel work:
+
+| Option | Concrete integration, effort and legal boundary | Device load cost and caching | First target |
+| --- | --- | --- | --- |
+| (a) external metal2vulkan | Medium: days for a pinned AIR parse/translation probe and narrow versioned C ABI adapter, weeks or more for specialization/binding/format correctness and iOS integration. The pin exposes Rust crates, not a ready stable C ABI/cdylib; build the adapter in the **external tree**, dlopen it from our original frontend, and pass bounded bytes/descriptors, results and free callbacks. Its AIR front end already understands metallib/bitcode, metadata, intrinsics and constants and emits SPIR-V plus pipeline/binding plans. All workspace crates declare **GPL-2.0-or-later OR LGPL-3.0-or-later**. Select/comply with LGPL for a separately replaceable dynamic library: notices/license texts, corresponding library source and modifications, and required relinking/replacement/installation rights/information. Dynamic loading alone does not waive those obligations. No static incorporation or vendoring here. Apple inputs and derived shader outputs stay external/private, outside repository/distribution artifacts. | Parse at library load; specialize/translate requested entry points at pipeline creation, then Turnip SPIR-V -> NIR/ir3 compilation. The library requires no llvm-as subprocess for binary AIR. The translator supplies content/profile/version keys and artifact encodings; it does **not** itself persist a cache. Its optional runtime has disk/memory and driver pipeline caches, but defaults (25 GiB disk/256 MiB memory) are unsuitable here. Use an explicit small bounded cache, atomic writes and corruption-as-miss. No A740 timing claim. | One std_vert0_lpf variant (or fixed_vert_lpf_spc) plus a fixed_frag_lpf_cpf constant-color specialization from CA's private default.metallib, BGRA8Unorm, one sample, no texture, no destination read/tile/compute. Get exact entry/constants/bindings from the external metallib; cache names alone do not establish their AIR ABI. |
+| (b) independent LLVM AIR -> SPIR-V | High: weeks for a narrow prototype, months for robust graphics. LLVM reading bitcode is only the front end: independently lower AIR metadata, address spaces, resource binding, sampling/interpolation, derivatives, function constants and graphics stage ABI into Vulkan Shader-capability SPIR-V. Khronos SPIRV-LLVM-Translator explicitly targets **OpenCL Kernel** SPIR-V; it is not a drop-in Vulkan vertex/fragment compiler. LLVM version compatibility and bitcode dialect remain checks. Observe LLVM/translator licenses and notices for the exact selected versions; using metal2vulkan's AIR crate/parser would retain its GPL/LGPL boundary rather than creating an independent permissive path. Never copy Apple's compiler implementation. | Larger LLVM dependency, startup/RSS and optimization cost on cold loads; still needs Turnip compilation. Translate only requested specializations, with finite budgets and the same content/ABI/driver cache keys. Host-assisted translation may speed experiments but is not the required on-device runtime. | The same constant-color pair, first proving metadata/resource/vertex IO lowering and spirv-val Vulkan validation. A generic llvm-spirv invocation is not this milestone. |
+| (c) original hand-ported replacements | Low for one offscreen constant-color test (days); medium/high and open-ended for CA compatibility (weeks/months as variants grow). Reimplement the observed interface and mathematically specified transform/color behavior in original GLSL/SPIR-V. No copied/decompiled Apple shader bodies, embedded Apple metallibs or instruction-by-instruction transcription; keep provenance for each implementation. Map only understood entry name + specialization + layout tuples and refuse every other variant. A small live working set has **not** been established. | Ship only our own compiled SPIR-V; no AIR translation at load. Still pay Vulkan pipeline/ir3 compilation once, cache by replacement version + specialization + render state + driver identity. Lower startup/RSS than an LLVM path but a growing compatibility table. | Original transform + solid premultiplied-color pair, one BGRA8Unorm target. Useful as a separately named validation control for (a); not evidence that it replaces CA's shader library. |
+
+Sources: pinned [manifest/license](https://github.com/steelbrain/metal2vulkan/blob/720ef1ce9ae2a2068999a8675717418b9416283e/Cargo.toml),
+[API and caching](https://github.com/steelbrain/metal2vulkan/blob/720ef1ce9ae2a2068999a8675717418b9416283e/docs/HOWTO.md),
+and Khronos [translator scope](https://github.com/KhronosGroup/SPIRV-LLVM-Translator#llvmspir-v-bi-directional-translator).
+
+M5b's concrete gate: parse the user's own external QuartzCore metallib, list
+entry points/constant IDs/binding metadata, choose the pair above, translate
+under a finite budget, validate Vulkan SPIR-V, create a bounded offscreen
+256x256 BGRA target and compare every pixel for an identity-transform solid
+quad plus edge sentinels. Record cold translation/pipeline time, warm cache
+load time and RSS on device; restart and test cache invalidation after a
+translator/profile/driver change. Validate color order, alpha, clipping and
+vertex layout before attempting texture sampling. Keep backboardd denied:
+passing that test does not supply the IOSurface/shared-event/presentation paths.
+
+## M5a build, verification and coordinator staging
+
+No XNU source/patch change. `build-fuxi-metal5a-images.sh` copies the M4 stripped
+and unstripped kernels, ADT and **exact command-line file**, then packs the new
+image. The resulting boot image is byte-identical to M4. The userspace bundle
+and policy must be staged for the gate to take effect; booting the renamed
+image alone does not install them.
+
+```sh
+# Native Mac, same external pinned Vulkan headers:
+bash tools/build-fuxi-metal.sh "$VULKAN_HEADERS"
+python3 tools/test-fuxi-metal-frontend.py
+python3 tools/test-fuxi-metal-stage.py
+# Linux actual backend with software Vulkan and injected faults:
+python3 tools/test-fuxi-metal-backend.py --headers "$VULKAN_HEADERS"
+# External absolute firmware/tool paths, same as M4:
+export FUXI_GMU_FIRMWARE FUXI_SQE_FIRMWARE FUXI_GPU_ZAP_MBN MKBOOTIMG
+bash tools/build-fuxi-metal5a-images.sh "$METAL4_ARTIFACTS"
+python3 tools/test-fuxi-metal-artifacts.py --lane metal5a \
+  --base "$METAL4_ARTIFACTS" --out xnu/out-fuxi-metal5a \
+  --firmware "$FUXI_GMU_FIRMWARE" --sqe "$FUXI_SQE_FIRMWARE" --zap "$FUXI_GPU_ZAP_MBN"
+# Coordinator only, on an already mounted writable root, as root:
+python3 tools/stage-fuxi-metal.py "$IOS_ROOT" \
+  tools/out/libvulkan_freedreno.dylib tools/out/FuxiMetal.bundle \
+  tools/out/fuxi-metal-smoke --conf tools/out/metal-smoke.conf \
+  --clients tools/out/metal-clients.conf
+```
+
+Passed: Mac ASan/UBSan frontend/gate/census and actual smoke control-flow tests;
+Linux software-Vulkan backend fill/copy/reopen plus timeout/loss/corruption;
+temporary-root staging and **codesign verification of the staged bundle** on
+Mac; existing Metal ABI/containment tests; artifact geometry, firmware sections,
+M4 byte equality and hash manifests. Plain arm64 iOS 16.0 artifacts were ad-hoc
+signed and signature-verified; load-command/CTR_EL0 audit and all **140** strong
+imports against the supplied iOS 16.7 cache passed. Audit reports now live
+outside the signed bundle and stale reports are removed before signing, so
+staging the three intended bundle members preserves its resource signature.
+These checks qualify host behavior/packaging, not M5a phone execution.
+
+Install all files below, **root:wheel (0:0)**. The default policy is exactly
+`fuxi-metal-smoke` plus newline, with no system UI allow/census entries. No
+launchd job, mounts, phone access, push, shader translator or firmware staging
+is part of this helper.
+
+| Artifact under `tools/out/` | iOS destination | Mode |
+| --- | --- | --- |
+| `libvulkan_freedreno.dylib` (unchanged M4) | `/usr/local/lib/libvulkan_freedreno.dylib` | 0755 |
+| `fuxi-metal-smoke` (unchanged M4) | `/usr/local/bin/fuxi-metal-smoke` | 0755 |
+| `metal-smoke.conf` | `/usr/local/share/fuxi/metal-smoke.conf` | 0644 |
+| **`metal-clients.conf`** | **`/usr/local/share/fuxi/metal-clients.conf`** | **0644** |
+| `FuxiMetal.bundle/FuxiMetal` | `/System/Library/Extensions/FuxiMetal.bundle/FuxiMetal` | 0755 |
+| `FuxiMetal.bundle/Info.plist` | `/System/Library/Extensions/FuxiMetal.bundle/Info.plist` | 0644 |
+| `FuxiMetal.bundle/_CodeSignature/CodeResources` | `/System/Library/Extensions/FuxiMetal.bundle/_CodeSignature/CodeResources` | 0644 |
+
+| M5a artifact | SHA256 |
+| --- | --- |
+| `xnu/out-fuxi-metal5a/kernel.development.fuxi` | `8bfeae158e8250e906e3b3ffbcbddb8f5d63404eedd9807cf8e2838cf7a1b5d9` |
+| `xnu/out-fuxi-metal5a/kernel.development.fuxi.unstripped` | `858e6cfe0b636530f7f8d097f23ca84a5f7efd0516093b74c5aba90431d353a8` |
+| `xnu/out-fuxi-metal5a/fuxi.adt` | `39aacea4d7db372314bdc7928a66271b3b5cc2bd878bec4d9cfe2f5191e83533` |
+| `shim/out/fuxi-metal5a-payload.bin` | `99ac95954ae0c743dac817d8be460933bcc99e7b05dff98925b4cda14ad7bcd8` |
+| `shim/out/fuxi-metal5a-boot.img` | `e10f981a0bae32ad5c892d978a786eabe4cc21acda6e35ed064f1ad68a53c4b6` |
+| `shim/out/fuxi-metal5a-loader.elf` | `0e5ae80e22a6a88d5e880a97d8b66a7c41750bae804728d8c99f76d9e23c07e9` |
+| `tools/out/libvulkan_freedreno.dylib` | `5661a054b5e4be57fe54bc38f3cccf6d264ae20562473caf72e50d2adc158a8c` |
+| `tools/out/FuxiMetal.bundle/FuxiMetal` | `1c4c8ab83cff014d45cb6dd8cb55802ff1ce7d8b693ca219967d0cfc0e6da37c` |
+| `tools/out/FuxiMetal.bundle/Info.plist` | `2578f53d73942a55e0163fa5c80c29beb00839bfb8db477a4060e0a81ab5fd06` |
+| `tools/out/FuxiMetal.bundle/_CodeSignature/CodeResources` | `9fcd9223ba2b40aee792c83c8edf32c7c1847f01369fbb0f230e1108a493451b` |
+| `tools/out/fuxi-metal-smoke` | `64e747d6a7079fee0a675b2f757752c1569b20c19484259d5122fcc63467aec7` |
+| `tools/out/metal-smoke.conf` | `1121cfccd5913f0a63fec40a6ffd44ea64f9dc135c66634ba001d10bcf4302a2` |
+| `tools/out/metal-clients.conf` | `8d5b163a382ff4eca7579803ec5dd9e2f24f8c0a4e3d65fc6965c539b3e7e6cc` |
+
+Complete manifests and analysis/test output are ignored. The supplied M4
+device input remains untracked. Only the original source, tools and this
+summary are committed; no external dependency, Apple code/binary, device log,
+firmware, machine-specific path or address is included.
+
 ---
 
 # Metal lane M4: native discovery and transfer-only frontend
@@ -78,8 +321,8 @@ Reproduce these checks with external Apple inputs; keep the output ignored:
 ```
 
 This establishes the lookup contract by disassembly/source review and native
-linking. The boot-time metaclass check and actual bundle/Metal registration
-still require the coordinator's device run; they are not host observations.
+linking. The coordinator subsequently observed the boot-time metaclass check and
+actual bundle/Metal registration PASS, as recorded in M5a above.
 M4a direct construction was unnecessary once this small route was established.
 
 ## M4 frontend contract
@@ -1378,9 +1621,9 @@ not establish Turnip or Metal success. Its documented Turnip IBs still hang CP.
    and CPU UI fallback after any future loss. Broader coherence, reset/recovery
    and workloads beyond the tested subset remain separate gates.
 4. **M4 Metal discovery/frontend:** native discovery class + signed transfer-only
-   bundle and smoke built/host-tested (M4 section above). **Device acceptance
-   pending:** require real unsandboxed-root MTLCreateSystemDefaultDevice,
-   shared-buffer blit fill, copy and 16 reuse rounds. A runtime size guard
+   bundle and smoke built/host-tested (M4 section above). **Observed PASS:** coordinator reported real unsandboxed-root
+   MTLCreateSystemDefaultDevice, shared-buffer blit fill, copy and 16 reuse
+   rounds. M5a adds a default-deny process gate and safe census stop. A runtime size guard
    requires 528. No iOS sandbox access, Apple user-client ABI or selector tunnel
    is implemented. Stop on failure; derive any additional requirements from
    the supplied iOS 16 cache before expanding the interface.
@@ -1404,8 +1647,8 @@ not establish Turnip or Metal success. Its documented Turnip IBs still hang CP.
 metal2g qualified raw IB/readback/reopen; metal3 subsequently qualified the
 reported Turnip fill/compute/triangle/reuse/reopen workload. These do not
 qualify general coherency, CP recovery, shaders beyond that workload, or M4
-Metal discovery. The M4 build adds the diagnostic frontend; device acceptance
-and all presentation integration remain pending. Raw PM4 is privileged and not validated as a security
+Metal discovery. M4 discovery/transfers passed on device; M5a adds host-verified gating and
+census. M5a device acceptance and all presentation integration remain pending. Raw PM4 is privileged and not validated as a security
 boundary; only an unsandboxed root diagnostic client is supported. Arbitrary
 root IBs can access privileged GPU state. Failed bus drain leaks/quarantines
 memory until reboot; wedged interconnect/MMIO can exceed software containment.

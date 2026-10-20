@@ -12,6 +12,8 @@ cxx=$(xcrun --sdk iphoneos --find clang++)
 flags=(-target arm64-apple-ios16.0 -isysroot "$sdk" -O2 -Wall -Wextra -Werror -Werror=unguarded-availability-new -fstack-protector-strong -fno-objc-arc -fblocks)
 bundle=$out/FuxiMetal.bundle
 mkdir -p "$bundle"
+# Audit reports are not bundle resources and must never enter its signature.
+rm -f "$bundle/FuxiMetal.undefined.txt"
 cp tools/fuxi-metal/Info.plist "$bundle/Info.plist"
 "$cxx" "${flags[@]}" -std=c++17 -I"$headers" -dynamiclib tools/fuxi-metal/Frontend.mm \
  -install_name /System/Library/Extensions/FuxiMetal.bundle/FuxiMetal \
@@ -24,6 +26,7 @@ for binary in "$bundle" "$out/fuxi-metal-smoke"; do
  codesign --verify --strict "$binary"
 done
 python3 tools/audit-fuxi-metal.py "$bundle/FuxiMetal" "$out/fuxi-metal-smoke"
+codesign --verify --strict "$bundle"
 shasum -a 256 "$bundle/FuxiMetal" "$bundle/Info.plist" "$bundle/_CodeSignature/CodeResources" \
  "$out/fuxi-metal-smoke" "$out/metal-smoke.conf" "$out/metal-clients.conf" > "$out/M5a-SHA256SUMS"
 cat "$out/M5a-SHA256SUMS"
