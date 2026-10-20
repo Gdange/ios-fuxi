@@ -1,7 +1,10 @@
 # ios-sweet
 
-> This checkout also tracks Xiaomi 13 (Fuxi) investigation in [FUXI.md](FUXI.md).
-> Fuxi has not booted XNU yet. The instructions below target Sweet only.
+> **Xiaomi 13 (`fuxi`, SM8550) port:** this fork also brings the same iOS 16 userland up on
+> the Xiaomi 13. It boots to SpringBoard from a `fastboot boot` loader, with touch, the power
+> and volume keys, a 60 Hz CPU-rendered display and CPU clock limits that keep it near 51 °C.
+> GPU work (Adreno A740: GMU firmware, HFI, GX power) is in progress. See [FUXI.md](FUXI.md),
+> [NOTES.md](NOTES.md) and [docs-lanes/](docs-lanes/). The instructions below target Sweet only.
 
 **Apple's iOS 16 running on a Redmi Note 10 Pro.**
 
@@ -202,5 +205,8 @@ Not in git: partition backups, live device trees, recovery images, Apple firmwar
 More in [`NOTES.md`](NOTES.md).
 
 ## Credits
+
+- **[ios-sweet](https://github.com/dipa-studio/ios-sweet) by [dipa-studio](https://github.com/dipa-studio)**: the original project this repository is forked from (the Sweet port, its XNU patches, tools and research). The Xiaomi 13 work builds on it.
+- **Claude Opus 5.5 ([Anthropic](https://www.anthropic.com))**: AI pair engineer on the Xiaomi 13 (`fuxi`) bring-up: loader, XNU patches, drivers, device testing and notes.
 
 Built on Apple's open-source releases (xnu, IOHIDFamily, libpthread, hfs), [BearSSL](https://bearssl.org), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build), [ipsw](https://github.com/blacktop/ipsw), Qualcomm/Xiaomi's published Linux kernel sources for the hardware details, and [OrangeFox Recovery](https://orangefox.download). iOS itself is Apple's and is not distributed here.
