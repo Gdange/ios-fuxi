@@ -2410,3 +2410,16 @@ normal memory; the 2D engine silently drops its writes. This firmware answers
 `is_supported(13)` with 0 even though the real PAS calls succeed, so the query is
 advisory only (Linux does not issue it either). The CB FSR bit 10 (0x400) on both
 banks remains unexplained and harmless so far.
+
+## Device results, milestone 6 in XNU (2026-10-20, coordinator)
+
+All runs boot iOS 16.7 to SpringBoard with `fuxigpu=1` and the 768 MiB `--gpu-reserve` layout.
+
+| Kernel | Result |
+| --- | --- |
+| 0096 / 0096b | Panic about 2 s after AppleCLCD: `kmem_alloc(…, 33554432, 0x100021): failed with 3`. Mapping the 32 MiB scratch through `ml_io_map` exhausts the 8 MiB IO submap, and the NOFAIL allocation panics instead of returning 0. (`mbuf_pool=64` in 0096b changed nothing.) |
+| 0096c | No panic. Clocks, GMU, HFI, GX, SMMU, CP and the fence all pass inside XNU. The zap fails: the first SMC returns with x0 still equal to the function id. The GPU disables itself and iOS keeps presenting on the CPU. |
+| 0096d | Root cause of 0096c: Apple's assembler treats `;` as a comment, so `"dsb sy; smc #0; dsb sy"` lost its `smc`. Fixed. All PAS calls return 0 on CPU0, the zap loads, TRUST goes to 0 and the self-test pixels pass. Every present goes through the GPU (600/600), but takes 13.6–14.0 ms per frame (38 fenced row batches, per-frame page mapping, busy polling), against about 1.25 ms for the CPU memcpy |
+| 0096e | Four cached backings, one submission per frame, targeted cache clean, sleeping wait. 594/596 presents on the GPU, 1.58 ms wall time and **0.72 ms CPU time per present** (clean 0.60, submit 0.03; the 0.93 ms wait is spent asleep). Cache hit 592/594 |
+
+The remaining CPU cost is cleaning the CPU-rendered source rows from the cache.
