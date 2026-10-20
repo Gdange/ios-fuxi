@@ -1,3 +1,87 @@
+# Metal lane, milestone 2g: full-width cache sync and bounded NC access
+
+2026-10-20, based on metal2e and Wi-Fi M6. No device execution in this lane.
+
+**Observed metal2f:** exec-swap as peakpowermanagerd reached open, query and
+DeviceInfo successfully, then panicked in `phystokv_range` with PA
+`0xc4f40000`, below the managed RAM base `0x8c0000000`. No backtrace was
+available. IOMFB_FDR_Loader previously passed `--launchd_boot`, which made the
+old test exit with usage before opening the GPU.
+
+**Root cause identified in the BO allocation cache path:**
+`FuxiAdrenoUserClient::allocate` requests `kIOMapWriteCombineCache` from
+`IOBufferMemoryDescriptor`. Changing wired pages from copyback to NC runs
+`pmap_sync_wimg` -> `pmap_sync_page_attributes_phys` -> `flush_dcache` ->
+`phystokv_range`. Upstream `osfmk/arm/pmap/pmap.c:6884` shifts the 32-bit
+`ppnum_t` before casting: `(vm_offset_t)(pp << PAGE_SHIFT)`. The metal2f
+kernel actually emits `lsl w0, w0, #14`. For example, managed PA
+`0x8c4f40000` becomes the exact reported illegal PA `0xc4f40000`. The log
+alone does not identify which original high RAM page was used; it does not
+establish that the reported low address was a real carve-out allocation.
+
+Patch 0101 widens before shifting. The final native kernel emits
+`ubfiz x19, x0, #14, #32`, preserving all 32 PFN bits. For reserved pages it
+looks up the entire page in the published GPU kernel_map NC windows and
+flushes through that VA, with `phys=FALSE`. Unknown non-RAM/non-window PAs
+are rejected before any physmap helper. Managed BO pages keep their full PA.
+
+**Access audit:** the ABI backend, present mapper, user client and shared
+GPU helpers contain no calls to physical zero/copy/read/write or physmap
+conversion functions. The user client accesses BOs through their descriptor
+KVAs. ABI/present `pmap_find_phys` calls translate wired source KVAs to PAs;
+`pmap_enter_options_addr` installs the persistent NC mappings and
+`pmap_remove` unwinds failed installation. These are not carve-out data
+accesses through physmap. Table walks, zeroing, ring storage, firmware and
+handoff reads now validate their full byte range through `G_PTR_RANGE` and
+`fuxi_gpu_nc_pointer`, with overflow and window-edge checks. MMIO validates
+the actual 4/8-byte width. There is no physmap fallback for NC windows.
+
+The test ignores host arguments whenever argv[0]'s basename differs from
+`fuxi-gpu-abi-test`. Only direct self invocation accepts `--watchdog`; host
+arguments can never select the hanging IB. Direct invalid arguments still
+return usage status 2.
+
+**Validation:** ASan/UBSan tests execute the actual NC lookup, scratch zero,
+patched pmap helper and argument parser. The original pmap helper fails the
+strict physmap trap with the reported low PA. All mapped apertures, unknown
+PAs, unpublished mappings, zero lengths, crossing ranges and overflow are
+covered. Existing ABI, execswap, mapper, present, shared probe, memory, WLAN
+M6 and final native SCM checks pass. Artifact checks verify firmware bytes,
+geometry, recovery table, service symbols, signed iOS arm64 tool and hashes.
+
+The Mac tree was synchronized to the current worktree, including replacing
+0099 with Wi-Fi M6, before building. The kernel and ad-hoc signed test were
+built on the Mac; the loader was packed with the existing host toolchain.
+The metal2g pack lane requires absolute external firmware/tool paths and
+copies metal2f's ADT and command line exactly: peakpowermanagerd exec-swap,
+bluetoothd/fairplayd.H2 blocked, and no `fuxiwlan` (Wi-Fi off).
+
+Artifacts: `xnu/out-fuxi-metal2g/`, `shim/out/fuxi-metal2g-boot.img`, and
+`tools/out/fuxi-gpu-abi-test`. SHA256s:
+
+- Kernel: `c476cba84af5e795d93e165c029df669b4127bd22d9de368b22f2a1c7942e217`
+- Unstripped: `dc80e71de18e10753eff3598fdc3ca248dbf13bfd0491dcc68f50e43b7fab7a3`
+- Boot: `aceb71bdf42b0741db826d636e6bbbbbe348181ff9497d77a3dcc91e76110556`
+- Signed test: `1114d442a5918ca05794acec6b0a4472ec92f62a5a1357a7886840682f252cb7`
+
+The rebuilt test still needs offline root restaging. Expected next device
+lines (not observed here), after the existing open/query/device-info lines:
+
+```text
+SWEET EXECSWAP: peakpowermanagerd -> /usr/local/bin/fuxi-gpu-abi-test pid N
+FUXI ABI: alloc pid N rc 0x00000000
+FUXI ABI: map pid N rc 0x00000000
+FUXI ABI: submit pid N rc 0x00000000
+FUXI ABI: wait pid N rc 0x00000000
+FUXI ABI: result pid N rc 0x00000000 mem 0xa740cafe bad-pixels 0 rounds 1/2
+```
+
+Then close/reopen, another successful alloc/map/submit/wait and result
+`rounds 2/2`, followed by close. A later respawn should report that the test
+already passed 2/2 rounds this boot. No physmap panic is expected.
+
+---
+
 # Metal lane, milestone 2c: page-granular UCHE readback
 
 2026-10-20, branch `codex-metal2c`, based on `2800fd5` (metal2b plus Wi-Fi

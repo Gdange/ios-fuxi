@@ -840,7 +840,7 @@ def main():
     source = source.replace('extern const uint8_t _zap_fw_start[], _zap_fw_end[];', 'extern uint8_t _zap_fw_start[], _zap_fw_end[];')
     source = source.replace('size_t bytes = (uintptr_t)_zap_fw_end-(uintptr_t)_zap_fw_start;', 'size_t bytes = test_zap_bytes;')
     source = re.sub(r'__asm__ volatile\([^;]+;', '', source)
-    needle = '*(volatile uint32_t *)G_PTR(base + off) = v;'
+    needle = '*(volatile uint32_t *)G_PTR_RANGE(base + off,4) = v;'
     assert source.count(needle) == 1
     source = source.replace(needle, needle + '\n mock_write(base + off, v);')
     with tempfile.TemporaryDirectory(prefix='fuxi-gpu-test-') as tmp:

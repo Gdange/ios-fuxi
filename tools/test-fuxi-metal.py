@@ -137,6 +137,7 @@ BACKEND_PREFIX = r'''
 #define kernel_pmap 0
 static uint8_t scratch[G_MEM_SIZE] __attribute__((aligned(16384)));
 #define G_PTR(pa) ((uintptr_t)(scratch+((pa)-G_MEM)))
+#define G_PTR_RANGE(pa, bytes) G_PTR(pa)
 typedef unsigned ppnum_t;
 typedef void *thread_call_param_t;
 typedef struct {void (*fn)(void *,void *);} thread_call_data_t;

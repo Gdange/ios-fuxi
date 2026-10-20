@@ -176,7 +176,7 @@ import os
 from pathlib import Path
 for key in ('FUXI_GMU_FIRMWARE','FUXI_SQE_FIRMWARE','FUXI_GPU_ZAP_MBN','MKBOOTIMG'):
     assert Path(os.environ[key]).is_absolute() and Path(os.environ[key]).is_file()
-out=Path('shim/out/fuxi-loader');out.mkdir(parents=True)
+out=Path('shim/out/fuxi-loader');out.mkdir(parents=True,exist_ok=True)
 for name in ('fuxi-xnu-boot.img','loader.elf'): (out/name).write_bytes(b'packed')
 PY
 ''')
@@ -199,6 +199,29 @@ PY
             (base/'cmdline.txt').write_text(invalid+'\n')
             assert subprocess.run(command,cwd=pack,env=env,capture_output=True).returncode
         print('PASS: metal2e exact cmdline, malformed/oversize base refusal, mandatory absolute firmware/tool paths forwarded to loader')
+        # metal2g must copy the exact metal2f command line, never normalize it.
+        out=pack/'xnu/out-fuxi-metal2g';out.mkdir()
+        for name in ('kernel.development.fuxi','kernel.development.fuxi.unstripped'):
+            (out/name).write_bytes(b'kernel')
+        metal2f=expected.replace('IOMFB_FDR_Loader:','peakpowermanagerd:')
+        (base/'cmdline.txt').write_text(metal2f+'\n')
+        command[-1]='metal2g'
+        for key in required:
+            for value in (None,'relative/path'):
+                badenv=dict(env)
+                if value is None:badenv.pop(key)
+                else:badenv[key]=value
+                run=subprocess.run(command,cwd=pack,env=badenv,capture_output=True,text=True)
+                assert run.returncode and key in run.stderr,run
+        subprocess.run(command,cwd=pack,env=env,check=True)
+        assert (out/'cmdline.txt').read_bytes()==(base/'cmdline.txt').read_bytes()
+        for invalid in (metal2f+' fuxiwlan=1',metal2f+' sweetexecswap=other:/test',
+                metal2f+' sweetnoexec=other',metal2f+' '+('x'*608),
+                metal2f.replace('peakpowermanagerd:','IOMFB_FDR_Loader:'),
+                metal2f.replace('sweetnoexec=bluetoothd,fairplayd.H2','sweetnoexec=fairplayd.H2')):
+            (base/'cmdline.txt').write_text(invalid+'\n')
+            assert subprocess.run(command,cwd=pack,env=env,capture_output=True).returncode
+        print('PASS: metal2g byte-exact metal2f cmdline, Wi-Fi off, mandatory absolute firmware inputs')
         stage=module('stage-fuxi-gpu-abi-test')
         root=temp/'root';cache=root/'System/Library/xpc/launchd.plist';cache.parent.mkdir(parents=True)
         other={'Label':'com.example.other','RunAtLoad':True}

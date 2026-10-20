@@ -125,11 +125,23 @@ static int round(io_connect_t c,bool hang)
  NativeAdrenoAbiBoFree release{bo.handle}; kr=call(c,4,&release,nullptr); errors+=line(!kr,"BO free",kr);
  return errors;
 }
+/* Exec-swap preserves the host argv, including launchd-only switches.
+ * Only explicit invocation of this test may request the hanging IB. */
+static int test_arguments(int argc, char **argv)
+{
+ const char *name=argc>0 && argv && argv[0] ? argv[0] : "";
+ const char *slash=strrchr(name,'/');
+ if (strcmp(slash ? slash+1 : name,"fuxi-gpu-abi-test")) return 0;
+ if (argc==1) return 0;
+ if (argc==2 && !strcmp(argv[1],"--watchdog")) return 1;
+ return -1;
+}
 int main(int argc,char **argv)
 {
  setbuf(stdout,nullptr); setbuf(stderr,nullptr);
- bool hang=argc==2 && !strcmp(argv[1],"--watchdog");
- if (argc>1 && !hang) { fprintf(stderr,"usage: %s [--watchdog]\n",argv[0]); return 2; }
+ int mode=test_arguments(argc,argv);
+ bool hang=mode==1;
+ if (mode<0) { fprintf(stderr,"usage: %s [--watchdog]\n",argv[0]); return 2; }
  if (!load()) return 1;
  io_service_t service=0;
  for (unsigned i=0;i<60 && !service;i++) {

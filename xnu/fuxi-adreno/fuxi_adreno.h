@@ -8,6 +8,8 @@ struct fg_times {
  uint64_t pin, lookup, map, clean, submit, wait, unmap, cpu;
  unsigned attempts, hits, misses, sleeps, blocks, groups;
 };
+/* Full-range lookup only; zero for unpublished, wrapping or unknown PAs. */
+uintptr_t fuxi_gpu_nc_pointer(uint64_t pa, uint64_t bytes);
 int fuxi_gpu_ready(void);
 void fuxi_gpu_start(uint64_t framebuffer, unsigned width, unsigned height, unsigned pitch);
 int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,

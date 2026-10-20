@@ -22,6 +22,9 @@
 #ifndef G_PTR
 #define G_PTR(pa) ((uintptr_t)(pa))
 #endif
+#ifndef G_PTR_RANGE
+#define G_PTR_RANGE(pa, bytes) G_PTR(pa)
+#endif
 #ifndef G_RING_INDEX
 #define G_RING_INDEX(w) (w)
 #endif
@@ -117,7 +120,7 @@ static uint32_t g_rd(uint64_t base, uint32_t off)
  #ifdef FUXI_GPU_XNU
  uint32_t f, v = probe_safe_rd32(base + off, &f);
 #else
- uint32_t v = *(volatile uint32_t *)G_PTR(base + off);
+ uint32_t v = *(volatile uint32_t *)G_PTR_RANGE(base + off,4);
 #endif
  __asm__ volatile("dmb oshld" ::: "memory");
  return v;
@@ -128,7 +131,7 @@ static void g_wr(uint64_t base, uint32_t off, uint32_t v)
  #ifdef FUXI_GPU_XNU
  (void)probe_safe_wr32(base + off, v);
 #else
- *(volatile uint32_t *)G_PTR(base + off) = v;
+ *(volatile uint32_t *)G_PTR_RANGE(base + off,4) = v;
 #endif
  __asm__ volatile("dsb osh" ::: "memory");
 }
@@ -214,13 +217,13 @@ static void g_wr64(uint64_t at, uint64_t val)
  #ifdef FUXI_GPU_XNU
  fg_store64(at, val);
 #else
- *(volatile uint64_t *)G_PTR(at) = val;
+ *(volatile uint64_t *)G_PTR_RANGE(at,8) = val;
 #endif
  __asm__ volatile("dsb sy" ::: "memory");
 }
 static void g_zero(uint64_t at, unsigned bytes)
 {
- volatile uint64_t *p = (volatile uint64_t *)G_PTR(at);
+ volatile uint64_t *p = (volatile uint64_t *)G_PTR_RANGE(at,bytes);
  for (unsigned i = 0; i < bytes / 8; i++) p[i] = 0;
  __asm__ volatile("dsb sy" ::: "memory");
 }
@@ -306,13 +309,13 @@ static int g_map_at(uint64_t root, unsigned *next, unsigned va, uint64_t pa, uns
 {
  for (unsigned off = 0; off < size; off += 4096) {
   unsigned v = va + off;
-  volatile uint64_t *l1 = (volatile uint64_t *)G_PTR(root);
+  volatile uint64_t *l1 = (volatile uint64_t *)G_PTR_RANGE(root,4096);
   unsigned a = v >> 30;
   if (!l1[a]) { uint64_t t = g_new_table_at(root, next); if (!t) return 0; l1[a] = t | 3; }
-  volatile uint64_t *l2 = (volatile uint64_t *)G_PTR(l1[a] & ~0xfffull);
+  volatile uint64_t *l2 = (volatile uint64_t *)G_PTR_RANGE(l1[a] & ~0xfffull,4096);
   unsigned b = (v >> 21) & 511;
   if (!l2[b]) { uint64_t t = g_new_table_at(root, next); if (!t) return 0; l2[b] = t | 3; }
-  volatile uint64_t *l3 = (volatile uint64_t *)G_PTR(l2[b] & ~0xfffull);
+  volatile uint64_t *l3 = (volatile uint64_t *)G_PTR_RANGE(l2[b] & ~0xfffull,4096);
   unsigned c = (v >> 12) & 511;
   if (l3[c]) return 0;
   l3[c] = (pa + off) | 3 | (3u << 8) | (1u << 10) | attr;
@@ -854,7 +857,7 @@ static void g3_emit(uint32_t word)
 #ifdef FUXI_GPU_XNU
  /* Uncached scratch, serialized once at the doorbell. Avoid an MMIO
   * recovery call and three barriers for every command dword. */
- ((volatile uint32_t *)G_PTR(G3_RING_PA))[G_RING_INDEX(g3_wptr++)] = word;
+ ((volatile uint32_t *)G_PTR_RANGE(G3_RING_PA,32768))[G_RING_INDEX(g3_wptr++)] = word;
 #else
  g_wr(G3_RING_PA, G_RING_INDEX(g3_wptr++) * 4, word);
 #endif
@@ -1533,8 +1536,8 @@ static int g4_copy(unsigned panel, uint32_t *d)
    * Baseline is probe.c's volatile byte memcpy, MMU/caches off. */
   d[3] = 7; start = g4_counter();
   for (unsigned y = 0; y < height; y++)
-   memcpy((void *)G_PTR(panel ? G4_FB_PA+((y+G4_FB_Y)*1080u+G4_FB_X)*4u : G4_DST_PA+y*1024u),
-          (const void *)G_PTR(G4_SRC_PA+y*1024u), 1024);
+   memcpy((void *)G_PTR_RANGE(panel ? G4_FB_PA+((y+G4_FB_Y)*1080u+G4_FB_X)*4u : G4_DST_PA+y*1024u,1024),
+          (const void *)G_PTR_RANGE(G4_SRC_PA+y*1024u,1024), 1024);
   __asm__ volatile("dsb sy" ::: "memory");
   elapsed = g4_counter()-start; d[40] = elapsed; d[41] = elapsed>>32;
   d[43] |= G4_CPU_VALID;

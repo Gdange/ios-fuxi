@@ -10,7 +10,68 @@
  iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
 --- a/bsd/dev/gpu.c
 +++ b/bsd/dev/gpu.c
-@@ -672,10 +672,16 @@
+@@ -21,6 +21,9 @@
+  * supplies mapped addresses, fault-contained MMIO and staged firmware. */
+ #ifndef G_PTR
+ #define G_PTR(pa) ((uintptr_t)(pa))
++#endif
++#ifndef G_PTR_RANGE
++#define G_PTR_RANGE(pa, bytes) G_PTR(pa)
+ #endif
+ #ifndef G_RING_INDEX
+ #define G_RING_INDEX(w) (w)
+@@ -117,7 +120,7 @@
+  #ifdef FUXI_GPU_XNU
+  uint32_t f, v = probe_safe_rd32(base + off, &f);
+ #else
+- uint32_t v = *(volatile uint32_t *)G_PTR(base + off);
++ uint32_t v = *(volatile uint32_t *)G_PTR_RANGE(base + off,4);
+ #endif
+  __asm__ volatile("dmb oshld" ::: "memory");
+  return v;
+@@ -128,7 +131,7 @@
+  #ifdef FUXI_GPU_XNU
+  (void)probe_safe_wr32(base + off, v);
+ #else
+- *(volatile uint32_t *)G_PTR(base + off) = v;
++ *(volatile uint32_t *)G_PTR_RANGE(base + off,4) = v;
+ #endif
+  __asm__ volatile("dsb osh" ::: "memory");
+ }
+@@ -214,13 +217,13 @@
+  #ifdef FUXI_GPU_XNU
+  fg_store64(at, val);
+ #else
+- *(volatile uint64_t *)G_PTR(at) = val;
++ *(volatile uint64_t *)G_PTR_RANGE(at,8) = val;
+ #endif
+  __asm__ volatile("dsb sy" ::: "memory");
+ }
+ static void g_zero(uint64_t at, unsigned bytes)
+ {
+- volatile uint64_t *p = (volatile uint64_t *)G_PTR(at);
++ volatile uint64_t *p = (volatile uint64_t *)G_PTR_RANGE(at,bytes);
+  for (unsigned i = 0; i < bytes / 8; i++) p[i] = 0;
+  __asm__ volatile("dsb sy" ::: "memory");
+ }
+@@ -306,13 +309,13 @@
+ {
+  for (unsigned off = 0; off < size; off += 4096) {
+   unsigned v = va + off;
+-  volatile uint64_t *l1 = (volatile uint64_t *)G_PTR(root);
++  volatile uint64_t *l1 = (volatile uint64_t *)G_PTR_RANGE(root,4096);
+   unsigned a = v >> 30;
+   if (!l1[a]) { uint64_t t = g_new_table_at(root, next); if (!t) return 0; l1[a] = t | 3; }
+-  volatile uint64_t *l2 = (volatile uint64_t *)G_PTR(l1[a] & ~0xfffull);
++  volatile uint64_t *l2 = (volatile uint64_t *)G_PTR_RANGE(l1[a] & ~0xfffull,4096);
+   unsigned b = (v >> 21) & 511;
+   if (!l2[b]) { uint64_t t = g_new_table_at(root, next); if (!t) return 0; l2[b] = t | 3; }
+-  volatile uint64_t *l3 = (volatile uint64_t *)G_PTR(l2[b] & ~0xfffull);
++  volatile uint64_t *l3 = (volatile uint64_t *)G_PTR_RANGE(l2[b] & ~0xfffull,4096);
+   unsigned c = (v >> 12) & 511;
+   if (l3[c]) return 0;
+   l3[c] = (pa + off) | 3 | (3u << 8) | (1u << 10) | attr;
+@@ -672,10 +675,16 @@
  #define G3_RING_PA  (G_MEM + 0x1320000)
  #define G3_PTR_PA   (G_MEM + 0x1328000)
  #define G3_FENCE_PA (G_MEM + 0x1329000)
@@ -30,6 +91,26 @@
  #define G3_MAGIC    0xa740f00du
  #define G3_GUARD    0x5ac3e17bu
  #define G3_FSR_MASK 0xc00001feu /* SMMUv2 defined faults; keep reserved bit10 in report */
+@@ -848,7 +857,7 @@
+ #ifdef FUXI_GPU_XNU
+  /* Uncached scratch, serialized once at the doorbell. Avoid an MMIO
+   * recovery call and three barriers for every command dword. */
+- ((volatile uint32_t *)G_PTR(G3_RING_PA))[G_RING_INDEX(g3_wptr++)] = word;
++ ((volatile uint32_t *)G_PTR_RANGE(G3_RING_PA,32768))[G_RING_INDEX(g3_wptr++)] = word;
+ #else
+  g_wr(G3_RING_PA, G_RING_INDEX(g3_wptr++) * 4, word);
+ #endif
+@@ -1527,8 +1536,8 @@
+    * Baseline is probe.c's volatile byte memcpy, MMU/caches off. */
+   d[3] = 7; start = g4_counter();
+   for (unsigned y = 0; y < height; y++)
+-   memcpy((void *)G_PTR(panel ? G4_FB_PA+((y+G4_FB_Y)*1080u+G4_FB_X)*4u : G4_DST_PA+y*1024u),
+-          (const void *)G_PTR(G4_SRC_PA+y*1024u), 1024);
++   memcpy((void *)G_PTR_RANGE(panel ? G4_FB_PA+((y+G4_FB_Y)*1080u+G4_FB_X)*4u : G4_DST_PA+y*1024u,1024),
++          (const void *)G_PTR_RANGE(G4_SRC_PA+y*1024u,1024), 1024);
+   __asm__ volatile("dsb sy" ::: "memory");
+   elapsed = g4_counter()-start; d[40] = elapsed; d[41] = elapsed>>32;
+   d[43] |= G4_CPU_VALID;
 --- a/bsd/dev/fuxi_adreno.c
 +++ b/bsd/dev/fuxi_adreno.c
 @@ -21,6 +21,9 @@
@@ -42,10 +123,53 @@
  extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
  /* The BSD header export omits sched_prim's private dependencies. These match
   * osfmk/kern/{processor,sched_prim}.h; processor_t remains opaque here. */
-@@ -139,6 +142,13 @@
-  *size = h->fw_size[which];
-  return (const uint8_t *)fg_pointer(FG_FW_BASE + which*FG_FW_SLOT);
+@@ -95,17 +98,31 @@
+ static unsigned fg_access_failed;
+ uint32_t probe_fault_esr;
+ uint64_t probe_fault_far;
+-static uintptr_t fg_pointer(uint64_t pa)
+-{
++uintptr_t fuxi_gpu_nc_pointer(uint64_t pa, uint64_t bytes)
++{
++ if (!bytes) return 0;
+  for (unsigned i = 0; i < sizeof(fg_windows)/sizeof(fg_windows[0]); i++) {
+   struct fg_window *w = &fg_windows[i];
+-  if (pa >= w->pa && pa-w->pa < w->size && w->va) return w->va + pa-w->pa;
++  if (pa < w->pa || !w->va) continue;
++  uint64_t offset = pa-w->pa;
++  if (offset >= w->size || bytes > w->size-offset || offset > UINTPTR_MAX-w->va) continue;
++  uintptr_t va = w->va + offset;
++  if (bytes-1 <= UINTPTR_MAX-va) return va;
+  }
+  return 0;
  }
++/* No physmap fallback: reserved scratch, firmware and MMIO live in the
++ * lifetime kernel_map NC windows. Reject an entire access crossing an edge. */
++static uintptr_t fg_pointer(uint64_t pa) { return fuxi_gpu_nc_pointer(pa, 1); }
++static uintptr_t fg_pointer_range(uint64_t pa, uint64_t bytes)
++{
++ uintptr_t va = fuxi_gpu_nc_pointer(pa, bytes);
++ if (!va) panic("FUXI GPU: unmapped NC range PA %#llx bytes %#llx", pa, bytes);
++ return va;
++}
+ static unsigned fg_access(uint64_t pa, uint64_t *v, unsigned wr, unsigned wide)
+ {
+- uintptr_t va = fg_pointer(pa);
++ uintptr_t va = fuxi_gpu_nc_pointer(pa, wide ? 8 : 4);
+  if (!va || (pa & (wide ? 7 : 3))) return fg_access_failed = 1;
+  unsigned bad = fuxi_gpu_access(va, v, wr, wide);
+  if (bad) {
+@@ -135,12 +152,20 @@
+ }
+ static const uint8_t *fg_firmware(unsigned which, unsigned *size)
+ {
+- const struct fg_handoff *h = (const struct fg_handoff *)fg_pointer(FG_HANDOFF);
++ const struct fg_handoff *h = (const struct fg_handoff *)fg_pointer_range(FG_HANDOFF, sizeof(struct fg_handoff));
+  *size = h->fw_size[which];
+- return (const uint8_t *)fg_pointer(FG_FW_BASE + which*FG_FW_SLOT);
+-}
++ return (const uint8_t *)fg_pointer_range(FG_FW_BASE + which*FG_FW_SLOT, FG_FW_SLOT);
++}
 +static unsigned fg_abi_enabled, fg_client_busy;
 +static IOLock *fg_ring_lock;
 +/* Present callers already hold the surface lock. ABI never takes that lock;
@@ -55,8 +179,22 @@
 +#define FG_GUARD struct fg_guard guard __attribute__((cleanup(fg_guard_exit))) = {fg_ring_lock}; if (guard.lock) IOLockLock(guard.lock)
  #define FUXI_GPU_XNU 1
  #define G_PTR(pa) fg_pointer(pa)
++#define G_PTR_RANGE(pa, bytes) fg_pointer_range(pa, bytes)
  #define G_RING_INDEX(w) ((w) & 8191u)
-@@ -265,6 +275,7 @@
+ static void fg_scm_call(uint64_t ret[4], unsigned slot, unsigned step,
+     uint32_t fn, uint32_t info, uint64_t a, uint64_t b, uint64_t c);
+@@ -200,8 +225,8 @@
+ static ppnum_t fg_ppns[FG_SOURCE_BYTES/PAGE_SIZE+1];
+ static volatile uint64_t *fg_l2(void)
+ {
+- volatile uint64_t *root = (volatile uint64_t *)G_PTR(G3_PT);
+- return (volatile uint64_t *)G_PTR(root[1] & ~4095ULL);
++ volatile uint64_t *root = (volatile uint64_t *)G_PTR_RANGE(G3_PT,4096);
++ return (volatile uint64_t *)G_PTR_RANGE(root[1] & ~4095ULL,4096);
+ }
+ static volatile unsigned fg_state; /* 0 disabled/starting, 1 ready, 2 permanently failed */
+ static unsigned fg_started, fg_limit, fg_force, fg_seq;
+@@ -265,6 +290,7 @@
   * new generation. No PFN scan or TLB invalidation on a cache hit. */
  int fuxi_gpu_unmap(unsigned slot, struct fg_times *t)
  {
@@ -64,7 +202,7 @@
   if (slot >= FG_CACHE_SLOTS || fg_busy) return 0;
   uint64_t start = mach_absolute_time();
   volatile uint64_t *l2 = fg_l2();
-@@ -285,6 +296,7 @@
+@@ -285,10 +311,11 @@
  int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,
      uint64_t length, struct fg_times *t)
  {
@@ -72,7 +210,12 @@
   if (!fuxi_gpu_ready() || slot >= FG_CACHE_SLOTS || !generation || fg_generation[slot] || !length ||
       length > FG_SOURCE_BYTES || length+(source&4095) > FG_SOURCE_BYTES) return 0;
   uint64_t start = mach_absolute_time();
-@@ -341,6 +353,7 @@
+- volatile uint64_t *leaves = (volatile uint64_t *)G_PTR(FG_SOURCE_TABLE+slot*32768);
++ volatile uint64_t *leaves = (volatile uint64_t *)G_PTR_RANGE(FG_SOURCE_TABLE+slot*32768,32768);
+  volatile uint64_t *l2 = fg_l2();
+  unsigned first = ((FG_SOURCE_VA >> 21) & 511) + slot*FG_SOURCE_L3;
+  unsigned pages = (length+(source&4095)+4095)/4096;
+@@ -341,6 +368,7 @@
   t->misses++;
   return 1;
  }
@@ -80,7 +223,25 @@
  static thread_call_data_t fg_init_call;
  static void fg_thread(thread_call_param_t arg, thread_call_param_t result)
  {
-@@ -393,7 +406,13 @@
+@@ -359,7 +387,7 @@
+  }
+  kern_return_t kr = fg_map_windows();
+  if (kr != KERN_SUCCESS) { fg_fail("uncached mapping failed", kr); goto out; }
+- const struct fg_handoff *h = (const struct fg_handoff *)G_PTR(FG_HANDOFF);
++ const struct fg_handoff *h = (const struct fg_handoff *)G_PTR_RANGE(FG_HANDOFF,sizeof(struct fg_handoff));
+  if (h->magic != FG_MAGIC || h->version != 1 || h->bytes != sizeof(*h) || h->reserved ||
+      h->base != FG_SCRATCH || h->size != FG_SCRATCH_SIZE) {
+   fg_fail("missing/invalid cold firmware handoff", 3); goto out;
+@@ -367,7 +395,7 @@
+  for (unsigned i = 0; i < 3; i++) {
+   unsigned n = h->fw_size[i];
+   if (!n || n > FG_FW_SLOT || (n & 3) ||
+-      fg_hash((const uint8_t *)G_PTR(FG_FW_BASE+i*FG_FW_SLOT), n) != h->fw_hash[i]) {
++      fg_hash((const uint8_t *)G_PTR_RANGE(FG_FW_BASE+i*FG_FW_SLOT,n), n) != h->fw_hash[i]) {
+    fg_fail("firmware size/checksum", i); goto out;
+   }
+  }
+@@ -393,7 +421,13 @@
   uint32_t tlb[128] = {0};
   if (g4_tlb(tlb) || fg_access_failed) { fg_fail("initial TLB sync", 5); goto out; }
   printf("FUXI GPU: ready, BGRA strided rects + one fence, 4 cached backings, 220 MHz, async one-in-flight, no timer sleep\n");
@@ -94,7 +255,7 @@
   out: return;
  }
  void fuxi_gpu_start(uint64_t fb, unsigned width, unsigned height, unsigned pitch)
-@@ -402,6 +421,12 @@
+@@ -402,6 +436,12 @@
   (void)PE_parse_boot_argn("fuxigpu", &enable, sizeof(enable));
   if (enable != 1 || fg_started) return;
   fg_started = 1; fg_limit = 17;
@@ -107,7 +268,7 @@
   (void)PE_parse_boot_argn("fuxigpu_stage", &fg_limit, sizeof(fg_limit));
   (void)PE_parse_boot_argn("fuxigpu_fail", &fg_force, sizeof(fg_force));
   if ((fg_limit != 13 && fg_limit != 16 && fg_limit != 17) ||
-@@ -455,6 +480,7 @@
+@@ -455,6 +495,7 @@
   * A completed fence wins over a late timer/deadline. */
  int fuxi_gpu_poll(struct fg_times *t)
  {
@@ -115,7 +276,7 @@
   if (!fg_busy) return 1;
   int err = fg_access_failed || g3_faulted();
   if (!err && g3_read(G3_FENCE_PA+64) == fg_magic && g3_gr(0x806) == g3_wptr &&
-@@ -475,7 +501,8 @@
+@@ -475,7 +516,8 @@
      unsigned pitch, unsigned sx, unsigned sy, unsigned dx, unsigned dy,
      unsigned width, unsigned height, struct fg_times *t)
  {
@@ -125,7 +286,7 @@
   if (!width || !height || width > 1080 || height > 2400 || dx > 1080-width || dy > 2400-height ||
       (source & 3) || (pitch & 3) || pitch > 131008 || ((uint64_t)sx+width)*4 > pitch ||
       length+(source&4095) > FG_SOURCE_BYTES ||
-@@ -512,4 +539,5 @@
+@@ -512,4 +554,5 @@
   fg_busy = 1;
   return 2; /* submitted; source is owned until poll retires this fence */
  }
@@ -133,7 +294,7 @@
  #endif
 --- a/bsd/dev/fuxi_adreno.h
 +++ b/bsd/dev/fuxi_adreno.h
-@@ -2,7 +2,8 @@
+@@ -2,11 +2,14 @@
  #define FUXI_ADRENO_H
  #define FG_CACHE_SLOTS 4u
  /* Timings in mach absolute ticks, CPU uses scheduler runtime (excludes sleep).
@@ -143,6 +304,12 @@
  struct fg_times {
   uint64_t pin, lookup, map, clean, submit, wait, unmap, cpu;
   unsigned attempts, hits, misses, sleeps, blocks, groups;
+ };
++/* Full-range lookup only; zero for unpublished, wrapping or unknown PAs. */
++uintptr_t fuxi_gpu_nc_pointer(uint64_t pa, uint64_t bytes);
+ int fuxi_gpu_ready(void);
+ void fuxi_gpu_start(uint64_t framebuffer, unsigned width, unsigned height, unsigned pitch);
+ int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,
 --- a/iokit/Kernel/arm/FuxiAdrenoUserClient.cpp
 +++ b/iokit/Kernel/arm/FuxiAdrenoUserClient.cpp
 @@ -0,0 +1,315 @@
@@ -484,7 +651,7 @@
 +static volatile uint64_t *fg_abi_leaf(uint64_t iova)
 +{
 + unsigned chunk = (unsigned)((iova-FG_ABI_VA_START)>>21);
-+ return (volatile uint64_t *)G_PTR(FG_ABI_PT+(4u+chunk)*4096)+((iova>>12)&511);
++ return (volatile uint64_t *)G_PTR_RANGE(FG_ABI_PT+(4u+chunk)*4096,4096)+((iova>>12)&511);
 +}
 +static int fg_abi_switch(uint64_t root)
 +{
@@ -608,10 +775,10 @@
 +  }
 + }
 + g_zero(FG_ABI_PT,FG_ABI_PT_BYTES);
-+ volatile uint64_t *root = (volatile uint64_t *)G_PTR(FG_ABI_PT);
-+ volatile uint64_t *l20 = (volatile uint64_t *)G_PTR(FG_ABI_PT+4096);
-+ volatile uint64_t *l21 = (volatile uint64_t *)G_PTR(FG_ABI_PT+8192);
-+ volatile uint64_t *runtime = (volatile uint64_t *)G_PTR(FG_ABI_PT+12288);
++ volatile uint64_t *root = (volatile uint64_t *)G_PTR_RANGE(FG_ABI_PT,4096);
++ volatile uint64_t *l20 = (volatile uint64_t *)G_PTR_RANGE(FG_ABI_PT+4096,4096);
++ volatile uint64_t *l21 = (volatile uint64_t *)G_PTR_RANGE(FG_ABI_PT+8192,4096);
++ volatile uint64_t *runtime = (volatile uint64_t *)G_PTR_RANGE(FG_ABI_PT+12288,4096);
 + root[0]=(FG_ABI_PT+4096)|3; root[1]=(FG_ABI_PT+8192)|3;
 + l20[G3_SQE_VA>>21]=(FG_ABI_PT+12288)|3;
 + for (unsigned i=0;i<0x2a000/4096;i++) {

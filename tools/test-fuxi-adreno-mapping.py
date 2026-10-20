@@ -20,9 +20,10 @@ PREFIX = r'''
 #define FG_GUARD
 static unsigned fg_abi_enabled;
 static void *fg_ring_lock;
+#include <stdlib.h>
+static void panic(const char *fmt, ...) { (void)fmt; abort(); }
 static void *IOLockAlloc(void) { return (void *)1; }
 #include <stdint.h>
-#include <stdlib.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -237,8 +238,8 @@ def main():
         for b, m in windows[i+1:]:
             assert a+n <= b or b+m <= a, 'overlapping platform mappings'
     functions = ''.join(submit.function(adapter, n) for n in
-                        ('fg_map_window', 'fg_map_windows', 'fg_pointer', 'fg_fail'))
-    functions += 'static thread_call_data_t fg_init_call;\n#define G_PTR(pa) fg_pointer(pa)\n'
+                        ('fg_map_window', 'fg_map_windows', 'fuxi_gpu_nc_pointer', 'fg_pointer', 'fg_pointer_range', 'fg_fail'))
+    functions += 'static thread_call_data_t fg_init_call;\n#define G_PTR(pa) fg_pointer(pa)\n#define G_PTR_RANGE(pa, bytes) fg_pointer_range(pa, bytes)\n'
     functions += ''.join(submit.function(adapter, n) for n in ('fg_thread', 'fuxi_gpu_start'))
     handoff = (ROOT / 'shim/fuxi-probe/gpu-handoff.h').read_text()
     with tempfile.TemporaryDirectory() as d:

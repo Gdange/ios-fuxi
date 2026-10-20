@@ -18,7 +18,7 @@ static thread_call_data_t fg_client_watchdog;
 static volatile uint64_t *fg_abi_leaf(uint64_t iova)
 {
  unsigned chunk = (unsigned)((iova-FG_ABI_VA_START)>>21);
- return (volatile uint64_t *)G_PTR(FG_ABI_PT+(4u+chunk)*4096)+((iova>>12)&511);
+ return (volatile uint64_t *)G_PTR_RANGE(FG_ABI_PT+(4u+chunk)*4096,4096)+((iova>>12)&511);
 }
 static int fg_abi_switch(uint64_t root)
 {
@@ -142,10 +142,10 @@ static int fg_abi_init(void)
   }
  }
  g_zero(FG_ABI_PT,FG_ABI_PT_BYTES);
- volatile uint64_t *root = (volatile uint64_t *)G_PTR(FG_ABI_PT);
- volatile uint64_t *l20 = (volatile uint64_t *)G_PTR(FG_ABI_PT+4096);
- volatile uint64_t *l21 = (volatile uint64_t *)G_PTR(FG_ABI_PT+8192);
- volatile uint64_t *runtime = (volatile uint64_t *)G_PTR(FG_ABI_PT+12288);
+ volatile uint64_t *root = (volatile uint64_t *)G_PTR_RANGE(FG_ABI_PT,4096);
+ volatile uint64_t *l20 = (volatile uint64_t *)G_PTR_RANGE(FG_ABI_PT+4096,4096);
+ volatile uint64_t *l21 = (volatile uint64_t *)G_PTR_RANGE(FG_ABI_PT+8192,4096);
+ volatile uint64_t *runtime = (volatile uint64_t *)G_PTR_RANGE(FG_ABI_PT+12288,4096);
  root[0]=(FG_ABI_PT+4096)|3; root[1]=(FG_ABI_PT+8192)|3;
  l20[G3_SQE_VA>>21]=(FG_ABI_PT+12288)|3;
  for (unsigned i=0;i<0x2a000/4096;i++) {

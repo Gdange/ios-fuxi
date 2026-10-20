@@ -60,6 +60,7 @@ static ppnum_t fg_ppns[FG_SOURCE_BYTES/PAGE_SIZE+1];
 static uint64_t model_leaves[16384];
 static volatile uint64_t *fg_l2(void) { return model_l2; }
 #define G_PTR(pa) ((uintptr_t)((uint8_t *)model_leaves+(pa)-FG_SOURCE_TABLE))
+#define G_PTR_RANGE(pa, bytes) G_PTR(pa)
 static unsigned fg_state=1, fg_force, fg_seq, fg_access_failed, g3_wptr;
 static unsigned g3_slot[2]={1,2};
 static uint64_t fg_deadline, fg_submit_time, ticks;

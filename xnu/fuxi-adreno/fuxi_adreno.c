@@ -98,17 +98,31 @@ static kern_return_t fg_map_windows(void)
 static unsigned fg_access_failed;
 uint32_t probe_fault_esr;
 uint64_t probe_fault_far;
-static uintptr_t fg_pointer(uint64_t pa)
+uintptr_t fuxi_gpu_nc_pointer(uint64_t pa, uint64_t bytes)
 {
+ if (!bytes) return 0;
  for (unsigned i = 0; i < sizeof(fg_windows)/sizeof(fg_windows[0]); i++) {
   struct fg_window *w = &fg_windows[i];
-  if (pa >= w->pa && pa-w->pa < w->size && w->va) return w->va + pa-w->pa;
+  if (pa < w->pa || !w->va) continue;
+  uint64_t offset = pa-w->pa;
+  if (offset >= w->size || bytes > w->size-offset || offset > UINTPTR_MAX-w->va) continue;
+  uintptr_t va = w->va + offset;
+  if (bytes-1 <= UINTPTR_MAX-va) return va;
  }
  return 0;
 }
+/* No physmap fallback: reserved scratch, firmware and MMIO live in the
+ * lifetime kernel_map NC windows. Reject an entire access crossing an edge. */
+static uintptr_t fg_pointer(uint64_t pa) { return fuxi_gpu_nc_pointer(pa, 1); }
+static uintptr_t fg_pointer_range(uint64_t pa, uint64_t bytes)
+{
+ uintptr_t va = fuxi_gpu_nc_pointer(pa, bytes);
+ if (!va) panic("FUXI GPU: unmapped NC range PA %#llx bytes %#llx", pa, bytes);
+ return va;
+}
 static unsigned fg_access(uint64_t pa, uint64_t *v, unsigned wr, unsigned wide)
 {
- uintptr_t va = fg_pointer(pa);
+ uintptr_t va = fuxi_gpu_nc_pointer(pa, wide ? 8 : 4);
  if (!va || (pa & (wide ? 7 : 3))) return fg_access_failed = 1;
  unsigned bad = fuxi_gpu_access(va, v, wr, wide);
  if (bad) {
@@ -138,9 +152,9 @@ static void fg_store64(uint64_t pa, uint64_t value)
 }
 static const uint8_t *fg_firmware(unsigned which, unsigned *size)
 {
- const struct fg_handoff *h = (const struct fg_handoff *)fg_pointer(FG_HANDOFF);
+ const struct fg_handoff *h = (const struct fg_handoff *)fg_pointer_range(FG_HANDOFF, sizeof(struct fg_handoff));
  *size = h->fw_size[which];
- return (const uint8_t *)fg_pointer(FG_FW_BASE + which*FG_FW_SLOT);
+ return (const uint8_t *)fg_pointer_range(FG_FW_BASE + which*FG_FW_SLOT, FG_FW_SLOT);
 }
 static unsigned fg_abi_enabled, fg_client_busy;
 static IOLock *fg_ring_lock;
@@ -151,6 +165,7 @@ static void fg_guard_exit(struct fg_guard *g) { if (g->lock) IOLockUnlock(g->loc
 #define FG_GUARD struct fg_guard guard __attribute__((cleanup(fg_guard_exit))) = {fg_ring_lock}; if (guard.lock) IOLockLock(guard.lock)
 #define FUXI_GPU_XNU 1
 #define G_PTR(pa) fg_pointer(pa)
+#define G_PTR_RANGE(pa, bytes) fg_pointer_range(pa, bytes)
 #define G_RING_INDEX(w) ((w) & 8191u)
 static void fg_scm_call(uint64_t ret[4], unsigned slot, unsigned step,
     uint32_t fn, uint32_t info, uint64_t a, uint64_t b, uint64_t c);
@@ -210,8 +225,8 @@ static uint64_t fg_generation[FG_CACHE_SLOTS];
 static ppnum_t fg_ppns[FG_SOURCE_BYTES/PAGE_SIZE+1];
 static volatile uint64_t *fg_l2(void)
 {
- volatile uint64_t *root = (volatile uint64_t *)G_PTR(G3_PT);
- return (volatile uint64_t *)G_PTR(root[1] & ~4095ULL);
+ volatile uint64_t *root = (volatile uint64_t *)G_PTR_RANGE(G3_PT,4096);
+ return (volatile uint64_t *)G_PTR_RANGE(root[1] & ~4095ULL,4096);
 }
 static volatile unsigned fg_state; /* 0 disabled/starting, 1 ready, 2 permanently failed */
 static unsigned fg_started, fg_limit, fg_force, fg_seq;
@@ -300,7 +315,7 @@ int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,
  if (!fuxi_gpu_ready() || slot >= FG_CACHE_SLOTS || !generation || fg_generation[slot] || !length ||
      length > FG_SOURCE_BYTES || length+(source&4095) > FG_SOURCE_BYTES) return 0;
  uint64_t start = mach_absolute_time();
- volatile uint64_t *leaves = (volatile uint64_t *)G_PTR(FG_SOURCE_TABLE+slot*32768);
+ volatile uint64_t *leaves = (volatile uint64_t *)G_PTR_RANGE(FG_SOURCE_TABLE+slot*32768,32768);
  volatile uint64_t *l2 = fg_l2();
  unsigned first = ((FG_SOURCE_VA >> 21) & 511) + slot*FG_SOURCE_L3;
  unsigned pages = (length+(source&4095)+4095)/4096;
@@ -372,7 +387,7 @@ static void fg_thread(thread_call_param_t arg, thread_call_param_t result)
  }
  kern_return_t kr = fg_map_windows();
  if (kr != KERN_SUCCESS) { fg_fail("uncached mapping failed", kr); goto out; }
- const struct fg_handoff *h = (const struct fg_handoff *)G_PTR(FG_HANDOFF);
+ const struct fg_handoff *h = (const struct fg_handoff *)G_PTR_RANGE(FG_HANDOFF,sizeof(struct fg_handoff));
  if (h->magic != FG_MAGIC || h->version != 1 || h->bytes != sizeof(*h) || h->reserved ||
      h->base != FG_SCRATCH || h->size != FG_SCRATCH_SIZE) {
   fg_fail("missing/invalid cold firmware handoff", 3); goto out;
@@ -380,7 +395,7 @@ static void fg_thread(thread_call_param_t arg, thread_call_param_t result)
  for (unsigned i = 0; i < 3; i++) {
   unsigned n = h->fw_size[i];
   if (!n || n > FG_FW_SLOT || (n & 3) ||
-      fg_hash((const uint8_t *)G_PTR(FG_FW_BASE+i*FG_FW_SLOT), n) != h->fw_hash[i]) {
+      fg_hash((const uint8_t *)G_PTR_RANGE(FG_FW_BASE+i*FG_FW_SLOT,n), n) != h->fw_hash[i]) {
    fg_fail("firmware size/checksum", i); goto out;
   }
  }
