@@ -7,6 +7,13 @@ cd "$(dirname "$0")"
 : "${OBJCOPY:?Set OBJCOPY to llvm-objcopy}"
 : "${READELF:?Set READELF to llvm-readelf}"
 : "${MKBOOTIMG:?Set MKBOOTIMG to AOSP mkbootimg.py}"
+# GPU-bearing payloads must never silently produce a GPU-disabled image.
+: "${FUXI_GMU_FIRMWARE:?Set the pinned GMU firmware absolute path}"
+: "${FUXI_SQE_FIRMWARE:?Set the pinned sheng-firmware/a740_sqe.fw absolute path}"
+: "${FUXI_GPU_ZAP_MBN:?Set the pinned ZAP MBN absolute path}"
+for input in "$MKBOOTIMG" "$FUXI_GMU_FIRMWARE" "$FUXI_SQE_FIRMWARE" "$FUXI_GPU_ZAP_MBN"; do
+ [[ $input == /* && -f $input ]] || { echo 'Packing inputs must be existing absolute file paths' >&2; exit 1; }
+done
 out=../out/fuxi-loader
 mkdir -p "$out"
 # Reject a payload made from a different board, truncated segments, or unsafe RAM.
@@ -23,8 +30,7 @@ for i in range(n):
  va,vs,off,sz=struct.unpack_from('<4Q',b,680+32*i)
  assert off<=len(b) and sz<=len(b)-off and sz<=vs
 PY
-# Optional local firmware input; only the ignored build directory receives bytes.
-# An empty section gives non-GPU builds the same symbols with size zero.
+# Required pinned firmware input; only the ignored build directory receives bytes.
 python3 - "$payload" "${FUXI_GMU_FIRMWARE:-}" "${FUXI_SQE_FIRMWARE:-}" "${FUXI_GPU_ZAP_MBN:-}" "$out/gpu-fw.S" <<'FWPY'
 import hashlib, json, pathlib, struct, sys
 payload, gmu, sqe, zap, dst = sys.argv[1:]
@@ -65,6 +71,13 @@ done
 "$CLANG" "${flags[@]}" -c "$out/payload.S" -o "$out/payload.o"
 "$CLANG" "${flags[@]}" -c "$out/gpu-fw.S" -o "$out/gpu-fw.o"
 "$LLD" -T loader.ld --build-id=none "$out/start.o" "$out/loader.o" "$out/console.o" "$out/probe.o" "$out/gpu-fw.o" "$out/payload.o" -o "$out/loader.elf"
+python3 - "$out/loader.elf" "$READELF" <<'GPUCHECK'
+import re, subprocess, sys
+sections = subprocess.check_output([sys.argv[2], '-SW', sys.argv[1]], text=True)
+match = re.search(r'\.gpu_fw\s+PROGBITS\s+[0-9a-fA-F]+\s+[0-9a-fA-F]+\s+([0-9a-fA-F]+)', sections)
+assert match and int(match[1], 16) == 0x25ac8, 'loader .gpu_fw must be exactly 0x25ac8 bytes'
+print('Verified loader .gpu_fw size 0x25ac8')
+GPUCHECK
 "$OBJCOPY" -O binary "$out/loader.elf" "$out/Image"
 python3 - "$out/Image" <<'PY'
 import struct,sys

@@ -578,3 +578,239 @@ allocation failures, MSI/MSI-X masking, ordered cleanup and buffer quarantine.
 It also round-trips a synthetic M5 console report through the decoder. Native
 XNU build passed; the existing M4 device log still decodes correctly. These
 checks do not establish hardware DMA or firmware success.
+
+## Milestone 6 — owned apps-SMMU translation for WLAN
+
+M6 supersedes M5's physical-bypass requirement and low-DDR prerequisite.
+The coordinator's M5 observation is: steps 1–16 passed; `sCR0=0x2d0406`,
+`IDR0=0x4c017e69`, `IDR1=0x60000046`; SIDs `0x1400` and `0x1401`
+were unmatched and faulted by USFCFG. The abort contained the endpoint and
+freed buffers; iOS continued. Those observations establish **stage-1 support,
+105 stream matching groups, 70 context banks, 4-KiB register pages, and context
+base `0x15080000`**. They do not establish a vacant bank, IDR2 capabilities,
+secure write permission, a working RID route, or successful endpoint DMA.
+M6 reads these again at runtime and stops on uncertainty. No M6 phone run
+was performed during development.
+
+### Addressing and ownership
+
+The saved live DT was inspected offline. `/soc/apps-smmu@15000000` is
+`qcom,qsmmu-v500`, register size `0x100000`, with two IOMMU cells. PCIe0 has
+`qcom,smmu-sid-base=<0x1400>` and vendor four-cell `iommu-map` entries
+`<0 phandle 0x1400 1>` and `<0x100 phandle 0x1401 1>`. The final cell is
+range length, **not a wildcard mask**. There is no `iommu-map-mask` override
+and no endpoint `iommus` wildcard: match the complete endpoint SID, SMR mask
+zero. The cnss IOMMU group requests coherent fastmap, a separate vendor IOVA
+pool, and nonfatal faults with stall disabled. M6 owns its own small window
+instead of using that unimplemented vendor allocator. The RC SID `0x1400`
+remains unchanged; endpoint requests use `0x1401`.
+
+Wired XNU allocations use `kmem_alloc` with ZERO/DATA/NOPAGEWAIT, with no
+low-physical-address or contiguity requirement. Every physical page must be
+nonzero and below the explicitly configured 36-bit output limit. XNU's RAM
+starting at `0x8c0000000` meets that limit. Each 16-KiB XNU page contributes
+four independently addressed 4-KiB SMMU pages. Device addresses in BHI, BHIe
+vectors, MHI contexts and doorbells are IOVAs in `[0x10000000,0x11000000)`.
+Only image, vector and context/ring allocations are mapped; zeroed allocation
+padding is included, page tables are excluded. The image bound is now 15 MiB,
+leaving room for metadata and tables inside the 16-MiB allocation budget.
+Both vendor images documented in M5 fit. No loader/ADT low-DDR reservation or
+GPU memory-layout change is needed.
+
+Step 17 reads IDR0/1/2, computes register geometry and checks bounds against
+the 1-MiB DT resource. It requires stage-1, stream matching, AArch64 4-KiB
+page tables and at least 36-bit input/output physical widths. It rejects
+CLIENTPD, EXID mode, invalid ID encodings and inaccessible/all-ones registers.
+It scans **all** SMR/S2CR pairs and all CB SCTLRs. A candidate stream must have
+SMR.VALID clear and a saved FAULT/BYPASS S2CR default. Any valid exact or masked
+match for SID `0x1401` causes refusal. A candidate bank must have SCTLR.M clear,
+be stage-1 capable and be unreferenced by **any** S2CR, including an invalid
+stream or a bypass/fault entry. CB index is its ASID; enabled banks' TTBR0/1
+ASIDs are checked for conflicts. Existing valid streams and enabled or
+referenced banks are never written. Vacancy and ASID checks repeat after VFS
+and allocation sleeps, immediately before programming. There is no general
+apps-SMMU allocator in XNU; this is a single boot-thread ownership protocol.
+
+The RC table is checked independently: CRC8 polynomial `0x07` over RID bytes
+`01 00` yields slot `0x15`, and the bounded chain must resolve uniquely to
+relative SID 1. SID_OFFSET must be zero. An existing enabled correct route
+is retained. If the **entire 256-entry table is empty**, the driver owns only
+PARF `+0x2054`, writes `0x01000100`, verifies it, then clears only CFG `+0x2c00`
+BYPASS bit 0 with readback. A conflicting/nonempty unproven table, duplicate
+RID, nonzero offset or readback fault stops at 17. No collision chain or
+SID_OFFSET is changed. Original entry/config are saved for abort. This
+small RC repair handles the dedicated WLAN RC's reset defaults; it is not a
+replacement for general PCI enumeration. CFG/entry/SID_OFFSET and the owned
+stream/context are rechecked before BME. The fixed port SID base follows the
+live DT and Qualcomm's relative-SID table encoding; the BHI result remains
+the endpoint proof of that hardware path.
+
+### What is written
+
+Step 20 builds ten 4-KiB tables in wired high RAM: L1 root, L2, and eight L3
+pages. L1[0] references L2; L2[128..135] reference the L3 pages. Only buffer
+leaf entries are valid, with RW unprivileged, NS, AF, nG, inner-shareable WB
+and XN permissions (`PA | 0x60000000000f63`). Tables and outgoing buffers
+are cache-cleaned page by page, followed by DSB SY. Table pointers use each
+page's actual PA, including when allocations are physically noncontiguous.
+
+For selected stream `s` and context `c`, let `G=0x15000000`,
+`GR1=G+(1<<IDR1.PAGESIZE_shift)`, and `CB=runtime_CBbase+(c<<shift)`:
+
+| Address | Value / purpose |
+|---|---|
+| `CB+0x00` | 0 while configuring; finally `0x1027` (ASIDPNE, CFRE, AFE, TRE, M; IRQ and stall disabled) |
+| `GR1+0x800+4*c` | CBA2R=1, AArch64 format |
+| `GR1+4*c` | CBAR=`0x1f300`, stage-1 / stage-2 bypass, weakest override attributes |
+| `CB+0x10` | TCR2=`0x38011`, upstream SEP, 16-bit ASID, 36-bit PA |
+| `CB+0x30` | TCR=`0x803520`, EPD1, 32-bit IOVA, 4-KiB granule, inner-shareable WB table walk |
+| `CB+0x24/+0x20` | TTBR0 high then low: root PA plus ASID `c` in [63:48] |
+| `CB+0x2c/+0x28` | TTBR1 high then low: ASID, zero base, disabled by EPD1 |
+| `CB+0x38/+0x3c` | MAIR0=`0xff`, MAIR1=0 |
+| `CB+0x58` | W1C defined FSR mask `0xc00001fe` once before DMA, only on this owned bank |
+| `CB+0x610`, `CB+0x7f0` | TLBIASID=`c`, TLBSYNC=0; poll `CB+0x7f4.ACTIVE` for at most 100 ms |
+| `G+0xc00+4*s` | S2CR=`c`, translate with default privilege policy |
+| `G+0x800+4*s` | SMR=`0x80001401`, VALID last, exact SID mask zero |
+
+All configuration registers have exact readback checks. TLB operations use
+bounded completion polling. No global CR0/USFCFG, global TLB invalidation,
+existing context, TBU halt, implementation ACTLR or unrelated SMMU is written.
+Secure-firmware restrictions that reject writes stop before BME. Context
+fault interrupts are not enabled; the host polls and terminates on faults.
+
+### DMA proof, steps and bisection
+
+The BHI status/cookie is an endpoint MMIO result, not a documented device
+write to a host cookie buffer. There is no standalone harmless host-write
+operation in the referenced PBL interface. M5's IDR0 also has ATOSNS set, so
+M6 does not issue speculative address-translation operations. **BHI's first
+512-KiB transfer at 21/22 is the first endpoint translation test**. Step 20
+explicitly logs this fallback. A successful BHI/SBL transition with no CB
+faults provides the first positive endpoint-read evidence; later MHI event
+writes exercise the mapped context/ring buffers. A zero FSR alone is never
+reported as DMA success.
+
+M6 keeps steps **1–28** and `fuxiwlan=1` = all, `2..28` = inclusive limit:
+
+| Step | M6 behavior |
+|---|---|
+| 17 | Runtime capability/ownership scan, exact SID policy, RC route verification or empty-table repair; BME remains off. |
+| 18 | Existing endpoint TCSR firmware selection. |
+| 19 | Existing root/file/ELF checks; wired high-RAM allocation with low IOVA. |
+| 20 | Existing vectors/44-byte contexts/IRQ masking; build tables, re-prove ownership, program and read back stage-1 translation, TLB sync. |
+| 21–22 | BHI IOVA transfer and completion: first actual DMA proof. |
+| 23–25 | READY, IOVA context bases/event WPs, M0/SBL. |
+| 26–28 | Full-image BHIe IOVAs, matching completion, mission EE/M0. |
+
+After each step with an owned bank, log CB FSR/FAR/FSYNR0/1 plus read-only
+global GFSR/GFSYNR1. Poll loops also check CB FSR, so a fault ends the current
+wait without waiting for success/timeout. Defined fault bits `0xc00001fe`
+abort; format-only FSR bits are logged without being misclassified as faults.
+An unmatched-stream global fault naming SID `0x1401` also aborts. DMA fault
+registers are preserved for diagnosis; shared global faults are never cleared.
+The pre-BHIe TXVECSTATUS can be undefined (M5 showed upper status bits set
+before any BHIe doorbell). Modes 0–2 therefore ignore that stale status; BHIe
+error checks begin only after its own doorbell. The fake device starts with
+that M5 value to cover this condition.
+The `m6` report has magic `0x574c0006`, IDR2 in word 7, selected SMR/CB in
+8/9, final fault snapshot in 80–86, and per-step FSR in 96–107. Existing step
+results and firmware/state fields keep their M5 positions. The offline decoder
+accepts m3/m4/m5/m6; historical M5 logs remain readable.
+
+Expected lines (values and slot/bank numbers are runtime findings):
+
+```
+FUXI WLAN: M6 apps_smmu ... IDR2 ... NUMSMRG 105 NUMCB 70 CBbase 0x15080000
+FUXI WLAN: SMMU free SMR ... CB ... SCTLR ... unreferenced; SID 0x1401 mask 0
+FUXI WLAN: RC RID 0x100 SID cfg ... offset 0 hash 0x15 entry ... matches ...
+FUXI WLAN: RC owned empty RID slot 0x15 -> DT SID 0x1401 (mask 0)
+FUXI WLAN: SMMU owned stage1 SMR ... CB ... TTBR ... IOVA 0x10000000-... readback verified
+FUXI WLAN: DMA self-test: no standalone BHI host-write cookie; step 21/22 BHI transfer + CB faults is first endpoint proof
+FUXI WLAN: BHI doorbell seq ... bytes 0x80000 bus master on
+FUXI WLAN: M6 step 22 CB ... FSR 0 FAR ... FSYNR ... GFSR ... GFSYNR1 ...
+FUXI WLAN: M6 step 25 EE 0x1 (SBL) ... (M0 ready ...)
+FUXI WLAN: BHIe doorbell seq ...
+FUXI WLAN: M6 mission mode M0 confirmed ...
+FUXI WLAN: m6 r[...]
+```
+
+The `RC owned empty` line is conditional; an existing correct route needs no
+write. Reboot per limit: **16 → 17 → 18 → 19 → 20 → 21 → 22 → 23 → 24 → 25 →
+26 → 27 → 28 → 1**. Inspect 17's ownership/route evidence and 20's readbacks
+before proceeding to 21. Stop at the first failure or fault; never proceed
+because FSR is zero after a timed-out transfer.
+
+### Abort and undo
+
+On any failure, snapshot endpoint and CB faults, request bounded MHI RESET,
+clear endpoint BME and confirm by readback, assert PERST and confirm, then
+wait 10 ms for transaction drain. Only after **both containment confirmations**:
+
+1. Invalidate our SMR and verify VALID clear.
+2. Restore that slot's saved FAULT/BYPASS S2CR exactly.
+3. Disable our CB and verify SCTLR=0.
+4. Invalidate our ASID and complete the bounded context TLB sync.
+5. Restore the saved invalid SMR bits, then restore our optional RC CFG/entry.
+6. Free table, context, vector and image allocations.
+
+Cleanup accesses bypass the normal write-after-fault latch only for these
+containment/owned addresses, using the fault-contained accessor. The original
+fault counter stays latched. If containment or any undo readback/sync fails,
+retain **all** allocations until reboot. No attempt to resume after a failed
+partial setup is made. Disabled CB configuration values can remain after a
+successful undo; no live route or table walker can reach freed memory.
+Deliberate successful partial limits **17–27** use the same containment/undo,
+including a route-only step-17 stop. Successful 28 retains the mappings and
+all buffers for firmware paging, with no channels or QMI enabled.
+
+### Build and verification
+
+`tools/test-fuxi-wlan-m6.py` compiles the actual C with fake registers/VFS/wired
+pages under ASan/UBSan. It checks full sequence and IOVA ABI, every 4-KiB leaf
+against noncontiguous high PAs, unmapped guards/tables, occupied and wildcard
+streams, active/referenced banks, late ownership changes, RC route conflicts,
+readback mismatch, TLB timeout, fault abort, reverse undo ordering, quarantined
+allocations, bounded firmware polls and offline decoding. The old M5 test
+command forwards to this current-driver suite.
+`tools/test-fuxi-wlan-m6-artifacts.py` rebuilds the payload offline, checks
+the M5 ADT/cmdline/header, embedded ELF/boot bytes, pinned firmware section
+size/hashes, and the complete artifact manifest.
+
+Build only the dedicated WLAN native tree, then copy the stripped/unstripped
+kernels to `xnu/out-fuxi-wlan6/`. Run
+`tools/build-fuxi-wlan6-images.sh BASE_METAL2A_ARTIFACT_DIR`; it preserves the
+M5 base ADT and appends the same single `fuxiwlan=1` argument (under 608 bytes),
+using the same payload and header-v4 packing. Outputs:
+`shim/out/fuxi-wlan-m6-{boot.img,loader.elf,payload.bin}` and
+`xnu/out-fuxi-wlan6/SHA256SUMS`. Build logs and binaries remain ignored.
+
+The loader script now requires **existing absolute paths** for MKBOOTIMG,
+FUXI_GMU_FIRMWARE, FUXI_SQE_FIRMWARE and FUXI_GPU_ZAP_MBN. The SQE input is the
+pinned `research/firmware/gpu/sheng-firmware/a740_sqe.fw`; GMU/SQE/ZAP hashes
+remain pinned in the script. It fails if an input is unset, relative, missing
+or has the wrong hash, and verifies the linked ELF `.gpu_fw` section is
+**exactly `0x25ac8` bytes** before packing. Firmware is never committed.
+
+Register/layout references: [generic arm-smmu programming](https://github.com/torvalds/linux/blob/master/drivers/iommu/arm/arm-smmu/arm-smmu.c),
+[arm-smmu registers](https://github.com/torvalds/linux/blob/master/drivers/iommu/arm/arm-smmu/arm-smmu.h),
+[AArch64 I/O page tables](https://github.com/torvalds/linux/blob/master/drivers/iommu/io-pgtable-arm.c),
+[Qualcomm relative RID-to-SID table](https://github.com/torvalds/linux/blob/master/drivers/pci/controller/dwc/pcie-qcom.c),
+and the MHI/BHI sources linked in M5. These are reference facts, not imported
+driver code. Hardware write ownership and endpoint DMA remain to be verified
+by the coordinator's fresh-boot bisection.
+
+M6 validation completed: Linux and native-Mac ASan/UBSan host suites passed;
+the dedicated native XNU build includes the inherited `93da876` ABI fix
+and passed, and the final packed artifacts passed
+the offline checks. `.gpu_fw` is `0x25ac8`; M5 ADT/cmdline/header comparisons
+are byte-identical (apart from the boot header kernel-size field).
+
+| Final artifact | SHA256 |
+|---|---|
+| `shim/out/fuxi-wlan-m6-boot.img` | `70fe6e2d129a1d046363604b50bd65e56044a598ddd3040f6b792198b52251ca` |
+| `xnu/out-fuxi-wlan6/kernel.development.fuxi` | `67af671fe43aa8a38dc71736d5f41bbeef5c637ac72d871541c837c1040c817e` |
+| `shim/out/fuxi-wlan-m6-loader.elf` | `7dfb1d7cf313d587582bc22dbccd09f113827a1755c0a8126892a5f74b784ee1` |
+
+The complete seven-file manifest is in the ignored M6 output directory.
+No firmware, captured device console, private input path or host address is
+part of this change. These build/host results do not establish device DMA.

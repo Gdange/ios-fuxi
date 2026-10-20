@@ -236,9 +236,30 @@ def decode_m5(r):
     return '\n'.join(o)
 
 
+def decode_m6(r):
+    steps = dict(M5_STEPS)
+    steps[17] = 'runtime SMMU capabilities, vacant stream/CB + RC RID route'
+    steps[19] = 'checked ELF into wired high RAM, low IOVA'
+    steps[20] = 'vectors/contexts + stage-1 tables, TLBI, translation readback'
+    lines = [f'magic={r[0]:#x} limit={r[1]} last_step={r[2]} result={r[3]:#x}']
+    for step, name in steps.items():
+        code = r[32 + step]
+        if code:
+            state = 'OK' if code == (0x1000 | step) else f'FAIL reason {code & 255}'
+            lines.append(f'  step {step} {state} {name}; CB FSR={r[96 + step - 17]:#x}')
+    lines.append(f'  SMMU IDR0={r[5]:#x} IDR1={r[6]:#x} IDR2={r[7]:#x} '
+                 f'SMR={r[8]} CB={r[9]} (selection valid only after successful step 17)')
+    lines.append(f'  CB FSR={r[80]:#x} FAR={r[82]:#x}:{r[81]:08x} FSYNR={r[83]:#x}/{r[84]:#x}')
+    # Common firmware/state summary, without M5 physical-bypass classification.
+    common = decode_m5(r).splitlines()
+    lines.extend(line.replace('PA=', 'IOVA=') for line in common
+                 if line.startswith(('  TCSR=', '  image=', '  final snapshot', '  Per-step')))
+    return '\n'.join(lines)
+
+
 def from_xnu_log(path):
-    """Rebuild the m3/m4/m5 reports from 'FUXI WLAN: m3 r[  8] ...' console lines."""
-    reports = {'m3': [0] * 128, 'm4': [0] * 64, 'm5': [0] * 128}
+    """Rebuild the m3/m4/m5/m6 reports from 'FUXI WLAN: m3 r[  8] ...' console lines."""
+    reports = {'m3': [0] * 128, 'm4': [0] * 64, 'm5': [0] * 128, 'm6': [0] * 128}
     seen = set()
     for line in path.read_text(errors='replace').splitlines():
         at = line.find('FUXI WLAN: ')
@@ -257,7 +278,7 @@ def from_xnu_log(path):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--xnu-log', type=Path,
-                    help='decode the FUXI WLAN m3/m4/m5 dump lines of an XNU console log (fuxiwlan=1)')
+                    help='decode the FUXI WLAN m3/m4/m5/m6 dump lines of an XNU console log (fuxiwlan=1)')
     ap.add_argument('--m3', type=int, metavar='LIMIT', choices=range(1, 14),
                     help='run gated M3 steps 1..LIMIT (writes hardware; see docs-lanes/wlan-bt.md)')
     ap.add_argument('--m3-report', action='store_true', help='re-read the M3 report')
@@ -269,13 +290,15 @@ def main():
     if args.xnu_log:
         reports, seen = from_xnu_log(args.xnu_log)
         if not seen:
-            raise SystemExit('no "FUXI WLAN: m3/m4/m5 r[...]" lines found')
+            raise SystemExit('no "FUXI WLAN: m3/m4/m5/m6 r[...]" lines found')
         if 'm3' in seen:
             print(decode_m3(reports['m3']))
         if 'm4' in seen:
             print(decode_m4(reports['m4']))
         if 'm5' in seen:
             print(decode_m5(reports['m5']))
+        if 'm6' in seen:
+            print(decode_m6(reports['m6']))
         return 0
     if args.decode:
         blob = args.decode.read_bytes()

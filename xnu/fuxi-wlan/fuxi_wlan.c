@@ -1,11 +1,11 @@
 /*
- * FUXI WLAN (lane-wlan milestones 4/5): WCN7850 power-up, PCIe0 link, BAR0
+ * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
  * assignment and a read-only MHI/BHI register dump from XNU.
  * Gated by boot-arg fuxiwlan (default 0 = do nothing):
  *   fuxiwlan=1      run all 28 steps
  *   fuxiwlan=2..28  stop after that step (bisecting a hang or reset)
  * Steps 17..28 probe DMA safety and load rootfs firmware through BHI/BHIe.
- * No interrupts, channels or QMI are enabled; see docs-lanes/wlan-bt.md M5.
+ * No interrupts, channels or QMI are enabled; see docs-lanes/wlan-bt.md M6.
  *
  * Steps 1..13 are the loader's milestone-3 sequence, compiled from an exact
  * copy of shim/fuxi-probe/wlan.c (bsd/dev/wlan.c, FUXI_WLAN_XNU). Every write
@@ -30,8 +30,8 @@
  *      ath12k (mhi.c) points mhi_ctrl->regs at BAR0, so the MHI block is at
  *      offset 0.
  * All device accesses go through fuxi_gpu_access (synchronous aborts are
- * recovered); after a fault normal writes are refused. M5 cleanup permits
- * only MHI reset, bus-master-off and PERST containment writes.
+ * recovered); after a fault normal writes are refused. M6 cleanup permits
+ * containment and undo of only our proven-owned SMMU/RC slots.
  */
 #if defined(FUXI)
 #include <sys/param.h>
@@ -72,7 +72,7 @@ static struct fw_window fw_windows[] = {
 	{0x008c0000, 0x4000, 0},    /* QUP2 wrapper */
 	{0x01c00000, 0x8000, 0},    /* PCIe0 PARF 0x1c00000 + QMP PHY 0x1c06000 */
 	{0x01fd4000, 0x4000, 0},    /* TCSR clkref 0x1fd5100 */
-	{0x15000000, 0x4000, 0},    /* apps SMMU GR0: read-only stream probe */
+	{0x15000000, 0x100000, 0},  /* apps SMMU: GR0/GR1 + runtime-bounded CBs */
 	{0x60480000, 0x4000, 0},    /* EP internal register window (TCSR version) */
 	{0x0f14c000, 0x18000, 0},   /* TLMM tiles gpio76..96 */
 	{0x17a20000, 0x4000, 0},    /* apps RSC DRV2 + TCS */
@@ -412,19 +412,29 @@ wl4_step(unsigned step)
 /* ---- milestone 5: polling only, no channel start or QMI ----
  * Register/layout references (independent implementation): Linux MHI common.h,
  * host/boot.c + pm.c, arm-smmu.h; OpenBSD if_qwz_pci.c READY/FBC sequence.
- * All DMA addresses are PAs, so only proven apps-SMMU bypass is accepted.
+ * M6 uses owned stage-1 translation of low IOVAs to wired XNU pages.
  */
 #define WL5_STEPS 28u
 #define WL_SMMU 0x15000000ull
 #define WL_CHUNK 0x80000u
-#define WL_FW_MAX 0x2000000u
+#define WL_FW_MAX 0xf00000u
 #define WL_SEQ_MASK 0x3fffffffu
 static uint32_t wl5_report[128];
 static uint32_t wl_bhi, wl_bhie, wl_fw_size, wl_seq;
 static const char *wl_fw_path;
-static bool wl_mhi_valid, wl_dma_started;
-struct wl_dma { vm_offset_t va; vm_size_t size; uint64_t pa; };
-static struct wl_dma wl_image, wl_vectors, wl_contexts;
+static bool wl_mhi_valid;
+struct wl_dma { vm_offset_t va; vm_size_t size; uint64_t pa, iova; };
+static struct wl_dma wl_image, wl_vectors, wl_contexts, wl_tables;
+#define WL_IOVA 0x10000000ull
+#define WL_IOVA_END 0x11000000ull
+static uint64_t wl_iova_next = WL_IOVA, wl_cb_base, wl_gr1;
+static unsigned wl_slot, wl_cb, wl_smr_count, wl_cb_count, wl_pgshift;
+static uint32_t wl_old_smr, wl_old_s2cr, wl_old_sctlr;
+static uint32_t wl_route_cfg, wl_route_entry;
+static unsigned wl_route_hash;
+static bool wl_owned, wl_enabled, wl_route_owned;
+static int wl_contain_wr(uint64_t, uint32_t);
+static int wl_smmu_fault(unsigned);
 /* Packed MHI contexts are 44 bytes; the old research note's 40 was wrong. */
 struct wl_context {
 	uint32_t cfg, type, index;
@@ -452,34 +462,38 @@ wl_sleep(unsigned ms)
 	thread_block(THREAD_CONTINUE_NULL);
 }
 
+/* Wired allocations need neither physical contiguity nor low DDR. */
+static uint64_t
+wl_phys(vm_offset_t va)
+{
+	return ptoa_64(pmap_find_phys(kernel_pmap, va)) + (va & PAGE_MASK);
+}
+
 static int
 wl_dma_alloc(struct wl_dma *d, vm_size_t bytes)
 {
 	d->size = round_page(bytes);
-	kern_return_t kr = kmem_alloc_contig(kernel_map, &d->va, d->size,
-	    PAGE_MASK, (ppnum_t)(0xffffffffull >> PAGE_SHIFT), 0,
+	if (!bytes || d->size > WL_IOVA_END - wl_iova_next) { return 1; }
+	kern_return_t kr = kmem_alloc(kernel_map, &d->va, d->size,
 	    KMA_DATA | KMA_ZERO | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT);
 	if (kr != KERN_SUCCESS) {
-		printf("FUXI WLAN: DMA allocation bytes %#llx below 4 GiB failed %d; need allocator-owned low DDR (high-RAM bus alias not assumed)\n", (uint64_t)d->size, kr);
-		return 1;
+		printf("FUXI WLAN: wired DMA allocation failed %d\n", kr); return 1;
 	}
-	d->pa = ptoa_64(pmap_find_phys(kernel_pmap, d->va));
-	if (!d->pa || d->pa + d->size > 0x100000000ull) {
-		return 2;
-	}
-	/* Check every page rather than trusting the allocation's first PPN. */
 	for (vm_size_t off = 0; off < d->size; off += PAGE_SIZE) {
-		if (ptoa_64(pmap_find_phys(kernel_pmap, d->va + off)) != d->pa + off) {
-			return 3;
-		}
+		uint64_t pa = wl_phys(d->va + off);
+		if (!pa || pa >= (1ull << 36)) { return 2; }
 	}
+	d->pa = wl_phys(d->va);
+	d->iova = wl_iova_next; wl_iova_next += d->size;
 	return 0;
 }
 
 static void
 wl_dma_clean(struct wl_dma *d)
 {
-	flush_dcache64(d->pa, (unsigned)d->size, TRUE);
+	for (vm_size_t off = 0; off < d->size; off += PAGE_SIZE) {
+		flush_dcache64(wl_phys(d->va + off), PAGE_SIZE, TRUE);
+	}
 	__asm__ volatile("dsb sy" ::: "memory");
 }
 
@@ -513,81 +527,261 @@ wl5_status(unsigned step)
 	r[68] = wl_mrd(wl_bhi + 0x30);
 	for (unsigned i = 0; i < 3; i++) { r[69 + i] = wl_mrd(wl_bhi + 0x34 + 4 * i); }
 	r[72] = wl_mrd(wl_bhie + 0x44); r[73] = wl_prd(WL_EPCFG + 4);
-	printf("FUXI WLAN: M5 step %u EE %#x (%s) MHISTATUS %#x (%s ready %u) MHICTRL %#x BHI %#x ERRCODE %#x ERRDBG %#x/%#x/%#x BHIE %#x EPcmd %#x\n",
+	printf("FUXI WLAN: M6 step %u EE %#x (%s) MHISTATUS %#x (%s ready %u) MHICTRL %#x BHI %#x ERRCODE %#x ERRDBG %#x/%#x/%#x BHIE %#x EPcmd %#x\n",
 	    step, r[64], wl_mhi_ee(r[64]), r[65], wl_mhi_state((r[65] >> 8) & 255),
 	    r[65] & 1, r[66], r[67], r[68], r[69], r[70], r[71], r[72], r[73]);
 }
 
+/* DT: PCIe0 qcom,smmu-sid-base=0x1400; RID 0x100 -> SID 0x1401,
+ * length 1; no iommu-map-mask override, no wildcard SMMU mask (mask=0).
+ * Own only a vacant endpoint lookup entry. Never rewrite a collision chain,
+ * SID_OFFSET, a populated entry, or an enabled route belonging to another RID. */
+static int
+wl_rc_route(void)
+{
+	wl_route_cfg = wl_prd(WL_PARF + 0x2c00);
+	uint32_t offset = wl_prd(WL_PARF + 0x234);
+	unsigned hash = 0;
+	for (unsigned byte = 0; byte < 2; byte++) {
+		hash ^= byte ? 0 : 1;
+		for (unsigned bit = 0; bit < 8; bit++) {
+			hash = ((hash << 1) ^ ((hash & 0x80) ? 7 : 0)) & 255;
+		}
+	}
+	wl_route_hash = hash;
+	bool route = false, empty = true;
+	unsigned matches = 0;
+	for (unsigned i = 0; i < 256; i++) {
+		uint32_t v = wl_prd(WL_PARF + 0x2000 + 4 * i);
+		if (v) { empty = false; }
+		if ((v >> 16) == 0x100) { matches++; }
+	}
+	unsigned next = hash;
+	for (unsigned i = 0; i < 256; i++) {
+		uint32_t v = wl_prd(WL_PARF + 0x2000 + 4 * next);
+		if ((v >> 16) == 0x100) { route = ((v >> 8) & 255) == 1; wl_route_hash = next; break; }
+		if (!(v & 255)) { break; }
+		next = v & 255;
+	}
+	wl_route_entry = wl_prd(WL_PARF + 0x2000 + 4 * hash);
+	wl5_report[22] = wl_route_cfg; wl5_report[23] = offset; wl5_report[24] = wl_route_entry;
+	printf("FUXI WLAN: RC RID 0x100 SID cfg %#x offset %#x hash %#x entry %#x matches %u\n",
+	    wl_route_cfg, offset, hash, wl_route_entry, matches);
+	if (fw_faults || offset || wl_route_cfg == ~0u || matches > 1) { return 1; }
+	if (route && !(wl_route_cfg & 1) && matches == 1) { return 0; }
+	/* Reset RC: only install when the entire table is empty. */
+	if (!empty) { return 2; }
+	wl_route_owned = true;
+	wl_pwr(WL_PARF + 0x2000 + 4 * hash, 0x01000100);
+	if (wl_prd(WL_PARF + 0x2000 + 4 * hash) != 0x01000100 || fw_faults) { return 3; }
+	wl_pwr(WL_PARF + 0x2c00, wl_route_cfg & ~1u);
+	if (wl_prd(WL_PARF + 0x2c00) != (wl_route_cfg & ~1u) || fw_faults) { return 3; }
+	printf("FUXI WLAN: RC owned empty RID slot %#x -> DT SID 0x1401 (mask 0)\n", hash);
+	return 0;
+}
+
+static uint64_t
+wl_cb_addr(unsigned cb)
+{
+	return wl_cb_base + ((uint64_t)cb << wl_pgshift);
+}
+
+/* Strictly read-only selection. Reserve CBs referenced by ANY S2CR, even an
+ * invalid SMR or non-translating S2CR: conservative with firmware leftovers. */
 static int
 wl_smmu_probe(void)
 {
 	uint32_t *r = wl5_report;
 	r[4] = wl_prd(WL_SMMU); r[5] = wl_prd(WL_SMMU + 0x20);
-	r[6] = wl_prd(WL_SMMU + 0x24);
-	printf("FUXI WLAN: apps_smmu sCR0 %#x ID0 %#x ID1 %#x (read-only)\n", r[4], r[5], r[6]);
-	if (fw_faults || r[4] == ~0u || r[5] == ~0u || r[6] == ~0u) { return 1; }
-	unsigned count = r[5] & 255, exid = !!(r[4] & 8);
-	if (!(r[5] & (1u << 27)) || !count || (r[4] & 1) ||
-	    (exid && !(r[5] & 256))) {
-		printf("FUXI WLAN: SMMU unsupported stream format or CLIENTPD; DMA safety unproven, stop\n");
-		return 2;
-	}
-	unsigned matches[2] = {0, 0};
-	bool all_bypass = !(r[4] & 0x400);
-	uint32_t types[2] = { (r[4] & 0x400) ? 2u : 1u, (r[4] & 0x400) ? 2u : 1u };
-	/* EXIDENABLE moves VALID to S2CR bit 10 and frees SMR mask bit 15. */
-	for (unsigned i = 0; i < count; i++) {
+	r[6] = wl_prd(WL_SMMU + 0x24); r[7] = wl_prd(WL_SMMU + 0x28);
+	wl_smr_count = r[5] & 255; wl_cb_count = r[6] & 255;
+	wl_pgshift = (r[6] & (1u << 31)) ? 16 : 12;
+	unsigned pages = 1u << (((r[6] >> 28) & 7) + 1);
+	wl_gr1 = WL_SMMU + (1u << wl_pgshift);
+	wl_cb_base = WL_SMMU + ((uint64_t)pages << wl_pgshift);
+	printf("FUXI WLAN: M6 apps_smmu sCR0 %#x IDR0 %#x IDR1 %#x IDR2 %#x NUMSMRG %u NUMCB %u CBbase %#llx\n",
+	    r[4], r[5], r[6], r[7], wl_smr_count, wl_cb_count, wl_cb_base);
+	/* No EXID, global reconfiguration or guesses about unsupported formats. */
+	if (fw_faults || r[4] == ~0u || r[5] == ~0u || r[6] == ~0u || r[7] == ~0u ||
+	    (r[4] & 9) || (r[5] & 0x48000000) != 0x48000000 ||
+	    !(r[7] & 0x1000) || !(r[7] & 15) || (r[7] & 15) > 5 ||
+	    !((r[7] >> 4) & 15) || ((r[7] >> 4) & 15) > 5 ||
+	    !wl_smr_count || !wl_cb_count || wl_cb_count > 128 ||
+	    ((r[6] >> 16) & 255) > wl_cb_count || ((r[7] >> 8) & 15) > 5 ||
+	    wl_cb_base + ((uint64_t)wl_cb_count << wl_pgshift) > WL_SMMU + 0x100000) { return 1; }
+	bool referenced[128] = {false};
+	wl_slot = wl_smr_count; wl_cb = wl_cb_count;
+	for (unsigned i = 0; i < wl_smr_count; i++) {
 		uint32_t smr = wl_prd(WL_SMMU + 0x800 + 4 * i);
 		uint32_t s2cr = wl_prd(WL_SMMU + 0xc00 + 4 * i);
-		if (fw_faults) { return 1; }
-		if (!(exid ? (s2cr & 0x400) : (smr & 0x80000000u))) { continue; }
-		if (((s2cr >> 16) & 3) != 1) { all_bypass = false; }
-		uint32_t mask = (smr >> 16) & (exid ? 0xffff : 0x7fff);
-		for (unsigned n = 0; n < 2; n++) {
-			unsigned sid = 0x1400 + n;
-			if (((sid ^ smr) & ~mask & 0xffff) != 0) { continue; }
-			matches[n]++; types[n] = (s2cr >> 16) & 3;
-			r[8 + 4 * n] = i; r[9 + 4 * n] = smr; r[10 + 4 * n] = s2cr;
-			if (matches[n] <= 4) {
-				printf("FUXI WLAN: SMMU SID %#x slot %u SMR %#x S2CR %#x CB %u\n", sid, i, smr, s2cr, s2cr & 255);
+		if (smr == ~0u || s2cr == ~0u || fw_faults) { return 1; }
+		if ((s2cr & 255) < wl_cb_count) { referenced[s2cr & 255] = true; }
+		if (smr & 0x80000000u) {
+			if (((0x1401 ^ smr) & ~((smr >> 16) & 0x7fff) & 0xffff) == 0) {
+				printf("FUXI WLAN: SMMU endpoint collision slot %u SMR %#x S2CR %#x\n", i, smr, s2cr); return 2;
 			}
+		} else if (wl_slot == wl_smr_count && ((s2cr >> 16) & 3) >= 1 && ((s2cr >> 16) & 3) <= 2) {
+			wl_slot = i; wl_old_smr = smr; wl_old_s2cr = s2cr;
 		}
 	}
-	for (unsigned n = 0; n < 2; n++) {
-		r[11 + 4 * n] = types[n];
-		printf("FUXI WLAN: SMMU SID %#x %s (%u matches%s)\n", 0x1400 + n,
-		    matches[n] > 1 ? "AMBIGUOUS" : types[n] == 0 ? "TRANSLATED" : types[n] == 1 ? "BYPASS" : types[n] == 2 ? "FAULT" : "RESERVED",
-		    matches[n], matches[n] ? "" : ", sCR0.USFCFG default");
-	}
-	if (types[0] != 1 || types[1] != 1 || matches[0] > 1 || matches[1] > 1) {
-		printf("FUXI WLAN: SMMU DMA blocked: need owned apps-SMMU stream/context for SID 0x1401, identity mappings + TLB sync (and verify RC RID-to-SID); no SMMU writes in M5\n");
-		return 3;
-	}
-	/* DT describes the intended SID; a reset RC may have lost its RID table.
-	 * Validate the hardware lookup, or require bypass for every possible SID.
-	 * Qualcomm 1.9.0 uses CRC8 (poly 0x07), BDF in network byte order. */
-	r[22] = wl_prd(WL_PARF + 0x2c00); r[23] = wl_prd(WL_PARF + 0x234);
-	unsigned hash = 0;
-	for (unsigned byte = 0; byte < 2; byte++) {
-		hash ^= byte ? 0 : 1; /* RID 01:00.0 = 0x0100 */
-		for (unsigned bit = 0; bit < 8; bit++) {
-			hash = ((hash << 1) ^ ((hash & 0x80) ? 7 : 0)) & 255;
+	unsigned s2only = (r[6] >> 16) & 255;
+	for (unsigned i = 0; i < wl_cb_count; i++) {
+		uint32_t ctl = wl_prd(wl_cb_addr(i));
+		if (ctl == ~0u) { return 3; }
+		if (i >= s2only && !referenced[i] && !(ctl & 1) && wl_cb == wl_cb_count) {
+			wl_cb = i; wl_old_sctlr = ctl;
 		}
 	}
-	bool route = false;
-	for (unsigned i = 0; !(r[22] & 1) && i < 256; i++) {
-		uint32_t entry = wl_prd(WL_PARF + 0x2000 + 4 * hash);
-		if ((entry >> 16) == 0x100) {
-			r[24] = entry; route = ((entry >> 8) & 255) == 1; break;
+	if (fw_faults || wl_slot == wl_smr_count || wl_cb == wl_cb_count) { return 3; }
+	/* CB index is also the unique ASID, as in the generic arm-smmu driver.
+	 * Refuse firmware configurations reusing this ASID in any enabled bank. */
+	for (unsigned i = 0; i < wl_cb_count; i++) {
+		if (wl_prd(wl_cb_addr(i)) & 1) {
+			if ((wl_prd(wl_cb_addr(i) + 0x24) >> 16) == wl_cb ||
+			    (wl_prd(wl_cb_addr(i) + 0x2c) >> 16) == wl_cb) { return 3; }
 		}
-		if (!(entry & 255)) { break; }
-		hash = entry & 255;
 	}
-	printf("FUXI WLAN: RC RID 0x100 SID cfg %#x offset %#x entry %#x route %s all-stream-bypass %u\n",
-	    r[22], r[23], r[24], route ? "DT-0x1401" : "unproven", all_bypass);
-	if (fw_faults || r[22] == ~0u || r[23] == ~0u || (!route && !all_bypass)) {
-		printf("FUXI WLAN: SMMU DMA blocked: RC RID-to-SID unproven; need verified RID 0x100 to DT SID 0x1401 before DMA\n");
-		return 5;
+	if (fw_faults || (wl_prd(WL_EPCFG + 4) & 4)) { return 4; }
+	printf("FUXI WLAN: SMMU free SMR %u old %#x/%#x CB %u SCTLR %#x unreferenced; SID 0x1401 mask 0\n",
+	    wl_slot, wl_old_smr, wl_old_s2cr, wl_cb, wl_old_sctlr);
+	wl5_report[8] = wl_slot; wl5_report[9] = wl_cb;
+	return wl_rc_route() ? 5 : 0;
+}
+
+static int
+wl_smmu_wr(uint64_t pa, uint32_t v)
+{
+	wl_pwr(pa, v);
+	return fw_faults || wl_prd(pa) != v;
+}
+
+static int
+wl_smmu_sync(bool cleanup)
+{
+	uint64_t cb = wl_cb_addr(wl_cb);
+	if (cleanup) {
+		if (wl_contain_wr(cb + 0x610, wl_cb) || wl_contain_wr(cb + 0x7f0, 0)) { return 1; }
+	} else {
+		wl_pwr(cb + 0x610, wl_cb); wl_pwr(cb + 0x7f0, 0);
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+	for (unsigned i = 0; i <= 100; i++) {
+		uint32_t v = wl_prd(cb + 0x7f4);
+		if (v == ~0u || (!cleanup && fw_faults)) { return 1; }
+		if (!(v & 1)) { return 0; }
+		if (i < 100) { wl_sleep(1); }
+	}
+	printf("FUXI WLAN: SMMU CB %u TLB sync timeout 100 ms\n", wl_cb);
+	return 1;
+}
+
+/* 4-KiB AArch64 stage-1 tables: L1 root, L2, eight L3 tables for the 16-MiB
+ * window. Tables themselves are never mapped into endpoint address space. */
+static uint64_t
+wl_pt_pa(unsigned table)
+{
+	return wl_phys(wl_tables.va + table * 4096);
+}
+
+static int
+wl_smmu_enable(void)
+{
+	if (wl_dma_alloc(&wl_tables, 10 * 4096)) { return 1; }
+	uint64_t *root = (uint64_t *)wl_tables.va;
+	uint64_t *l2 = (uint64_t *)(wl_tables.va + 4096);
+	root[0] = wl_pt_pa(1) | 3;
+	for (unsigned i = 0; i < 8; i++) { l2[128 + i] = wl_pt_pa(2 + i) | 3; }
+	struct wl_dma *bufs[] = { &wl_image, &wl_vectors, &wl_contexts };
+	for (unsigned i = 0; i < 3; i++) {
+		struct wl_dma *d = bufs[i];
+		for (vm_size_t off = 0; off < d->size; off += 4096) {
+			uint64_t addr = d->iova + off;
+			if (addr < WL_IOVA || addr >= WL_IOVA_END) { return 2; }
+			unsigned n = (unsigned)((addr - WL_IOVA) >> 21);
+			uint64_t *l3 = (uint64_t *)(wl_tables.va + (2 + n) * 4096);
+			/* RW unprivileged, AF, nG, NS, inner-shareable WB, XN. */
+			l3[(addr >> 12) & 511] = wl_phys(d->va + off) | 0x60000000000f63ull;
+		}
+	}
+	wl_dma_clean(&wl_tables);
+	/* Re-prove vacancy after allocations/VFS sleeps, immediately before writes. */
+	if (wl_prd(WL_SMMU + 0x800 + 4 * wl_slot) != wl_old_smr ||
+	    wl_prd(WL_SMMU + 0xc00 + 4 * wl_slot) != wl_old_s2cr ||
+	    wl_prd(wl_cb_addr(wl_cb)) != wl_old_sctlr) { return 3; }
+	for (unsigned i = 0; i < wl_smr_count; i++) {
+		uint32_t smr = wl_prd(WL_SMMU + 0x800 + 4 * i), s2cr = wl_prd(WL_SMMU + 0xc00 + 4 * i);
+		if ((s2cr & 255) == wl_cb || ((smr & 0x80000000u) &&
+		    (((smr ^ 0x1401) & ~((smr >> 16) & 0x7fff) & 0xffff) == 0))) { return 3; }
+	}
+	if (fw_faults || (wl_prd(WL_EPCFG + 4) & 4)) { return 3; }
+	for (unsigned i = 0; i < wl_cb_count; i++) {
+		if (wl_prd(wl_cb_addr(i)) & 1) {
+			if ((wl_prd(wl_cb_addr(i) + 0x24) >> 16) == wl_cb ||
+			    (wl_prd(wl_cb_addr(i) + 0x2c) >> 16) == wl_cb) { return 3; }
+		}
+	}
+	if (fw_faults || wl_prd(WL_SMMU) != wl5_report[4]) { return 3; }
+	uint64_t cb = wl_cb_addr(wl_cb), ttbr = wl_pt_pa(0) | ((uint64_t)wl_cb << 48);
+	wl_owned = true; /* includes partial setup: abort must disable and sync */
+	if (wl_smmu_wr(cb, 0) ||
+	    wl_smmu_wr(wl_gr1 + 0x800 + 4 * wl_cb, 1) || /* VA64 */
+	    wl_smmu_wr(wl_gr1 + 4 * wl_cb, 0x1f300) || /* S1, S2 bypass */
+	    wl_smmu_wr(cb + 0x10, 0x38011) || /* SEP upstream, AS, 36-bit PA */
+	    wl_smmu_wr(cb + 0x30, 0x803520) || /* EPD1, WB/ISH, 32-bit IOVA */
+	    wl_smmu_wr(cb + 0x24, (uint32_t)(ttbr >> 32)) ||
+	    wl_smmu_wr(cb + 0x20, (uint32_t)ttbr) ||
+	    wl_smmu_wr(cb + 0x2c, wl_cb << 16) || wl_smmu_wr(cb + 0x28, 0) ||
+	    wl_smmu_wr(cb + 0x38, 0xff) || wl_smmu_wr(cb + 0x3c, 0)) { return 4; }
+	/* FSR is W1C only for our newly owned bank; preserve later DMA faults. */
+	wl_pwr(cb + 0x58, 0xc00001fe);
+	if (wl_smmu_fault(20) || wl_smmu_sync(false) ||
+	    wl_smmu_wr(cb, 0x1027) || /* ASIDPNE, CFRE, AFE, TRE, M; IRQ/stall off */
+	    wl_smmu_wr(WL_SMMU + 0xc00 + 4 * wl_slot, wl_cb) ||
+	    wl_smmu_wr(WL_SMMU + 0x800 + 4 * wl_slot, 0x80001401)) { return 5; }
+	wl_enabled = true;
+	printf("FUXI WLAN: SMMU owned stage1 SMR %u CB %u TTBR %#llx IOVA %#llx-%#llx readback verified\n",
+	    wl_slot, wl_cb, wl_pt_pa(0), WL_IOVA, wl_contexts.iova + wl_contexts.size - 1);
+	printf("FUXI WLAN: DMA self-test: no standalone BHI host-write cookie; step 21/22 BHI transfer + CB faults is first endpoint proof\n");
+	return 0;
+}
+
+static int
+wl_smmu_fault(unsigned step)
+{
+	if (!wl_owned) { return 0; }
+	uint64_t cb = wl_cb_addr(wl_cb);
+	uint32_t fsr = wl_prd(cb + 0x58), lo = wl_prd(cb + 0x60), hi = wl_prd(cb + 0x64);
+	uint32_t syn = wl_prd(cb + 0x68), syn1 = wl_prd(cb + 0x6c);
+	uint32_t global = wl_prd(WL_SMMU + 0x48), sid = wl_prd(WL_SMMU + 0x54);
+	wl5_report[80] = fsr; wl5_report[81] = lo; wl5_report[82] = hi;
+	wl5_report[83] = syn; wl5_report[84] = syn1;
+	wl5_report[85] = global; wl5_report[86] = sid;
+	if (step >= 17 && step <= 28) { wl5_report[96 + step - 17] = fsr; }
+	printf("FUXI WLAN: M6 step %u CB %u FSR %#x FAR %#x:%08x FSYNR %#x/%#x GFSR %#x GFSYNR1 %#x\n", step, wl_cb, fsr, hi, lo, syn, syn1, global, sid);
+	return fw_faults || !!(fsr & 0xc00001fe) || ((global & 2) && (sid & 0xffff) == 0x1401);
+}
+
+/* Fault-contained cleanup is restricted to this driver's proven vacant slots.
+ * BME off + PERST/drain are prerequisites in wl5_abort. Failure quarantines
+ * tables and data; never free a table while a walker could still use it. */
+static int
+wl_smmu_undo(void)
+{
+	if (wl_owned) {
+		uint64_t smr = WL_SMMU + 0x800 + 4 * wl_slot;
+		uint64_t s2cr = WL_SMMU + 0xc00 + 4 * wl_slot;
+		if (wl_contain_wr(smr, 0x1401) || (wl_prd(smr) & 0x80000000u)) { return 1; }
+		if (wl_contain_wr(s2cr, wl_old_s2cr) || wl_prd(s2cr) != wl_old_s2cr) { return 1; }
+		if (wl_contain_wr(wl_cb_addr(wl_cb), 0) || wl_prd(wl_cb_addr(wl_cb)) != 0) { return 1; }
+		if (wl_smmu_sync(true)) { return 1; }
+		if (wl_contain_wr(smr, wl_old_smr) || wl_prd(smr) != wl_old_smr) { return 1; }
+		wl_enabled = wl_owned = false;
+		printf("FUXI WLAN: SMMU undo SMR invalid, S2CR restored, CB disabled, TLBI synced\n");
+	}
+	if (wl_route_owned) {
+		if (wl_contain_wr(WL_PARF + 0x2c00, wl_route_cfg) || wl_prd(WL_PARF + 0x2c00) != wl_route_cfg ||
+		    wl_contain_wr(WL_PARF + 0x2000 + 4 * wl_route_hash, wl_route_entry) || wl_prd(WL_PARF + 0x2000 + 4 * wl_route_hash) != wl_route_entry) { return 1; }
+		wl_route_owned = false;
 	}
 	return 0;
 }
@@ -664,8 +858,8 @@ wl_read_firmware(void)
 	if (ehsize != (b[4] == 1 ? 52 : 64) || !phnum || phsize != (b[4] == 1 ? 32 : 56) ||
 	    phoff < ehsize || phoff > wl_fw_size || (uint64_t)phsize * phnum > wl_fw_size - phoff) { e = 6; goto close; }
 	wl_dma_clean(&wl_image);
-	wl5_report[17] = wl_fw_size; wl5_report[18] = (uint32_t)wl_image.pa;
-	printf("FUXI WLAN: firmware %s bytes %u ELF%u DMA %#llx cache-clean\n", wl_fw_path, wl_fw_size, b[4] == 1 ? 32 : 64, wl_image.pa);
+	wl5_report[17] = wl_fw_size; wl5_report[18] = (uint32_t)wl_image.iova;
+	printf("FUXI WLAN: firmware %s bytes %u ELF%u DMA %#llx cache-clean\n", wl_fw_path, wl_fw_size, b[4] == 1 ? 32 : 64, wl_image.iova);
 	e = 0;
 close:
 	(void)vnode_close(vp, FREAD, ctx);
@@ -678,11 +872,12 @@ static int
 wl_poll(unsigned mode)
 {
 	for (unsigned i = 0; i <= 200; i++) {
+		if (wl_owned && (wl_prd(wl_cb_addr(wl_cb) + 0x58) & 0xc00001fe)) { return 3; }
 		uint32_t ee = wl_mrd(wl_bhi + 0x28), st = wl_mrd(0x48);
 		uint32_t bs = wl_mrd(wl_bhi + 0x2c), es = wl_mrd(wl_bhie + 0x44);
 		uint32_t ctrl = wl_mrd(0x38), state = (st >> 8) & 255;
 		if (fw_faults || (st & 4) || state == 255 || (bs >> 30) == 3 ||
-		    (es >> 30) == 3 || ee == 3 || ee == 6 || ee == ~0u) { return 1; }
+		    (mode >= 3 && (es >> 30) == 3) || ee == 3 || ee == 6 || ee == ~0u) { return 1; }
 		if ((mode == 0 && ((bs >> 30) == 2 || ee == 1)) ||
 		    (mode == 1 && !(ctrl & 2) && (st & 1)) ||
 		    (mode == 2 && ee == 1 && state == 2) ||
@@ -729,32 +924,38 @@ wl5_step(unsigned s)
 		struct wl_vector *v = (struct wl_vector *)wl_vectors.va;
 		for (unsigned i = 0; i < n; i++) {
 			unsigned off = i * WL_CHUNK;
-			v[i].addr = wl_image.pa + off;
+			v[i].addr = wl_image.iova + off;
 			v[i].size = MIN(WL_CHUNK, wl_fw_size - off);
 		}
 		struct wl_context *e = (struct wl_context *)(wl_contexts.va + WL_ECTX);
 		for (unsigned i = 0; i < 2; i++) {
-			e[i].type = 1; e[i].base = e[i].rp = wl_contexts.pa + (i ? WL_ER1 : WL_ER0);
+			e[i].type = 1; e[i].base = e[i].rp = wl_contexts.iova + (i ? WL_ER1 : WL_ER0);
 			e[i].len = i ? 4096 : 512; e[i].wp = e[i].base + e[i].len - 16;
 		}
 		struct wl_context *c = (struct wl_context *)(wl_contexts.va + WL_CCTX);
-		c->base = c->rp = c->wp = wl_contexts.pa + WL_CR; c->len = 2048;
+		c->base = c->rp = c->wp = wl_contexts.iova + WL_CR; c->len = 2048;
 		wl_dma_clean(&wl_contexts); wl_dma_clean(&wl_vectors);
 		wl5_report[19] = n * sizeof(struct wl_vector);
-		wl5_report[20] = (uint32_t)wl_vectors.pa; wl5_report[21] = (uint32_t)wl_contexts.pa;
+		wl5_report[20] = (uint32_t)wl_vectors.iova; wl5_report[21] = (uint32_t)wl_contexts.iova;
 		printf("FUXI WLAN: prepared %u vectors (%u bytes), 44-byte contexts, channels disabled; bus master off\n", n, wl5_report[19]);
-		return fw_faults ? 3 : 0;
+		return fw_faults ? 3 : wl_smmu_enable();
 	}
 	case 21:
+		if (!wl_enabled || wl_smmu_fault(21) ||
+		    (wl_prd(WL_PARF + 0x2000 + 4 * wl_route_hash) & 0xffffff00) != 0x01000100 ||
+		    wl_prd(WL_SMMU) != wl5_report[4] ||
+		    wl_prd(WL_SMMU + 0x800 + 4 * wl_slot) != 0x80001401 ||
+		    wl_prd(WL_SMMU + 0xc00 + 4 * wl_slot) != wl_cb ||
+		    wl_prd(wl_cb_addr(wl_cb)) != 0x1027 ||
+		    (wl_prd(WL_PARF + 0x2c00) & 1) || wl_prd(WL_PARF + 0x234)) { return 6; }
 		for (unsigned o = 0x60; o <= 0x70; o += 4) { wl_mwr(wl_bhie + o, 0); }
 		wl_mwr(wl_bhi + 0x20, 0); wl_mwr(wl_bhi + 0x2c, 0);
-		wl_mwr64(wl_bhi + 8, wl_image.pa); wl_mwr(wl_bhi + 0x10, WL_CHUNK);
+		wl_mwr64(wl_bhi + 8, wl_image.iova); wl_mwr(wl_bhi + 0x10, WL_CHUNK);
 		wl_dma_clean(&wl_image);
 		if (fw_faults) { return 1; }
 		/* Only now, immediately before the first image doorbell, allow DMA.
 		 * Disable legacy INTx; MSI/MSI-X remain unconfigured/disabled. */
 		wl_pwr(WL_EPCFG + 4, (wl_prd(WL_EPCFG + 4) & 0xffff) | 0x404);
-		wl_dma_started = true;
 		if ((wl_prd(WL_EPCFG + 4) & 0x406) != 0x406 || fw_faults) { return 2; }
 		wl_seq = ((uint32_t)mach_absolute_time() & WL_SEQ_MASK) | 1;
 		wl_mwr(wl_bhi + 0x18, wl_seq);
@@ -766,13 +967,13 @@ wl5_step(unsigned s)
 		uint32_t erdb = wl_mrd(0x20);
 		if ((erdb & 7) || erdb < 0x100 || erdb > 0x3ff0 ||
 		    (wl_mrd(0x10) & 255) != 128) { return 1; }
-		wl_mwr64(0x58, wl_contexts.pa); wl_mwr64(0x60, wl_contexts.pa + WL_ECTX);
-		wl_mwr64(0x68, wl_contexts.pa + WL_CCTX);
+		wl_mwr64(0x58, wl_contexts.iova); wl_mwr64(0x60, wl_contexts.iova + WL_ECTX);
+		wl_mwr64(0x68, wl_contexts.iova + WL_CCTX);
 		wl_mwr64(0x80, 0); wl_mwr64(0x88, 0xffffffffull);
 		wl_mwr64(0x98, 0); wl_mwr64(0xa0, 0xffffffffull);
 		wl_mwr(0x10, (wl_mrd(0x10) & 0xffff) | (2u << 16));
-		wl_mwr64(erdb, wl_contexts.pa + WL_ER0 + 512 - 16);
-		wl_mwr64(erdb + 8, wl_contexts.pa + WL_ER1 + 4096 - 16);
+		wl_mwr64(erdb, wl_contexts.iova + WL_ER0 + 512 - 16);
+		wl_mwr64(erdb + 8, wl_contexts.iova + WL_ER1 + 4096 - 16);
 		return fw_faults ? 2 : 0;
 	}
 	case 25:
@@ -780,7 +981,7 @@ wl5_step(unsigned s)
 		return wl_poll(2);
 	case 26:
 		wl_dma_clean(&wl_image); wl_dma_clean(&wl_vectors);
-		wl_mwr64(wl_bhie + 0x2c, wl_vectors.pa);
+		wl_mwr64(wl_bhie + 0x2c, wl_vectors.iova);
 		wl_mwr(wl_bhie + 0x34, wl5_report[19]);
 		wl_seq = (wl_seq + 1) & WL_SEQ_MASK; if (!wl_seq) { wl_seq = 1; }
 		wl_mwr(wl_bhie + 0x3c, (wl_mrd(wl_bhie + 0x3c) & ~WL_SEQ_MASK) | wl_seq);
@@ -789,7 +990,7 @@ wl5_step(unsigned s)
 	case 27: return wl_poll(3);
 	case 28: {
 		int e = wl_poll(4);
-		if (!e) { printf("FUXI WLAN: M5 mission mode M0 confirmed (READY observed at step 23); no channels/QMI; DMA buffers retained\n"); }
+		if (!e) { printf("FUXI WLAN: M6 mission mode M0 confirmed (READY observed at step 23); no channels/QMI; DMA buffers retained\n"); }
 		return e;
 	}
 	}
@@ -797,7 +998,7 @@ wl5_step(unsigned s)
 }
 
 /* Cleanup is the only exception to the normal write-after-fault latch. These
- * three containment destinations were mapped before bring-up. Keep each access
+ * containment/owned undo destinations were mapped before bring-up. Keep each access
  * fault-contained, and never clear the original fault counters. */
 static int
 wl_contain_wr(uint64_t pa, uint32_t value)
@@ -812,6 +1013,7 @@ static void
 wl5_abort(unsigned step)
 {
 	wl5_status(step);
+	(void)wl_smmu_fault(step);
 	int reset_bad = 0;
 	if (wl_mhi_valid) {
 		reset_bad = wl_contain_wr((uint64_t)WL_BAR0 + 0x38, 2);
@@ -838,11 +1040,12 @@ wl5_abort(unsigned step)
 	    reset_bad ? "unconfirmed" : "done", bm_bad ? "unconfirmed" : "yes", perst_bad ? "unconfirmed" : "yes");
 	/* No DMA buffer is ever returned to the allocator while containment is
 	 * unproven. This is a bounded leak on an MMIO fault, never a panic/UAF. */
-	if (!wl_dma_started || (!bm_bad && !perst_bad)) {
+	if (!bm_bad && !perst_bad && !wl_smmu_undo()) {
+		wl_dma_free(&wl_tables);
 		wl_dma_free(&wl_contexts); wl_dma_free(&wl_vectors); wl_dma_free(&wl_image);
 		printf("FUXI WLAN: abort buffers freed\n");
 	} else {
-		printf("FUXI WLAN: abort buffers quarantined until reboot (DMA containment unproven)\n");
+		printf("FUXI WLAN: abort buffers quarantined until reboot (containment or SMMU undo unproven)\n");
 	}
 }
 
@@ -893,7 +1096,7 @@ fw_run(unsigned limit)
 	uint32_t *r4 = wl4_report;
 	r4[0] = WL4_MAGIC;
 	r4[1] = limit;
-	wl5_report[0] = 0x574c0005; wl5_report[1] = limit;
+	wl5_report[0] = 0x574c0006; wl5_report[1] = limit;
 	for (unsigned s = 1; s <= limit; s++) {
 		uint64_t t0 = mach_absolute_time(), ns = 0;
 		unsigned faults0 = fw_faults;
@@ -908,7 +1111,10 @@ fw_run(unsigned limit)
 			wl_mark(s);
 			wl3_faults = 0;
 			e = s <= WL4_STEPS ? wl4_step(s) : wl5_step(s);
-			if (s > WL4_STEPS) { wl5_status(s); }
+			if (s > WL4_STEPS) {
+				wl5_status(s);
+				if (wl_smmu_fault(s) && !e) { e = 0xfc; }
+			}
 			wl3_report[124] += wl3_faults;
 		}
 		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
@@ -936,7 +1142,7 @@ fw_run(unsigned limit)
 	}
 	printf("FUXI WLAN: %u steps done\n", limit);
 	/* A deliberate partial M5 run also shuts down before releasing memory. */
-	if (limit >= 19 && limit < WL5_STEPS) { wl5_abort(limit); }
+	if (limit >= 17 && limit < WL5_STEPS) { wl5_abort(limit); }
 out:
 	/* Shared GCC vote registers (touch and GPU also read-modify-write
 	 * 0x52008/0x52000 without a common lock): show the final values. */
@@ -944,7 +1150,7 @@ out:
 	    usb_rd(WL_GCC, 0x52000), usb_rd(WL_GCC, 0x52008), usb_rd(WL_GCC, 0x52020));
 	fw_dump("m3", wl3_report, 128);
 	fw_dump("m4", wl4_report, 64);
-	if (limit >= 17) { fw_dump("m5", wl5_report, 128); }
+	if (limit >= 17) { fw_dump("m6", wl5_report, 128); }
 }
 
 static void
