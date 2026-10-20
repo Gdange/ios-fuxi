@@ -1,3 +1,53 @@
+# Milestone 5b
+
+Branch `codex-gpu-m5b`, based on M5 `fd83647`. This note supersedes M5's
+support gates and report size below. Coordinator fresh-boot evidence for M5
+image `ec9f0953`: stages7..13 PASS; stage16 stopped at step4, `f06`, after
+availability returned x0=0/x1=1 and PAS13 support returned x0=0/x1=0.
+Private decode: `research-log/stage-16m5.log` (not committed).
+**Guess:** PAS13's real operations may work despite that support boolean.
+
+M5b records both query booleans and continues, including zero/unknown x1.
+It queries availability (`42000601`, arginfo1) immediately before init, setup,
+and auth, with SIP-owner arguments `02000201`, `02000202`, `02000205`.
+Any nonzero transport x0 still stops at the first call (`f05` availability,
+`f06` support); init/setup/auth/resume also require service x1=0. No retries.
+All other power, memory, secure-exit, pixel, scanout and one-shot gates remain.
+
+Rechecked the supplied Linux MDT/SCM sources: only valid non-hash, nonempty
+PT_LOADs contribute; any bit27 enables relocation. Init precedes conditional
+setup with **reserved PA, ALIGN(max LOAD end,4096)-min LOAD paddr**, then segment
+copy/zero/readback and auth. This MBN needs `mem_setup(13,9b09a000,1000)`;
+fixed images skip setup and its availability query. The
+[Linux zap path](https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/msm/adreno/adreno_gpu.c)
+does not gate on PAS support. The
+[SCM metadata contract](https://github.com/torvalds/linux/blob/v6.12/drivers/firmware/qcom/qcom_scm.c)
+requires physically contiguous, 4KiB-aligned, uncached memory. Our existing
+dedicated scratch retains the packed `fcc` bytes untouched through auth and
+until reset, including failures; no SHM bridge or metadata-size SCM argument.
+
+Report **v9**, signature `a7400009`: **8192 bytes, sixteen pages**, selectors
+`100..10f`. Pages0..14 keep field layouts. Page14 words48..127 hold SCM1..5;
+new page15 has signature/stage16 at words0/1 and SCM6..8 at words16..63.
+Records retain step, fn, arginfo, arguments, full x0..x3 and in-flight marker;
+setup's third argument remains page14 word16. Relocatable cold path has eight
+calls; fixed path six. Decoder supports v8 and older captures unchanged.
+
+Validation: synthetic and exact external GMU/SQE/zap UBSan models PASS;
+Linux/Mesa audits PASS; false/unknown queries, every transport error at every
+slot, operational service failures, metadata retention, fixed relocation and
+frozen reports covered. Firmware-enabled/empty loader and standalone probe
+builds have **zero warnings**, using M5's compiler, firmware environment and
+unchanged integ1 payload. Boot-v4/Image/ELF checks and exact blob comparison PASS.
+
+Image: `shim/out/lane-gpu/fuxi-gpu-m5b-boot.img` (20,897,792 bytes).
+SHA256: `eaabc9a4606f03800754beb797f50503495efaed70795fa03d1c5baa78ee2616`.
+Image, ELF and SHA256 sidecar are saved alongside it; firmware stays untracked.
+No phone access or push. Hardware acceptance remains pending: TZ can deny,
+stall or reset; inherited SCM bandwidth is unverified; successful auth alone
+does not prove secure exit or working pixels. Coordinator order remains fresh
+7..13 →16, inspect16/14, then optional15 in the same boot.
+
 # Milestone 5 — Fuxi-signed zap through TrustZone PAS
 
 Branch `codex-gpu-m5`, based on `3633e99` (M4b). This section supersedes the

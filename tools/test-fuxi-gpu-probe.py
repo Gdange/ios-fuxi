@@ -35,7 +35,9 @@ static void mock_smc(uint64_t ret[4], uint32_t fn, uint32_t info, uint64_t a, ui
 SUFFIX = r'''
 static int firmware_success = 1, ack_mode, corrupt_readback, tlb_busy;
 static unsigned scm_calls, scm_fail_call, scm_service_fail, secure_mode, require_zap;
-static uint64_t scm_transport;
+static uint64_t scm_transport, scm_available, scm_supported;
+static unsigned metadata_protected;
+static uint8_t metadata_snapshot[G5_META_BYTES];
 
 static unsigned firmware_releases, mmio_writes;
 static int cp_mode; /* 1 stalled, 2 fault, 3 missing fence, 4 corrupt fence guard */
@@ -47,6 +49,7 @@ uint32_t probe_fault_esr;
 uint64_t probe_fault_far;
 uint32_t probe_safe_rd32(uint64_t pa, uint32_t *faulted)
 {
+ assert(!metadata_protected || pa < G5_META_PA || pa >= G5_META_PA+G5_META_BYTES);
  *faulted = pa == abort_read;
  if (*faulted) { probe_fault_esr=0x96000010; probe_fault_far=pa; return 0xdeadfa17; }
  const unsigned ports[3][2] = {{G3_STAT_ADDR,G3_STAT_DATA},{G3_BV_STAT_ADDR,G3_BV_STAT_DATA},{G3_AC_STAT_ADDR,G3_AC_STAT_DATA}};
@@ -57,6 +60,7 @@ uint32_t probe_safe_rd32(uint64_t pa, uint32_t *faulted)
 }
 unsigned probe_safe_wr32(uint64_t pa, uint32_t v)
 {
+ assert(!metadata_protected || pa < G5_META_PA || pa >= G5_META_PA+G5_META_BYTES);
  if (pa == abort_write) { probe_fault_esr=0x96000050; probe_fault_far=pa; return 1; }
  g_wr(pa, 0, v); return 0;
 }
@@ -68,29 +72,40 @@ static void mock_smc(uint64_t ret[4], uint32_t fn, uint32_t info, uint64_t a, ui
  assert(*ptr(GPU_REG_BASE+0x806*4)==G3_FENCE_DWORDS);
  if (fn==0x4200010a) { assert(info==2 && a==0 && b==13 && c==0 && g5_zap_loaded); }
  else {
-  const unsigned fns[]={0x42000601,0x42000207,0x42000201,0x42000202,0x42000205};
+  const unsigned fns[]={0x42000601,0x42000207,0x42000601,0x42000201,
+                        0x42000601,0x42000202,0x42000601,0x42000205};
   unsigned relocated=!!(cdb32(_zap_fw_start+108)&(1u<<27));
-  unsigned index=scm_calls==4 && !relocated ? 4 : scm_calls-1;
-  assert(scm_calls<=5 && fn==fns[index]);
-  if(scm_calls==1) assert(info==1 && a==0x02000207 && !b && !c);
-  else if(scm_calls==2) assert(info==1 && a==13 && !b && !c);
-  else if(scm_calls==3) {
+  unsigned index=scm_calls-1;
+  if (!relocated && scm_calls>=5) index+=2;
+  assert(index<8 && fn==fns[index]);
+  uint32_t *slot=g5_scm_slot(gpu_extra[13],scm_calls-1);
+  assert(gpu_extra[13][5]==scm_calls && !slot[3] && slot[1]==fn && slot[2]==info);
+  assert((slot[4]|(uint64_t)slot[5]<<32)==a && (slot[6]|(uint64_t)slot[7]<<32)==b);
+  if (metadata_protected) assert(!memcmp((void *)(uintptr_t)G5_META_PA,metadata_snapshot,G5_META_BYTES));
+  if(fn==0x42000601) {
+   const unsigned args[]={0x02000207,0,0x02000201,0,0x02000202,0,0x02000205};
+   assert(info==1 && a==args[index] && !b && !c);
+  } else if(fn==0x42000207) assert(info==1 && a==13 && !b && !c);
+  else if(fn==0x42000201) {
    assert(info==0x82 && a==13 && b==G5_META_PA && !c);
+   assert(!(G5_META_PA&4095));
    assert(memcmp((void *)(uintptr_t)G5_META_PA,_zap_fw_start,0x94)==0);
    assert(memcmp((void *)(uintptr_t)(G5_META_PA+0x94),_zap_fw_start+0x2000,0xf38)==0);
    assert(*ptr(G5_ZAP_PA)==0x6b6b6b6b); /* init before LOAD copy */
+   memcpy(metadata_snapshot,(void *)(uintptr_t)G5_META_PA,G5_META_BYTES);
   } else if(fn==0x42000202) assert(info==3 && a==13 && b==G5_ZAP_PA && c==0x1000);
   else {
    assert(info==1 && a==13 && !b && !c);
    assert(memcmp((void *)(uintptr_t)G5_ZAP_PA,_zap_fw_start+0x1000,0x430)==0);
   }
  }
- ret[0]=0; ret[1]=(fn==0x42000601 || fn==0x42000207);
+ ret[0]=0; ret[1]=fn==0x42000601 ? scm_available : fn==0x42000207 ? scm_supported : 0;
  ret[2]=0x123456789abcdef0ull; ret[3]=0xfedcba9876543210ull;
  if (scm_calls==scm_fail_call) {
   ret[0]=scm_transport;
-  if(scm_service_fail) ret[1]=fn==0x42000601 || fn==0x42000207 ? 0 : (uint64_t)-7;
+  if(scm_service_fail) ret[1]=(uint64_t)-7;
  }
+ if(fn==0x42000201 && !ret[0] && !ret[1]) metadata_protected=1;
 }
 
 static void mock_write(uint64_t at, uint32_t val)
@@ -167,7 +182,7 @@ static void reset_model(void)
 {
  drop_sqe_base=start_fault=doorbells=sqe_controls=0;
  test_zap_bytes=(uintptr_t)_zap_fw_end-(uintptr_t)_zap_fw_start;
- scm_calls=scm_fail_call=scm_service_fail=secure_mode=require_zap=g5_zap_loaded=0; scm_transport=0;
+ scm_calls=scm_fail_call=scm_service_fail=secure_mode=require_zap=g5_zap_loaded=0; scm_transport=0; scm_available=scm_supported=1; metadata_protected=0;
  memset((void *)(uintptr_t)G5_ZAP_PA,0x6b,G5_ZAP_BYTES);
  memset((void *)(uintptr_t)GPU_REG_BASE, 0, 0x100000);
  memset((void *)(uintptr_t)G_MEM, 0, G_MEM_SIZE);
@@ -184,7 +199,7 @@ static void reset_model(void)
  *ptr(GPU_SMMU_BASE) = 0x2f0406;
  *ptr(GPU_GMU_CORE+0x5000*4) = 1;
  *ptr(GPU_GMU_CORE+(0x1c00+0xff8)*4) = 0x20010005;
- gpu_extra[0][0] = 0xa7400008;
+ gpu_extra[0][0] = 0xa7400009;
  assert(g_snapshot());
 }
 static void aux_fixture(void)
@@ -558,15 +573,15 @@ int main(int argc, char **argv)
  /* M5: exact metadata packing/relocation + full-word SCM returns and no retry. */
  reset_model(); aux_fixture(); require_zap=1; gpu_m2(16);
  uint32_t *z=gpu_extra[13];
- assert(z[2]==1 && z[3]==13 && z[4] && scm_calls==5 && z[5]==5);
+ assert(z[2]==1 && z[3]==13 && z[4] && scm_calls==8 && z[5]==8);
  assert(z[7]==0xfcc && z[12]==0x1000 && z[13]==0x2000 && z[16]==0x1000);
  assert(z[17]==0x430 && !z[18] && z[19]==1 && !z[20]);
  assert(z[25]==11 && z[27]==13 && z[28]==13 && z[39]==g3_pkt7(0x66,1));
  assert(z[37]==1 && gpu_extra[11][54]==84 && gpu_extra[11][32]==158 && !gpu_extra[12][1]);
  assert(z[48+13]==0x12345678 && z[48+15]==0xfedcba98 && gpu_stage==16);
- uint32_t frozen16[128]; memcpy(frozen16,z,sizeof(frozen16));
+ uint32_t frozen16[256]; memcpy(frozen16,z,sizeof(frozen16));
  before=doorbells; gpu_m2(16); gpu_m2(14);
- assert(doorbells==before && scm_calls==5 && !memcmp(z,frozen16,sizeof(frozen16)));
+ assert(doorbells==before && scm_calls==8 && !memcmp(z,frozen16,sizeof(frozen16)));
  FILE *m5=fopen("report-m5.bin","wb"); assert(m5); gpu_report[0]=0xa740;
  fwrite(gpu_report,sizeof(gpu_report),1,m5); fwrite(gpu_extra,sizeof(gpu_extra),1,m5); fclose(m5);
  panel_fixture(); gpu_m2(15); assert(gpu_extra[12][2]==1 && gpu_extra[12][32]==1681);
@@ -576,7 +591,7 @@ int main(int argc, char **argv)
  uint8_t saved_flags=_zap_fw_start[111]; _zap_fw_start[111]&=~8;
  for(unsigned i=0;i<4;i++) _zap_fw_start[96+i]=(G5_ZAP_PA>>(i*8))&255;
  reset_model(); aux_fixture(); gpu_m2(16); z=gpu_extra[13];
- assert(z[2]==1 && z[5]==4 && !z[14] && z[97]==0x42000205);
+ assert(z[2]==1 && z[5]==6 && !z[14] && g5_scm_slot(z,5)[1]==0x42000205);
  memcpy(_zap_fw_start+96,saved_pa,4); _zap_fw_start[111]=saved_flags;
  reset_model(); assert(g5_copy(G5_ZAP_PA,0,32));
  for(unsigned i=0;i<8;i++) assert(!*ptr(G5_ZAP_PA+i*4));
@@ -587,35 +602,55 @@ int main(int argc, char **argv)
  struct g5_plan zp={0}; z=gpu_extra[13]; z[3]=3;
  assert(g5_pas(z,_zap_fw_start,&zp)==1 && z[38]==2 && scm_calls==1);
  assert(z[49]==0x4200010a && z[52]==0 && z[54]==13);
- for(unsigned failed=1;failed<=5;failed++) for(unsigned kind=0;kind<2;kind++) {
-  reset_model(); aux_fixture(); scm_fail_call=failed;
-  scm_transport=kind ? 0 : (uint64_t)-12; scm_service_fail=kind;
+ /* False/unknown query results, including the observed support=0, are
+  * advisory. Operational calls still execute and authenticate normally. */
+ const uint64_t query_values[]={0,1,0x123456789abcdef0ull};
+ for(unsigned i=0;i<3;i++) for(unsigned j=0;j<3;j++) {
+  reset_model(); aux_fixture(); scm_available=query_values[i]; scm_supported=query_values[j];
   gpu_m2(16); z=gpu_extra[13];
-  unsigned errors[]={0,0xf05,0xf06,0xf07,0xf08,0xf0a};
-  assert(z[2]==errors[failed] && scm_calls==failed && z[44]==failed);
-  assert(!z[4] && !z[43] && !gpu_extra[11][1] && !gpu_extra[12][1]);
-  before=doorbells; gpu_m2(16); gpu_m2(15); gpu_m2(14);
-  assert(scm_calls==failed && doorbells==before && !gpu_extra[11][1]);
+  assert(z[2]==1 && z[4] && scm_calls==8 && !z[44]);
+  for(unsigned k=0;k<8;k++) {
+   uint32_t *slot=g5_scm_slot(z,k);
+   uint64_t value=slot[10]|(uint64_t)slot[11]<<32;
+   assert(slot[3] && !slot[8] && !slot[9]);
+   if(k==1) assert(value==query_values[j]);
+   else if(k==0 || k==2 || k==4 || k==6) assert(value==query_values[i]);
+   else assert(!value);
+  }
  }
  const int transport_errors[]={-1,-2,-3,-4,-5,-12,1,2};
- for(unsigned i=0;i<sizeof(transport_errors)/sizeof(transport_errors[0]);i++) {
-  reset_model(); aux_fixture(); scm_fail_call=3; scm_transport=(uint64_t)(int64_t)transport_errors[i];
-  gpu_m2(16); z=gpu_extra[13]; assert(z[2]==0xf07 && scm_calls==3 && !z[43]);
+ for(unsigned failed=1;failed<=8;failed++) for(unsigned kind=0;kind<=8;kind++) {
+  /* x1 is only a status on init/setup/auth, not on boolean queries. */
+  if(!kind && failed!=4 && failed!=6 && failed!=8) continue;
+  reset_model(); aux_fixture(); scm_fail_call=failed;
+  scm_transport=kind ? (uint64_t)(int64_t)transport_errors[kind-1] : 0;
+  scm_service_fail=!kind;
+  gpu_m2(16); z=gpu_extra[13];
+  const unsigned errors[]={0,0xf05,0xf06,0xf05,0xf07,0xf05,0xf08,0xf05,0xf0a};
+  assert(z[2]==errors[failed] && scm_calls==failed && z[44]==failed);
+  uint32_t *slot=g5_scm_slot(z,failed-1);
+  assert(slot[3] && (slot[8]|(uint64_t)slot[9]<<32)==scm_transport);
+  if(!kind) assert((slot[10]|(uint64_t)slot[11]<<32)==(uint64_t)-7);
+  assert(!z[4] && !z[43] && !gpu_extra[11][1] && !gpu_extra[12][1]);
+  uint32_t frozen[256]; memcpy(frozen,z,sizeof(frozen));
+  before=doorbells; gpu_m2(16); gpu_m2(15); gpu_m2(14);
+  assert(scm_calls==failed && doorbells==before && !gpu_extra[11][1]);
+  assert(!memcmp(frozen,z,sizeof(frozen)));
  }
  for(unsigned mode=1;mode<=3;mode++) {
   reset_model(); aux_fixture(); secure_mode=mode; gpu_m2(16); z=gpu_extra[13];
   unsigned errors[]={0,0xf0d,0xf0c,0xf0e};
   assert(z[2]==errors[mode] && z[4] && z[43] && !gpu_extra[11][1]);
-  before=doorbells; gpu_m2(15); gpu_m2(16); assert(before==doorbells && scm_calls==5);
+  before=doorbells; gpu_m2(15); gpu_m2(16); assert(before==doorbells && scm_calls==8);
  }
  reset_model(); aux_fixture(); gpu_m2(14); before=doorbells; gpu_m2(16);
  assert(gpu_extra[13][2]==0xf0f && !scm_calls && before==doorbells);
  reset_model(); aux_fixture(); gpu_m2(13); abort_write=G5_META_PA; gpu_m2(16);
- assert(gpu_extra[13][2]==0xf09 && scm_calls==2 && !gpu_extra[11][1]);
+ assert(gpu_extra[13][2]==0xf09 && scm_calls==3 && !gpu_extra[11][1]);
  reset_model(); aux_fixture(); gpu_m2(13); abort_write=G5_ZAP_PA; gpu_m2(16);
- assert(gpu_extra[13][2]==0xf09 && scm_calls==4 && !gpu_extra[13][4]);
+ assert(gpu_extra[13][2]==0xf09 && scm_calls==6 && !gpu_extra[13][4]);
  reset_model(); aux_fixture(); gpu_m2(13); abort_read=G5_META_PA; gpu_m2(16);
- assert(gpu_extra[13][2]==0xf09 && scm_calls==2);
+ assert(gpu_extra[13][2]==0xf09 && scm_calls==3);
  reset_model(); aux_fixture(); gpu_m2(13); blit_mode=9; gpu_m2(16);
  assert(gpu_extra[13][2]==0xe06 && gpu_extra[13][37]==0xe06 && !gpu_extra[12][1]);
  before=doorbells; gpu_m2(15); assert(before==doorbells && !gpu_extra[12][1]);
@@ -631,7 +666,7 @@ int main(int argc, char **argv)
  assert(g5_plan_mbn(mbn,zb,&zp)==0xf04); memcpy(mbn,_zap_fw_start,zb);
  mbn[52+32+27]&=~8; assert(g5_plan_mbn(mbn,zb,&zp)==0xf04); memcpy(mbn,_zap_fw_start,zb);
  mbn[52+64+24]=0; mbn[52+64+27]=0; assert(g5_plan_mbn(mbn,zb,&zp)==0xf04);
- puts("PASS: M5 PAS metadata/relocation, ABI, all SCM errors/no-retry, packet/idle/trust/2D gates and frozen reports");
+ puts("PASS: M5b advisory queries, retained contiguous metadata/relocation, ABI, all SCM errors/no-retry, packet/idle/trust/2D gates and frozen reports");
  puts("PASS: M4 pixels/row pitches/fences/guards/faults/no-retry; SMMU snapshot/ownership/readback, all icache PTEs, firmware load, HFI order/ACK/wrap/errors/timeouts, m3 mappings/CP packets/fence/abort/timeouts, one-shot GMU/handoff latch");
  return 0;
 }
@@ -715,7 +750,23 @@ def audit_linux_pas(msm):
     assert re.search(r'name="CP_SET_SECURE_MODE" value="0x66"', xml)
     dts = (kernel / 'arch/arm64/boot/dts/qcom/sm8550.dtsi').read_text()
     assert re.search(r'gpu_micro_code_mem:.*?reg = <0 0x9b09a000 0 0x2000>;.*?no-map;', dts, re.S)
-    print('PASS: Linux PAS service IDs, init_image RW arginfo, secure packet and SM8550 zap reservation')
+    mdt = (kernel / 'drivers/soc/qcom/mdt_loader.c').read_text()
+    valid = mdt.split('static bool mdt_phdr_valid', 1)[1].split('static ', 1)[0]
+    assert 'p_type != PT_LOAD' in valid and 'QCOM_MDT_TYPE_HASH' in valid and '!phdr->p_memsz' in valid
+    init = mdt.split('int qcom_mdt_pas_init(', 1)[1].split('EXPORT_SYMBOL_GPL', 1)[0]
+    assert 'phdr->p_flags & QCOM_MDT_RELOCATABLE' in init
+    assert 'min_addr = phdr->p_paddr' in init
+    assert 'max_addr = ALIGN(phdr->p_paddr + phdr->p_memsz, SZ_4K)' in init
+    assert re.search(r'if \(relocate\)\s*\{\s*ret = qcom_scm_pas_mem_setup\(pas_id, mem_phys, max_addr - min_addr\)', init)
+    assert init.index('qcom_scm_pas_init_image') < init.index('qcom_scm_pas_mem_setup')
+    pas = scm.split('int qcom_scm_pas_init_image(', 1)[1].split('EXPORT_SYMBOL_GPL', 1)[0]
+    assert 'dma_alloc_coherent' in pas and 'desc.args[1] = mdata_phys' in pas
+    assert 'physically contiguous, 4K aligned' in pas and 'ctx->ptr = mdata_buf' in pas
+    assert 'desc.args[2]' not in pas
+    zap = (msm / 'adreno/adreno_gpu.c').read_text().split('static int zap_shader_load_mdt(', 1)[1].split('int adreno_zap_shader_load', 1)[0]
+    assert 'qcom_scm_pas_supported' not in zap
+    assert zap.index('qcom_mdt_load(') < zap.index('qcom_scm_pas_auth_and_reset(')
+    print('PASS: Linux PAS IDs/ABI, advisory zap support, MDT relocation/setup arguments and contiguous metadata context')
 
 
 def audit_mesa(mesa):
@@ -853,6 +904,8 @@ def main():
         assert 'fn=0x42000201 arginfo=0x82 returned=1' in m5report
         assert 'x2=0x123456789abcdef0 x3=0xfedcba9876543210' in m5report
         assert 'target=13 after=13/13' in m5report and 'TRUST before/after=0x1/0x0' in m5report
+        assert 'SCM[8] step=8 fn=0x42000205' in m5report and 'calls=8' in m5report
+        assert 'arg2(span)=0x1000' in m5report and m5report.count('advisory query boolean') == 5
         # v7 has fourteen pages; retain its clear validity and timing decoding.
         import struct
         old7 = bytearray((tmp / 'report-m4.bin').read_bytes()[:7168])
@@ -862,13 +915,35 @@ def main():
         decoded7 = subprocess.run(['python3', str(ROOT / 'tools/fuxi-gpu-probe.py'), '--decode', str(legacy7)],
                                   check=True, capture_output=True, text=True).stdout
         assert 'solid_clear=0x1 (PASS)' in decoded7 and 'validity=0x3f' in decoded7
-        # Failed and in-flight SCM slots must not look like returned zeros.
-        words = [list(struct.unpack('<128I', (tmp / 'report-m5.bin').read_bytes()[i:i+512])) for i in range(0, 7680, 512)]
-        z = words[14]; z[2] = 0xf07; z[5] = 3; z[3] = 5; z[83] = 0
-        text = decoder['decode'](words[0], words[1:])
-        assert 'PAS init_image SCM error' in text and 'in flight (no returned registers)' in text
-        z[83] = 1; z[88] = 0xfffffff4; z[89] = 0xffffffff
-        assert 'x0=0xfffffffffffffff4' in decoder['decode'](words[0], words[1:])
+        blob = (tmp / 'report-m5.bin').read_bytes()
+        assert len(blob) == 8192
+        words = [list(struct.unpack('<128I', blob[i:i+512])) for i in range(0, len(blob), 512)]
+        # Legacy v8 keeps its five original slots and failure explanations.
+        old8 = [p[:] for p in words[:15]]
+        for page in old8[1:]:
+            if page[0] == 0xa7400009:
+                page[0] = 0xa7400008
+        slots = [words[14][48+i*16:64+i*16] if i<5 else words[15][16+(i-5)*16:32+(i-5)*16] for i in range(8)]
+        old8[14][48:] = sum([slots[i] for i in (0, 1, 3, 5, 7)], [])
+        old8[14][5] = 5
+        legacy8 = tmp / 'v8.bin'; legacy8.write_bytes(b''.join(struct.pack('<128I', *p) for p in old8))
+        decoded8 = subprocess.run(['python3', str(ROOT / 'tools/fuxi-gpu-probe.py'), '--decode', str(legacy8)],
+                                  check=True, capture_output=True, text=True).stdout
+        assert 'SCM[5] step=8 fn=0x42000205' in decoded8 and 'advisory query' not in decoded8
+        old8[14][2] = 0xf06
+        assert 'PAS13 unsupported or SCM error' in decoder['decode'](old8[0], old8[1:])
+        # Failed/in-flight slots on both sides of the page boundary retain
+        # high return halves; an incomplete v9 capture reports missing slots.
+        for failed in range(8):
+            z = words[14]; z[2] = 0xf07; z[5] = failed+1; z[3] = 5
+            slot = words[14] if failed<5 else words[15]
+            off = 48+failed*16 if failed<5 else 16+(failed-5)*16
+            slot[off+3] = 0
+            text = decoder['decode'](words[0], words[1:])
+            assert 'PAS init_image SCM error' in text and 'in flight (no returned registers)' in text
+            slot[off+3] = 1; slot[off+8] = 0xfffffff4; slot[off+9] = 0xffffffff
+            assert 'x0=0xfffffffffffffff4' in decoder['decode'](words[0], words[1:])
+        assert 'SCM records missing: captured=5 issued=8' in decoder['decode'](words[0], words[1:15])
         # Reproduce v6's failed-stage14 reporting: zero CPU ticks mean unrun.
         old6 = bytearray((tmp / 'report-m4.bin').read_bytes())
         import struct
@@ -884,7 +959,7 @@ def main():
         struct.pack_into('<I', legacy, 512, 0xa7400005)
         old = tmp / 'v5.bin'; old.write_bytes(legacy)
         subprocess.run(['python3', str(ROOT / 'tools/fuxi-gpu-probe.py'), '--decode', str(old)], check=True, stdout=subprocess.DEVNULL)
-        print('PASS: fifteen-page M5, M4/v6 and legacy v5 offline Python decoder')
+        print('PASS: sixteen-page M5b, legacy M5/v8, M4/v7/v6 and v5 offline Python decoder')
 
 
 if __name__ == '__main__':

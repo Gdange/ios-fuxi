@@ -1,4 +1,4 @@
-/* M5: one-shot Qualcomm PAS13, Linux6.12 mdt_loader + qcom_scm ARM64 ABI.
+/* M5b: one-shot Qualcomm PAS13, Linux6.12 mdt_loader + qcom_scm ARM64 ABI.
  * Included after gpu_m4. All input remains in the optional, external MBN.
  * No SCM retries, WAITQ, interrupted-call continuation or TRUST MMIO writes.
  */
@@ -85,21 +85,28 @@ static void g5_smc_raw(uint64_t ret[4], uint32_t fn, uint32_t info,
   :: "x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","cc","memory");
  ret[0] = x0; ret[1] = x1; ret[2] = x2; ret[3] = x3;
 }
-/* Five fixed slots, including in-flight markers for a non-returning SMC.
+/* Eight fixed slots, including in-flight markers for a non-returning SMC.
+ * First five retain the v8 layout; last three use v9 page15 words16..63.
  * Each slot: step, fn, arginfo, returned, arg0/arg1 low/high, x0..x3 low/high.
  * mem_setup arg2 is the validated span in page word16. */
-static int g5_scm(uint32_t *d, uint32_t fn, unsigned info,
-                   uint64_t a, uint64_t b, uint64_t c, unsigned predicate)
+static uint32_t *g5_scm_slot(uint32_t *d, unsigned i)
 {
- if (d[5] >= 5) return 0;
- uint32_t *s = d+48+16*d[5]++;
+ return i < 5 ? d+48+16*i : gpu_extra[14]+16+16*(i-5);
+}
+static int g5_scm(uint32_t *d, uint32_t fn, unsigned info,
+                   uint64_t a, uint64_t b, uint64_t c, unsigned advisory)
+{
+ if (d[5] >= 8) return 0;
+ uint32_t *s = g5_scm_slot(d, d[5]++);
  s[0] = d[3]; s[1] = fn; s[2] = info;
  s[4] = a; s[5] = a>>32; s[6] = b; s[7] = b>>32;
  __asm__ volatile("dsb sy" ::: "memory");
  uint64_t ret[4]; g5_smc_raw(ret, fn, info, a, b, c);
  for (unsigned i = 0; i < 4; i++) { s[8+i*2] = ret[i]; s[9+i*2] = ret[i]>>32; }
  s[3] = 1;
- int ok = !ret[0] && (predicate ? ret[1] != 0 : ret[1] == 0);
+ /* Query x1 is a boolean, not a service status. Record even false/unknown;
+  * only transport errors stop queries. Real PAS calls require x0=x1=0. */
+ int ok = !ret[0] && (advisory || !ret[1]);
  if (!ok) d[44] = d[5];
  return ok;
 }
@@ -127,12 +134,18 @@ static int g5_pas(uint32_t *d, const uint8_t *fw, const struct g5_plan *p)
  d[3] = 4;
  if (!g5_scm(d, G5_SMC(7), 1, G5_PAS, 0, 0, 1)) return 0xf06;
  d[3] = 5;
+ if (!g5_scm(d, 0x42000601, 1, 0x02000201, 0, 0, 1)) return 0xf05;
  if (!g5_copy(G5_META_PA, 0, G5_META_BYTES) ||
      !g5_copy(G5_META_PA, fw, p->header) ||
      !g5_copy(G5_META_PA+p->header, fw+p->hash_off, p->hash_size)) return 0xf09;
  if (!g5_scm(d, G5_SMC(1), 0x82, G5_PAS, G5_META_PA, 0, 0)) return 0xf07;
  d[3] = 6;
- if (p->relocate && !g5_scm(d, G5_SMC(2), 3, G5_PAS, G5_ZAP_PA, p->max-p->min, 0)) return 0xf08;
+ /* Linux qcom_mdt_pas_init: any valid relocatable LOAD enables setup;
+  * args are reserved base and ALIGN(max end,4K)-min paddr, not reservation size. */
+ if (p->relocate) {
+  if (!g5_scm(d, 0x42000601, 1, 0x02000202, 0, 0, 1)) return 0xf05;
+  if (!g5_scm(d, G5_SMC(2), 3, G5_PAS, G5_ZAP_PA, p->max-p->min, 0)) return 0xf08;
+ }
  d[3] = 7;
  for (unsigned i = 0; i < p->phnum; i++) {
   const uint8_t *ph = fw+p->phoff+i*32u;
@@ -143,6 +156,7 @@ static int g5_pas(uint32_t *d, const uint8_t *fw, const struct g5_plan *p)
   d[17] += file; d[18] += mem-file;
  }
  d[3] = 8;
+ if (!g5_scm(d, 0x42000601, 1, 0x02000205, 0, 0, 1)) return 0xf05;
  if (!g5_scm(d, G5_SMC(5), 1, G5_PAS, 0, 0, 0)) return 0xf0a;
  g5_zap_loaded = d[4] = 1;
  return 1;
@@ -214,7 +228,8 @@ static void gpu_m5(void)
 {
  uint32_t *d = gpu_extra[13];
  if (d[1]) return; /* includes failure: never retry or resume on a report read */
- g_enter(16); d[0] = 0xa7400008; d[1] = 16;
+ g_enter(16); d[0] = 0xa7400009; d[1] = 16;
+ gpu_extra[14][0] = 0xa7400009; gpu_extra[14][1] = 16;
  d[2] = g5_run(d);
  /* Retain raw CP errors even when packet waiting stopped before SECVID.
   * GX/OOB were proved by13 and are never released. No diagnostic clears. */

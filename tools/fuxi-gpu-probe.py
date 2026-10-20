@@ -90,7 +90,7 @@ def decode(r, pages=None):
     out.append(f'  version={r[80]:#x} magic={r[81]:#010x} (want 0x0c0330db) slaves={r[82]}')
     for i, nm in enumerate(NAMES):
         out.append(f'  {nm:<9} addr={r[83 + i]:#x}')
-    if pages and pages[0][0] in (0xa7400002, 0xa7400003, 0xa7400004, 0xa7400005, 0xa7400006, 0xa7400007, 0xa7400008):
+    if pages and pages[0][0] in (0xa7400002, 0xa7400003, 0xa7400004, 0xa7400005, 0xa7400006, 0xa7400007, 0xa7400008, 0xa7400009):
         e = pages[0]
         errors = {
             0: 'not-run', 1: 'PASS',
@@ -132,8 +132,8 @@ def decode(r, pages=None):
             0xf01: 'zap idle/ring/OOB/guard precondition lost',
             0xf02: 'no embedded zap MBN', 0xf03: 'invalid zap ELF32 header',
             0xf04: 'zap metadata/LOAD bounds or relocation invalid',
-            0xf05: 'PAS support-call unavailable or SCM error',
-            0xf06: 'PAS13 unsupported or SCM error', 0xf07: 'PAS init_image SCM error',
+            0xf05: 'PAS availability query transport error' if e[0] == 0xa7400009 else 'PAS support-call unavailable or SCM error',
+            0xf06: 'PAS support query transport error' if e[0] == 0xa7400009 else 'PAS13 unsupported or SCM error', 0xf07: 'PAS init_image SCM error',
             0xf08: 'PAS mem_setup SCM error', 0xf09: 'zap metadata/LOAD copy fault or mismatch',
             0xf0a: 'PAS auth_and_reset SCM error', 0xf0b: 'zap/secure packet safe-access fault',
             0xf0c: 'zap/secure packet CP/RBBM/SMMU fault', 0xf0d: 'secure packet idle timeout',
@@ -168,7 +168,7 @@ def decode(r, pages=None):
         out.append(f'  result={result(e[60])} OOB_intr={e[61]:#x} SPTPRAC={e[62]:#x} GX_GDSCR={e[63]:#x} RBBM_read={e[65]} RBBM_STATUS={e[64]:#x}')
         out.append(f'  live: intr={e[84]:#x} AOirq={e[85]:#x} fence={e[86]:#x} GFSR={e[87]:#x} CB_FSR={e[88]:#x} FAR={e[90]:08x}{e[89]:08x} FSYNR={e[91]:#x}/{e[92]:#x}')
         out.append(f'  queues: command r/w={e[93]}/{e[94]} response r/w={e[95]}/{e[96]}')
-        if len(pages) >= 7 and e[0] in (0xa7400003, 0xa7400004, 0xa7400005, 0xa7400006, 0xa7400007, 0xa7400008):
+        if len(pages) >= 7 and e[0] in (0xa7400003, 0xa7400004, 0xa7400005, 0xa7400006, 0xa7400007, 0xa7400008, 0xa7400009):
             m = pages[5]
             out.append('-- stage 11 GPU SID0/1 context --')
             out.append(f'  result={result(m[2])} slots={m[10]}/{m[34]} CB={m[11]} ASID={m[12]} GMU_CB/ASID={m[8]}/{m[9]} tables={m[33]} PT={(m[14]<<32)|m[13]:#x}')
@@ -183,10 +183,10 @@ def decode(r, pages=None):
             out.append('-- stage 13 CP_MEM_WRITE fence --')
             out.append(f'  result={result(m[4])} fence before/after={m[52]:#x}/{m[53]:#x} expected={m[54]:#x} CP rptr before/after={m[55]}/{m[56]} wptr={m[57]} polls={m[58]}')
             out.append(f'  safe MMIO faults={m[116]} first_PA={m[118]:08x}{m[117]:08x} last_PA={m[111]:08x}{m[110]:08x} op={m[115]} ESR={m[112]:#x} FAR={m[114]:08x}{m[113]:08x}')
-            if e[0] in (0xa7400004, 0xa7400005, 0xa7400006, 0xa7400007, 0xa7400008):
+            if e[0] in (0xa7400004, 0xa7400005, 0xa7400006, 0xa7400007, 0xa7400008, 0xa7400009):
                 out.append(f'  halt-clear readbacks: GBIF={m[95]:#x} RBBM_GBIF={m[96]:#x}')
-            init_words = 7 if e[0] in (0xa7400004, 0xa7400005, 0xa7400006, 0xa7400007, 0xa7400008) else 10
-            if e[0] in (0xa7400005, 0xa7400006, 0xa7400007, 0xa7400008):
+            init_words = 7 if e[0] in (0xa7400004, 0xa7400005, 0xa7400006, 0xa7400007, 0xa7400008, 0xa7400009) else 10
+            if e[0] in (0xa7400005, 0xa7400006, 0xa7400007, 0xa7400008, 0xa7400009):
                 out.append('  raw SQE payload prefix: ' + ' '.join(f'{v:08x}' for v in m[97:97+min(m[109], 12)]))
                 out.append(f'  checkpoint mask={m[119]:#x} (bit0=OOB,bit1=configured,bit2=RUN)')
             out.append('  init packet: ' + ' '.join(f'{v:08x}' for v in m[80:80+init_words]))
@@ -204,7 +204,7 @@ def decode(r, pages=None):
                         syn = d[at+4]
                         out.append(f'      fault attributes: {"write" if syn & 16 else "read"} level={syn & 3} IND={bool(syn & 64)} PNU={bool(syn & 32)} PTWF={bool(syn & 1024)} MID={d[at+5] & 255} ({fault_client(d[at+5], 0x7f)})')
                 out.append(f'    fence guards={d[32]:#x}/{d[33]:#x} MMIO_faults={d[31]}')
-                if e[0] in (0xa7400004, 0xa7400005, 0xa7400006, 0xa7400007, 0xa7400008) and len(pages) >= 9:
+                if e[0] in (0xa7400004, 0xa7400005, 0xa7400006, 0xa7400007, 0xa7400008, 0xa7400009) and len(pages) >= 9:
                     x = pages[8 if start else 7]
                     out.append(f'    extended: stage={x[1]} step={x[2]} phase={x[3]} (1=verify,2=SQE/wptr0,3=doorbell,4=cold-entry) bad_pointer_index={m[94]}')
                     out.append(f'      before doorbell: polls={x[4]} CP_INT={x[5]:#x} GPU_FSR={x[6]:#x} RBBM={x[7]:#x}')
@@ -224,7 +224,7 @@ def decode(r, pages=None):
                     out.append(f'      BR SQE_STAT count={x[63]} [0..50]: ' + ' '.join(f'{v:08x}' for v in x[64:115]))
                     out.append('      raw UCODE_DBG[0..3]: ' + ' '.join(f'{v:08x}' for v in x[120:124]))
                     out.append('      CPU SQE[0..3]:       ' + ' '.join(f'{v:08x}' for v in x[124:128]))
-                if e[0] in (0xa7400005, 0xa7400006, 0xa7400007, 0xa7400008):
+                if e[0] in (0xa7400005, 0xa7400006, 0xa7400007, 0xa7400008, 0xa7400009):
                     if not start:
                         for i, name in enumerate(('OOB/pre-setup', 'configured/pre-RUN', 'immediate/post-RUN')):
                             if not (m[119] & (1 << i)):
@@ -238,7 +238,7 @@ def decode(r, pages=None):
                             out.append(f'      {name} SQE_STAT count={y[2+j]} [0..50]: ' + ' '.join(f'{v:08x}' for v in y[16+j*51:16+j*51+min(y[2+j], 51)]))
                             out.append(f'      {name} raw UCODE_DBG[0..3]: ' + ' '.join(f'{v:08x}' for v in y[5+j*4:9+j*4]))
                         out.append(f'      raw AQE bases={y[119]:08x}{y[118]:08x}/{y[121]:08x}{y[120]:08x} MISC/BR_CHICKEN/BV_CHICKEN={y[122]:#x}/{y[123]:#x}/{y[124]:#x} APERTURE_CD={y[125]:#x} SMMU_INFO={y[127]:08x}{y[126]:08x}')
-    if pages and len(pages) >= 13 and pages[0][0] in (0xa7400006, 0xa7400007, 0xa7400008):
+    if pages and len(pages) >= 13 and pages[0][0] in (0xa7400006, 0xa7400007, 0xa7400008, 0xa7400009):
         for d in pages[11:13]:
             if not d[1]:
                 continue
@@ -250,7 +250,7 @@ def decode(r, pages=None):
             out.append(f'  ring start/end/count={d[31]}/{d[32]}/{d[33]} rptr/wptr={d[35]}/{d[36]} polls={d[34]} fence VA={d[17]:#x} expected/actual={d[18]:08x}/{d[37]:08x}')
             gpu_ticks = d[38] | d[39] << 32
             cpu_ticks = d[40] | d[41] << 32
-            v7 = d[0] in (0xa7400007, 0xa7400008)
+            v7 = d[0] in (0xa7400007, 0xa7400008, 0xa7400009)
             cpu_valid = bool(d[43] & 1) if v7 else d[3] >= 7 and bool(cpu_ticks)
             gpu_valid = bool(d[43] & 8) if v7 else d[3] >= 5
             cpu_text = str(cpu_ticks) if cpu_valid else 'N/A (not run)'
@@ -274,7 +274,7 @@ def decode(r, pages=None):
                 out.append(f'  {name} CB{d[at]} FSR={d[at+1]:#x} FAR={d[at+3]:08x}{d[at+2]:08x} FSYNR={d[at+4]:#x}/{d[at+5]:#x} SID={d[at+6]:#x} SCTLR={d[at+7]:#x}')
             out.append(f'  RBBM_STATUS1/2/3={d[89]:#x}/{d[90]:#x}/{d[91]:#x} safe_faults={d[92]} last_PA={d[94]:08x}{d[93]:08x} ESR={d[95]:#x}')
             out.append(f'  first {16 if v7 else 32} copy command words: ' + ' '.join(f'{v:08x}' for v in d[96:112 if v7 else 128]))
-    if len(pages) >= 14 and pages[0][0] == 0xa7400008 and pages[13][1] == 16:
+    if len(pages) >= 14 and pages[0][0] in (0xa7400008, 0xa7400009) and pages[13][1] == 16:
         d = pages[13]
         out.append('-- stage 16 PAS13 zap + stage-14 clear/copy --')
         out.append(f'  result={result(d[2])} step={d[3]} authenticated={d[4]} path={d[38]} (1=cold,2=owned-resume) calls={d[5]} failed_call={d[44]} clear_copy={result(d[37])}')
@@ -282,11 +282,18 @@ def decode(r, pages=None):
         out.append(f'  TRUST before/after={d[19]:#x}/{d[20]:#x} TSB before/after={d[22]:08x}{d[21]:08x}/{d[24]:08x}{d[23]:08x} (after valid at step>=11)')
         out.append(f'  secure packet={d[39]:08x} {d[40]:08x} submitted={d[43]} ring before={d[25]}/{d[26]} target={d[27]} after={d[28]}/{d[29]} polls={d[30]} RBBM={d[31]:#x} CP_INT={d[32]:#x} HW_FAULT={d[46]:#x} PROTECT={d[45]:#x} RBBM_INT={d[47]:#x}')
         out.append(f'  guards={d[41]:08x}/{d[42]:08x} safe_faults={d[33]} last_PA={d[35]:08x}{d[34]:08x} ESR={d[36]:#x}')
-        for i in range(min(d[5], 5)):
-            slot = d[48+i*16:64+i*16]
+        slots = [d[48+i*16:64+i*16] for i in range(5)]
+        v9 = pages[0][0] == 0xa7400009
+        if v9 and len(pages) >= 15 and pages[14][:2] == [0xa7400009, 16]:
+            slots += [pages[14][16+i*16:32+i*16] for i in range(3)]
+        if d[5] > len(slots):
+            out.append(f'  SCM records missing: captured={len(slots)} issued={d[5]}')
+        for i, slot in enumerate(slots[:d[5]]):
             args = [slot[j] | slot[j+1] << 32 for j in (4, 6)]
             returns = [slot[j] | slot[j+1] << 32 for j in (8, 10, 12, 14)]
             out.append(f'  SCM[{i+1}] step={slot[0]} fn={slot[1]:#010x} arginfo={slot[2]:#x} returned={slot[3]} args0/1={args[0]:#x}/{args[1]:#x}' + (f' arg2(span)={d[16]:#x}' if slot[1] == 0x42000202 else ''))
+            if v9 and slot[1] in (0x42000601, 0x42000207):
+                out.append('    advisory query boolean; nonzero x0 still stops')
             if slot[3]:
                 out.append('    ' + ' '.join(f'x{j}={value:#018x}' for j, value in enumerate(returns)))
             else:
@@ -306,8 +313,8 @@ def main():
     args = ap.parse_args()
     if args.decode:
         blob = args.decode.read_bytes()
-        if len(blob) not in (512, 3072, 4096, 5120, 6144, 7168, 7680):
-            ap.error('report must be 512 (legacy), 3072 (v2), 4096 (v3), 5120 (v4), 6144 (v5), 7168 (v6/v7), or 7680 (v8) bytes')
+        if len(blob) not in (512, 3072, 4096, 5120, 6144, 7168, 7680, 8192):
+            ap.error('report must be 512 (legacy), 3072 (v2), 4096 (v3), 5120 (v4), 6144 (v5), 7168 (v6/v7), 7680 (v8), or 8192 (v9) bytes')
     else:
         import usb.core
         import usb.util
@@ -328,7 +335,7 @@ def main():
         if args.read_reports or stage >= 8:
             extra = read(0x101)
             version = struct.unpack_from('<I', extra)[0]
-            page_count = {0xa7400002: 6, 0xa7400003: 8, 0xa7400004: 10, 0xa7400005: 12, 0xa7400006: 14, 0xa7400007: 14, 0xa7400008: 15}.get(version)
+            page_count = {0xa7400002: 6, 0xa7400003: 8, 0xa7400004: 10, 0xa7400005: 12, 0xa7400006: 14, 0xa7400007: 14, 0xa7400008: 15, 0xa7400009: 16}.get(version)
             if page_count is None:
                 ap.error(f'unsupported report version {version:#x}')
             blob += extra + b''.join(read(0x100 + i) for i in range(2, page_count))
