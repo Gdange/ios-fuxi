@@ -78,18 +78,20 @@ static int fg_abi_init(void)
  /* Snapshot once before checking: do not short-circuit away the evidence.
   * GPU offsets are dwords; SMMU_ID2 is a byte offset. The UCHE address
   * registers are adjacent 32-bit low/high pairs, including on A740.
-  * Keep exact checks until hardware readback establishes any RAZ bits. */
- static const struct { const char *name; unsigned reg; uint32_t want; } checks[] = {
-  {"UCHE_WRITE_THRU_BASE_LO",0xe07,0xfffff000u},
-  {"UCHE_WRITE_THRU_BASE_HI",0xe08,0x1ffff},
-  {"UCHE_TRAP_BASE_LO",0xe09,0xfffff000u},
-  {"UCHE_TRAP_BASE_HI",0xe0a,0x1ffff},
-  {"UCHE_GMEM_RANGE_MIN_LO",0xe0b,0x1000000},
-  {"UCHE_GMEM_RANGE_MIN_HI",0xe0c,0},
-  {"UCHE_GMEM_RANGE_MAX_LO",0xe0d,0x12fffff},
-  {"UCHE_GMEM_RANGE_MAX_HI",0xe0e,0},
-  {"UCHE_MODE_CNTL_HBB",0xe01,3},
-  {"RBBM_NC_MODE_CNTL",0x534,1},
+  * Address low words have 4K granularity: A740 reads GMEM MAX as
+  * 0x12ff000 after writing inclusive end 0x12fffff. Compare page addresses;
+  * high words, NC mode and the extracted HBB field remain exact. */
+ static const struct { const char *name; unsigned reg; uint32_t want, mask; } checks[] = {
+  {"UCHE_WRITE_THRU_BASE_LO",0xe07,0xfffff000u,0xfffff000u},
+  {"UCHE_WRITE_THRU_BASE_HI",0xe08,0x1ffff,UINT32_MAX},
+  {"UCHE_TRAP_BASE_LO",0xe09,0xfffff000u,0xfffff000u},
+  {"UCHE_TRAP_BASE_HI",0xe0a,0x1ffff,UINT32_MAX},
+  {"UCHE_GMEM_RANGE_MIN_LO",0xe0b,0x1000000,0xfffff000u},
+  {"UCHE_GMEM_RANGE_MIN_HI",0xe0c,0,UINT32_MAX},
+  {"UCHE_GMEM_RANGE_MAX_LO",0xe0d,0x12fffff,0xfffff000u},
+  {"UCHE_GMEM_RANGE_MAX_HI",0xe0e,0,UINT32_MAX},
+  {"UCHE_MODE_CNTL_HBB",0xe01,3,UINT32_MAX},
+  {"RBBM_NC_MODE_CNTL",0x534,1,UINT32_MAX},
  };
  uint32_t values[sizeof(checks)/sizeof(checks[0])];
  for (unsigned i=0;i<sizeof(checks)/sizeof(checks[0]);i++) values[i]=g3_gr(checks[i].reg);
@@ -107,7 +109,7 @@ static int fg_abi_init(void)
  }
  for (unsigned i=0;i<sizeof(checks)/sizeof(checks[0]);i++) {
   uint32_t got=checks[i].reg==0xe01 ? (values[i]>>21)&3 : values[i];
-  if (got!=checks[i].want) {
+  if ((got&checks[i].mask)!=(checks[i].want&checks[i].mask)) {
    printf("FUXI GPU ABI: init check %s got 0x%x want 0x%x\n",checks[i].name,got,checks[i].want);
    return 0;
   }
@@ -119,7 +121,10 @@ static int fg_abi_init(void)
  /* SM8550 UBWC4 configuration, same NC values as stage14 (also run by
   * stage16). GX OOB stays held; fg_state is not ready, so no present can
   * race these CPU MMIO writes. CP protection applies to packets, not AHB.
-  * Host PIPE bits 13:12 select BR=1/BV=2; restore default aperture last. */
+  * Host PIPE bits 13:12 select BR=1/BV=2; restore default aperture last.
+  * g3_gw checks access faults, not value readback, so NC/aperture writes
+  * impose no exact-read assumption. Tables below are NC scratch stores,
+  * not register readback. TTBR switching checks an aligned PA plus ASID. */
  static const struct { const char *name; unsigned reg; uint32_t value; } writes[] = {
   {"G4_RB_NC",G4_RB_NC,0x816},
   {"G4_TPL1_NC",G4_TPL1_NC,6},

@@ -1,3 +1,93 @@
+# Metal lane, milestone 2c: page-granular UCHE readback
+
+2026-10-20, branch `codex-metal2c`, based on `2800fd5` (metal2b plus Wi-Fi
+M5). Native build, all eleven host test scripts, shim host renderer, native
+SCM audit and artifact checks pass. No device execution is claimed.
+
+**Observed (supplied metal2b boot log):** GMEM MAX reads `0x12ff000` after
+writing inclusive end `0x12fffff`. The other snapshot values match. This
+explains the named init failure before the NC/aperture/table setup.
+
+The canonical backend and regenerated patch 0098 now compare UCHE address
+low words (WRITE_THRU, TRAP, GMEM MIN/MAX) through mask `0xfffff000` on both
+operands. Address high words and NC mode retain exact comparisons; HBB
+retains its exact extracted-field check and SMMU OAS its minimum check.
+Raw snapshots and failure messages still report the unmasked values.
+No programmed register value or userspace ABI changes.
+
+**GMEM:** reconstruct the inclusive end before computing size:
+`(0x12ff000 | 0xfff) - 0x1000000 + 1 = 0x300000` (3 MiB).
+[Linux v6.16 A740 catalog](https://github.com/torvalds/linux/blob/v6.16/drivers/gpu/drm/msm/adreno/a6xx_catalog.c#L1370-L1376)
+lists chip `0x43050a01` with `3 * SZ_1M`;
+[Linux UCHE setup](https://github.com/torvalds/linux/blob/v6.16/drivers/gpu/drm/msm/adreno/a6xx_gpu.c)
+programs GMEM MAX as MIN + size - 1, with a 16 MiB base for A740.
+DeviceInfo already advertises this base and 3 MiB size; it remains unchanged.
+Query reports ABI/address/allocation limits, not GMEM size. Host tests now
+compile and execute the actual Query/DeviceInfo branches and check these
+values against the observed range, avoiding the 4095-byte underestimate.
+
+**Follow-on audit:** `g3_gw`/`g3_write`/`probe_safe_wr32` and `fg_access`
+report MMIO access faults, not exact value readback. Thus the eight NC and
+BR/BV/default aperture writes have no similar equality assumption to fix.
+They still fail closed with a named write failure. `g_zero`, root/L2/L3
+construction and fence initialization use ordinary reserved NC memory
+stores, followed by `dsb sy`, rather than hardware address registers.
+Later TTBR switches do compare the 4 KiB-aligned root PA plus ASID exactly;
+there is no inclusive-end offset to reconstruct or discard there. The
+existing SMMU setup uses the same aligned addressing. Explicit BR/BV aperture
+selection, ABI table use and userspace submissions still need device testing.
+
+Host tests use `0x12ff000` by default, accept both rounded and inclusive MAX
+models, exercise each of the 12 ignored offset bits in all four low words,
+and reject page-address/high-word/HBB/NC corruption. All prior read faults,
+eight write failures, publication/table refusal, one-time snapshot bounds,
+PM4, mapping, watchdog, execswap, governor, root-tool and Wi-Fi M5 tests pass.
+
+**Build:** only `ci-lane-metal2` was used. Its prior 32 native input hashes
+were verified before synchronization. All tracked repository files were
+synchronized; the native source overlay includes the current 0099 M5 source
+and this backend change. The final 32-input manifest differs from metal2b
+only in those two files; all hashes pass on the Mac. The packed command line
+and ADT are byte-identical to metal2b, including the absent `fuxiwlan` gate
+(Wi-Fi off). The existing signed raw tool and pinned loader inputs are
+unchanged. Kernel linking has the existing toolchain/linker warnings; loader
+packing completes without warnings.
+
+Repack and verify using the same private build environment:
+
+```sh
+bash tools/build-fuxi-metal2-images.sh "$METAL2B_ARTIFACTS" metal2c
+python3 tools/test-fuxi-metal-artifacts.py --lane metal2c \
+  --base "$METAL2B_ARTIFACTS" --out xnu/out-fuxi-metal2c
+```
+
+Outputs, manifests and logs: `xnu/out-fuxi-metal2c/`.
+Image: `shim/out/fuxi-metal2c-boot.img`, SHA256
+`eca58669dd03844dbeee53d6d67e8ae54b5544c8e95a359d489b3f317129cc91`.
+The complete artifact manifest is `xnu/out-fuxi-metal2c/SHA256SUMS`.
+
+**Expected next device evidence, not an observed result:** retain the eleven
+raw init lines, including `UCHE_GMEM_RANGE_MAX_LO [0xe0d]=0x12ff000`, with no
+MAX mismatch. If subsequent setup succeeds:
+
+```text
+FUXI GPU ABI: NativeAdrenoGpuPublished v1
+FUXI ABI: open pid N rc 0x00000000
+FUXI ABI: query pid N rc 0x00000000
+FUXI ABI: device-info pid N rc 0x00000000
+FUXI ABI: submit pid N rc 0x00000000
+FUXI ABI: wait pid N rc 0x00000000
+FUXI ABI: result pid N rc 0x00000000 mem 0xa740cafe bad-pixels 0 rounds 1/2
+FUXI ABI: result pid N rc 0x00000000 mem 0xa740cafe bad-pixels 0 rounds 2/2
+```
+
+Allocation/mapping/cleanup lines occur between these markers as in 2a. The
+second round follows close/reopen; later diagnostic opens are refused after
+two successful rounds. A named `init write ... failed`, service withheld,
+nonzero rc, bad pixels, watchdog or missing round remains failure evidence.
+
+---
+
 # Metal lane, milestone 2b: identify ABI init failures
 
 2026-10-20, branch `codex-metal2b`. Built in the existing `ci-lane-metal2`

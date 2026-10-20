@@ -1,16 +1,16 @@
 #!/bin/bash
-# Repack metal2a from 0098i, or metal2b with byte-identical metal2a inputs.
+# Repack metal2a from 0098i, or metal2b/metal2c with byte-identical base inputs.
 # Supply the same private toolchain/firmware environment used for 0098i.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-base=${1:?Usage: build-fuxi-metal2-images.sh BASE_ARTIFACT_DIR [metal2a|metal2b]}
+base=${1:?Usage: build-fuxi-metal2-images.sh BASE_ARTIFACT_DIR [metal2a|metal2b|metal2c]}
 lane=${2:-metal2a}
-[[ $lane == metal2a || $lane == metal2b ]]
+[[ $lane == metal2a || $lane == metal2b || $lane == metal2c ]]
 out=xnu/out-fuxi-$lane
 mkdir -p "$out" shim/out
 [[ -f $out/kernel.development.fuxi && -f $out/kernel.development.fuxi.unstripped ]]
 cp "$base/fuxi.adt" "$out/fuxi.adt"
-if [[ $lane == metal2b ]]; then
+if [[ $lane == metal2b || $lane == metal2c ]]; then
  cp "$base/cmdline.txt" "$out/cmdline.txt"
  python3 - "$out/cmdline.txt" <<'PY2B'
 from pathlib import Path

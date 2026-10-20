@@ -20,7 +20,7 @@ def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--base', type=Path, required=True)
     ap.add_argument('--out', type=Path, default=Path('xnu/out-fuxi-metal1'))
-    ap.add_argument('--lane', choices=('metal1','metal2a','metal2b'), default='metal1')
+    ap.add_argument('--lane', choices=('metal1','metal2a','metal2b','metal2c'), default='metal1')
     ap.add_argument('--nm', default='llvm-nm-18')
     ap.add_argument('--firmware', type=Path)
     ap.add_argument('--sqe', type=Path)
@@ -48,7 +48,7 @@ def main():
     assert payload[:8]==b'SWEETXNU'
     cmdline=payload[72:680].split(b'\0')[0]
     basecmd=args.base.joinpath('cmdline.txt').read_bytes().strip()
-    if args.lane=='metal2b':
+    if args.lane in ('metal2b','metal2c'):
         expected=basecmd
         assert (args.out/'cmdline.txt').read_bytes()==(args.base/'cmdline.txt').read_bytes()
         assert b'fuxigpuabi=1' in expected.split() and not any(a.startswith(b'fuxiwlan=') for a in expected.split())

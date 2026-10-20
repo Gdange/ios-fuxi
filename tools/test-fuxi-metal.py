@@ -33,6 +33,16 @@ static unsigned packet(const uint32_t *w,unsigned n,unsigned *op,unsigned *len) 
  assert(*len<n); return type;
 }
 int main() {
+ NativeAdrenoAbiParams query={};NativeAdrenoAbiDeviceInfo info={};
+ assert(!deviceQuery(NativeAdrenoMethodQuery,nullptr,&query));
+ assert(query.abi_version==1 && query.input_bits==31 && query.output_bits==36 &&
+     query.flags==0 && query.max_bo_bytes==(1u<<28));
+ assert(!deviceQuery(NativeAdrenoMethodGetDeviceInfo,nullptr,&info));
+ /* Decode the actual page-granular 2b readback, restoring inclusive end. */
+ const uint32_t min=0x1000000,max=0x12ff000;
+ assert((max|0xfff)-min+1==0x300000);
+ assert(info.chip_id==0x43050a01 && info.gmem_base==min &&
+     info.gmem_bytes==(max|0xfff)-min+1 && info.gmem_bytes==3u*1024*1024);
  const unsigned is[]={0,0,16,32,8,416,16,0,0,80,80,8,8,8,16,0,16};
  const unsigned os[]={0,24,8,8,0,8,0,8,16,0,80,8,0,16,0,64,8};
  for(unsigned s=1;s<=16;s++) {assert(fg_abi_input_size(s)==is[s]);assert(fg_abi_output_size(s)==os[s]);}
@@ -165,7 +175,7 @@ static int thread_call_enter_delayed(thread_call_data_t *c,uint64_t d) {(void)c;
 BACKEND_TEST = r'''
 static void seed(void) {
  memset(scratch,0x5a,sizeof(scratch)); memset(regs,0,sizeof(regs));memset(sregs,0,sizeof(sregs));
- regs[0xe07]=regs[0xe09]=0xfffff000;regs[0xe08]=regs[0xe0a]=0x1ffff;regs[0x534]=1;regs[0xe0b]=0x1000000;regs[0xe0d]=0x12fffff;regs[0xe01]=3u<<21;
+ regs[0xe07]=regs[0xe09]=0xfffff000;regs[0xe08]=regs[0xe0a]=0x1ffff;regs[0x534]=1;regs[0xe0b]=0x1000000;regs[0xe0d]=0x12ff000;regs[0xe01]=3u<<21;
  sregs[SMMU_ID2/4]=0x5511;
  state=drainGood=1;fg_busy=fg_client_busy=fg_access_failed=0;g3_wptr=0;
  fg_abi_live=fg_abi_seq=fg_abi_completed=fg_abi_poisoned=fg_abi_timed_out=0;
@@ -190,7 +200,7 @@ int main(void) {
   "UCHE_GMEM_RANGE_MIN_HI","UCHE_GMEM_RANGE_MAX_LO","UCHE_GMEM_RANGE_MAX_HI",
   "UCHE_MODE_CNTL_HBB","RBBM_NC_MODE_CNTL"};
  for(unsigned i=0;i<10;i++) {
-  seed();regs[verified[i]]^=i==8 ? 1u<<21 : 1;
+  seed();regs[verified[i]]^=i==8 ? 1u<<21 : i<8 && !(i&1) ? 1u<<12 : 1;
   assert(!fg_abi_init() && !fg_abi_live && !writeCount);
   assert(strstr(lastLog,"init check") && strstr(lastLog,names[i]) && strstr(lastLog,"got 0x") && strstr(lastLog,"want 0x"));
   assert(dumpLines==11 && logLines==(i ? 1u : 12u));
@@ -216,6 +226,14 @@ int main(void) {
   assert(*(uint64_t *)G_PTR(FG_ABI_PT)==0x5a5a5a5a5a5a5a5aULL);
  }
  puts("PASS: actual init all register mismatches/read faults/eight write failures, no publication or tables, one-time bounded dump");
+ /* Only address low words ignore offset bits; page-address corruption and
+  * all high-word/control mismatches above still refuse publication. */
+ for(unsigned i=0;i<8;i+=2) for(unsigned bit=0;bit<12;bit++) {
+  seed();regs[verified[i]]^=1u<<bit;
+  assert(fg_abi_init() && fuxi_gpu_abi_available() && writeCount==8 && !logLines);
+ }
+ seed();regs[0xe0d]=0x12fffff;assert(fg_abi_init()); /* unrounded model also valid */
+ puts("PASS: observed A740 page-granular addresses, every ignored offset bit, inclusive GMEM end and exact high/control checks");
  reset();
  assert(writeCount==8 && !regs[G3_APERTURE_HOST] && !logLines);
  assert(*(uint64_t *)G_PTR(G3_PT)==0x5a5a5a5a5a5a5a5aULL);
@@ -277,7 +295,10 @@ def main():
     with tempfile.TemporaryDirectory() as temp:
         out = Path(temp)
         wire = out/'wire.cpp'
-        wire.write_text(WIRE)
+        client=(HEADERS/'FuxiAdrenoUserClient.cpp').read_text()
+        query=client[client.index(' IOReturn run('):client.index('  if (method==NativeAdrenoMethodWaitFence)')]
+        query=query.replace(' IOReturn run(', 'static int deviceQuery(')+' (void)in;return -1;\n}\n'
+        wire.write_text(WIRE.replace('int main() {', 'static constexpr int kIOReturnSuccess=0;\n'+query+'\nint main() {'))
         backend = (HEADERS/'fuxi_gpu_abi_backend.inc').read_text()
         backend = re.sub(r'__asm__ volatile\("dsb sy" ::: "memory"\);', '(void)0;', backend)
         model = out/'backend.c'
