@@ -281,7 +281,8 @@ treatment, the only renderer for it is Metal-backed, the reply is nil and the st
 view never gets an image. SBRendererService's first-ever launch in exactly this boot fits.
 Not explained: why the undrawn area is white rather than black (whatever is behind the
 static wallpaper view; no white placeholder was found in PaperBoardUI's static path) and why
-the lock-screen text is dark (style 2). Neither changes the fix.
+the lock-screen text is dark (style 2). Neither changes the fix. (Superseded: the light image
+stayed white too, see 1d.)
 
 ### Fix
 
@@ -297,6 +298,75 @@ still start it; a nil sample is harmless). If it is still white: SBRendererServi
 white means the image layer itself does not render (look at CA image upload in SpringBoard
 with `sweetsample=SpringBoard`). A dark wallpaper needs a working MTLDevice or a non-image
 (color) configuration.
+
+## 1d. Boot 0098-metal2e: light cpbitmap still white -> colour wallpaper
+
+Root edit #3 wrote the light gradient (tool: style 2, luma 0.91). Evidence:
+`research/device/ios-0098-metal2e/{boot.log,framebuffer.png}`, the pre-edit-3 root pull
+(`research/rootfs/pull-20261020/ios-root-raw.img`, i.e. the state after the 0098-wlan5 boot),
+20H392 PaperBoardUI/UIKitCore disassembly. No post-metal2e root pull exists.
+
+### Facts (observed)
+
+- Framebuffer pixel-identical to 0098-wlan5 and 0098-metal2d: background (255,255,255),
+  clock/date (77,38,77) (wlan5: (76,38,77)), platter (20,20,20). So the 1c fix changed nothing
+  visible, with a dark and with a light image.
+- boot.log: `exec SBRendererService` again (line 2330, after `exec SpringBoard` at 534); no
+  crash, no IOSurface from it. SpringBoard creates no 1125x2436 surface. This boot had
+  `sweetsample`/`sweetscan` for backboardd/Preferences/PosterBoard only, so no SpringBoard
+  heap strings.
+- Root after the wlan5 boot: SpringBoard wrote `LockBackgroundThumbnail.jpg` (206x446, dark
+  blue/purple (41,58,114) .. (95,63,146)) = our dark gradient. The cpbitmap was decoded and
+  drawn correctly into the thumbnail.
+- `Caches/MappedImageCache/Wallpaper/WallpaperPreview-{lock,home}-120.000000.cpbitmap`
+  (format 6, AAPL/ASTC 360x780, written in that boot): all ASTC void-extent blocks (0,0,0,0),
+  i.e. the snapshot of the wallpaper view was fully transparent (nothing drawn).
+- `home-wallpaperController-(2020_...)-untinted-...cpbitmap` (blur/material image, same boot):
+  void-extent colour (1,0,1,1) = magenta. `-[PBUITreatImageRequest configureState:error:]`
+  sets the render layer `backgroundColor = magentaColor` before putting the image in
+  `imageLayer.contents` and applying the CoreImage filter, so a render where the image layer
+  does not draw comes out magenta. Earlier (black-fallback) entries of the same cache are
+  black void-extent.
+- `-[PBUIWallpaperConfigurationManager init]`: data stores = Directory then UserDefaults
+  (Shared directory store only for multi-user). `wallpaperConfigurationForVariant:...`
+  checks per store procedural, colour (`wallpaperColorForVariant:fromDataStore:colorName:`:
+  colour name -> `+[UIColor pbui_wallpaperColorForName:]`, else data store colour), gradient,
+  image. A colour returns immediately. The black fallback is the same configuration type
+  (`initWithVariant:type:4` + `setWallpaperColor:blackColor`), and it rendered black with a
+  white clock (0098-metal2a/b).
+- UserDefaults store = `PBUIWallpaperDefaultsDomain` (suite `com.apple.springboard`):
+  `SBLockScreenWallpapers` (variant 0) / `SBHomeScreenWallpapers` (variant 1), a dict per
+  `_keyForWallpaperMode:` (mode 0 -> `none`, already present on the root), read by
+  `-[PBUIWallpaperDefaultsWrapper initWithWallpaperDefaultsDict:]`: `SBWallpaperColorDataKey`,
+  `SBWallpaperColorNameKey`, `SBWallpaperGradientDataKey`, ... `wallpaperColorForVariant:`
+  decodes the data with `unarchivedObjectOfClass:UIColor`; `-[UIColor initWithCoder:]` reads
+  `UIColorComponentCount` 4 + `UIRed/UIGreen/UIBlue/UIAlpha` (`-Double` variants optional).
+
+### Conclusion (inference)
+
+High confidence: the image is decoded fine; what fails is drawing it through the wallpaper
+view on this GPU-less system (the view snapshot is empty, the blur render is the magenta
+background without the image). Which layer step fails (UIImageView contents of a large
+direct-provider CGImage, or the treatment path still being taken) is not proven; the white
+is whatever is behind the empty wallpaper view (not found). The purple text tint is most
+likely derived from the magenta material, not from our image: identical for both images.
+Not chased further: a colour configuration avoids the image path entirely.
+
+### Fix: `--legacy-wallpaper-color [#RRGGBB]`
+
+Writes an archived UIColor (default #2e3a6e, dark blue: white text, style 1, no treatment for
+a colour view) as `SBWallpaperColorDataKey` in `SB{Lock,Home}ScreenWallpapers/none` of
+`/var/mobile/Library/Preferences/com.apple.springboard.plist` (other keys kept), removes the
+cpbitmaps, `*BackgroundThumbnail.jpg`, `MappedImageCache/Wallpaper/*` and
+`WallpaperColorBoxesCache/*` (stale derived images). `--no-legacy-wallpaper-color` removes the
+colour; `--legacy-wallpaper-image` now also drops colour keys (a colour would win). Apply with
+`--only-optional --legacy-wallpaper-color` (Autobahn override already on the root).
+
+Expected next boot: lock and home background (46,58,110), white clock/date. If it stays white,
+the colour view itself does not draw here (boot with `sweetsample=SpringBoard
+sweetscan=SpringBoard`); if it is black the colour was not loaded (unarchive failure is logged
+through PBUILogCommon) or the defaults were not read (cfprefsd cache, wrong owner; the plist
+must be mobile 0600).
 
 ## 2. Settings > General > About
 

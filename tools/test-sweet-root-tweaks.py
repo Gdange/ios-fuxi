@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Host-side checks for the legacy wallpaper step of sweet-root-tweaks.py."""
-import importlib.util, os, struct, tempfile, zlib
+import importlib.util, os, plistlib, struct, tempfile, zlib
 from pathlib import Path
 
 spec = importlib.util.spec_from_file_location('tweaks', Path(__file__).with_name('sweet-root-tweaks.py'))
@@ -87,4 +87,38 @@ with tempfile.TemporaryDirectory() as tmp:
     m.remove_legacy_wallpaper_image(root)
     assert not any(os.path.exists(os.path.join(root, m.WALLPAPER_DIR, n)) for n in m.WALLPAPER_FILES)
 
-print('PASS: cpbitmap trailer/length/pixels, legibility style, PNG decode, wallpaper files')
+    # Colour wallpaper: archived UIColor in both variants' 'none' entry, other
+    # keys kept, image files and derived caches gone.
+    prefs = os.path.join(root, 'private/var/mobile/Library/Preferences/com.apple.springboard.plist')
+    os.makedirs(os.path.dirname(prefs))
+    plistlib.dump({'BKNoWatchdogs': True, 'SBLockScreenWallpapers': {'none': {
+        'SBWallpaperParallaxFactorKey': 1.0, 'SBWallpaperColorNameKey': 'red'}}},
+        open(prefs, 'wb'), fmt=plistlib.FMT_BINARY)
+    m.legacy_wallpaper_image(root, None, owner)
+    cache = os.path.join(root, 'private/var/mobile/Library/Caches/MappedImageCache/Wallpaper')
+    os.makedirs(cache)
+    open(os.path.join(cache, 'WallpaperPreview-lock-120.000000.cpbitmap'), 'wb').write(b'x')
+    open(os.path.join(root, m.WALLPAPER_DIR, 'LockBackgroundThumbnail.jpg'), 'wb').write(b'x')
+    m.legacy_wallpaper_color(root, '#2E3A6E', owner)
+    d = plistlib.load(open(prefs, 'rb'))
+    assert d['BKNoWatchdogs'] and d['SBLockScreenWallpapers']['none']['SBWallpaperParallaxFactorKey'] == 1.0
+    for key in m.WALLPAPER_PREFS:
+        e = d[key]['none']
+        assert 'SBWallpaperColorNameKey' not in e
+        a = plistlib.loads(e['SBWallpaperColorDataKey'])
+        top = a['$objects'][a['$top']['root'].data]
+        assert a['$objects'][top['$class'].data]['$classname'] == 'UIColor'
+        assert top['UIColorComponentCount'] == 4 and top['UIAlpha'] == 1.0
+        assert [round(top[c] * 255) for c in ('UIRed', 'UIGreen', 'UIBlue')] == [0x2e, 0x3a, 0x6e]
+    assert os.listdir(cache) == []
+    assert os.listdir(os.path.join(root, m.WALLPAPER_DIR)) == []
+    m.set_wallpaper_color(root, None, owner)
+    d = plistlib.load(open(prefs, 'rb'))
+    assert all('SBWallpaperColorDataKey' not in d[k]['none'] for k in m.WALLPAPER_PREFS)
+    try:
+        m.parse_color('2e3a6')
+        raise AssertionError('short colour accepted')
+    except ValueError:
+        pass
+
+print('PASS: cpbitmap trailer/length/pixels, legibility style, PNG decode, wallpaper files, colour wallpaper prefs')
