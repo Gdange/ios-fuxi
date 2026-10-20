@@ -1025,3 +1025,16 @@ lane artifact contains **both** blobs. Commit: the commit containing this
 handoff (`git log -1` on `codex-gpu-m3b`). Next action: coordinator fresh stage12
 after regressions/stage11, using the new phase/PC/SID fields before further
 pointer changes. The hardware root cause remains unconfirmed.
+
+## Device results, milestone 3 (2026-10-20)
+- m3 (first build): 11 PASS (SID0/1 -> CB2, ASID2). 12: CP instruction fetch at IOVA 0
+  (FSYNR0 IND=1, CP_INT BR_ILLEGAL_INSTR). m3b removed the null CP_INIT list: same fault, now
+  before the doorbell. m3c root cause: SQE_CNTL was set before CP_SQE_INSTR_BASE, so the SQE
+  started fetching from 0. Linux cold ordering (bases verified, then RUN) fixes it.
+- m3c 12: CP_INIT consumed (rptr 0 -> 7 = wptr), CP_INT 0, SMMU clean. RBBM_SECVID_TRUST_CNTL
+  stays 0x1 after writing 0 (FACT; GUESS: TZ-owned on retail, needs the zap shader via PAS).
+  m3d treats this as a report value, not a failure.
+- **m3d 13 PASS: CP_MEM_WRITE of 0xa740f00d to the fence page (VA 0x40029000) landed, read by the
+  CPU; rptr 7 -> 11, no faults, CP_INT 0, TRUST still 0x1.** The GPU executes PM4 from our ring
+  through our SMMU context.
+- Open: CB FSR bit 10 (0x400) on both banks from programming time; secure-mode exit; no draw yet.
