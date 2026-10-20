@@ -35,7 +35,7 @@ static int firmware_success = 1, ack_mode, corrupt_readback, tlb_busy;
 static unsigned firmware_releases, mmio_writes;
 static int cp_mode; /* 1 stalled, 2 fault, 3 missing fence, 4 corrupt fence guard */
 static uint64_t abort_read, abort_write;
-static unsigned blit_mode;
+static unsigned blit_mode; /* 8 clear-only loss, 9 copy-only loss, 10 omit clean, 11 omit BR */
 static void model_blit_stream(unsigned end);
 static unsigned drop_sqe_base, start_fault, doorbells, sqe_controls;
 uint32_t probe_fault_esr;
@@ -137,7 +137,7 @@ static void reset_model(void)
  *ptr(GPU_SMMU_BASE) = 0x2f0406;
  *ptr(GPU_GMU_CORE+0x5000*4) = 1;
  *ptr(GPU_GMU_CORE+(0x1c00+0xff8)*4) = 0x20010005;
- gpu_extra[0][0] = 0xa7400006;
+ gpu_extra[0][0] = 0xa7400007;
  assert(g_snapshot());
 }
 static void aux_fixture(void)
@@ -186,7 +186,8 @@ static void model_blit_stream(unsigned end)
  assert(end<=8192 && end>pos);
  if (blit_mode==1) return;
  if (blit_mode==4) { *ptr(GPU_REG_BASE+0x823*4)=4; return; }
- uint32_t regs[0xc000]={0}; unsigned copies=0, fences=0;
+ uint32_t regs[0xc000]={0}; unsigned copies=0, fences=0, br=0, pending=0;
+ uint32_t cache[65536][2];
  while (pos<end) {
   uint32_t hdr=*ptr(G3_RING_PA+pos++*4);
   if ((hdr>>28)==4) {
@@ -205,25 +206,41 @@ static void model_blit_stream(unsigned end)
    uint32_t *args=ptr(G3_RING_PA+pos*4);
    if (op==0x2c) {
     assert(count==1 && args[0]==3);
-    assert(regs[0x8c00]==0x10f03000 && regs[0x8400]==regs[0x8c00]);
+    unsigned solid=!!(regs[0x8c00]&128);
+    assert(regs[0x8c00]==(0x10f03000u | solid<<7) && regs[0x8400]==regs[0x8c00]);
     assert(regs[0xa9bf]==0xf180 && regs[0xb2d2]==1u<<29);
-    assert(regs[0xb2c0]==0x500430 && regs[0x8c17]==0x430);
+    assert((solid || regs[0xb2c0]==0x500430) && regs[0x8c17]==0x430);
+    if(solid) assert(!regs[0xb2c0] && !regs[0xb2c2]); /* no source state */
     assert(regs[0x88e5]==0xc0000000);
     assert(!regs[0xb2c3] && !regs[0x8c19]);
     unsigned sx=regs[0x8401]>>8, ex=regs[0x8402]>>8;
     unsigned sy=regs[0x8403]>>8, ey=regs[0x8404]>>8;
     unsigned dx=regs[0x8405]&0xffff, dy=regs[0x8405]>>16;
     unsigned bx=regs[0x8406]&0xffff, by=regs[0x8406]>>16;
-    assert(ex-sx==bx-dx && ey-sy==by-dy);
+    assert(solid || (ex-sx==bx-dx && ey-sy==by-dy));
     unsigned sp=(regs[0xb2c4]>>9)*64, dp=regs[0x8c1a]*64;
-    assert(sp==1024 && dp>=(bx+1)*4);
+    assert((solid || sp==1024) && dp>=(bx+1)*4);
     assert((regs[0x8c18]&63)==0 && (regs[0xb2c2]&63)==0);
-    for(unsigned y=0;y<=ey-sy;y++) for(unsigned x=0;x<=ex-sx;x++) {
+    for(unsigned y=0;y<=by-dy;y++) for(unsigned x=0;x<=bx-dx;x++) {
      unsigned src=regs[0xb2c2]+(sy+y)*sp+(sx+x)*4;
      unsigned dst=regs[0x8c18]+(dy+y)*dp+(dx+x)*4;
-     *ptr(model_gpu_pa(dst,1))=*ptr(model_gpu_pa(src,0));
+     uint32_t pixel=solid ? regs[0x8c2e] | regs[0x8c2d]<<8 | regs[0x8c2c]<<16 | regs[0x8c2f]<<24
+                         : *ptr(model_gpu_pa(src,0));
+     /* Independent model: A7xx writes remain in a separate blit cache until
+      * resolve-clean. Color/depth clean and UCHE fence don't drain it. */
+     if(br && !(blit_mode==8 && solid) && !(blit_mode==9 && !solid)) {
+      assert(pending<65536); cache[pending][0]=dst; cache[pending++][1]=pixel;
+     }
     }
     copies++;
+   } else if(op==0x17) {
+    assert(count==1 && args[0]==((1u<<27)|1u));
+    br=blit_mode!=11;
+   } else if(op==0x46 && count==1 && args[0]==26) {
+    if(blit_mode!=10) {
+     for(unsigned i=0;i<pending;i++) *ptr(model_gpu_pa(cache[i][0],1))=cache[i][1];
+     pending=0;
+    }
    } else if(op==0x46 && count==4) {
     assert(args[0]==(49u|1u<<27) && !args[2]);
     if(blit_mode!=3) *ptr(model_gpu_pa(args[1],1))=args[3];
@@ -431,13 +448,17 @@ int main(int argc, char **argv)
  reset_model(); aux_fixture(); panel_fixture(); gpu_m2(14);
  assert(gpu_extra[11][2]==1 && gpu_extra[11][21]==0 && gpu_extra[11][20]==gpu_extra[11][19]);
  assert(!gpu_extra[12][1] && gpu_extra[5][4]==1);
- assert(gpu_extra[11][28]==5 && gpu_extra[11][31]==11 && gpu_extra[11][32]==74);
+ assert(gpu_extra[11][28]==5 && gpu_extra[11][31]==82 && gpu_extra[11][54]==82 && gpu_extra[11][32]==156);
+ assert(gpu_extra[11][44]==1 && !gpu_extra[11][56] && !gpu_extra[11][58]);
+ assert(gpu_extra[11][40] && gpu_extra[11][43]==63);
+ printf("M4b rings: clear 11..%u, copy %u..%u (%u words)\n",gpu_extra[11][54],gpu_extra[11][31],gpu_extra[11][32],gpu_extra[11][33]);
  assert(gpu_extra[11][38] && gpu_extra[11][37]==0xa740b014);
  uint32_t frozen14[128]; memcpy(frozen14,gpu_extra[11],sizeof(frozen14));
  before=doorbells; gpu_m2(15);
  assert(gpu_extra[12][2]==1 && gpu_extra[12][21]==0 && gpu_extra[12][47]==0);
  assert(!gpu_extra[12][26] && !gpu_extra[12][49] && !gpu_extra[12][45]);
- assert(gpu_extra[12][28]==10 && doorbells==before+1 && gpu_extra[12][32]==1586);
+ assert(gpu_extra[12][28]==10 && doorbells==before+1 && gpu_extra[12][32]==1679);
+ printf("M4b stage15 ring: %u..%u (%u words)\n",gpu_extra[12][31],gpu_extra[12][32],gpu_extra[12][33]);
  assert(memcmp(frozen14,gpu_extra[11],sizeof(frozen14))==0);
  before=doorbells; gpu_m2(15); gpu_m2(14); assert(doorbells==before && gpu_gmu_started);
  FILE *m4=fopen("report-m4.bin","wb");
@@ -450,6 +471,17 @@ int main(int argc, char **argv)
   assert(gpu_extra[11][2]==errors[mode] && !gpu_extra[12][1] && ticks-begun<100000);
   if(mode==2) assert(gpu_extra[11][21]==1 && gpu_extra[11][22]==3 && gpu_extra[11][23]==1);
   before=doorbells; gpu_m2(15); assert(doorbells==before && gpu_gmu_started);
+ }
+ /* Diagnose missing writes independently: source-free failure vs source-only
+  * failure, and the two m4 omissions with CP still consuming/fencing. */
+ for(unsigned mode=8;mode<=11;mode++) {
+  reset_model(); aux_fixture(); gpu_m2(13); blit_mode=mode; gpu_m2(15);
+  uint32_t *d=gpu_extra[11];
+  assert(d[2]==(mode==8 ? 0xe0b : 0xe06) && !gpu_extra[12][1]);
+  assert(d[43]==62 && d[55]==G4_CLEAR_MAGIC && d[37]==0xa740b014);
+  assert(d[58]==(mode==9 ? 0 : 65536));
+  assert(d[21]==(mode==8 ? 0 : 65536));
+  assert(!d[40] && !d[67] && !d[71]);
  }
  reset_model(); aux_fixture(); gpu_m2(14); panel_fixture(); *ptr(0x0ae05024)=4352;
  before=doorbells; gpu_m2(15); assert(gpu_extra[12][2]==0xe08 && doorbells==before);
@@ -470,6 +502,8 @@ int main(int argc, char **argv)
  before=doorbells; gpu_m2(15); assert(gpu_extra[11][2]==0xe01 && before==doorbells);
  reset_model(); aux_fixture(); gpu_m2(14); panel_fixture(); abort_read=0x0ae05014;
  gpu_m2(15); assert(gpu_extra[12][2]==0xe01);
+ reset_model(); aux_fixture(); gpu_m2(13); abort_read=GPU_REG_BASE+G4_CCU_CNTL*4;
+ gpu_m2(15); assert(gpu_extra[11][2]==0xe01 && !gpu_extra[12][1]);
  reset_model(); aux_fixture(); gpu_m2(13); g3_wptr=8190;
  before=doorbells; gpu_m2(15); assert(gpu_extra[11][2]==0xe04 && before==doorbells);
  puts("PASS: M4 pixels/row pitches/fences/guards/faults/no-retry; SMMU snapshot/ownership/readback, all icache PTEs, firmware load, HFI order/ACK/wrap/errors/timeouts, m3 mappings/CP packets/fence/abort/timeouts, one-shot GMU/handoff latch");
@@ -524,7 +558,8 @@ def audit_linux(msm):
                   'G4_RB_NC': 'RB_NC_MODE_CNTL', 'G4_SP_FORMAT': 'SP_2D_DST_FORMAT',
                   'G4_SP_NC': 'SP_NC_MODE_CNTL', 'G4_SP_SRC_INFO': 'SP_PS_2D_SRC_INFO',
                   'G4_SP_WINDOW': 'SP_PS_2D_WINDOW_OFFSET', 'G4_TPL1_BLIT': 'SP_PS_UNKNOWN_B2D2',
-                  'G4_TPL1_NC': 'TPL1_NC_MODE_CNTL'})
+                  'G4_TPL1_NC': 'TPL1_NC_MODE_CNTL', 'G4_RB_SOLID': 'RB_2D_SRC_SOLID_C0',
+                  'G4_RB_DBG': 'RB_DBG_ECO_CNTL', 'G4_RB_CMP_DBG': 'RB_CMP_DBG_ECO_CNTL'})
     for macro, name in names.items():
         value = int(re.search(r'^#define ' + macro + r'\s+(0x[0-9a-f]+)', header, re.M)[1], 16)
         assert value == offsets[name], f'{macro}: Linux {name} offset drift'
@@ -536,7 +571,50 @@ def audit_linux(msm):
     firmware = (msm / 'adreno/adreno_gpu.c').read_text().split('struct drm_gem_object *adreno_fw_create_bo', 1)[1].split('int adreno_hw_init', 1)[0]
     assert 'memcpy(ptr, &fw->data[4], fw->size - 4)' in firmware
     assert 'MSM_BO_WC | MSM_BO_GPU_READONLY' in firmware
-    print('PASS: Linux source audit: 54 HWCG pairs, 48 protection slots, 36 CP/2D offsets; cold SQE order and firmware copy')
+    print('PASS: Linux source audit: 54 HWCG pairs, 48 protection slots, 39 CP/2D offsets; cold SQE order and firmware copy')
+
+
+def audit_mesa(mesa):
+    """Independent A7xx bit-field/event checks against the supplied Mesa XML."""
+    import xml.etree.ElementTree as ET
+    xml = mesa / 'src/freedreno/registers/adreno'
+    regs = ET.parse(xml / 'a6xx.xml').getroot()
+    pm4 = ET.parse(xml / 'adreno_pm4.xml').getroot()
+
+    def named(root, tag, name):
+        return [e for e in root.iter() if e.tag.rsplit('}', 1)[-1] == tag and e.get('name') == name]
+
+    def enum(root, name):
+        return {int(e.get('value'), 0) for e in named(root, 'value', name)}
+
+    def field(root, tag, name, bit, low, high):
+        for e in named(root, tag, name):
+            for f in e.iter():
+                if f.get('name') == bit:
+                    a = int(f.get('pos', f.get('low', '-1')))
+                    b = int(f.get('pos', f.get('high', '-1')))
+                    if (a, b) == (low, high):
+                        return
+        raise AssertionError((name, bit, low, high))
+
+    assert enum(pm4, 'CP_SET_THREAD_BR') == {1}
+    assert enum(pm4, 'CCU_RESOLVE_CLEAN') == {26}
+    assert enum(pm4, 'CCU_CLEAN_COLOR') == {33}
+    assert enum(pm4, 'CACHE_CLEAN') == {49}
+    assert enum(regs, 'FMT6_8_8_8_8_UNORM') == {0x30}
+    assert enum(regs, 'R2D_UNORM8') == {0x10}
+    assert enum(regs, 'CCU_CACHE_SIZE_FULL') == {0}
+    field(pm4, 'domain', 'CP_THREAD_CONTROL', 'THREAD', 0, 1)
+    field(pm4, 'domain', 'CP_THREAD_CONTROL', 'CONCURRENT_BIN_DISABLE', 27, 27)
+    field(pm4, 'domain', 'CP_EVENT_WRITE7', 'WRITE_ENABLED', 27, 27)
+    for name, low, high in [('SOLID_COLOR', 7, 7), ('COLOR_FORMAT', 8, 15), ('MASK', 20, 23), ('IFMT', 24, 28)]:
+        field(regs, 'bitset', 'a6xx_2d_blit_cntl', name, low, high)
+    field(regs, 'reg32', 'RB_CCU_CNTL2', 'COLOR_OFFSET', 23, 31)
+    # A7xx pitch is bytes<<3 (A6xx's shr6/low9 yields the same aligned value).
+    field(regs, 'reg32', 'SP_PS_2D_SRC_PITCH', 'PITCH', 3, 23)
+    assert 1024 << 3 == (1024 >> 6) << 9 == 8192
+    assert (0x180000 >> 12) << 23 == 0xc0000000
+    print('PASS: Mesa A7xx thread/event/2D format, solid-color, pitch and CCU fields')
 
 
 def main():
@@ -544,7 +622,10 @@ def main():
     ap.add_argument('--sqe', type=Path, help='external local a740_sqe.fw')
     ap.add_argument('--firmware', type=Path, help='external local gmu_gen70200.bin; never copied into git')
     ap.add_argument('--linux-msm', type=Path, help='supplied drivers/gpu/drm/msm source directory for register/table audit')
+    ap.add_argument('--mesa', type=Path, help='local Mesa source for A7xx field/event audit')
     args = ap.parse_args()
+    if args.mesa:
+        audit_mesa(args.mesa)
     if args.linux_msm:
         audit_linux(args.linux_msm)
     source = (ROOT / 'shim/fuxi-probe/gpu.c').read_text()
@@ -598,13 +679,24 @@ def main():
                                   check=True, capture_output=True, text=True).stdout
         assert 'stage 14 A7xx 2D blit' in m4report and 'stage 15 A7xx 2D blit' in m4report
         assert 'mismatch=0' in m4report and 'CPU_mismatch=0' in m4report
+        assert 'solid_clear=0x1 (PASS)' in m4report and 'validity=0x3f' in m4report
+        assert 'CCU_CNTL2=' in m4report and 'copy after 100us' in m4report
+        # Reproduce v6's failed-stage14 reporting: zero CPU ticks mean unrun.
+        old6 = bytearray((tmp / 'report-m4.bin').read_bytes())
+        import struct
+        struct.pack_into('<I', old6, 512, 0xa7400006)
+        struct.pack_into('<I', old6, 12*512, 0xa7400006)
+        struct.pack_into('<II', old6, 12*512+2*4, 0xe06, 6)
+        struct.pack_into('<II', old6, 12*512+40*4, 0, 0)
+        words = [list(struct.unpack('<128I', old6[i:i+512])) for i in range(0, len(old6), 512)]
+        text = decoder['decode'](words[0], words[1:])
+        assert 'CPU=N/A (not run)' in text and 'CPU=0.000 us' not in text
         # v5's unchanged prefix must still decode as a 12-page saved report.
         legacy = bytearray((tmp / 'report.bin').read_bytes()[:6144])
-        import struct
         struct.pack_into('<I', legacy, 512, 0xa7400005)
         old = tmp / 'v5.bin'; old.write_bytes(legacy)
         subprocess.run(['python3', str(ROOT / 'tools/fuxi-gpu-probe.py'), '--decode', str(old)], check=True, stdout=subprocess.DEVNULL)
-        print('PASS: fourteen-page M4 and legacy v5 offline Python decoder')
+        print('PASS: fourteen-page M4b/v6 and legacy v5 offline Python decoder')
 
 
 if __name__ == '__main__':

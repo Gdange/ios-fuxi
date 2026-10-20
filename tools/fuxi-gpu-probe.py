@@ -3,7 +3,7 @@
 
 --stage 8a snapshots all GPU SMMU streams/banks after stages1..7.
 8 maps SID5 and loads externally embedded firmware; 9 starts GMU/HFI;
-10 requests GX; 11 maps GPU SIDs0/1; 12 starts SQE/CP; 13 writes a fence; 14 copies scratch pixels; 15 blits to scanout. Run each on a fresh loader boot first.
+10 requests GX; 11 maps GPU SIDs0/1; 12 starts SQE/CP; 13 writes a fence; 14 clears/copies scratch pixels; 15 blits to scanout. Run each on a fresh loader boot first.
 --read-reports retrieves pages without replaying hardware setup.
 See docs-lanes/gpu.md for memory reservations, risks and report words.
 """
@@ -90,7 +90,7 @@ def decode(r, pages=None):
     out.append(f'  version={r[80]:#x} magic={r[81]:#010x} (want 0x0c0330db) slaves={r[82]}')
     for i, nm in enumerate(NAMES):
         out.append(f'  {nm:<9} addr={r[83 + i]:#x}')
-    if pages and pages[0][0] in (0xa7400002, 0xa7400003, 0xa7400004, 0xa7400005, 0xa7400006):
+    if pages and pages[0][0] in (0xa7400002, 0xa7400003, 0xa7400004, 0xa7400005, 0xa7400006, 0xa7400007):
         e = pages[0]
         errors = {
             0: 'not-run', 1: 'PASS',
@@ -128,6 +128,7 @@ def decode(r, pages=None):
             0xe07: 'scratch guard or panel border overwritten',
             0xe08: 'live framebuffer geometry mismatch', 0xe09: 'blit mapping failure',
             0xe0a: 'CPU comparison copy/readback mismatch',
+            0xe0b: 'source-free solid clear pixel mismatch',
         })
         result = lambda v: f'{v:#x} ({errors.get(v, "unknown")})'
         out.append('-- stage 8a SMMU snapshot (frozen before stage8 writes) --')
@@ -157,7 +158,7 @@ def decode(r, pages=None):
         out.append(f'  result={result(e[60])} OOB_intr={e[61]:#x} SPTPRAC={e[62]:#x} GX_GDSCR={e[63]:#x} RBBM_read={e[65]} RBBM_STATUS={e[64]:#x}')
         out.append(f'  live: intr={e[84]:#x} AOirq={e[85]:#x} fence={e[86]:#x} GFSR={e[87]:#x} CB_FSR={e[88]:#x} FAR={e[90]:08x}{e[89]:08x} FSYNR={e[91]:#x}/{e[92]:#x}')
         out.append(f'  queues: command r/w={e[93]}/{e[94]} response r/w={e[95]}/{e[96]}')
-        if len(pages) >= 7 and e[0] in (0xa7400003, 0xa7400004, 0xa7400005, 0xa7400006):
+        if len(pages) >= 7 and e[0] in (0xa7400003, 0xa7400004, 0xa7400005, 0xa7400006, 0xa7400007):
             m = pages[5]
             out.append('-- stage 11 GPU SID0/1 context --')
             out.append(f'  result={result(m[2])} slots={m[10]}/{m[34]} CB={m[11]} ASID={m[12]} GMU_CB/ASID={m[8]}/{m[9]} tables={m[33]} PT={(m[14]<<32)|m[13]:#x}')
@@ -172,10 +173,10 @@ def decode(r, pages=None):
             out.append('-- stage 13 CP_MEM_WRITE fence --')
             out.append(f'  result={result(m[4])} fence before/after={m[52]:#x}/{m[53]:#x} expected={m[54]:#x} CP rptr before/after={m[55]}/{m[56]} wptr={m[57]} polls={m[58]}')
             out.append(f'  safe MMIO faults={m[116]} first_PA={m[118]:08x}{m[117]:08x} last_PA={m[111]:08x}{m[110]:08x} op={m[115]} ESR={m[112]:#x} FAR={m[114]:08x}{m[113]:08x}')
-            if e[0] in (0xa7400004, 0xa7400005, 0xa7400006):
+            if e[0] in (0xa7400004, 0xa7400005, 0xa7400006, 0xa7400007):
                 out.append(f'  halt-clear readbacks: GBIF={m[95]:#x} RBBM_GBIF={m[96]:#x}')
-            init_words = 7 if e[0] in (0xa7400004, 0xa7400005, 0xa7400006) else 10
-            if e[0] in (0xa7400005, 0xa7400006):
+            init_words = 7 if e[0] in (0xa7400004, 0xa7400005, 0xa7400006, 0xa7400007) else 10
+            if e[0] in (0xa7400005, 0xa7400006, 0xa7400007):
                 out.append('  raw SQE payload prefix: ' + ' '.join(f'{v:08x}' for v in m[97:97+min(m[109], 12)]))
                 out.append(f'  checkpoint mask={m[119]:#x} (bit0=OOB,bit1=configured,bit2=RUN)')
             out.append('  init packet: ' + ' '.join(f'{v:08x}' for v in m[80:80+init_words]))
@@ -193,7 +194,7 @@ def decode(r, pages=None):
                         syn = d[at+4]
                         out.append(f'      fault attributes: {"write" if syn & 16 else "read"} level={syn & 3} IND={bool(syn & 64)} PNU={bool(syn & 32)} PTWF={bool(syn & 1024)} MID={d[at+5] & 255} ({fault_client(d[at+5], 0x7f)})')
                 out.append(f'    fence guards={d[32]:#x}/{d[33]:#x} MMIO_faults={d[31]}')
-                if e[0] in (0xa7400004, 0xa7400005, 0xa7400006) and len(pages) >= 9:
+                if e[0] in (0xa7400004, 0xa7400005, 0xa7400006, 0xa7400007) and len(pages) >= 9:
                     x = pages[8 if start else 7]
                     out.append(f'    extended: stage={x[1]} step={x[2]} phase={x[3]} (1=verify,2=SQE/wptr0,3=doorbell,4=cold-entry) bad_pointer_index={m[94]}')
                     out.append(f'      before doorbell: polls={x[4]} CP_INT={x[5]:#x} GPU_FSR={x[6]:#x} RBBM={x[7]:#x}')
@@ -213,7 +214,7 @@ def decode(r, pages=None):
                     out.append(f'      BR SQE_STAT count={x[63]} [0..50]: ' + ' '.join(f'{v:08x}' for v in x[64:115]))
                     out.append('      raw UCODE_DBG[0..3]: ' + ' '.join(f'{v:08x}' for v in x[120:124]))
                     out.append('      CPU SQE[0..3]:       ' + ' '.join(f'{v:08x}' for v in x[124:128]))
-                if e[0] in (0xa7400005, 0xa7400006):
+                if e[0] in (0xa7400005, 0xa7400006, 0xa7400007):
                     if not start:
                         for i, name in enumerate(('OOB/pre-setup', 'configured/pre-RUN', 'immediate/post-RUN')):
                             if not (m[119] & (1 << i)):
@@ -227,7 +228,7 @@ def decode(r, pages=None):
                             out.append(f'      {name} SQE_STAT count={y[2+j]} [0..50]: ' + ' '.join(f'{v:08x}' for v in y[16+j*51:16+j*51+min(y[2+j], 51)]))
                             out.append(f'      {name} raw UCODE_DBG[0..3]: ' + ' '.join(f'{v:08x}' for v in y[5+j*4:9+j*4]))
                         out.append(f'      raw AQE bases={y[119]:08x}{y[118]:08x}/{y[121]:08x}{y[120]:08x} MISC/BR_CHICKEN/BV_CHICKEN={y[122]:#x}/{y[123]:#x}/{y[124]:#x} APERTURE_CD={y[125]:#x} SMMU_INFO={y[127]:08x}{y[126]:08x}')
-    if pages and len(pages) >= 13 and pages[0][0] == 0xa7400006:
+    if pages and len(pages) >= 13 and pages[0][0] in (0xa7400006, 0xa7400007):
         for d in pages[11:13]:
             if not d[1]:
                 continue
@@ -239,16 +240,30 @@ def decode(r, pages=None):
             out.append(f'  ring start/end/count={d[31]}/{d[32]}/{d[33]} rptr/wptr={d[35]}/{d[36]} polls={d[34]} fence VA={d[17]:#x} expected/actual={d[18]:08x}/{d[37]:08x}')
             gpu_ticks = d[38] | d[39] << 32
             cpu_ticks = d[40] | d[41] << 32
-            out.append(f'  cntpct GPU_submit_to_idle={gpu_ticks} CPU_volatile_byte_memcpy={cpu_ticks} cntfrq={d[42]} Hz (polling, uncached loader)')
-            if d[42]:
-                out.append(f'  GPU={gpu_ticks*1e6/d[42]:.3f} us CPU={cpu_ticks*1e6/d[42]:.3f} us')
+            v7 = d[0] == 0xa7400007
+            cpu_valid = bool(d[43] & 1) if v7 else d[3] >= 7 and bool(cpu_ticks)
+            gpu_valid = bool(d[43] & 8) if v7 else d[3] >= 5
+            cpu_text = str(cpu_ticks) if cpu_valid else 'N/A (not run)'
+            gpu_text = str(gpu_ticks) if gpu_valid else 'N/A (not submitted)'
+            out.append(f'  cntpct GPU_submit_to_idle={gpu_text} CPU_volatile_byte_memcpy={cpu_text} cntfrq={d[42]} Hz (polling, uncached loader)')
+            if d[42] and gpu_valid:
+                cpu_us = f'{cpu_ticks*1e6/d[42]:.3f} us' if cpu_valid else 'N/A (not run)'
+                out.append(f'  GPU={gpu_ticks*1e6/d[42]:.3f} us CPU={cpu_us}')
+            if v7:
+                out.append(f'  validity={d[43]:#x} solid_clear={result(d[44])} end={d[54]} fence={d[55]:08x} mismatch={d[56]} first_actual={d[57]:08x} expected=ff336699 untouched_deadbeef={d[58]} guard_bad={d[61]} source_bad={d[62]} polls={d[63]}')
+                if d[43] & 2:
+                    out.append(f'  clear after 100us RBBM={d[59]:#x} ({bit_names(d[59], RBBM_BITS)}) CP_INT={d[60]:#x} ({bit_names(d[60], CP_BITS)})')
+                if d[43] & 32:
+                    out.append(f'  copy after 100us RBBM={d[112]:#x} ({bit_names(d[112], RBBM_BITS)}) CP_INT={d[113]:#x} ({bit_names(d[113], CP_BITS)})')
+                    names = ('CCU_CNTL', 'CCU_CNTL2', 'RB_BLIT', 'GRAS_BLIT', 'SP_FORMAT', 'SRC_INFO', 'SRC_SIZE', 'SRC_PITCH', 'DST_INFO', 'DST_PITCH', 'TPL1_BLIT', 'RB_CMP_DBG', 'RB_DBG', 'APERTURE_HOST')
+                    out.append('  raw state (host aperture): ' + ' '.join(f'{name}={v:08x}' for name, v in zip(names, d[114:128])))
             out.append(f'  tables={d[28]} TLBstatus={d[29]:#x} TLBpolls={d[30]} display PA/pitch/size/format=' + '/'.join(f'{v:#x}' for v in d[50:54]))
             out.append(f'  frozen CP r/w={d[64]}/{d[65]} RBBM={d[66]:#x} CP_INT={d[67]:#x} HW_FAULT={d[68]:#x} PROTECT={d[69]:#x} RBBM_INT={d[70]:#x} GFSR={d[71]:#x} TRUST={d[88]:#x}')
             out.append(f'  CP_INT bits: {bit_names(d[67], CP_BITS)}; RBBM busy bits: {bit_names(d[66], RBBM_BITS)}')
             for at, name in ((72, 'GPU'), (80, 'GMU')):
                 out.append(f'  {name} CB{d[at]} FSR={d[at+1]:#x} FAR={d[at+3]:08x}{d[at+2]:08x} FSYNR={d[at+4]:#x}/{d[at+5]:#x} SID={d[at+6]:#x} SCTLR={d[at+7]:#x}')
             out.append(f'  RBBM_STATUS1/2/3={d[89]:#x}/{d[90]:#x}/{d[91]:#x} safe_faults={d[92]} last_PA={d[94]:08x}{d[93]:08x} ESR={d[95]:#x}')
-            out.append('  first 32 command words: ' + ' '.join(f'{v:08x}' for v in d[96:]))
+            out.append(f'  first {16 if v7 else 32} copy command words: ' + ' '.join(f'{v:08x}' for v in d[96:112 if v7 else 128]))
     return '\n'.join(out)
 
 
@@ -286,7 +301,7 @@ def main():
         if args.read_reports or stage >= 8:
             extra = read(0x101)
             version = struct.unpack_from('<I', extra)[0]
-            page_count = {0xa7400002: 6, 0xa7400003: 8, 0xa7400004: 10, 0xa7400005: 12, 0xa7400006: 14}.get(version)
+            page_count = {0xa7400002: 6, 0xa7400003: 8, 0xa7400004: 10, 0xa7400005: 12, 0xa7400006: 14, 0xa7400007: 14}.get(version)
             if page_count is None:
                 ap.error(f'unsupported report version {version:#x}')
             blob += extra + b''.join(read(0x100 + i) for i in range(2, page_count))

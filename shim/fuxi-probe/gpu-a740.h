@@ -152,3 +152,8 @@ static const uint32_t g3_protect[48] = {
 #define G4_SP_WINDOW  0xb2d1
 #define G4_TPL1_BLIT  0xb2d2
 #define G4_TPL1_NC    0xb604
+
+/* M4b: Mesa 25.0.7 XML / Linux 6.12, safe CPU MMIO for ECO registers. */
+#define G4_RB_SOLID   0x8c2c
+#define G4_RB_DBG     0x8e04
+#define G4_RB_CMP_DBG 0x8e28

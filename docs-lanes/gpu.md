@@ -1,3 +1,189 @@
+# Milestone 4b — A7xx render-thread selection and blit-cache writeback
+
+Branch `codex-gpu-m4b`, based on `fuxi-bringup` / M4 commit `1302cee`.
+This section supersedes M4's artifact, ring counts and report layout below.
+**Hardware acceptance is pending.** No phone, USB, adb or fastboot access was
+used for M4b, and nothing was pushed. The GMU-start handoff lock remains.
+
+## M4 device result (fact)
+
+Coordinator's fresh boot of M4 image SHA256
+`00fc43ebbba2d0b3b01fa2e3d42a4c0a5aae9b46e9cbf1ba2a39272807041782`
+ran stages7..14 together. Stages7..13 PASS, including fence `a740f00d` and
+rptr7→11. Stage14 returned `e06`, step6: all65536 destination pixels remained
+`deadbeef`, first x/y0/0 expected`00000000`; source and every guard were intact.
+The ring was consumed, rptr=wptr74, and the following event fence `a740b014`
+landed. CP_INT, HW_FAULT, PROTECT, RBBM_INT and GFSR were0; both context banks
+retained only the pre-existing FSR bit10 (`400`). Frozen RBBM_STATUS was1 and
+STATUS1/2/3 were0. Private decoded evidence is `research-log/stage-14m4.log`;
+it is not part of the commit. This establishes CP progress without visible
+2D destination writes; it does not establish a working render pipeline.
+
+CPU=0.000us was a decoder validity bug: M4 never ran a stage14 CPU comparator,
+and failed GPU verification also prevented the stage15 comparator. Zero in an
+unreached timing field is **not a measured zero-duration memcpy**.
+
+## Source comparison and candidate fixes
+
+Primary references are the supplied **Mesa25.0.7** tree and **Linux6.12** msm
+source, not a newer driver's register names. UniXNU's A740 derivation scripts,
+NativeAdreno hw-init table and AdrenoPM4 builders were read as secondary
+cross-checks; no implementation was copied from them.
+
+- **Confirmed omission:** Linux `a7xx_cp_init` emits THREAD_CONTROL=`08000000`
+  to disable concurrent binning. That does not select BR: the XML enumerates
+  BR=1, BV=2, BOTH=3. Turnip `tu_cmd_buffer.cc:tu6_init_hw` explicitly emits
+  `08000001` before graphics state. Linux `a7xx_submit` also selects BR before
+  submission. M4 did neither after CP init. M4b selects **BR, binning disabled**
+  at the beginning of each clear/copy stream, preserving stages1..13's sequence.
+  **Hypothesis:** M4's zero thread selector allowed CP control/fence progress
+  while render work/state did not reach BR. The exact retail SQE behavior for
+  selector0 remains unverified; source omission alone is not a device proof.
+- **Confirmed omission:** Turnip's `FD_CCU_CLEAN_BLIT_CACHE` maps through
+  `common/freedreno_gpu_event.h` to A7xx **CCU_RESOLVE_CLEAN26**. Its flush code
+  explicitly requests this in addition to ordinary CCU/UCHE maintenance.
+  M4 emitted color/depth cleans33/32 and CACHE_CLEAN49, but no26. M4b emits26
+  before work and after each job, then color/depth clean and invalidate, then
+  the write-enabled CACHE_CLEAN49 fence and WFI. **Hypothesis:** undrained
+  A7xx blit writes contributed to the untouched CPU-visible destination.
+- M4b adds WFI after static `RB_CCU_CNTL=0`, matching Turnip's requirement that
+  static A7xx CCU configuration take effect across WFI. Resolve/unresolve
+  concurrency stays disabled. Linux's A7xx `RB_CMP_DBG_ECO_CNTL` bit11 ordering
+  workaround is applied by safe CPU read/modify/write at stage14, before jobs.
+- **Already present/correct:** UCHE TRAP/WRITE_THRU bases=`1fffffffff000`,
+  A740 GMEM VA range=`1000000..12fffff`, UCHE cache/CMDQ/GBIF setup, Linux's
+  A740 HBB16 RB/TPL1/SP/GRAS NC configuration, HWCG and CP_PROTECT tables.
+  These are not newly guessed missing writes. Mesa `tu_device.cc` allocates
+  six256KiB depth CCUs before the color cache, yielding color offset`180000`;
+  `emit_rb_ccu_cntl` and XML encode full caches as `RB_CCU_CNTL2=c0000000`.
+- The `r2d_setup_common/src_buffer/dst/run` comparison retains format`30`,
+  UNORM8 ifmt`10`, maskf, WXYZ BGRA swap1, SP output`f180`, A7xx source at
+  `b2c0`, TPL1 TEX_2D at`b2d2`, inclusive BR coordinates, no scissor/UBWC/sRGB.
+  Mesa25.0.7 A7xx source pitch is bytes<<3; for aligned1024 bytes its value
+  `2000` equals M4's `(pitch>>6)<<9`. Destination pitch is bytes>>6. These
+  encodings were rechecked, not changed. RM6_BLIT2DSCALE was already emitted.
+
+The two principal omissions are corrected together; a passing M4b run cannot
+attribute the fix to one of them. Missing additional cold graphics state or
+retail secure-mode behavior (TRUST remains1) are residual hypotheses if neither
+variant writes. No secure-mode transition, zap/PAS/SCM or SID2 mapping is added.
+
+## One stage14 run: source-free clear, then independent patterned copy
+
+After existing mapping/idle/fault/guard gates, stage14 submits a **solid-color
+2D clear** using SOLID_COLOR bit7, RB/GRAS control`10f03080`, per-channel
+R/G/B/A=`33/66/99/ff`, and destination BGRA pixel`ff336699`. It emits no source
+surface registers. The original read-only source mapping is retained so CPU
+checks can detect any source corruption. Clear uses its own fence
+`40029030=a740c014`. Every destination/source pixel and every scratch/old
+fence guard is checked after fence+rptr+wptr+idle completion and a100us delay.
+
+A clear **pixel-only mismatch** is retained while the separately planned copy
+runs once; any fault, timeout, safe abort, source corruption or guard damage
+stops immediately. After a clean/invalidated, idle clear, CPU refills destination
+with `deadbeef` so the copy test is independent. The original full256x256 pattern
+copy then uses `40029010=a740b014`. Both variants must pass before stage14 can
+PASS. There is no retry, recovery or ring reuse. Stage15 remains gated on14 PASS.
+
+| Clear / copy observation | Interpretation limit |
+|---|---|
+| Both untouched, both fences and idle succeed | General 2D routing/state/writeback remains suspect; source fetch alone cannot explain the clear failure |
+| Clear passes, patterned copy fails | Destination write path works for solid color; investigate source fetch/format/coordinates |
+| Clear fails, copy passes | Inspect solid channel packing/clear state; new result `e0b` blocks15 |
+| Both pass, all guards/source checks pass | Scratch acceptance; proceed to the separately authorized scanout test |
+
+After GPU verification, stage14 now also times256 identical1024-byte CPU row
+copies to scratch; stage15 retains64 row copies to its panel region. Counter
+reads have ISB/compiler barriers; final DSB stays inside the interval. This is
+still the loader's uncached volatile-byte memcpy, not an optimized XNU baseline.
+CPU readback follows timing. A validity bit distinguishes an executed benchmark
+from an unrun field, including failed-stage14 legacy-v6 reports in the decoder.
+
+Expected successful rings: clear **11→82** (71 words), patterned copy
+**82→156** (74 words), stage15 **156→1679** (1523 words). Page tables remain
+3→5→10. Primary stage14 ring/timing fields describe the copy only. Its GPU time
+excludes clear,100us diagnostic delay and CPU pixel verification.
+
+## Report v7 (same fourteen512-byte pages)
+
+Signatures become`a7400007`; selectors100..10d and7168-byte size stay unchanged.
+The host still accepts v2..v6. Existing words0..42,45..53,64..95 retain meaning,
+with primary ring fields valid only if copy-submitted is set. New layout:
+
+| Local words on page12/13 | Meaning |
+|---|---|
+| 43 | Validity bits0 CPU benchmark ran,1 clear submitted,2 clear completed,3 copy submitted,4 copy completed,5 delayed copy state sampled |
+| 44 | Clear result (0 not run,1 PASS,`e0b` pixels wrong; other M4 failures unchanged) |
+| 54..58 | Clear end rptr target, observed clear fence, mismatch count, first actual mismatch, count still`deadbeef` |
+| 59/60 | RBBM_STATUS / CP_INT sampled100us after clear wait returns, including timeout |
+| 61..63 | Clear guard mismatches (scratch+old fence), source mismatches, completion polls |
+| 96..111 | First16 **copy** command words (v6 stored32) |
+| 112/113 | RBBM_STATUS / CP_INT sampled100us after copy wait returns, including timeout |
+| 114..127 | Raw CCU_CNTL, CCU_CNTL2, RB_BLIT, GRAS_BLIT, SP_FORMAT, SRC_INFO, SRC_SIZE, SRC_PITCH, DST_INFO, DST_PITCH, TPL1_BLIT, RB_CMP_DBG, RB_DBG, APERTURE_HOST |
+
+Raw context-register reads depend on host aperture; do not mistake a banked
+readback for packet decoding. Defined XML RBBM busy bits7/8/9 report RB/CCU/A2D;
+no speculative RB/CCU status offsets are accessed. Frozen final fault snapshots
+remain in64..95. Safe diagnostic aborts stop acceptance. A successful14 has
+validity`3f`, successful15=`39` (no clear there). CPU fields are N/A until bit0.
+
+## Offline validation, artifact and device order
+
+Native UBSan model (`-Wall -Wextra -Werror`) passes with synthetic and exact
+sheng GMU/SQE inputs, including both variant readbacks, guards, no next stage
+on failure, clear-only/copy-only write loss, omitted BR, omitted resolve-clean,
+fence/stall/fault/abort/TLB/geometry/ring capacity cases and frozen replay.
+The model deliberately separates render-thread routing and queued blit-cache
+writes from CP consumption/fences; this tests handling of those hypotheses,
+**not their real SQE/cache behavior**. Mesa XML field/event audit and Linux
+54-HWCG/48-protection/39-offset audit pass. v7/v6/v5 decoding passes, and the
+private M4 log was reconstructed/decoded offline with CPU=N/A.
+
+```
+python3 tools/test-fuxi-gpu-probe.py
+python3 tools/test-fuxi-gpu-probe.py --mesa "$MESA" --linux-msm "$MSM" \
+  --firmware "$FW/gmu_gen70200.bin" --sqe "$FW/a740_sqe.fw"
+```
+
+The firmware-enabled loader, explicitly empty-firmware loader and standalone
+probe build with clang-r547379: **PASS, zero warnings**. Loader enforces-Werror;
+C relocation, link and Image guards pass. Saved image inspection verifies boot
+v4, empty ramdisk/padding, exact GMU/SQE bytes, unchanged integ1 payload and no
+linked relocations. Build environment/recipe is the M4 section6 below, with
+external firmware inputs; the firmware image was saved before empty-fw checks.
+
+Ignored image: `shim/out/lane-gpu/fuxi-gpu-m4b-boot.img`, **20,881,408 bytes**.
+SHA256: `d5807c0de62c50359e5453814e5ee8ca835eba4f2b4e91c2b367ad35633be397`.
+Kernel Image20,873,296 bytes. Saved ELF GMU`147c0..24cdc`, SQE`24cdc..37350`,
+BSS`38000..68000`, payload`78000`, end`13e8050`; firmware/payload hashes are
+unchanged from M4. Saved ELF/Image and a SHA256 file sit beside the boot image.
+No firmware, private log, generated binary or local absolute input path is
+committed. Commit: the commit containing this section.
+
+Coordinator order (temporary fresh boots; lane itself must not access device):
+
+1. Regress7,8a ownership review,10, then11→12→13. Expect the proven7/11 init/fence
+   counts, TRUST1/read-only, no new defined faults; retain both raw FSR`400`s.
+2. Fresh stage14 with updated decoder `--raw --save <private-report>`; inspect
+   **both** clear and copy. Require result1/step8, validity3f, rings82/156,
+   both magic fences, all pixel/source/guard counts0 and CPU timing valid.
+   Check delayed busy/CP_INT, raw CCU state and final faults. Stop on failure.
+3. Only after14 acceptance, stage15 on a fresh boot (its14 gate reruns and must
+   pass), then same-boot11→12→13→14→15 with report fetches/delays. Require15
+   end1679, validity39, geometry and GPU/CPU/perimeter checks, and visually
+   inspect bars. A readback alone is not proof of visible scanout.
+4. Replay stages/report reads without new submissions; keep request49 refusal.
+   Any failure: retain all14 pages, exact image hash and reset outcome; no
+   climbing, retries or recovery in that boot.
+
+Remaining risk: the source-derived fix has **no M4b device result** yet. Cold2D
+may still hang/fault or fail readback, and new safe state reads may abort.
+Stage15 additionally writes active scanout; it cannot run until both scratch
+variants and the CPU comparator pass. No offline PASS is a claim of stage14
+hardware success or physical panel output.
+
+---
+
 # Lane: GPU A740 — milestone 4, 2026-10-20
 
 Branch `codex-gpu-m4`, based on main `b6996c1`. This section supersedes earlier
