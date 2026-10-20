@@ -1,3 +1,131 @@
+# Milestone 6b — fallible XNU GPU mappings
+
+Branch `codex-gpu-m6b`, based on M6 `8b36bdc` plus monitor fix `33d5615`.
+**0096c built and checked offline; device acceptance is pending.** No phone,
+adb, fastboot, USB access or push. Protected handoff files are unchanged.
+The M6 section below describes the original implementation and artifacts;
+this section supersedes its mapping and startup-allocation behavior.
+
+## Device result and root cause
+
+Coordinator reports two identical M6 boots (0096 and 0096b, `fuxigpu=1`,
+768 MiB RAM). XNU registers AppleCLCD at `0xb8000000`, 1080×2400, stride 4320,
+and starts all seven CPUs. About two seconds later, immediately after
+`using 935 buffer headers`, it panics:
+`kmem_alloc(<map>, 33554432, 0x100021): failed with 3 @vm_kern.c:178`.
+Adding `mbuf_pool=64` made no difference. Private evidence is
+`research-log/ios-0096b-01-boot.log`; it is not committed. No backtrace was
+printed, so the caller attribution comes from the allocation size, timing and
+source audit rather than a symbolized device stack.
+
+The exact native XNU tree confirms the cause: `osfmk/arm/io_map.c` defines
+`IO_MAP_SIZE (8ul << 20)`, registers `io_range` with
+`KMEM_RANGE_REGISTER_STATIC`, and creates `io_submap` at KMEM startup.
+After startup, `ml_io_map` in `osfmk/arm64/machine_routines.c` calls `io_map`,
+which allocates from that submap with
+`KMA_NOFAIL | KMA_PAGEABLE | KMA_PERMANENT` (`0x100021`).
+The failed 33554432-byte request is the driver's entire 32 MiB scratch aperture,
+not a buffer-header allocation. It exceeds even an empty 8 MiB IO range;
+other platform mappings and the GPU's earlier MMIO mappings further reduce
+headroom. This IO VA limit is fixed, independent of the 768 MiB physical RAM
+window or mbuf pool. `KERN_NO_SPACE=3` panics before the old null check.
+
+## Fix and complete 0096 allocation audit
+
+All ten windows now use the same checked mapper, including GPU/GCC/GMU/RSCC/
+SMMU/RPMh/cmd-db MMIO, display geometry and the enclosing 16 KiB zap page.
+It reserves VA in `kernel_map` with
+`KMA_VAONLY | KMA_KOBJECT | KMA_NOPAGEWAIT`, without NOFAIL or PERMANENT,
+then enters each 16 KiB physical page using `pmap_enter_options_addr`,
+RW/NX, `VM_WIMG_IO`, wired, `PMAP_OPTIONS_NOWAIT`. It checks every return.
+KOBJECT reuses `kernel_object`; VAONLY allocates no new scratch backing RAM.
+The kernel-page alignment and physical-overflow checks precede allocation.
+A page-entry failure removes the incomplete window and frees its VA before
+publishing any pointer. A mapping failure logs PA, size, error and completed
+mapped bytes, calls `fg_fail`, and permanently keeps CPU presents before any
+probe/MMIO/SCM operation. Completed mappings remain retained until reset.
+
+This uses the permitted fallible mapping alternative and deliberately retains
+the existing full 32 MiB scratch mapping. The shared probe clears the entire
+GMU icache backing (16 MiB minus 16 KiB) and 1 MiB table pools, in addition to
+firmware staging,
+GMU data/HFI/log/debug, SQE/ring/rptr/fence, PAS metadata, self-test surfaces,
+and source leaves. Their offsets, zeroing and ownership stay unchanged.
+Success logs exactly:
+
+```text
+FUXI GPU: mapped 35127296 bytes NC in kernel_map, IO submap 0 bytes
+```
+
+That is 33.5 MiB total: 32 MiB scratch plus 1.5 MiB other windows, 2144 kernel
+pages. The physical reservation still excludes scratch from both VM bounds
+and ADT RAM. Mapping kernel VA does not allocate another 32 MiB of RAM.
+
+The audit also covers the APIs behind apparent failure returns:
+
+- `ml_io_map_with_prot`, `ml_io_map_wcomb`, and `ml_io_map_unmappable` all
+  reach the same NOFAIL allocation; the unmappable variant merely chooses
+  `kernel_map`. None is used. `pmap_map` panics on entry failure; it is also
+  avoided. `pmap_map_high_window_bd` has exhaustion panics and installs default
+  cache attributes, so it is unsuitable here.
+- The original `kernel_thread_start` reaches a `Z_NOFAIL` thread allocation
+  and `stack_alloc`'s `KMA_NOFAIL` stack allocation. GPU startup now uses a
+  static `thread_call_data_t`, set up once and enqueued with a two-second
+  deadline at kernel priority. The callback runs in sleepable worker context
+  while display presents continue. It allocates neither a private thread/stack
+  nor a call record; it does not use the panic-on-exhaustion internal pool of
+  `thread_call_func_delayed`. There is no callback self-termination or retry.
+- Tables, HFI/GMU buffers, reports, firmware and PM4 storage are fixed scratch
+  or static storage. Present uses existing source leaves/ring, `pmap_find_phys`
+  and cache maintenance; it allocates no VM, page tables or DMA buffers.
+  The framebuffer workloop serializes presents. Accepted sources are wired
+  kernel `IOBufferMemoryDescriptor`s, which auto-prepare at construction;
+  present's matched `prepare`/`complete` increments/decrements that existing
+  preparation. A returned prepare error selects CPU copy, and the existing
+  failed-drain path retains the preparation/reference until reset.
+
+There is no remaining driver-controlled panic-on-allocation-failure API for a
+recoverable GPU resource. XNU's shared VM-map/zone and worker infrastructure
+still has system-wide invariants; this change does not promise survival of
+arbitrary global kernel resource exhaustion. Hardware abort containment,
+asynchronous faults, SMC stalls and failed-drain DMA risks remain as in M6.
+
+## Build, validation and artifacts
+
+Rebuilt natively, exit 0, in the existing `ci-lane-gpu6` only. Updated 0096 applies
+cleanly to the integration baseline; all ten patched files match the native
+build tree. `sync-fuxi-adreno-shared.py --check` passes. The ASan/UBSan model
+compiles the actual mapper, startup and failure functions and injects all 10 VA
+reservation failures and all 2144 page-insertion failures, checking partial
+unwind, unpublished pointers, exact accounting, permanent CPU fallback and no
+hardware calls. It also checks static delayed startup, opt-out, invalid
+reservation/VM bounds and duplicate-start suppression. The existing 1018
+pixel-copy / 1000-frame model and exact external GMU/SQE/zap probe model pass.
+These are software models, not tests of native VM exhaustion on hardware.
+
+Packaging follows M6: extract the original integ1 ADT and command line, apply
+`mkadt-fuxi.py --template ... --gpu-reserve`, run `mkpayload.py` with the rebuilt
+kernel and **exactly the integ1 command line plus ` fuxigpu=1`**, then build the
+loader with the same externally supplied SHA256-pinned firmware. No added
+`mbuf_pool` argument. Offline verification passes boot-v4/Image/payload geometry,
+768 MiB memory bounds, native linked read/write abort recovery records and
+exact embedded firmware. ADT comparison changes only `dram-size` and the GPU
+reservation property: identity, root extents and seven CPUs are preserved.
+
+| Artifact | SHA256 |
+| --- | --- |
+| `xnu/out-fuxi-0096c/kernel.development.fuxi` | `fe3b2112313c6e9110bbc06b7dda8d8765d6a2827777ce7c4db20f7cab3612dd` |
+| `xnu/out-fuxi-0096c/kernel.development.fuxi.unstripped` | `3e68c8226109164a295d60526d3c8a5d3f6b2d372b62167d92fc9c94e6fa5581` |
+| `shim/out/fuxi-0096c-payload.bin` | `b38d7da9b2a25c387b1c41eb49019134be34425540e1f57bef498ea8ec4e5d08` |
+| `shim/out/fuxi-0096c-boot.img` | `68432587f28360f653affbd122e2ea91596a024cf0f70354c9c681157f6ff8cf` |
+
+All binaries, sidecars and build/test logs are gitignored. Firmware remains
+external and untracked. Coordinator acceptance: fresh 0096c boot, inspect the
+mapped-byte log, then the M6 stage/PAS/self-test/ready and 600-frame present
+checks. A native mapping shortage should instead log its failure and
+`disabled permanently`, with CPU frames continuing. No 0096c device outcome,
+performance improvement or fix for the other M6 hardware risks is claimed.
+
 # Milestone 6 — XNU GPU present copy
 
 Implemented on `codex-gpu-m6`, based on `0f827d9`, in the self-contained kernel

@@ -17,7 +17,7 @@ spec.loader.exec_module(sync)
 
 
 def function(source, name):
-    match = re.search(r'^(?:static )?(?:unsigned|uint32_t|int|void) ' + name + r'\([^;]*?\)\s*\{', source, re.M)
+    match = re.search(r'^(?:static )?(?:unsigned|uint32_t|uintptr_t|kern_return_t|int|void) ' + name + r'\([^;]*?\)\s*\{', source, re.M)
     assert match, name
     depth, end = 1, match.end()
     while depth:
@@ -236,6 +236,7 @@ int main(void)
 
 def main():
     subprocess.run(['python3', str(ROOT / 'tools/sync-fuxi-adreno-shared.py'), '--check'], check=True)
+    subprocess.run(['python3', str(ROOT / 'tools/test-fuxi-adreno-mapping.py')], check=True)
     probe = sync.added_file('gpu.c')
     adapter = sync.added_file('fuxi_adreno.c')
     windows = [(int(a, 16), int(b, 16)) for a, b in re.findall(r'\{(0x[0-9a-f]+),(0x[0-9a-f]+),0\}', adapter)]

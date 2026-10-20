@@ -10,7 +10,7 @@
  bsd/dev/sweet_spmi.c			standard
 --- a/bsd/dev/fuxi_adreno.c
 +++ b/bsd/dev/fuxi_adreno.c
-@@ -0,0 +1,322 @@
+@@ -0,0 +1,367 @@
 +/* M6 platform adapter. gpu.c/gpu-a740.h/gpu-zap.h are exact shared probe
 + * sources, copied into patch 0096 by tools/sync-fuxi-adreno-shared.py.
 + * Fixed memory is excluded from boot_args AND ADT RAM before VM bootstrap.
@@ -21,19 +21,22 @@
 +#include <sys/param.h>
 +#include <sys/systm.h>
 +#include <kern/clock.h>
-+#include <kern/thread.h>
-+#include <kern/sched_prim.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
 +#include <pexpert/device_tree.h>
 +#include <vm/vm_kern.h>
 +#include <vm/pmap.h>
 +#include <arm/caches_internal.h>
++/* Expose only the private APIs used by this built-in BSD platform adapter. */
++#define MACH_KERNEL_PRIVATE 1
++#include <kern/thread_call.h>
++#undef MACH_KERNEL_PRIVATE
 +#include "fuxi_adreno.h"
 +#include "gpu-handoff.h"
-+extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
-+extern kern_return_t thread_terminate(thread_t);
++/* ARM64 pmap_paddr_t is uint64_t; the typedef is private to Mach headers. */
++extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t,
++    uint64_t, vm_prot_t, vm_prot_t, unsigned, boolean_t, unsigned, void *);
 +/* Fault-contained aligned 32/64-bit access in machine_routines_asm.s. */
 +extern unsigned fuxi_gpu_access(uintptr_t, uint64_t *, unsigned, unsigned);
 +#define rsr(r) ({ uint64_t v; __asm__ volatile("mrs %0, " r : "=r"(v)); v; })
@@ -50,6 +53,50 @@
 + {FG_SCRATCH,FG_SCRATCH_SIZE,0}, {0x9b098000,0x4000,0},
 + {0xae04000,0x4000,0},
 +};
++static uint64_t fg_mapped_bytes;
++/* io_map's 8 MiB submap and ALL ml_io_map variants use KMA_NOFAIL.
++ * Use kernel_map VA only (no backing RAM) and fallible page-table expansion.
++ * KOBJECT reuses kernel_object rather than allocating a fresh VM object.
++ * Every window is kernel-page aligned, including the zap reservation's
++ * enclosing 16K page. No early-boot/interrupt-context callers are permitted.
++ * Keep completed mappings until reset, as the GPU may retain DMA ownership. */
++static kern_return_t fg_map_window(struct fg_window *w)
++{
++ vm_offset_t va = 0;
++ if (!w->size || (w->pa & PAGE_MASK) || (w->size & PAGE_MASK) ||
++     w->pa > UINT64_MAX - w->size || w->va) return KERN_INVALID_ARGUMENT;
++ kern_return_t kr = kmem_alloc(kernel_map, &va, w->size,
++     KMA_VAONLY | KMA_KOBJECT | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT);
++ if (kr != KERN_SUCCESS) return kr;
++ for (vm_size_t off = 0; off < w->size; off += PAGE_SIZE) {
++  kr = pmap_enter_options_addr(kernel_pmap, va + off, w->pa + off,
++      VM_PROT_READ | VM_PROT_WRITE, VM_PROT_NONE, VM_WIMG_IO, TRUE,
++      PMAP_OPTIONS_NOWAIT, NULL);
++  if (kr != KERN_SUCCESS) {
++   /* Never publish a partial window; no GPU has been started yet. */
++   pmap_remove(kernel_pmap, va, va + w->size);
++   kmem_free(kernel_map, va, w->size);
++   return kr;
++  }
++ }
++ w->va = va;
++ fg_mapped_bytes += w->size;
++ return KERN_SUCCESS;
++}
++static kern_return_t fg_map_windows(void)
++{
++ for (unsigned i = 0; i < sizeof(fg_windows)/sizeof(fg_windows[0]); i++) {
++  struct fg_window *w = &fg_windows[i];
++  kern_return_t kr = fg_map_window(w);
++  if (kr != KERN_SUCCESS) {
++   printf("FUXI GPU: map PA %#llx bytes %#llx failed %d, mapped %llu bytes, IO submap 0 bytes\n",
++       w->pa, w->size, kr, fg_mapped_bytes);
++   return kr;
++  }
++ }
++ printf("FUXI GPU: mapped %llu bytes NC in kernel_map, IO submap 0 bytes\n", fg_mapped_bytes);
++ return KERN_SUCCESS;
++}
 +static unsigned fg_access_failed;
 +uint32_t probe_fault_esr;
 +uint64_t probe_fault_far;
@@ -163,14 +210,11 @@
 + g_zero(FG_SOURCE_TABLE, 8*4096);
 + return 1;
 +}
-+static void fg_thread(void *arg, wait_result_t result)
++static thread_call_data_t fg_init_call;
++static void fg_thread(thread_call_param_t arg, thread_call_param_t result)
 +{
 + (void)arg; (void)result;
-+ /* Scheduling is after AppleCLCD registration; sleep off the boot path. */
-+ uint64_t deadline;
-+ clock_interval_to_deadline(2, NSEC_PER_SEC, &deadline);
-+ (void)assert_wait_deadline(&fg_started, THREAD_UNINT, deadline);
-+ thread_block(THREAD_CONTINUE_NULL);
++ /* Sleepable thread-call worker, delayed until after AppleCLCD registers. */
 + DTEntry chosen; void *prop; unsigned bytes;
 + if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
 +     SecureDTGetProperty(chosen, "fuxi-gpu-memory", &prop, &bytes) != kSuccess ||
@@ -182,11 +226,8 @@
 + if (gPhysBase != FG_RAM_BASE || gPhysSize > FG_RAM_SIZE) {
 +  fg_fail("scratch is inside XNU RAM", 2); goto out;
 + }
-+ for (unsigned i = 0; i < sizeof(fg_windows)/sizeof(fg_windows[0]); i++) {
-+  struct fg_window *w = &fg_windows[i];
-+  w->va = ml_io_map(w->pa, w->size);
-+  if (!w->va) { fg_fail("uncached mapping failed", i); goto out; }
-+ }
++ kern_return_t kr = fg_map_windows();
++ if (kr != KERN_SUCCESS) { fg_fail("uncached mapping failed", kr); goto out; }
 + const struct fg_handoff *h = (const struct fg_handoff *)G_PTR(FG_HANDOFF);
 + if (h->magic != FG_MAGIC || h->version != 1 || h->bytes != sizeof(*h) || h->reserved ||
 +     h->base != FG_SCRATCH || h->size != FG_SCRATCH_SIZE) {
@@ -222,7 +263,7 @@
 + if (g4_tlb(tlb) || fg_access_failed) { fg_fail("initial TLB sync", 5); goto out; }
 + printf("FUXI GPU: ready, BGRA row blits + fence, 220 MHz, polling\n");
 + __atomic_store_n(&fg_state, 1, __ATOMIC_RELEASE);
-+ out: (void)thread_terminate(current_thread());
++ out: return;
 +}
 +void fuxi_gpu_start(uint64_t fb, unsigned width, unsigned height, unsigned pitch)
 +{
@@ -236,9 +277,13 @@
 +     fb != G4_FB_PA || width != 1080 || height != 2400 || pitch != 4320) {
 +  fg_fail("unsupported boot framebuffer/stage", fg_limit); return;
 + }
-+ thread_t thread;
-+ if (kernel_thread_start(fg_thread, NULL, &thread) != KERN_SUCCESS) fg_fail("thread start", 6);
-+ else thread_deallocate(thread);
++ /* Static storage avoids kernel_thread_start's NOFAIL thread/stack allocation
++  * and thread_call_func_delayed's panic-on-exhaustion fixed call pool. */
++ uint64_t deadline;
++ thread_call_setup_with_options(&fg_init_call, fg_thread, NULL,
++     THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
++ clock_interval_to_deadline(2, NSEC_PER_SEC, &deadline);
++ (void)thread_call_enter_delayed(&fg_init_call, deadline);
 +}
 +
 +/* Validated one-row variant of g4_blit: neither surface pitch is rounded down.
