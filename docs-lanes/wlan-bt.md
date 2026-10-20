@@ -1224,3 +1224,209 @@ unmeasured in this lane.
 | `xnu/out-fuxi-wlan6d/kernel.development.fuxi.unstripped` | `326a1d80d40242043482a95ef9aa4465a2fe461d74ab78525a76d75ebe49c125` |
 | `shim/out/fuxi-wlan-m6d-s20-boot.img` | `a4cd9c45f912eac1c8da1b097691e82d0db63b2704873a27ad5c0ea328c65838` |
 | `shim/out/fuxi-wlan-m6d-boot.img` | `ed23bd7105feaaa2515af63beb3febbd28bd9651dde0e8c1eb30a3cb59dd8a98` |
+
+## 16. Milestone 6e: distinguish PBL rejection from inaccessible transport
+
+M6e adds BHI setup verification and two read-only step-22 snapshots. It does
+not claim to fix the firmware rejection or prove successful endpoint DMA.
+No device run is part of this milestone.
+
+### Error interpretation and source comparison
+
+Linux defines BHI_STATUS bits [31:30] as the transfer status: reset 0,
+success 2, error 3. Thus raw all-ones extracts as error 3, but it also has
+the usual inaccessible-MMIO ambiguity. Linux prints ERRCODE and ERRDBG1–3
+without decoding the private ROM error namespace. The public upstream and
+Xiaomi vendor sources examined contain no decode of `0xef0e0003`; exact-code
+public searches found none either. Authentication, ELF validation and DMA
+failure remain possible explanations, not identified meanings of that code.
+See [Linux v6.6 BHI definitions](https://github.com/torvalds/linux/blob/v6.6/drivers/bus/mhi/common.h#L42-L71),
+[upstream BHI loader](https://github.com/torvalds/linux/blob/v6.6/drivers/bus/mhi/host/boot.c#L210-L275)
+and [Xiaomi SM8550 vendor BHI loader](https://github.com/LineageOS/android_kernel_xiaomi_sm8550/blob/2cac706017fd8fd44a1d6a27855ef1b685ce4ea2/drivers/bus/mhi/host/boot.c).
+The vendor function is named `mhi_fw_load_bhi`; older vendor trees use
+`mhi_fw_load_sbl` for the same BHI download, not a different image format.
+
+The supplied M6d evidence has non-all-ones EXECENV, MHISTATUS, MHICTRL,
+ERRCODE, ERRDBG and endpoint command/status in the same snapshot as the
+all-ones BHI_STATUS. This supports a PBL-reported failure with other registers
+still readable, rather than a sustained whole-BAR/config disappearance.
+Those reads were sequential: a transient link loss/reset remains unexcluded.
+Neither the unchanged address/size in ERRDBG nor the lack of a translation
+fault proves that all 512 KiB were fetched correctly. CB FSR bit 10 is the
+format indicator; only the existing fault mask is used for failure detection.
+Raw device logs remain outside git.
+
+### Firmware, layout and ordering audit
+
+The filename rule is now supported by
+[`cnss_pci_update_fw_name` and `cnss_get_mhi_soc_info`](https://github.com/LineageOS/android_kernel_xiaomi_sm8550-modules/blob/959e4811619b8392b0a95711f86a95e6c58872a2/qcom/opensource/wlan/platform/cnss2/pci.c):
+KIWI major version 2 selects `kiwi/amss20.bin`; other majors select
+`kiwi/amss.bin`. CNSS extracts bits [15:8], then keeps the low four bits of
+the major version. This matches our selector. The startup message now says
+`CNSS kiwi major-version rule` instead of filename inference.
+Upstream [ath12k MHI configuration](https://github.com/torvalds/linux/blob/v6.6/drivers/net/wireless/ath/ath12k/mhi.c)
+uses FBC, 512-KiB SBL size and 512-KiB BHIe segments. Its firmware directory
+is [WCN7850/hw2.0](https://github.com/torvalds/linux/blob/v6.6/drivers/net/wireless/ath/ath12k/hw.c),
+where the image is named `amss.bin`. The upstream basename is not evidence
+that the phone's two different vendor binaries can be interchanged.
+
+Offline analysis of the read-only inputs:
+
+| Field | vendor `amss20.bin` | vendor `amss.bin` |
+|---|---|---|
+| Bytes | 5,890,112 | 7,458,880 |
+| ELF | ELF32, little-endian, ET_EXEC, EM_ARM, version 1 | same |
+| Header / program entry bytes | 52 / 32 | 52 / 32 |
+| Program table offset / entries | 52 / 23 | 52 / 25 |
+| Entry address | `0x17b4c00` | `0x1794c00` |
+| Header pseudo-segment bytes | `0x314` | `0x354` |
+| Hash pseudo-segment offset / bytes | `0x1000` / `0x308` | `0x1000` / `0x348` |
+| Hash flags / alignment | `0x02200000` / `0x1000` | same |
+| Embedded variant identity | WCN7850 eval v2 | WCN7850 eval v1 |
+
+Each hash segment has a 40-byte version-5 header followed by one 32-byte
+SHA-256 entry per program header. Every nonzero entry matches the corresponding
+file range, including ELF/header metadata. The hash segment's own slot and an
+empty segment's slot are zero. This checks internal file consistency, not ROM
+acceptance or signing policy. Firmware bytes, OEM strings and build paths are
+not included here or in git.
+
+For FBC, [Linux's firmware handler](https://github.com/torvalds/linux/blob/v6.6/drivers/bus/mhi/host/boot.c#L360-L496)
+copies `min(sbl_size, firmware_size)` bytes from file offset zero into a DMA
+buffer. Our full image is read from file offset zero into the IOVA allocation;
+BHI receives its start and `0x80000` bytes, not an ELF PT_LOAD address, segment
+contents, or the BHIe vector table. Both inputs exceed that size. The vendor
+loader does the same first transfer. Its special TME path excludes the initial
+SBL from the later BHIe transfer only for TME-enabled devices; CNSS enables
+that path for PEACH, not KIWI.
+
+BHI offsets relative to BHIOFF remain LOW `+8`, HIGH `+0xc`, SIZE `+0x10`,
+TXDB `+0x18`, INTVEC `+0x20`, EE `+0x28`, STATUS `+0x2c`, ERRCODE `+0x30`,
+DBG1–3 `+0x34..+0x3c`. Linux **does write STATUS=0**, then address HIGH,
+LOW, size and finally doorbell. M6d already used those values and that order.
+M6e additionally reads back address, size, INTVEC, STATUS and EE before BME;
+a mismatch fails step 21 reason 7 without ringing the doorbell.
+
+[Linux power-up and READY transitions](https://github.com/torvalds/linux/blob/v6.6/drivers/bus/mhi/host/pm.c)
+set INTVEC=0 before loading, check a load-capable EE (PBL or EDL), then wait
+for BHI completion. They do not force MHICTRL to BHI or M0 before the first
+transfer. After download they wait for reset-clear and READY, program contexts
+and ring pointers, then request M0. SBL EE later triggers BHIe. Our PBL-only
+precondition and subsequent bounded READY/SBL polling preserve this sequence.
+
+Linux enables its host IRQ and normally gets an EE-change wakeup, whereas this
+lane polls registers and implements the transitions itself. INTVEC=0 selects
+vector zero; it does not disable MSI. Endpoint MSI/MSI-X and legacy INTx remain
+disabled here. The public loader does not require a host interrupt ACK to fetch
+the image or publish status, and the supplied error response is evidence of
+PBL processing with interrupts disabled. There is no justification yet to add
+MSI just to address this failure; successful later transitions still need device
+validation.
+
+### Cacheability, coherence and alignment
+
+The vendor DT marks both
+[PCIe0](https://github.com/LineageOS/android_kernel_xiaomi_sm8550-devicetrees/blob/13913424c9d0af031a8b8f9981c003bbb9632f73/qcom/kalama-pcie.dtsi)
+and [apps_smmu](https://github.com/LineageOS/android_kernel_xiaomi_sm8550-devicetrees/blob/13913424c9d0af031a8b8f9981c003bbb9632f73/qcom/msm-arm-smmu-kalama.dtsi)
+`dma-coherent`. These describe endpoint transactions and table walks separately;
+MAIR alone does not establish coherence. Our MAIR0 index 0 is `0xff` (normal
+inner/outer WB), PTEs select that index with inner shareability, and TCR requests
+cacheable shareable walks. No speculative attribute change is made.
+
+The image, vectors and contexts are flushed page by page using physical
+addresses and `flush_dcache64`, followed by `dsb sy`. The page tables receive
+the same treatment after every PTE has been populated and before TTBR/enable.
+The image is cleaned again immediately before BME/doorbell. MMIO stores have
+an outer-shareable store barrier, and the added setup readbacks drain/check
+posted writes. Host tests now require **every backing page** of all four
+allocations to have been cleaned before BME.
+
+The IOVA image base is 4-KiB aligned (also 16-KiB and 512-KiB aligned for the
+initial allocation); the first size is exactly 512 KiB. Wired physical pages
+may be noncontiguous: the endpoint sees a contiguous IOVA range. The Linux
+BHI loader has no extra ELF-segment alignment rule beyond its DMA allocation;
+we retain the checked page mappings and explicitly reject a misaligned BHI
+address. No CPU pointer or physical address is substituted for the IOVA.
+
+### Step-22 diagnostics and report extension
+
+After polling, step 22 takes sample 0, sleeps 10 ms, and takes sample 1 before
+returning or entering cleanup. This repeats reads only, never the transfer.
+Both samples print raw STATUS and its field, ERRCODE, ERRDBG1–3, EXECENV,
+MHISTATUS/MHICTRL, REGLEN/MHICFG, PARF LTSSM, ELBI SYS_STTS, root-port link
+control/status and command/status, endpoint ID/command/status/BAR0, PMCSR,
+PERST GPIO and root/endpoint AER status. Capability traversal is bounded and
+read-only; missing/unreadable optional PM/AER fields print all-ones and are
+not interpreted as D3 or AER faults. No serial or OEM-key registers are read.
+Offsets and ELBI link bit follow
+[the vendor PCIe controller](https://github.com/LineageOS/android_kernel_xiaomi_sm8550/blob/2cac706017fd8fd44a1d6a27855ef1b685ce4ea2/drivers/pci/controller/pci-msm.c):
+PARF LTSSM `+0x1b0`, ELBI SYS_STTS `+8`, XMLH_LINK_UP bit 10.
+
+The classification is evidence, not a private-code decode:
+
+| Flag | Meaning |
+|---|---|
+| `0x001` | BHI_STATUS alone is all-ones |
+| `0x002` | essential BAR register read is all-ones |
+| `0x004` | endpoint ID disappeared/changed |
+| `0x008` | root link status unavailable, DLLLA clear, or ELBI link-up clear |
+| `0x010` | endpoint memory decode/BAR assignment changed |
+| `0x020` | PERST asserted/unreadable |
+| `0x040` | present/readable PMCSR reports non-D0 |
+| `0x080` | transport checks readable, EE=PBL, status field=error, real nonzero ERRCODE |
+| `0x100` | fault-contained MMIO access fault latched |
+| `0x200` | optional capability chain invalid/unreadable or traversal limit reached |
+
+A transport flag in either sample fails step 22 reason 5 (`0x1605`), retaining
+SMMU reason 3 if already present. A PBL error stays reason 1 (`0x1601`).
+All-ones STATUS with readable transport and a real error code may therefore
+produce flags `0x81`, not a spurious link-down conclusion. A late error/reset
+or transport loss cannot turn an earlier poll success into step-22 OK.
+Normal abort/containment and SMMU undo remain in force.
+
+Report word 108 is extension marker `0x4d366500`; 109 is latest flags;
+110–123 are LTSSM, ELBI, RC link, RC command/status, EP ID, BAR low/high,
+PMCSR, RC AER uncorrectable/correctable/root, EP AER uncorrectable/correctable,
+and PERST. Words 124/125 retain sample-0 BHI_STATUS/ERRCODE; 126 retains
+sample-0 flags; 127 retains the original poll result. Existing words 64–73
+hold the latest MHI/BHI snapshot. The offline decoder recognizes this marker
+without changing historical M5/M6 reports.
+
+### Validation, packing and expected output
+
+Linux ASan/UBSan host tests pass. Added cases cover an isolated all-ones BHI
+status with a real error, independently lost BAR/config/link/decode, ELBI link
+down, PERST and D3, PM/AER traversal, cyclic capability chains, MMIO faults,
+late link loss/error during the repeat, setup corruption before BME, the CNSS
+v1/v2 selector, whole-image prefix and page-by-page cleaning. Diagnostics are
+asserted to issue no hardware writes. The embedded integration-patch sources
+must still match both standalone C sources byte for byte.
+
+`tools/build-fuxi-wlan6e-images.sh BASE_METAL2A_ARTIFACT_DIR` packs the kernels
+from `xnu/out-fuxi-wlan6e/` with the existing ADT/header and pinned GPU firmware.
+As with M6d, all private packing/firmware environment variables must reference
+existing absolute files. It emits the full `fuxiwlan=1` image and the
+`fuxiwlan=22` stop-after-BHI image. The latter **does initiate DMA** and stops
+after step 22 only on success; failure uses the normal abort path.
+`tools/test-fuxi-wlan-m6-artifacts.py --milestone m6e` checks both payloads,
+loader ELF sections, GPU hashes, boot header, command lines and every manifest
+hash. Firmware and private build inputs stay ignored.
+
+Expected new messages (templates, not captured device logs):
+
+```text
+FUXI WLAN: TCSR_SOC_HW_VERSION ... firmware ... (CNSS kiwi major-version rule)
+FUXI WLAN: M6e BHI layout file offset 0 ELF ident 7f454c46 class 1 phoff 0x34 phnum 23 first 0x80000 bytes; no segment extraction
+FUXI WLAN: M6e BHI preflight addr 0:10000000 size 0x80000 INTVEC 0 STATUS 0 EE 0 image/tables cache-clean + dsb sy
+FUXI WLAN: M6e BHI sample 0 STATUS raw ... field ... ERRCODE ... ERRDBG ... EXECENV ... REGLEN ... MHICFG ... flags ...: ...
+FUXI WLAN: M6e link sample 0 PARF_LTSSM ... ELBI_SYS_STTS ... RC_LNKCTLSTA ... RCcmd/status ... EPid ... EPcmd/status ... BAR0 ... PMCSR ... PERST_IO ...
+FUXI WLAN: M6e AER sample 0 RC uncor/cor/root ... EP uncor/cor ...
+FUXI WLAN: M6e BHI sample 1 ...
+FUXI WLAN: M6e link sample 1 ...
+FUXI WLAN: M6e AER sample 1 ...
+```
+
+Native kernel build, native-Mac host tests, final image packing and artifact
+hashes are pending access to the dedicated Mac build host. The implementation
+and Linux host verification above are complete; no M6e boot image is claimed
+as built or device-validated yet.

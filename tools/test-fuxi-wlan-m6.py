@@ -80,6 +80,7 @@ static struct read_mask read_masks[32];
 static unsigned nread_masks;
 static bool probe_block[128], probe_steal, probe_change_next;
 static int open_error, read_resid;
+static unsigned diag_repeat_kind;
 static uint8_t fixture[0x80000 + 37];
 static uint64_t file_size = sizeof(fixture);
 struct alloc { uintptr_t va; size_t size; uint64_t pa; };
@@ -140,7 +141,14 @@ static unsigned fuxi_gpu_access(uintptr_t pa, uint64_t *v, unsigned wr, unsigned
 }
 static const char *wl_mhi_ee(uint32_t e) { return "fake"; }
 static const char *wl_mhi_state(uint32_t s) { return "fake"; }
-static void assert_wait_timeout(event_t e, int intr, unsigned ms, unsigned ns) { sleeps+=ms; }
+static void assert_wait_timeout(event_t e, int intr, unsigned ms, unsigned ns) {
+    sleeps+=ms;
+    if(ms==10 && diag_repeat_kind) {
+        if(diag_repeat_kind==1) { setreg(WL_DBI+0x80,0); setreg(WL_EPCFG,~0u); }
+        if(diag_repeat_kind==2) { setreg(WL_BAR0+0x12c,~0u); setreg(WL_BAR0+0x130,0xef0e0003); setreg(WL_BAR0+0x128,0); }
+        diag_repeat_kind=0;
+    }
+}
 static void thread_block(int cont) { }
 static uint64_t mach_absolute_time(void) { return 0x12345; }
 static int kmem_alloc(int map, uintptr_t *va, size_t size, int flags, int tag) {
@@ -187,7 +195,7 @@ static void init(void) {
     progress=true; fail_bm=fail_perst=no_root=false;
     mismatch_pa=0x15001004ull; read_fault_pa=0;
     high_memory=noncontig=fail_alloc=tlb_busy=mismatch=inject_fault=false; open_error=read_resid=0;
-    fw_faults=0; wl_mhi_valid=false; wl_smmu_mismatches=0; loglen=0; logbuf[0]=0;
+    diag_repeat_kind=0; fw_faults=0; wl_mhi_valid=false; wl_smmu_mismatches=0; loglen=0; logbuf[0]=0;
     memset(wl_cb_unusable,0,sizeof(wl_cb_unusable));
     memset(probe_block,0,sizeof(probe_block));
     probe_steal=probe_change_next=false; corrupt_write_pa=0; corrupt_write_mask=1; nread_masks=0;
@@ -201,6 +209,10 @@ static void init(void) {
     setreg(WL_SMMU,0x400); setreg(WL_SMMU+0x20,0x48001e04); setreg(WL_SMMU+0x24,0x60000046);
     setreg(WL_SMMU+0x28,0x1000|0x22);
     for(unsigned i=0;i<4;i++) setreg(WL_SMMU+0xc00+4*i,0x20000);
+    setreg(WL_DBI+0x34,0x70); setreg(WL_DBI+0x70,0x10);
+    setreg(WL_DBI+0x80,1u<<29); setreg(WL_DBI+0xf28,0x400); setreg(WL_PARF+0x1b0,0x111);
+    setreg(WL_EPCFG,0x110717cb); setreg(WL_EPCFG+0x10,WL_BAR0|4);
+    setreg(WL_BAR0,0x100);
     setreg(WL_BAR0+0x80000,0x201); setreg(WL_BAR0+0x10,0x800080);
     setreg(WL_BAR0+0x268,0xcab04cf5); /* undefined before first BHIe DB */
     setreg(WL_BAR0+0x20,0x700); setreg(WL_EPCFG+4,0x100002);
@@ -259,7 +271,18 @@ int main(void) {
     int bhi=findwrite(WL_BAR0+0x118,0x12345,0);
     assert(bme>0 && bhi>bme);
     assert(findwrite(0x15081000,0,0)>findwrite(WL_PARF+0x2c00,0,0));
-    bool cleaned=false; for(int i=0;i<bme;i++) if(events[i].kind=='C') cleaned=true; assert(cleaned);
+    /* Every image and table backing page is cleaned before BME, not just one. */
+    struct wl_dma *cleanbufs[]={&wl_image,&wl_vectors,&wl_contexts,&wl_tables};
+    for(unsigned d=0;d<4;d++) for(size_t o=0;o<cleanbufs[d]->size;o+=PAGE_SIZE) {
+        bool cleaned=false;
+        for(int i=0;i<bme;i++) if(events[i].kind=='C' && events[i].pa==wl_phys(cleanbufs[d]->va+o) && events[i].v==PAGE_SIZE) cleaned=true;
+        assert(cleaned);
+    }
+    assert(!memcmp((void *)wl_image.va,fixture,WL_CHUNK));
+    assert(findwrite(WL_BAR0+0x12c,0,0)<bhi);
+    assert(findwrite(WL_BAR0+0x110,WL_CHUNK,0)<bhi);
+    assert(findwrite(WL_BAR0+0x120,0,0)<bhi);
+    assert(strstr(logbuf,"CNSS kiwi major-version rule") && strstr(logbuf,"file offset 0"));
     assert(findwrite(WL_BAR0+0x10c,0,0)<findwrite(WL_BAR0+0x108,wl_image.iova,0));
     assert(findwrite(WL_BAR0+0x64,0,0)<findwrite(WL_BAR0+0x60,wl_contexts.iova+WL_ECTX,0));
     assert(findwrite(WL_BAR0+0x38,0x200,0)>findwrite(WL_BAR0+0x700,wl_contexts.iova+WL_ER0+496,0));
@@ -280,6 +303,77 @@ int main(void) {
     for(unsigned i=start;i<ne;i++) if(events[i].kind=='F') assert(i>(unsigned)sync);
     assert(!wl_image.va && fw_faults==1);
     for(unsigned i=start;i<ne;i++) if(events[i].kind=='F') assert(i>(unsigned)perst);
+
+    /* M6e: all-ones STATUS is not enough to diagnose a lost endpoint. */
+    init(); for(unsigned s=17;s<=21;s++) assert(wl5_step(s)==0);
+    setreg(WL_BAR0+0x12c,~0u); setreg(WL_BAR0+0x130,0xef0e0003);
+    setreg(WL_BAR0+0x128,0);
+    unsigned diag_start=ne, diag_sleeps=sleeps;
+    assert(wl5_step(22)==1 && sleeps==diag_sleeps+10 && ne==diag_start);
+    assert(wl5_report[109]==129 && wl5_report[126]==129 && wl5_report[124]==~0u);
+    assert(wl5_report[125]==0xef0e0003 && wl5_report[127]==1);
+    assert(strstr(logbuf,"PBL error evidence") && strstr(logbuf,"BHI sample 1"));
+    wl5_abort(22); assert(frees==4);
+    /* Independent whole-BAR loss, config loss, DLLLA loss, decode/BAR change,
+       PERST assertion and D3 each classify separately and stop before BHIe. */
+    const struct {uint64_t pa; uint32_t value, flag;} lost[]={
+        {WL_BAR0,~0u,2}, {WL_EPCFG,~0u,4}, {WL_DBI+0x80,0,8}, {WL_DBI+0xf28,0,8},
+        {WL_EPCFG+4,0x404,16}, {WL_EPCFG+0x10,0,16},
+        {TS_TLMM+0x1000*94+4,0,32}, {WL_EPCFG+0x44,3,64},
+    };
+    for(unsigned i=0;i<sizeof(lost)/sizeof(*lost);i++) {
+        init(); for(unsigned s=17;s<=21;s++) assert(wl5_step(s)==0);
+        if(lost[i].flag==64) {setreg(WL_EPCFG+0x34,0x40); setreg(WL_EPCFG+0x40,1);}
+        setreg(lost[i].pa,lost[i].value);
+        assert(wl5_step(22)==5 && (wl5_report[109]&lost[i].flag));
+        assert(!(wl5_report[109]&128)); release();
+    }
+    /* Optional capability traversal: PMCSR and both AERs, no status clears. */
+    init(); for(unsigned s=17;s<=21;s++) assert(wl5_step(s)==0);
+    setreg(WL_EPCFG+0x34,0x40); setreg(WL_EPCFG+0x40,1);
+    setreg(WL_EPCFG+0x44,0x8000);
+    setreg(WL_DBI+0x100,0x10001); setreg(WL_EPCFG+0x100,0x10001);
+    setreg(WL_DBI+0x104,0x1000); setreg(WL_DBI+0x110,0x40); setreg(WL_DBI+0x130,0x4);
+    setreg(WL_EPCFG+0x104,0x2000); setreg(WL_EPCFG+0x110,0x80);
+    diag_start=ne; assert(wl5_step(22)==0 && ne==diag_start);
+    assert(wl5_report[117]==0x8000 && wl5_report[118]==0x1000 && wl5_report[119]==0x40);
+    assert(wl5_report[120]==4 && wl5_report[121]==0x2000 && wl5_report[122]==0x80);
+    release();
+    init(); for(unsigned s=17;s<=21;s++) assert(wl5_step(s)==0);
+    setreg(WL_EPCFG+0x34,0x40); setreg(WL_EPCFG+0x40,0x4005); /* cycle */
+    setreg(WL_DBI+0x100,0x10010002); /* extended cycle */
+    diag_start=ne; assert(wl5_step(22)==0 && ne==diag_start && (wl5_report[109]&512)); release();
+    /* Capability bodies must fit their own config-space extent. */
+    init(); uint32_t cap_flags=0;
+    setreg(WL_EPCFG+0x34,0xfc); setreg(WL_EPCFG+0xfc,1);
+    assert(!wl_diag_cap(WL_EPCFG,1,false,&cap_flags) && cap_flags==512);
+    setreg(WL_EPCFG+0x100,0xffc10002); setreg(WL_EPCFG+0xffc,0x10001);
+    cap_flags=0;
+    assert(!wl_diag_cap(WL_EPCFG,1,true,&cap_flags) && cap_flags==512);
+    /* A repeat can detect a late link loss or a late PBL failure after success. */
+    for(unsigned kind=1;kind<=2;kind++) {
+        init(); for(unsigned s=17;s<=21;s++) assert(wl5_step(s)==0);
+        diag_repeat_kind=kind;
+        assert(wl5_step(22)==(kind==1?5:1));
+        assert(wl5_report[126]==0 && wl5_report[109]); release();
+    }
+    /* Real MMIO fault remains latched; diagnostics never write hardware. */
+    init(); for(unsigned s=17;s<=21;s++) assert(wl5_step(s)==0);
+    read_fault_pa=WL_DBI+0xf28; diag_start=ne;
+    assert(wl5_step(22)==5 && (wl5_report[109]&256) && ne==diag_start);
+    read_fault_pa=0; fw_faults=0; wl5_abort(22); assert(frees==4);
+    /* Reject corrupted setup readbacks before any BME/doorbell. */
+    const uint32_t bhi_setup[]={0x108,0x10c,0x110,0x120,0x12c};
+    for(unsigned i=0;i<sizeof(bhi_setup)/sizeof(*bhi_setup);i++) {
+        init(); for(unsigned s=17;s<=20;s++) assert(wl5_step(s)==0);
+        corrupt_write_pa=WL_BAR0+bhi_setup[i];
+        assert(wl5_step(21)==7 && !(wl_prd(WL_EPCFG+4)&4));
+        assert(findwrite(WL_BAR0+0x118,0x12345,0)<0);
+        corrupt_write_pa=0; wl5_abort(21); assert(frees==4);
+    }
+    init(); setreg(WL_BAR0+0x80000,0x40170100);
+    assert(wl5_step(17)==0 && wl5_step(18)==0 && strstr(wl_fw_path,"/amss.bin"));
+    wl5_abort(18);
 
     /* Proven vacancies; existing valid streams and active/referenced CBs survive. */
     init(); setreg(WL_SMMU+0x800,0x80001200); setreg(WL_SMMU+0xc00,2);
@@ -676,6 +770,14 @@ def main():
         assert seen == {'m6'} and reports['m6'] == r
         decoded = probe.decode_m6(r)
         assert 'step 28 OK' in decoded and 'amss20.bin' in decoded and 'state=M0' in decoded
+        r[108:110] = [0x4d366500, 129]
+        r[67:69] = [0xffffffff, 0xef0e0003]
+        r[124:128] = [0xffffffff, 0xef0e0003, 129, 1]
+        decoded = probe.decode_m6(r)
+        assert 'M6e sample 0: STATUS=0xffffffff field=3' in decoded
+        assert 'PBL-error-evidence' in decoded and 'STATUS-all-ones' in decoded
+        r[109] = 14
+        assert 'config-lost, link-lost' in probe.decode_m6(r)
         failed = [0] * 128
         failed[2], failed[49] = 17, (17 << 8) | 1
         assert 'FAIL reason 1' in probe.decode_m6(failed)

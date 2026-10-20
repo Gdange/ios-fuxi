@@ -259,6 +259,21 @@ def decode_m6(r):
     common = decode_m5(r).splitlines()
     lines.extend(line.replace('PA=', 'IOVA=') for line in common
                  if line.startswith(('  TCSR=', '  image=', '  final snapshot', '  Per-step')))
+    if r[108] == 0x4d366500:
+        flags = {1: 'STATUS-all-ones', 2: 'BAR-unreadable', 4: 'config-lost',
+                 8: 'link-lost', 16: 'decode-changed', 32: 'PERST-asserted',
+                 64: 'non-D0', 128: 'PBL-error-evidence', 256: 'MMIO-fault',
+                 512: 'capability-list-invalid'}
+        for sample, bits, status, error in ((0, r[126], r[124], r[125]),
+                                           (1, r[109], r[67], r[68])):
+            labels = ', '.join(name for bit, name in flags.items() if bits & bit) or 'transport-readable'
+            lines.append(f'  M6e sample {sample}: STATUS={status:#x} field={status >> 30} '
+                         f'ERRCODE={error:#x} flags={bits:#x} {labels}')
+        lines.append(f'  M6e latest LTSSM={r[110]:#x} ELBI={r[111]:#x} RC-link={r[112]:#x} '
+                     f'EP-ID={r[114]:#x} BAR0={r[116]:#x}:{r[115]:08x} '
+                     f'PMCSR={r[117]:#x} PERST={r[123]:#x}; poll result={r[127]}')
+        lines.append(f'  M6e AER RC uncor/cor/root={r[118]:#x}/{r[119]:#x}/{r[120]:#x} '
+                     f'EP uncor/cor={r[121]:#x}/{r[122]:#x}; all-ones means absent/unreadable')
     return '\n'.join(lines)
 
 

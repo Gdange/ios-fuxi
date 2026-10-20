@@ -535,6 +535,91 @@ wl5_status(unsigned step)
 	    r[65] & 1, r[66], r[67], r[68], r[69], r[70], r[71], r[72], r[73]);
 }
 
+enum {
+	WL_DIAG_STATUS_ONES = 1, WL_DIAG_BAR_LOST = 2, WL_DIAG_CONFIG_LOST = 4,
+	WL_DIAG_LINK_LOST = 8, WL_DIAG_DECODE_CHANGED = 16, WL_DIAG_PERST = 32,
+	WL_DIAG_NON_D0 = 64, WL_DIAG_PBL_ERROR = 128, WL_DIAG_MMIO_FAULT = 256,
+	WL_DIAG_CAP_INVALID = 512,
+	WL_DIAG_TRANSPORT = WL_DIAG_BAR_LOST | WL_DIAG_CONFIG_LOST | WL_DIAG_LINK_LOST |
+	    WL_DIAG_DECODE_CHANGED | WL_DIAG_PERST | WL_DIAG_NON_D0 | WL_DIAG_MMIO_FAULT
+};
+
+/* M6e diagnostics are read-only. Missing capabilities use ~0, malformed
+ * lists set a separate flag; neither is mistaken for a D3/AER indication. */
+static unsigned
+wl_diag_cap(uint64_t cfg, unsigned id, bool ext, uint32_t *flags)
+{
+	unsigned p = ext ? 0x100 : wl_prd(cfg + 0x34) & 255;
+	for (unsigned n = 0; p && n < 48; n++) {
+		if ((p & 3) || p < (ext ? 0x100u : 0x40u) || p > (ext ? 0xffcu : 0xfcu)) { break; }
+		uint32_t v = wl_prd(cfg + p);
+		if (v == ~0u) { break; }
+		if (!v) { return 0; }
+		if ((v & (ext ? 0xffffu : 255u)) == id) {
+			unsigned bytes = ext ? 0x34 : id == 0x10 ? 0x14 : 8;
+			if (p + bytes > (ext ? 0x1000u : 0x100u)) { break; }
+			return p;
+		}
+		p = ext ? (v >> 20) & 0xfff : (v >> 8) & 255;
+		if (!p) { return 0; }
+	}
+	if (p) { *flags |= WL_DIAG_CAP_INVALID; }
+	return 0;
+}
+
+static uint32_t
+wl_bhi_diag(unsigned sample)
+{
+	uint32_t *r = wl5_report, f = 0;
+	wl5_status(22); /* raw STATUS, ERRCODE, ERRDBG1..3, EE, MHI, EP cmd */
+	r[108] = 0x4d366500; /* M6e extension, r[109..123] is latest sample */
+	r[110] = wl_prd(WL_PARF + 0x1b0); /* LTSSM */
+	r[111] = wl_prd(WL_DBI + 0xf28); /* ELBI_SYS_STTS (ELBI + 8) */
+	unsigned cap = wl_diag_cap(WL_DBI, 0x10, false, &f);
+	r[112] = cap ? wl_prd(WL_DBI + cap + 0x10) : ~0u;
+	r[113] = wl_prd(WL_DBI + 4);
+	r[114] = wl_prd(WL_EPCFG);
+	r[115] = wl_prd(WL_EPCFG + 0x10); r[116] = wl_prd(WL_EPCFG + 0x14);
+	r[117] = r[118] = r[119] = r[120] = r[121] = r[122] = ~0u;
+	if (r[114] != ~0u && r[114]) {
+		cap = wl_diag_cap(WL_EPCFG, 1, false, &f);
+		if (cap) { r[117] = wl_prd(WL_EPCFG + cap + 4); }
+		cap = wl_diag_cap(WL_EPCFG, 1, true, &f);
+		if (cap) {
+			r[121] = wl_prd(WL_EPCFG + cap + 4);
+			r[122] = wl_prd(WL_EPCFG + cap + 0x10);
+		}
+	}
+	cap = wl_diag_cap(WL_DBI, 1, true, &f);
+	if (cap) {
+		r[118] = wl_prd(WL_DBI + cap + 4); r[119] = wl_prd(WL_DBI + cap + 0x10);
+		r[120] = wl_prd(WL_DBI + cap + 0x30);
+	}
+	r[123] = wl_prd(TS_TLMM + 0x1000ull * 94 + 4);
+	uint32_t len = wl_mrd(0), cfg = wl_mrd(0x10);
+	if (r[67] == ~0u) { f |= WL_DIAG_STATUS_ONES; }
+	if (len == ~0u || cfg == ~0u || r[64] == ~0u) { f |= WL_DIAG_BAR_LOST; }
+	if (r[114] != 0x110717cb) { f |= WL_DIAG_CONFIG_LOST; }
+	if (r[110] == ~0u || r[111] == ~0u || !(r[111] & 0x400) ||
+	    r[112] == ~0u || !(r[112] & (1u << 29))) { f |= WL_DIAG_LINK_LOST; }
+	if (r[73] == ~0u || !(r[73] & 2) || (r[115] & ~15u) != WL_BAR0 || r[116]) { f |= WL_DIAG_DECODE_CHANGED; }
+	if (r[123] == ~0u || !(r[123] & 2)) { f |= WL_DIAG_PERST; }
+	if (r[117] != ~0u && (r[117] & 3)) { f |= WL_DIAG_NON_D0; }
+	if (fw_faults) { f |= WL_DIAG_MMIO_FAULT; }
+	/* All-ones STATUS alone is ambiguous. Require independent transport and
+	 * PBL/error evidence before calling it a device-reported error. */
+	if (!(f & WL_DIAG_TRANSPORT) && r[64] == 0 && (r[67] >> 30) == 3 && r[68] && r[68] != ~0u) { f |= WL_DIAG_PBL_ERROR; }
+	r[109] = f;
+	printf("FUXI WLAN: M6e BHI sample %u STATUS raw %#x field %u ERRCODE %#x ERRDBG %#x/%#x/%#x EXECENV %#x REGLEN %#x MHICFG %#x flags %#x: %s\n",
+	    sample, r[67], r[67] >> 30, r[68], r[69], r[70], r[71], r[64], len, cfg, f,
+	    (f & WL_DIAG_TRANSPORT) ? "transport inaccessible/changed" : (f & WL_DIAG_PBL_ERROR) ? "PBL error evidence" : "transport readable; BHI result unclassified");
+	printf("FUXI WLAN: M6e link sample %u PARF_LTSSM %#x ELBI_SYS_STTS %#x RC_LNKCTLSTA %#x RCcmd/status %#x EPid %#x EPcmd/status %#x BAR0 %#x/%#x PMCSR %#x PERST_IO %#x\n",
+	    sample, r[110], r[111], r[112], r[113], r[114], r[73], r[115], r[116], r[117], r[123]);
+	printf("FUXI WLAN: M6e AER sample %u RC uncor/cor/root %#x/%#x/%#x EP uncor/cor %#x/%#x (absent/unreadable = all-ones)\n",
+	    sample, r[118], r[119], r[120], r[121], r[122]);
+	return f;
+}
+
 /* Linux qcom_pcie_config_sid_1_9_0: CRC8/MSB over big-endian BDF,
  * BDF[31:16] | (SID - first iommu-map SID)[15:8] | NEXT[7:0].
  * PCIe0's DT base is 0x1400, so offsets 0/1 mean SIDs 0x1400/0x1401.
@@ -1047,6 +1132,8 @@ wl_read_firmware(void)
 	wl_dma_clean(&wl_image);
 	wl5_report[17] = wl_fw_size; wl5_report[18] = (uint32_t)wl_image.iova;
 	printf("FUXI WLAN: firmware %s bytes %u ELF%u DMA %#llx cache-clean\n", wl_fw_path, wl_fw_size, b[4] == 1 ? 32 : 64, wl_image.iova);
+	printf("FUXI WLAN: M6e BHI layout file offset 0 ELF ident %02x%02x%02x%02x class %u phoff %#llx phnum %u first %#x bytes; no segment extraction\n",
+	    b[0], b[1], b[2], b[3], b[4], phoff, phnum, WL_CHUNK);
 	e = 0;
 close:
 	(void)vnode_close(vp, FREAD, ctx);
@@ -1097,7 +1184,7 @@ wl5_step(unsigned s)
 		if (!hw || hw == ~0u || fw_faults) { return 2; }
 		wl_fw_path = ((hw >> 8) & 15) == 2 ?
 		    "/usr/local/share/fuxi/wlan/amss20.bin" : "/usr/local/share/fuxi/wlan/amss.bin";
-		printf("FUXI WLAN: TCSR_SOC_HW_VERSION %#x major %u minor %u firmware %s (vendor filename inference)\n", hw, (hw >> 8) & 15, hw & 255, wl_fw_path);
+		printf("FUXI WLAN: TCSR_SOC_HW_VERSION %#x major %u minor %u firmware %s (CNSS kiwi major-version rule)\n", hw, (hw >> 8) & 15, hw & 255, wl_fw_path);
 		return 0;
 	}
 	case 19: return wl_read_firmware();
@@ -1127,7 +1214,7 @@ wl5_step(unsigned s)
 		printf("FUXI WLAN: prepared %u vectors (%u bytes), 44-byte contexts, channels disabled; bus master off\n", n, wl5_report[19]);
 		return fw_faults ? 3 : wl_smmu_enable();
 	}
-	case 21:
+	case 21: {
 		if (!wl_enabled || wl_smmu_fault(21) || wl_rc_check() ||
 		    wl_prd(WL_SMMU) != wl5_report[4] ||
 		    wl_prd(WL_SMMU + 0x800 + 4 * wl_slot) != 0x80001401 ||
@@ -1139,7 +1226,16 @@ wl5_step(unsigned s)
 		wl_mwr(wl_bhi + 0x20, 0); wl_mwr(wl_bhi + 0x2c, 0);
 		wl_mwr64(wl_bhi + 8, wl_image.iova); wl_mwr(wl_bhi + 0x10, WL_CHUNK);
 		wl_dma_clean(&wl_image);
+		/* Flush posted setup writes and verify the exact Linux BHI tuple before
+		 * enabling bus mastering. No MMIO write to MHICTRL before BHI. */
+		uint32_t hi = wl_mrd(wl_bhi + 0x0c), lo = wl_mrd(wl_bhi + 8);
+		uint32_t size = wl_mrd(wl_bhi + 0x10), ivec = wl_mrd(wl_bhi + 0x20);
+		uint32_t status = wl_mrd(wl_bhi + 0x2c), ee = wl_mrd(wl_bhi + 0x28);
+		printf("FUXI WLAN: M6e BHI preflight addr %#x:%08x size %#x INTVEC %#x STATUS %#x EE %#x image/tables cache-clean + dsb sy\n",
+		    hi, lo, size, ivec, status, ee);
 		if (fw_faults) { return 1; }
+		if (hi != (uint32_t)(wl_image.iova >> 32) || lo != (uint32_t)wl_image.iova ||
+		    size != WL_CHUNK || ivec || status || ee != 0 || (wl_image.iova & 4095)) { return 7; }
 		/* Only now, immediately before the first image doorbell, allow DMA.
 		 * Disable legacy INTx; MSI/MSI-X remain unconfigured/disabled. */
 		wl_pwr(WL_EPCFG + 4, (wl_prd(WL_EPCFG + 4) & 0xffff) | 0x404);
@@ -1148,7 +1244,20 @@ wl5_step(unsigned s)
 		wl_mwr(wl_bhi + 0x18, wl_seq);
 		printf("FUXI WLAN: BHI doorbell seq %#x bytes %#x bus master on\n", wl_seq, WL_CHUNK);
 		return fw_faults ? 3 : 0;
-	case 22: return wl_poll(0);
+	}
+	case 22: {
+		int e = wl_poll(0);
+		uint32_t first = wl_bhi_diag(0);
+		wl5_report[124] = wl5_report[67]; wl5_report[125] = wl5_report[68];
+		wl5_report[126] = first; wl5_report[127] = (uint32_t)e;
+		wl_sleep(10); /* diagnostic repeat only; never retry a failed transfer */
+		uint32_t again = wl_bhi_diag(1);
+		if ((first | again) & WL_DIAG_TRANSPORT) { return e == 3 ? e : 5; }
+		/* A late error/EE loss in the repeat must not turn into step-22 OK. */
+		if (!e && ((wl5_report[67] >> 30) == 3 || wl5_report[64] == 3 || wl5_report[64] == 6 ||
+		    (wl5_report[65] & 4) || ((wl5_report[65] >> 8) & 255) == 255 || (wl5_report[66] & 2))) { return 1; }
+		return e;
+	}
 	case 23: return wl_poll(1);
 	case 24: {
 		uint32_t erdb = wl_mrd(0x20);
