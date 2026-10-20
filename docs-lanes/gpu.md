@@ -426,3 +426,13 @@ next milestone is GPU user SIDs/context, SQE + hw_init, ring/CP_ME_INIT and one
 CP_MEM_WRITE; then an XNU driver and userspace acceleration. Those are outside
 this loader-only implementation. Keep Android, all partitions and private
 artifacts untouched by these probes.
+
+## Device results (2026-10-20, coordinator)
+- 7 PASS (m2). 8a: first m2 boot reset the SoC (sync abort -> fatal -> PSCI reset), not
+  reproduced on m2b, which reads the snapshot through `probe_safe_rd32` (0 faults; page1[48..52]).
+  Every SMR invalid, S2CR 0x20000, CBAR 0, no bank enabled.
+- 8 PASS (slot0 -> CB1, ASID1, 13 tables, fw read back).
+- 9: m2b 0x906 - the gen70200 GMU ACK header echoes the command id (0x00010304), not 126.
+  m2c accepts either (Linux checks only ret_header seq). m2c 9 PASS, all ACK errors 0.
+- 0x49 after GMU start: STALL. 10 PASS: GX_GDSCR 0xf8222800, RBBM_STATUS 0x1.
+
