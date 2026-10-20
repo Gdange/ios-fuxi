@@ -167,6 +167,9 @@ def main():
     virt, _, _, _, _, phys, size = struct.unpack_from('<7Q', payload, 16)
     if phys != 0x8c0000000 or size not in (0x40000000, 0x30000000, 0x13e000000):
         ap.error('unexpected Fuxi RAM window')
+    cmdline = payload[72:680].split(b'\0')[0].decode()
+    if 'fuxiperf=1' in cmdline.split() and (args.cpu_level or args.cpu_at):
+        ap.error('fuxiperf=1 owns EPSS: do not pass --cpu-level or --cpu-at')
     offsets = {name: value - virt for name, value in symbols(args.kernel).items()}
     if any(not 0 <= off < size - 0x400000 for off in offsets.values()):
         ap.error('symbol outside XNU window')

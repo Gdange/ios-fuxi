@@ -1,3 +1,59 @@
+# Milestone 7 — opt-in XNU touch boost
+
+Patch `0097-fuxi-touch-boost.patch` adds `fuxiperf=1` (default **off**).
+The FTS report hook (0091/0093) and debounced button-post hook (0092) publish
+input timestamps and wake a sleepable thread-call. AppleCLCD starts it in both
+GPU and CPU modes and records swap timestamps. Hooks do no MMIO and do not
+sleep. Only the worker owns EPSS/TSENS accesses; repeated input coalesces on
+that one thread-call. A 100 ms worker sample bounds thermal/expiry response.
+
+All three EPSS domains use their measured addresses below. The worker reads
+up to 40 frequency LUT rows, terminates at a repeated frequency, excludes
+one-core turbo rows, and chooses indices by decoded frequency, not assumed
+index order. Cool votes are the highest eligible rows at or below silver
+1228.8, gold 1401.6 and prime 1363.2 MHz. High votes for gold/prime are the
+highest eligible non-turbo LUT rows. Silver stays at its cool vote during
+boost, avoiding a rail boost for the loader's monitor core. Domain enable and
+per-core-vote mode are read first; every applicable perf-state register at
+`0x320 + 4*core` is written and read back. No PLL/voltage registers are changed;
+hardware CPR/LMh remain in control. A mapping/LUT/returned-access failure never
+raises an unknown domain; vote/readback failure disables further boosting and
+requests all known cool votes.
+
+Only recent input can start boosting. Once high, either input or frame swaps
+extend it; after **1500 ms without either**, the next sample requests cool.
+Swaps alone cannot start a boost. Every decision uses fresh TSENS data from
+TM0 sensors 1..15 (cpuss and gold/prime) and TM1 sensors 1..3 (silver), matching
+the thermal lane's CPU sensor inventory. Both TRDY bits and every CPU sensor's
+VALID bit must be set; signed deci-C values must be plausible (-40..150 C).
+Missing/invalid data forces cool. A new boost requires hottest CPU <=60 C;
+an existing boost can continue through 68 C, but **above 68 C forces cool**.
+It cannot restart above 60 C. These are software votes sampled at 100 ms,
+not new hardware trips or a guarantee about package/skin temperature.
+
+Do **not** pass `--cpu-level` or `--cpu-at` to the host monitor on a
+`fuxiperf=1` run: loader CL and XNU would race over the same votes. The monitor
+now rejects that combination before opening USB. `--monitor-idle 2` and
+read-only `--thermal-log` remain compatible. `fuxiperf=0` or an absent argument
+leaves host-controlled EPSS behavior available.
+
+Expected log shapes:
+
+```text
+FUXI PERF: ready, LUT cool .../.../... kHz high .../.../... kHz, hold 1500 ms guard 60/68 C
+FUXI PERF: stats boosts N boosted N ms max temp N dC valid N state high|cool
+```
+
+Stats use a ten-second wall window, independently of display activity; boosted
+time includes the portion of a boost crossing a window. `max temp` is the
+maximum valid CPU sample in that window, in signed deci-C (-400 is the sentinel
+if none were valid); `valid` describes the last sample. Errors log once on
+initialization or vote failure. Offline tests compile the actual policy,
+register read/vote and sensor routines: duplicate/turbo/nonmonotonic LUTs,
+60/68 C boundaries, invalid samples, signed sensors, all per-core votes,
+input-only boost entry, swap extension and expiry. Native build and device
+acceptance are separate: no phone test or thermal improvement is claimed.
+
 # Thermal lane (Fuxi, SM8550): measuring temperature and cooling iOS down
 
 Status 2026-10-20: offline work only. Nothing in this lane has run on the device yet.

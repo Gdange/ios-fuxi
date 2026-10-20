@@ -5,6 +5,12 @@ reserved for GPU scratch and the cold handoff. See [memory layout](memory.md)
 for addresses, XNU limit audit, USB offset extension and the `--ram-layout 1g`
 compatibility option. No device access or boot is claimed.
 
+Coordinator evidence for 0096e: GPU presents work at 1.58–1.61 ms wall and
+0.72–0.74 ms CPU time, with nearly all cache hits. The user reports worse
+subjective smoothness than CPU-present 1 GiB builds. RAM pressure, cool CPU
+votes and the sleeping display-timer wait are hypotheses; milestone 7 changes
+all three, so the GPU/CPU image pair isolates only the present backend.
+
 ## Async ownership and completion
 
 The display timer submits once and returns. At the start of every subsequent
@@ -38,6 +44,47 @@ retained-source lifetime, late fence, timeout/fault/isolation and quarantine.
 Offline tests do not establish producer compliance, real DMA coherency, tearing
 or smoothness. Failure containment can spend bounded time polling GBIF; normal
 completion has no poll loop. No device run is claimed.
+
+## 0097 offline build handoff
+
+Native build exit 0 in **ci-lane-gpu6 only**. Patches 0096 then 0097 apply
+cleanly to the integration baseline, and all sixteen resulting source inputs
+match the native build tree. Loader builds for both variants pass `-Werror`
+with zero warnings using clang-r547379 and the same pinned external GMU/SQE/zap
+firmware as 0096e. No firmware or binaries are tracked. No phone access or push.
+
+Validation passes shared-source sync, actual C/C++ ASan/UBSan GPU/cache tests,
+full/1g memory/USB-offset tests, actual governor policy/register tests, exact
+external-firmware probe models, native SCM instruction audit, linked abort
+recovery records, boot-v4/Image geometry, payload/ADT memory bounds and identity.
+GPU and CPU payloads differ in exactly one byte (`fuxigpu=1` versus `=0`);
+command line is 0096e plus ` fuxiperf=1`. Both use the same full-RAM kernel and
+ADT, pinned root extents and seven CPUs. Monitor runs must omit `--cpu-level`
+and `--cpu-at` with the governor enabled; the monitor enforces this.
+
+```sh
+python3 tools/sync-fuxi-adreno-shared.py --check
+python3 tools/test-fuxi-adreno.py
+python3 tools/test-fuxi-memory.py
+python3 tools/test-fuxi-perf.py
+python3 tools/test-fuxi-scm.py --kernel xnu/out-fuxi-0097/kernel.development.fuxi.unstripped
+```
+
+| Artifact | SHA256 |
+| --- | --- |
+| `xnu/out-fuxi-0097/kernel.development.fuxi` | `c977e00d69b3ba3acf2b1d4d4db28df6c18d28b237fef8083a7c10c3c53ca0c1` |
+| `xnu/out-fuxi-0097/kernel.development.fuxi.unstripped` | `b79d38fadc93a56b20e4a1b07a6414034902a978bdfb4ad06e481dbe211e2a98` |
+| `xnu/out-fuxi-0097/fuxi.adt` | `39aacea4d7db372314bdc7928a66271b3b5cc2bd878bec4d9cfe2f5191e83533` |
+| `shim/out/fuxi-0097-boot.img` | `f315e1b20dc8f26573180acaea3ba9821efb42bc419939ce082958a4fcf3b2e5` |
+| `shim/out/fuxi-0097-payload.bin` | `dff125f724a7b8399a6737af8111808530302c8c2e3d7f609dda1ba7ff2e6808` |
+| `shim/out/fuxi-0097-cpu-boot.img` | `06de9f3a7e3a0a7068241aa91156001091e6ae725d49717d260d20498dbb2bf0` |
+| `shim/out/fuxi-0097-cpu-payload.bin` | `18456f035e036dda278dbb9df4cab98a9151251f4a763effd4b626a46ccd7d21` |
+
+Risks requiring coordinator testing: upper-bank DMA/coherency and VM pressure,
+IOSurface producer compliance, display latency/tearing, EPSS/TSENS behavior in
+XNU and high-vote heating. The guard samples rather than enforcing a hardware
+thermal trip. PAS/SMC hangs, MMIO interconnect hangs and failed DMA-drain risks
+remain. Offline success is not evidence of improved smoothness or cooling.
 
 # Milestone 6d — present CPU cost
 
