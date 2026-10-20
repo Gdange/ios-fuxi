@@ -41,7 +41,7 @@ The host side, `tools/fuxi-xnu-monitor.py`, talks to the loader over USB. It str
 | Path | What |
 | --- | --- |
 | `xnu/patches/` | Kernel patches. 0001–0081 come from ios-sweet, 0082 onwards are Fuxi (RAM, UFS, extent root, SMP, touch, buttons, display) |
-| `.github/workflows/xnu.yml` | Builds the kernel on GitHub's macOS runners |
+| `tools/build-fuxi-native.sh` | Native kernel build on an Apple-silicon Mac |
 | `shim/fuxi-loader/` | The Fuxi loader and its boot image build (`build.sh`) |
 | `shim/fuxi-probe/` | Hardware probes linked into the loader: display, touch, thermal/EPSS, GPU (`gpu.c`) |
 | `tools/fuxi-*.py`, `tools/mkadt-fuxi.py` | USB monitor, GPU probe decoder, ADT builder, root staging, DTB inspection |
@@ -53,7 +53,7 @@ Not in git: partition backups, device trees, recovery images, Apple firmware and
 
 ## Building
 
-1. **Kernel:** push changes under `xnu/patches/` and let `.github/workflows/xnu.yml` build it, then download the `xnu-kernel` artifact (see [xnu/README.md](xnu/README.md)).
+1. **Kernel:** build xnu-8796 on macOS with [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build) (`MACOS_VERSION=13.5`) with `xnu/patches/` applied, or use `tools/build-fuxi-native.sh` (see [xnu/README.md](xnu/README.md)).
 2. **iOS root:** `tools/mkiosroot.sh` and `tools/fuxi-stage-root.py` build the HFS+ root from the iOS 16.7 IPSW, which you supply.
 3. **Payload and loader:** `tools/mkadt-fuxi.py` and `tools/mkpayload.py` pack the kernel and ADT, then `shim/fuxi-loader/build.sh <payload>` builds the boot image with an LLVM toolchain (`CLANG`, `LLD`, `OBJCOPY` and `MKBOOTIMG` environment variables).
 4. **Run:** `fastboot boot` the image, then attach `tools/fuxi-xnu-monitor.py`.
