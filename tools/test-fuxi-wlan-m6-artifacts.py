@@ -26,10 +26,10 @@ def sections(elf):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parents[1])
-    parser.add_argument('--milestone', choices=('m6', 'm6b'), default='m6')
+    parser.add_argument('--milestone', choices=('m6', 'm6b', 'm6c'), default='m6')
     args = parser.parse_args()
     root = args.root
-    lane = 'wlan6b' if args.milestone == 'm6b' else 'wlan6'
+    lane = 'wlan' + args.milestone[1:]
     out, old = root / f'xnu/out-fuxi-{lane}', root / 'xnu/out-fuxi-wlan5'
     shim = root / 'shim/out'
     adt, cmdline = (out / 'fuxi.adt').read_bytes(), (out / 'cmdline.txt').read_text().strip()
@@ -37,7 +37,7 @@ def main():
     assert cmdline == (old / 'cmdline.txt').read_text().strip(), 'M5 boot arguments changed'
     assert cmdline.split().count('fuxiwlan=1') == 1 and len(cmdline.encode()) < 608
     verify_variant(root, out, old, args.milestone, '', 1)
-    if args.milestone == 'm6b':
+    if args.milestone in ('m6b', 'm6c'):
         verify_variant(root, out, old, args.milestone, '-s20', 20)
     for line in (out / 'SHA256SUMS').read_text().splitlines():
         digest, filename = line.split(maxsplit=1)
@@ -58,8 +58,10 @@ def verify_variant(root, out, old, milestone, suffix, limit):
     assert payload == rebuilt, 'payload differs from packed kernel/ADT/cmdline'
     assert struct.unpack_from('<QQ', payload, 56) == (0x8c0000000, 0x13e000000)
     assert b'M6 apps_smmu' in payload and b'SMMU owned stage1' in payload
-    if milestone == 'm6b':
+    if milestone in ('m6b', 'm6c'):
         assert b'M6b RC bypassed table zeroed' in payload and b'RC table in use' in payload
+    if milestone == 'm6c':
+        assert b'M6c CB probe' in payload and b'M6c SMMU mismatch' in payload
     elf = (shim / f'{stem}-loader.elf').read_bytes()
     sec = sections(elf)
     assert sec['.payload'][1] == payload

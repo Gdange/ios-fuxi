@@ -21,7 +21,15 @@ PREAMBLE = r'''
 #include <stdio.h>
 #include <assert.h>
 #include <sys/types.h>
-#define printf(...) ((void)0)
+#include <stdarg.h>
+static char logbuf[131072];
+static size_t loglen;
+static void test_printf(const char *fmt, ...) {
+    va_list ap; va_start(ap,fmt);
+    int n=vsnprintf(logbuf+loglen,sizeof(logbuf)-loglen,fmt,ap);
+    va_end(ap); assert(n>=0 && (size_t)n<sizeof(logbuf)-loglen); loglen+=n;
+}
+#define printf test_printf
 typedef uintptr_t vm_offset_t;
 typedef size_t vm_size_t;
 typedef unsigned ppnum_t;
@@ -65,7 +73,8 @@ static struct ev events[8192];
 static unsigned nr, ne, sleeps, frees, allocations;
 static bool progress = true, fail_bm, fail_perst, no_root;
 static bool noncontig, high_memory, fail_alloc, tlb_busy, mismatch, inject_fault;
-static uint64_t mismatch_pa, read_fault_pa;
+static uint64_t mismatch_pa, read_fault_pa, corrupt_write_pa;
+static bool probe_block[128], probe_steal, probe_change_next;
 static int open_error, read_resid;
 static uint8_t fixture[0x80000 + 37];
 static uint64_t file_size = sizeof(fixture);
@@ -86,6 +95,17 @@ static void setreg(uint64_t pa, uint32_t v) {
 }
 static void raw_pwr(uint64_t pa, uint32_t v) {
     record('W',pa,v);
+    if (pa>=0x15080000ull && pa<0x15100000ull && (pa&0xfff)==0x10) {
+        unsigned cb=(pa-0x15080000ull)>>12;
+        if (probe_steal) setreg(0x15000c04ull,cb);
+        if (probe_change_next) {
+            setreg(0x15000c04ull,2); /* next bank becomes referenced */
+            setreg(0x15083000ull,1); /* active */
+            setreg(0x15085000ull,1); setreg(0x15085024ull,4u<<16); /* ASID4 busy */
+        }
+        if (probe_block[cb]) return;
+    }
+    if (pa==corrupt_write_pa) v^=1;
     if (fail_bm && pa==WL_EPCFG+4) return;
     if (fail_perst && pa==TS_TLMM+0x1000*94+4) return;
     if (mismatch && pa==mismatch_pa) return;
@@ -160,7 +180,10 @@ static void init(void) {
     progress=true; fail_bm=fail_perst=no_root=false;
     mismatch_pa=0x15001004ull; read_fault_pa=0;
     high_memory=noncontig=fail_alloc=tlb_busy=mismatch=inject_fault=false; open_error=read_resid=0;
-    fw_faults=0; wl_mhi_valid=false;
+    fw_faults=0; wl_mhi_valid=false; wl_smmu_mismatches=0; loglen=0; logbuf[0]=0;
+    memset(wl_cb_unusable,0,sizeof(wl_cb_unusable));
+    memset(probe_block,0,sizeof(probe_block));
+    probe_steal=probe_change_next=false; corrupt_write_pa=0;
     memset(&wl_image,0,sizeof(wl_image)); memset(&wl_vectors,0,sizeof(wl_vectors));
     memset(&wl_tables,0,sizeof(wl_tables)); wl_owned=wl_enabled=wl_route_owned=wl_route_installed=false; wl_iova_next=WL_IOVA;
     memset(&wl_contexts,0,sizeof(wl_contexts)); memset(wl5_report,0,sizeof(wl5_report));
@@ -195,6 +218,12 @@ static void check_mapping(void) {
     assert(wl_prd(wl_cb_addr(wl_cb)+0x24)==expected>>32);
     assert(wl_prd(wl_cb_addr(wl_cb)+0x30)==0x803520);
     assert(wl_prd(wl_cb_addr(wl_cb)+0x10)==0x38011);
+    assert(wl_prd(wl_gr1+0x800+4*wl_cb)==1);
+    assert(wl_prd(wl_gr1+4*wl_cb)==0x1f300);
+    assert(wl_prd(wl_cb_addr(wl_cb)+0x28)==0);
+    assert(wl_prd(wl_cb_addr(wl_cb)+0x2c)==wl_cb<<16);
+    assert(wl_prd(wl_cb_addr(wl_cb)+0x38)==0xff);
+    assert(wl_prd(wl_cb_addr(wl_cb)+0x3c)==0);
     for(unsigned i=0;i<3;i++) for(size_t off=0;off<bufs[i]->size;off+=4096) {
         uint64_t pte=walk(bufs[i]->iova+off);
         assert((pte&0xfffffffff000ull)==wl_phys(bufs[i]->va+off));
@@ -337,14 +366,96 @@ int main(void) {
     inject_fault=true; assert(wl5_step(21)==0); assert(wl_smmu_fault(21)==1 && wl_poll(0)==3);
     assert(wl5_report[100]==2); wl5_abort(21); assert(frees==4);
 
-    const uint64_t mismatch_regs[]={0x15001804,0x15081010,0x15081030,0x15081024,
-        0x15081020,0x1508102c,0x15081038,0x15081000,WL_SMMU+0xc00,WL_SMMU+0x800};
-    for(unsigned i=0;i<sizeof(mismatch_regs)/sizeof(*mismatch_regs);i++) {
-        init(); for(unsigned s=17;s<20;s++) assert(wl5_step(s)==0);
-        mismatch=true; mismatch_pa=mismatch_regs[i];
-        assert(wl5_step(20)!=0 && !wl_enabled && !(wl_prd(WL_EPCFG+4)&4));
-        mismatch=false; wl5_abort(20); assert(frees==4);
+    /* M6c: blocked zero probe skips a bank without claiming/programming it. */
+    init(); for(unsigned s=17;s<20;s++) assert(wl5_step(s)==0);
+    setreg(0x15081000,0x2468); /* unknown reset bits with M=0 are not ownership */
+    wl_old_sctlr=0x2468;
+    probe_block[1]=true; setreg(0x15081010,0x1234);
+    unsigned probe_start=ne;
+    assert(wl5_step(20)==0 && wl_cb==2 && wl5_report[9]==2 && wl_cb_unusable[1]);
+    assert(strstr(logbuf,"CB_TCR2 probe offset 0x81010 wrote 0 read 0x1234"));
+    for(unsigned i=probe_start;i<ne;i++) if(events[i].pa>=0x15081000 && events[i].pa<0x15082000)
+        assert(events[i].pa==0x15081010 && events[i].v==0);
+    wl5_abort(20); assert(frees==4);
+    assert(findwrite(0x15081000,0,probe_start)<0); /* rejected CB gets no undo */
+    assert(findwrite(0x15082000,0,probe_start)>0);
+
+    /* Exactly eight writes; a ninth accessible bank must remain untouched. */
+    init(); for(unsigned s=17;s<20;s++) assert(wl5_step(s)==0);
+    for(unsigned i=1;i<=8;i++) {probe_block[i]=true; setreg(wl_cb_addr(i)+0x10,1);}
+    probe_start=ne;
+    assert(wl5_step(20)==6 && !wl_owned && !wl_enabled);
+    unsigned probes=0;
+    for(unsigned i=probe_start;i<ne;i++) if(events[i].kind=='W' && events[i].pa>=WL_SMMU && events[i].pa<WL_SMMU+0x100000) {
+        assert((events[i].pa&0xfff)==0x10 && events[i].v==0); probes++;
     }
+    assert(probes==8 && findwrite(wl_cb_addr(9)+0x10,0,probe_start)<0);
+    assert(strstr(logbuf,"probe exhausted 8 candidates"));
+    wl_cb=1; probe_start=ne; /* the unusable set persists for this boot */
+    assert(wl_smmu_claim_candidate()==0 && wl_cb==9);
+    for(unsigned i=1;i<=8;i++) assert(findwrite(wl_cb_addr(i)+0x10,0,probe_start)<0);
+    wl5_abort(20); assert(frees==4);
+
+    /* Each retry rechecks references, M, and ASIDs; never write these banks. */
+    init(); for(unsigned s=17;s<20;s++) assert(wl5_step(s)==0);
+    probe_block[1]=true; setreg(0x15081010,1); probe_change_next=true;
+    probe_start=ne;
+    assert(wl5_step(20)==0 && wl_cb==6);
+    for(unsigned i=2;i<=5;i++) assert(findwrite(wl_cb_addr(i)+0x10,0,probe_start)<0);
+    probe_change_next=false; wl5_abort(20); assert(frees==4);
+    init(); for(unsigned s=17;s<20;s++) assert(wl5_step(s)==0);
+    probe_steal=true; probe_start=ne;
+    assert(wl5_step(20)==3 && !wl_owned);
+    assert(findwrite(wl_gr1+0x804,1,probe_start)<0);
+    probe_steal=false; wl5_abort(20); assert(frees==4);
+    init(); for(unsigned s=17;s<20;s++) assert(wl5_step(s)==0);
+    read_fault_pa=0x15081010;
+    assert(wl5_step(20)==6 && fw_faults && !wl_owned);
+    assert(findwrite(0x15082010,0,0)<0); read_fault_pa=0;
+    wl5_abort(20); assert(frees==4);
+
+    /* A RAZ/WI zero probe may pass; full TCR2 programming must still fail,
+       with NO fallback once claimed. Every register (including zero writes)
+       must identify its own offset, written value and actual readback. */
+    init(); for(unsigned s=17;s<20;s++) assert(wl5_step(s)==0);
+    probe_block[1]=true;
+    assert(wl5_step(20)==4 && wl_owned && wl_cb==1);
+    assert(strstr(logbuf,"CB_TCR2 offset 0x81010 wrote 0x38011 read 0"));
+    wl5_abort(20); assert(frees==4);
+    const struct {uint64_t pa; const char *name; unsigned error;} badregs[]={
+        {0x15081000,"CB_SCTLR disable",4}, {0x15001804,"GR1_CBA2R",4},
+        {0x15001004,"GR1_CBAR",4}, {0x15081030,"CB_TCR",4},
+        {0x15081024,"CB_TTBR0_HI",4}, {0x15081020,"CB_TTBR0_LO",4},
+        {0x1508102c,"CB_TTBR1_HI",4}, {0x15081028,"CB_TTBR1_LO",4},
+        {0x15081038,"CB_MAIR0",4}, {0x1508103c,"CB_MAIR1",4},
+        {WL_SMMU+0xc00,"GR0_S2CR",5}, {WL_SMMU+0x800,"GR0_SMR",5},
+    };
+    for(unsigned i=0;i<sizeof(badregs)/sizeof(*badregs);i++) {
+        init(); for(unsigned s=17;s<20;s++) assert(wl5_step(s)==0);
+        corrupt_write_pa=badregs[i].pa;
+        assert(wl5_step(20)==badregs[i].error && !wl_enabled && !(wl_prd(WL_EPCFG+4)&4));
+        char expected[128]; snprintf(expected,sizeof(expected),"%s offset %#x wrote ",badregs[i].name,(unsigned)(badregs[i].pa-WL_SMMU));
+        assert(strstr(logbuf,expected) && strstr(logbuf," read "));
+        corrupt_write_pa=0; wl5_abort(20); assert(frees==4);
+    }
+    init(); for(unsigned s=17;s<20;s++) assert(wl5_step(s)==0);
+    mismatch=true; mismatch_pa=0x15081000;
+    assert(wl5_step(20)==5 && strstr(logbuf,"CB_SCTLR enable offset 0x81000 wrote 0x1027 read 0"));
+    mismatch=false; wl5_abort(20); assert(frees==4);
+    init(); for(unsigned s=17;s<20;s++) assert(wl5_step(s)==0);
+    setreg(0x15081058,2); mismatch=true; mismatch_pa=0x15081058;
+    assert(wl5_step(20)==5 && strstr(logbuf,"CB_FSR W1C offset 0x81058 wrote 0xc00001fe read 0x2"));
+    mismatch=false; wl5_abort(20); assert(frees==4);
+    init(); for(unsigned s=17;s<20;s++) assert(wl5_step(s)==0);
+    setreg(0x15081058,0x400); /* format-only FSR is not a W1C/fault mismatch */
+    assert(wl5_step(20)==0 && wl5_report[80]==0x400);
+    wl5_abort(20); assert(frees==4);
+    /* Diagnostic cap is independent of repeated callers. */
+    init(); wl_cb=1;
+    for(unsigned i=0;i<20;i++) assert(wl_smmu_verify("cap",WL_SMMU,1,0,1,~0u));
+    unsigned lines=0; for(char *p=logbuf;(p=strstr(p,"SMMU mismatch"));p++) lines++;
+    assert(lines==16);
+
     /* A fault-contained MMIO abort latches normal writes off; owned undo still runs. */
     init(); for(unsigned s=17;s<20;s++) assert(wl5_step(s)==0);
     read_fault_pa=0x15081030; assert(wl5_step(20)==4 && fw_faults);

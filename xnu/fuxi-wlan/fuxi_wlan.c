@@ -430,6 +430,9 @@ static struct wl_dma wl_image, wl_vectors, wl_contexts, wl_tables;
 static uint64_t wl_iova_next = WL_IOVA, wl_cb_base, wl_gr1;
 static unsigned wl_slot, wl_cb, wl_smr_count, wl_cb_count, wl_pgshift;
 static uint32_t wl_old_smr, wl_old_s2cr, wl_old_sctlr;
+#define WL_CB_PROBE_MAX 8u
+static bool wl_cb_unusable[128];
+static unsigned wl_smmu_mismatches;
 static uint32_t wl_route_cfg;
 static unsigned wl_route_hash;
 static bool wl_owned, wl_enabled, wl_route_owned, wl_route_installed;
@@ -635,6 +638,7 @@ static int
 wl_smmu_probe(void)
 {
 	uint32_t *r = wl5_report;
+	wl_smmu_mismatches = 0;
 	r[4] = wl_prd(WL_SMMU); r[5] = wl_prd(WL_SMMU + 0x20);
 	r[6] = wl_prd(WL_SMMU + 0x24); r[7] = wl_prd(WL_SMMU + 0x28);
 	wl_smr_count = r[5] & 255; wl_cb_count = r[6] & 255;
@@ -691,11 +695,93 @@ wl_smmu_probe(void)
 	return wl_rc_route() ? 5 : 0;
 }
 
+/* Offsets are relative to the SMMU aperture, including GR1/CB page selection.
+ * No retry loop here: at most eight probe failures and one claimed-bank error.
+ * W1C/command registers must not use an equality-to-written-value check. */
 static int
-wl_smmu_wr(uint64_t pa, uint32_t v)
+wl_smmu_verify(const char *name, uint64_t pa, uint32_t written,
+    uint32_t readback, uint32_t expected, uint32_t mask)
+{
+	if (!fw_faults && (readback & mask) == expected) { return 0; }
+	if (wl_smmu_mismatches++ < 16) {
+		printf("FUXI WLAN: M6c SMMU mismatch CB %u %s offset %#x wrote %#x read %#x faults %u\n",
+		    wl_cb, name, (unsigned)(pa - WL_SMMU), written, readback, fw_faults);
+	}
+	return 1;
+}
+
+static int
+wl_smmu_wr(const char *name, uint64_t pa, uint32_t v)
 {
 	wl_pwr(pa, v);
-	return fw_faults || wl_prd(pa) != v;
+	uint32_t readback = wl_prd(pa);
+	return wl_smmu_verify(name, pa, v, readback, v, ~0u);
+}
+
+/* Return 0 only for a presently disabled, unreferenced stage-1 candidate with
+ * an unused ASID. 1 skips that bank; -1 aborts on shared ownership/access change.
+ * Re-read the entire stream table before EVERY probe, not just the saved slot.
+ * This driver never performs Linux's destructive global reset/quirk probes. */
+static int
+wl_smmu_candidate(unsigned candidate, uint32_t *ctl)
+{
+	if (fw_faults || wl_prd(WL_SMMU) != wl5_report[4] || wl_rc_check() ||
+	    (wl_prd(WL_EPCFG + 4) & 4) ||
+	    wl_prd(WL_SMMU + 0x800 + 4 * wl_slot) != wl_old_smr ||
+	    wl_prd(WL_SMMU + 0xc00 + 4 * wl_slot) != wl_old_s2cr) { return -1; }
+	bool referenced = false, asid_used = false;
+	for (unsigned i = 0; i < wl_smr_count; i++) {
+		uint32_t smr = wl_prd(WL_SMMU + 0x800 + 4 * i);
+		uint32_t s2cr = wl_prd(WL_SMMU + 0xc00 + 4 * i);
+		if (fw_faults || smr == ~0u || s2cr == ~0u ||
+		    ((smr & 0x80000000u) &&
+		    (((smr ^ 0x1401) & ~((smr >> 16) & 0x7fff) & 0xffff) == 0))) { return -1; }
+		if ((s2cr & 255) == candidate) { referenced = true; }
+	}
+	*ctl = wl_prd(wl_cb_addr(candidate));
+	for (unsigned i = 0; i < wl_cb_count; i++) {
+		if (wl_prd(wl_cb_addr(i)) & 1) {
+			if ((wl_prd(wl_cb_addr(i) + 0x24) >> 16) == candidate ||
+			    (wl_prd(wl_cb_addr(i) + 0x2c) >> 16) == candidate) { asid_used = true; }
+		}
+	}
+	if (fw_faults) { return -1; }
+	return referenced || asid_used || *ctl == ~0u || (*ctl & 1) ||
+	       candidate < ((wl5_report[6] >> 16) & 255) || wl_cb_unusable[candidate];
+}
+
+/* Zero TCR2 is a legal, non-enabling write, independent of ASID/TTBR format.
+ * CONTEXTIDR does not hold the ASID in long-descriptor formats; choose
+ * the configuration register we must program anyway.
+ * A zero readback is only a filter (RAZ/WI could pass); all configuration and
+ * GR1 readbacks remain mandatory. Never retry a failure AFTER claiming a CB. */
+static int
+wl_smmu_claim_candidate(void)
+{
+	unsigned attempts = 0;
+	for (unsigned i = wl_cb; i < wl_cb_count && attempts < WL_CB_PROBE_MAX; i++) {
+		uint32_t ctl;
+		int state = wl_smmu_candidate(i, &ctl);
+		if (state < 0) { return 3; }
+		if (state) { continue; }
+		wl_cb = i;
+		printf("FUXI WLAN: M6c CB probe %u/%u CB %u SCTLR %#x M=0 unreferenced; TCR2 zero\n",
+		    ++attempts, WL_CB_PROBE_MAX, i, ctl);
+		if (wl_smmu_wr("CB_TCR2 probe", wl_cb_addr(i) + 0x10, 0)) {
+			wl_cb_unusable[i] = true;
+			printf("FUXI WLAN: M6c CB %u unusable; probe failed%s\n", i, fw_faults ? "; MMIO fault, abort" : "; next candidate");
+			if (fw_faults) { return 6; }
+			continue;
+		}
+		uint32_t now;
+		if (wl_smmu_candidate(i, &now) || now != ctl) { return 3; }
+		wl_old_sctlr = ctl;
+		wl5_report[9] = i;
+		printf("FUXI WLAN: M6c CB %u probe accepted; claim pending full CB/GR1 readbacks\n", i);
+		return 0;
+	}
+	printf("FUXI WLAN: M6c CB probe exhausted %u candidates (limit %u); no bank claimed\n", attempts, WL_CB_PROBE_MAX);
+	return 6;
 }
 
 static int
@@ -765,23 +851,27 @@ wl_smmu_enable(void)
 		}
 	}
 	if (fw_faults || wl_prd(WL_SMMU) != wl5_report[4] || wl_rc_check()) { return 3; }
+	int claim = wl_smmu_claim_candidate();
+	if (claim) { return claim; }
 	uint64_t cb = wl_cb_addr(wl_cb), ttbr = wl_pt_pa(0) | ((uint64_t)wl_cb << 48);
 	wl_owned = true; /* includes partial setup: abort must disable and sync */
-	if (wl_smmu_wr(cb, 0) ||
-	    wl_smmu_wr(wl_gr1 + 0x800 + 4 * wl_cb, 1) || /* VA64 */
-	    wl_smmu_wr(wl_gr1 + 4 * wl_cb, 0x1f300) || /* S1, S2 bypass */
-	    wl_smmu_wr(cb + 0x10, 0x38011) || /* SEP upstream, AS, 36-bit PA */
-	    wl_smmu_wr(cb + 0x30, 0x803520) || /* EPD1, WB/ISH, 32-bit IOVA */
-	    wl_smmu_wr(cb + 0x24, (uint32_t)(ttbr >> 32)) ||
-	    wl_smmu_wr(cb + 0x20, (uint32_t)ttbr) ||
-	    wl_smmu_wr(cb + 0x2c, wl_cb << 16) || wl_smmu_wr(cb + 0x28, 0) ||
-	    wl_smmu_wr(cb + 0x38, 0xff) || wl_smmu_wr(cb + 0x3c, 0)) { return 4; }
+	if (wl_smmu_wr("CB_SCTLR disable", cb, 0) ||
+	    wl_smmu_wr("GR1_CBA2R", wl_gr1 + 0x800 + 4 * wl_cb, 1) || /* VA64 */
+	    wl_smmu_wr("GR1_CBAR", wl_gr1 + 4 * wl_cb, 0x1f300) || /* S1, S2 bypass */
+	    wl_smmu_wr("CB_TCR2", cb + 0x10, 0x38011) || /* SEP upstream, AS, 36-bit PA */
+	    wl_smmu_wr("CB_TCR", cb + 0x30, 0x803520) || /* EPD1, WB/ISH, 32-bit IOVA */
+	    wl_smmu_wr("CB_TTBR0_HI", cb + 0x24, (uint32_t)(ttbr >> 32)) ||
+	    wl_smmu_wr("CB_TTBR0_LO", cb + 0x20, (uint32_t)ttbr) ||
+	    wl_smmu_wr("CB_TTBR1_HI", cb + 0x2c, wl_cb << 16) || wl_smmu_wr("CB_TTBR1_LO", cb + 0x28, 0) ||
+	    wl_smmu_wr("CB_MAIR0", cb + 0x38, 0xff) || wl_smmu_wr("CB_MAIR1", cb + 0x3c, 0)) { return 4; }
 	/* FSR is W1C only for our newly owned bank; preserve later DMA faults. */
 	wl_pwr(cb + 0x58, 0xc00001fe);
+	if (wl_smmu_verify("CB_FSR W1C", cb + 0x58, 0xc00001fe,
+	    wl_prd(cb + 0x58), 0, 0xc00001fe)) { return 5; }
 	if (wl_smmu_fault(20) || wl_smmu_sync(false) ||
-	    wl_smmu_wr(cb, 0x1027) || /* ASIDPNE, CFRE, AFE, TRE, M; IRQ/stall off */
-	    wl_smmu_wr(WL_SMMU + 0xc00 + 4 * wl_slot, wl_cb) ||
-	    wl_smmu_wr(WL_SMMU + 0x800 + 4 * wl_slot, 0x80001401)) { return 5; }
+	    wl_smmu_wr("CB_SCTLR enable", cb, 0x1027) || /* ASIDPNE, CFRE, AFE, TRE, M; IRQ/stall off */
+	    wl_smmu_wr("GR0_S2CR", WL_SMMU + 0xc00 + 4 * wl_slot, wl_cb) ||
+	    wl_smmu_wr("GR0_SMR", WL_SMMU + 0x800 + 4 * wl_slot, 0x80001401)) { return 5; }
 	wl_enabled = true;
 	printf("FUXI WLAN: SMMU owned stage1 SMR %u CB %u TTBR %#llx IOVA %#llx-%#llx readback verified\n",
 	    wl_slot, wl_cb, wl_pt_pa(0), WL_IOVA, wl_contexts.iova + wl_contexts.size - 1);

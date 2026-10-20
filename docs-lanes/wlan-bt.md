@@ -927,3 +927,171 @@ fault snapshots and cleanup before continuing with fresh-boot limits 21–28
 and finally the full image. On a pre-existing active table expect
 `RC route refused: RC table in use (bypass clear)` and step 17 `0x1105`,
 with no table/SMMU programming. No M6b phone run was performed by this lane.
+
+## Milestone 6c — diagnose step 20 and probe before claiming a CB
+
+M6b reached step 20's configuration-readback failure after steps 17–19
+succeeded; containment and undo completed. That failure does **not** identify
+which register rejected the write. No M6c device run was performed. The new
+s20 image is for a fresh-boot pre-DMA diagnosis.
+
+### Sharing, ownership and bank selection
+
+[Qualcomm's access-control description, pp. 6–7](https://www.qualcomm.com/content/dam/qcomm-martech/dm-assets/documents/an-introduction-to-access-control-on-qualcomm-snapdragon-platforms.pdf)
+assigns secure banks to TrustZone, non-secure stream mapping and stage 2 to
+the hypervisor, and the OS's stage-1 contexts to HLOS. Thus an address inside
+the CB aperture, or SCTLR.M=0, does not grant HLOS write access. Secure or
+hyp-reserved banks must not be reconfigured. This is the Qualcomm hyp/Gunyah
+sharing concern; the WLAN evidence does not identify the installed hypervisor
+or establish its per-bank access policy.
+
+There is **no proven numeric HLOS CB allowlist** for this boot. NUMCB=70 is
+an architectural count, not an ownership grant. In
+[Linux v6.12's generic driver](https://github.com/torvalds/linux/blob/v6.12/drivers/iommu/arm/arm-smmu/arm-smmu.c),
+stage 1 allocates the first zero bit in `context_map`, starting at NUMS2CB;
+its ASID is the selected CB index. Probe order and existing reservations
+therefore affect the resulting bank number. It does not imply “WLAN uses
+CB 6” or “all higher CBs are HLOS-owned.”
+
+The [Qualcomm downstream driver](https://android.googlesource.com/kernel/msm.git/+/89594f79eb3779e02c47b5fd47427c55497cd5c9/drivers/iommu/arm-smmu.c)
+implements `arm_smmu_handoff_cbs`: read valid SMRs and their S2CRs, reserve
+translating CBs in the bitmap, and retain handoff metadata. Allocation can
+reuse a matching handoff or find the first free bank after NUMS2CB. Its
+`qcom,enable-static-cb` path instead requires the firmware assignment. These
+are distinct policies; do not conflate either with a fixed SoC bank partition.
+
+In the [upstream Qualcomm implementation reviewed at this revision](https://github.com/torvalds/linux/blob/f47d223627f80cb7a1eb14c585fe6cb35de5e984/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c),
+`qcom_smmu_cfg_probe` tests an S2CR BYPASS write. Some hyp versions ignore
+FAULT writes and turn BYPASS into FAULT; Linux reserves the last CB to emulate
+bypass when required. It imports valid bootloader SMRs into software, with
+initial software S2CR bypass metadata. **It does not test CBAR writeability or
+reserve every bootloader CB through that loop.** The source describes hyp
+trap/emulation problems, not a CBAR-based HLOS discovery algorithm. M6c does
+not copy Linux's global reset or destructive shared-register quirk probe.
+A successful Linux CB assignment would be evidence for that runtime, but
+there is no such assignment trace in this lane's input.
+
+The downstream `qcom,actlr` property contains SID/mask/value triples used to
+select ACTLR for an assigned domain, followed by a context TLB flush when
+changed. It is a tuning policy, not a CB ownership list. The
+[SM8550/Kalama vendor DT](https://github.com/LineageOS/android_kernel_xiaomi_sm8550-devicetrees/blob/43b5ada5654ed84c25f74789bc8f6326b7bacd20/qcom/msm-arm-smmu-kalama.dtsi)
+contains camera/compute/display tuning and a handoff-stream property; its
+apps ACTLR table has no match for WLAN SID `0x1401`. The reviewed upstream
+implementation selects ACTLR through a client-compatible table where
+configured. M6c leaves ACTLR and all shared implementation registers alone.
+
+The [MMU-500 TRM, §3.1–3.2](https://documentation-service.arm.com/static/5e908c70c8052b1608761996)
+specifies UNKNOWN reset values unless stated otherwise and distinguishes
+undefined bits from writable fields. Garbage SCTLR/FAR/FSYNR values alone
+therefore do not prove secure/hyp ownership. Conversely, failure to read back
+a legal write is grounds to reject a candidate, regardless of the cause.
+The TRM permits word-aligned 32-bit writes to either word of a 64-bit register;
+our split TTBR writes occur with M=0. Linux uses `writeq` for long descriptors.
+
+### Register-format audit
+
+Compared against [Linux's register definitions and TCR constructors](https://github.com/torvalds/linux/blob/v6.12/drivers/iommu/arm/arm-smmu/arm-smmu.h)
+and [SMMUv2 IHI0062D.c, chapters 10 and 16](https://documentation-service.arm.com/static/5f900d34f86e16515cdc08fb):
+
+| Register | M6c value / interpretation |
+|---|---|
+| TCR | `0x803520`: EPD1=1, A1=0, TG0=4 KiB, SH0=inner, ORGN0/IRGN0=WBWA, T0SZ=32. No AArch32 EAE bit. |
+| TCR2 | `0x38011`: SEP=7 upstream, AS=1 (16-bit ASIDs), PASIZE=1 (36-bit output). Reserved bits zero. |
+| TTBR0 | Root PA OR `CB << 48`; table aligned to 4 KiB, ASID in bits 63:48. |
+| TTBR1 | Same ASID, base zero; walks disabled by EPD1. |
+| MAIR0/1 | `0xff` / `0`: AttrIndx 0 is normal inner/outer WBWA; every mapped leaf selects 0. Unused slots zero. |
+| CBA2R | `1`: VA64 set; VMID16 and MONC zero. |
+| CBAR | `0x1f300`: TYPE=1 (S1 translate/S2 bypass), MEMATTR=15, BPSHCFG=3, VMID=0, IRPTNDX=0. |
+| SCTLR | Disable `0`; enable `0x1027`: ASIDPNE, CFRE, AFE, TRE, M; IRQ/stall off. |
+
+These CBAR/CBA2R fields follow Linux's stage-1 setup. SMMUv2 fixes the
+context interrupt index to the CB, so Linux sets CBAR.IRPTNDX only on v1.
+Linux enables CFIE; this polling lane omits it. Its
+[page-table implementation](https://github.com/torvalds/linux/blob/v6.12/drivers/iommu/io-pgtable-arm.c)
+uses the same cache/shareability encodings; M6c needs only one MAIR entry.
+No format change or relaxed full-word readback is justified by the unnamed
+M6b failure. Hyp may still reject GR1 writes despite a writable CB register.
+
+### Bounded probe, diagnostics and undo
+
+Step 17 still selects a tentative CB with read-only SMMU access. In step 20,
+after table allocation and the existing late-vacancy checks, try at most
+**eight eligible candidates**, in ascending order. Before each probe, recheck
+all SMRs/S2CRs, saved invalid slot, global config, RC table, BME-off state,
+SCTLR.M=0, NUMS2CB exclusion and active-bank ASID use. Any S2CR reference,
+even with an invalid SMR or non-translating type, excludes that CB. Valid SMRs
+are never changed. Shared-state uncertainty aborts.
+
+Write **zero only to CB_TCR2**, then read it back. This neither enables a
+walker nor changes stream/GR1 ownership. On mismatch, mark that bank unusable
+for the boot, log it, and try the next eligible CB. A fault-contained MMIO
+exception stops immediately. A rejected bank receives no other writes or
+claimed-bank undo; its only attempted change is the harmless TCR2 zero.
+After a passing probe, recheck vacancy and unchanged SCTLR before claiming.
+A zero readback can also come from RAZ/WI emulation: it is a filter, not proof
+of ownership. Full programming readbacks are mandatory; failure after claim
+aborts with the existing containment/undo, without trying another bank.
+
+All ordinary configuration writes now name their register, SMMU-relative
+byte offset (including page/bank), written value, actual readback and fault
+count on mismatch. Diagnostics cap at 16 lines; this path normally produces
+at most eight probe mismatches plus one claimed-bank mismatch. FSR W1C checks
+that defined fault bits clear, excluding format bits. TLBI/TLBSYNC are command
+registers: retain the bounded TLBSTATUS completion check rather than comparing
+a command readback to the written value. The accessor uses `str w4`, not
+`str wzr`, so zero writes do not depend on Qualcomm's documented zero-register
+trap quirk. All prior containment, bypass-first RC undo and allocation
+quarantine rules remain in force.
+
+Step-20 reason 6 (`0x1406`) means no candidate passed within the bound, or a
+probe MMIO fault. Reasons 3 (changed ownership), 4 (CB/GR1 config mismatch)
+and 5 (fault/sync/enable/stream install) retain their meanings. Report word 9
+is updated to the accepted CB; existing M6 report/decoder layout is unchanged.
+
+### Verification, artifacts and expected lines
+
+Linux and native-Mac ASan/UBSan host suites pass, including eight-rejection
+bounds, rejected-bank write isolation, per-boot exclusion, references/M/ASIDs
+changing between candidates, ownership changing during a probe, probe MMIO
+faults, RAZ/WI false acceptance, every named configuration mismatch (including
+zero writes), FSR W1C and the diagnostic cap. Existing routing, mapping, DMA
+containment, undo, quarantine and decoder tests still pass. Patch 0099 embeds
+both exact C sources. The native kernel build passed in `ci-lane-wlan`.
+
+`tools/build-fuxi-wlan6c-images.sh BASE_METAL2A_ARTIFACT_DIR` consumes the
+stripped/unstripped kernels in `xnu/out-fuxi-wlan6c/`. It uses the same required
+absolute firmware/tool paths as M6b, preserves ADT/header, and packs `fuxiwlan=1`
+and `fuxiwlan=20` variants. Both pass
+`python3 tools/test-fuxi-wlan-m6-artifacts.py --milestone m6c`, including payload
+reconstruction, pinned firmware hashes, `.gpu_fw=0x25ac8` and the eleven-file
+`xnu/out-fuxi-wlan6c/SHA256SUMS` manifest. Binaries/logs/private inputs are ignored.
+
+Use the **s20 image first**. Expected templates (bank numbers and readbacks
+are runtime findings, not predictions):
+
+```text
+FUXI WLAN: M6c CB probe 1/8 CB ... SCTLR ... M=0 unreferenced; TCR2 zero
+FUXI WLAN: M6c SMMU mismatch CB ... CB_TCR2 probe offset ... wrote 0 read ... faults 0
+FUXI WLAN: M6c CB ... unusable; probe failed; next candidate
+FUXI WLAN: M6c CB probe 2/8 CB ... SCTLR ... M=0 unreferenced; TCR2 zero
+FUXI WLAN: M6c CB ... probe accepted; claim pending full CB/GR1 readbacks
+FUXI WLAN: SMMU owned stage1 SMR ... CB ... TTBR ... IOVA ... readback verified
+FUXI WLAN: step 20 ok code 0x1014 (... ms, faults 0)
+FUXI WLAN: SMMU undo SMR invalid, S2CR restored, CB disabled, TLBI synced
+FUXI WLAN: M6b RC undo bypass restored first, 256 owned entries zeroed
+FUXI WLAN: abort buffers freed
+```
+
+Rejected-bank lines are conditional. If a probe passes but configuration
+fails, expect `M6c SMMU mismatch ... CB_SCTLR disable|GR1_CBA2R|GR1_CBAR|...`
+and step 20 `0x1404`, then undo. If all eight probes fail, expect
+`M6c CB probe exhausted 8 candidates (limit 8); no bank claimed`, `0x1406`,
+RC undo and buffer release. The s20 image must produce no BHI doorbell or
+bus-master-on line. Inspect the named failure, CB fault snapshot and complete
+undo before any fresh-boot step 21+ test. Host/build success proves no DMA.
+
+| M6c artifact | SHA256 |
+|---|---|
+| `xnu/out-fuxi-wlan6c/kernel.development.fuxi` | `ea1bf3582173cda80b48dea738e4cfc547ec7b595e0277eef92926e9a3857fe1` |
+| `shim/out/fuxi-wlan-m6c-boot.img` | `17ae60ae0870778ce4cc1fe80859b981bf09586e224418edc038d0cddbbbcc3a` |
+| `shim/out/fuxi-wlan-m6c-s20-boot.img` | `498b5c26167eb48fc9af0aae6a840e4d94046de50e1a08476073c12fcb48fc7c` |
