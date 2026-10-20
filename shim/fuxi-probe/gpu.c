@@ -672,10 +672,16 @@ static void g_gx(void)
 #define G3_RING_PA  (G_MEM + 0x1320000)
 #define G3_PTR_PA   (G_MEM + 0x1328000)
 #define G3_FENCE_PA (G_MEM + 0x1329000)
+/* The ABI root needs the full client aperture. Keep the runtime ring/SQE
+ * below it in BOTH roots when enabled; loader/default-off addresses stay put. */
+#if defined(FUXI_GPU_XNU)
+#define G3_SQE_VA   (fg_abi_enabled ? 0x10000000u : 0x40000000u)
+#else
 #define G3_SQE_VA   0x40000000u
-#define G3_RING_VA  0x40020000u
-#define G3_PTR_VA   0x40028000u
-#define G3_FENCE_VA 0x40029000u
+#endif
+#define G3_RING_VA  (G3_SQE_VA+0x20000u)
+#define G3_PTR_VA   (G3_SQE_VA+0x28000u)
+#define G3_FENCE_VA (G3_SQE_VA+0x29000u)
 #define G3_MAGIC    0xa740f00du
 #define G3_GUARD    0x5ac3e17bu
 #define G3_FSR_MASK 0xc00001feu /* SMMUv2 defined faults; keep reserved bit10 in report */

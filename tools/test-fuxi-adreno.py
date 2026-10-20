@@ -28,6 +28,8 @@ def function(source, name):
 
 PREFIX = r'''
 #include <assert.h>
+#define FG_GUARD
+static unsigned fg_client_busy;
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -265,6 +267,11 @@ int main(void)
  /* A thousand hot copies: no remapping, lookups, TLB sync or unmap. */
  reset(); assert(fuxi_gpu_map(0,42,(uintptr_t)source_buf,4352*2400,&times));
  unsigned hot_lookups=lookups, hot_tlbs=tlbs;
+ /* A client owns the ring: defer only GPU copying; the caller uses CPU. */
+ fg_client_busy=1;
+ assert(!fuxi_gpu_copy(0,42,(uintptr_t)source_buf,4352*2400,4352,3,2,7,6,65,70,&times));
+ assert(!doorbells && !fg_busy && fg_state==1);
+ fg_client_busy=0;
  for(unsigned i=0;i<1000;i++)
   assert(model_copy(0,42,(uintptr_t)source_buf,4352*2400,4352,3,2,7,6,65,70,&times)==1);
  assert(lookups==hot_lookups && tlbs==hot_tlbs && doorbells==1000);

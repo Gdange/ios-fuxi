@@ -17,6 +17,10 @@ spec.loader.exec_module(submit)
 
 PREFIX = r'''
 #include <assert.h>
+#define FG_GUARD
+static unsigned fg_abi_enabled;
+static void *fg_ring_lock;
+static void *IOLockAlloc(void) { return (void *)1; }
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -57,6 +61,9 @@ static uint32_t gpu_report[128], gpu_extra[16][128];
 #define G3_FENCE_PA (FG_SCRATCH+0x1329000)
 #define G4_FB_PA 0xb8000000u
 #define G4_FB_VA 0x41000000u
+static unsigned valid_handoff, abi_inits, abi_publishes, abi_fail;
+static int fg_abi_init(void) { assert(fg_state==0);abi_inits++;return !abi_fail; }
+static void fuxi_gpu_abi_publish(void) { assert(fg_state==1 && abi_inits==1);abi_publishes++; }
 static unsigned gpu_calls, alloc_calls, enter_calls, remove_calls, free_calls, enqueued;
 static unsigned fail_alloc, fail_enter, invalid_reservation;
 static size_t live, cursor, last_size, removed;
@@ -88,7 +95,17 @@ static int pmap_enter_options_addr(int map,vm_offset_t va,uint64_t pa,unsigned p
  assert(map==kernel_pmap && prot==(VM_PROT_READ|VM_PROT_WRITE) && !fault);
  assert(flags==VM_WIMG_IO && wired==TRUE && options==PMAP_OPTIONS_NOWAIT && !arg);
  assert(va>=last_va && va<last_va+last_size && !(va&PAGE_MASK) && !(pa&PAGE_MASK));
- if(!first_pa) next_pa=first_pa=pa;
+ if(!first_pa) {
+  next_pa=first_pa=pa;
+  if(valid_handoff && pa==FG_SCRATCH) {
+   struct fg_handoff *h=(struct fg_handoff *)(last_va+FG_HANDOFF-FG_SCRATCH);
+   *h=(struct fg_handoff){.magic=FG_MAGIC,.version=1,.bytes=sizeof(*h),.base=FG_SCRATCH,.size=FG_SCRATCH_SIZE};
+   for(unsigned i=0;i<3;i++) {
+    uint8_t *fw=(uint8_t *)(last_va+FG_FW_BASE-FG_SCRATCH+i*FG_FW_SLOT);
+    memset(fw,0x55,4);h->fw_size[i]=4;h->fw_hash[i]=fg_hash(fw,4);
+   }
+  }
+ }
  assert(pa==next_pa && va-last_va==pa-first_pa); next_pa+=PAGE_SIZE;
  if(++enter_calls==fail_enter) return KERN_RESOURCE_SHORTAGE;
  return KERN_SUCCESS;
@@ -107,8 +124,16 @@ static int SecureDTLookupEntry(void *p,const char *s,DTEntry *e)
 { assert(!p && !strcmp(s,"/chosen")); *e=1; return 0; }
 static int SecureDTGetProperty(DTEntry e,const char *s,void **p,unsigned *n)
 { assert(e==1 && !strcmp(s,"fuxi-gpu-memory")); *p=reservation; *n=invalid_reservation?0:16; return 0; }
-static void gpu_probe(unsigned stage) { (void)stage; gpu_calls++; }
-static unsigned g3_read(uint64_t a) { (void)a; return 0; }
+static void gpu_probe(unsigned stage) { (void)stage; gpu_calls++;if(valid_handoff) {gpu_extra[5][4]=1;gpu_extra[13][2]=1;} }
+static unsigned g3_read(uint64_t a) {
+ if(valid_handoff) {
+  if(a==0xae05014) return G4_FB_PA;
+  if(a==0xae05024) return 4320;
+  if(a==0xae05000) return (2400u<<16)|1080;
+  if(a==0xae05030) return 0x237ff;
+ }
+ return 0;
+}
 static unsigned g3_gr(unsigned a) { (void)a; return 0; }
 static int g_map_at(uint64_t p,unsigned *n,unsigned va,unsigned pa,unsigned size,unsigned attr)
 { (void)p;(void)n;(void)va;(void)pa;(void)size;(void)attr;return 1; }
@@ -135,6 +160,7 @@ static void reset(void)
  fail_alloc=fail_enter=invalid_reservation=0;
  live=cursor=removed=0;
  fg_limit=17; enable_arg=1; gPhysSize=FG_RAM_SIZE;
+ valid_handoff=abi_inits=abi_publishes=abi_fail=fg_abi_enabled=0;
 }
 int main(void)
 {
@@ -183,6 +209,13 @@ int main(void)
  assert(enqueued==1 && !alloc_calls && !gpu_calls);
  fuxi_gpu_start(G4_FB_PA,1080,2400,4320); assert(enqueued==1);
  reset(); fuxi_gpu_start(G4_FB_PA,1080,2400,1); assert(fg_state==2 && !enqueued);
+ /* ABI MMIO/table setup must precede publishing ready to the display;
+  * service publication must follow it. Failure only withholds the ABI. */
+ for(unsigned fail=0;fail<2;fail++) {
+  reset();valid_handoff=fg_abi_enabled=1;abi_fail=fail;
+  fg_thread(NULL,NULL);
+  assert(fg_state==1 && abi_inits==1 && abi_publishes==!fail);
+ }
 #undef printf
  printf("PASS: %zu windows, %llu mapped bytes, all %llu page-insertion failures + VA failures, partial unwind, CPU fallback, static delayed startup\n",
   COUNT,(unsigned long long)total,(unsigned long long)(total/PAGE_SIZE));

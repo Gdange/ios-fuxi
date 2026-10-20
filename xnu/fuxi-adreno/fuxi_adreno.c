@@ -21,6 +21,9 @@
 #include <kern/kern_types.h>
 #include "fuxi_adreno.h"
 #include "gpu-handoff.h"
+#include <IOKit/IOLocks.h>
+#include "fuxi_gpu_abi.h"
+#include "fuxi_abi_wire.h"
 extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
 /* The BSD header export omits sched_prim's private dependencies. These match
  * osfmk/kern/{processor,sched_prim}.h; processor_t remains opaque here. */
@@ -139,6 +142,13 @@ static const uint8_t *fg_firmware(unsigned which, unsigned *size)
  *size = h->fw_size[which];
  return (const uint8_t *)fg_pointer(FG_FW_BASE + which*FG_FW_SLOT);
 }
+static unsigned fg_abi_enabled, fg_client_busy;
+static IOLock *fg_ring_lock;
+/* Present callers already hold the surface lock. ABI never takes that lock;
+ * neither client waits nor BO allocations hold this short ring/table mutex. */
+struct fg_guard { IOLock *lock; };
+static void fg_guard_exit(struct fg_guard *g) { if (g->lock) IOLockUnlock(g->lock); }
+#define FG_GUARD struct fg_guard guard __attribute__((cleanup(fg_guard_exit))) = {fg_ring_lock}; if (guard.lock) IOLockLock(guard.lock)
 #define FUXI_GPU_XNU 1
 #define G_PTR(pa) fg_pointer(pa)
 #define G_RING_INDEX(w) ((w) & 8191u)
@@ -265,6 +275,7 @@ static int fg_source_tables(void)
  * new generation. No PFN scan or TLB invalidation on a cache hit. */
 int fuxi_gpu_unmap(unsigned slot, struct fg_times *t)
 {
+ FG_GUARD;
  if (slot >= FG_CACHE_SLOTS || fg_busy) return 0;
  uint64_t start = mach_absolute_time();
  volatile uint64_t *l2 = fg_l2();
@@ -285,6 +296,7 @@ int fuxi_gpu_unmap(unsigned slot, struct fg_times *t)
 int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,
     uint64_t length, struct fg_times *t)
 {
+ FG_GUARD;
  if (!fuxi_gpu_ready() || slot >= FG_CACHE_SLOTS || !generation || fg_generation[slot] || !length ||
      length > FG_SOURCE_BYTES || length+(source&4095) > FG_SOURCE_BYTES) return 0;
  uint64_t start = mach_absolute_time();
@@ -341,6 +353,7 @@ int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,
  t->misses++;
  return 1;
 }
+static int fg_abi_init(void);
 static thread_call_data_t fg_init_call;
 static void fg_thread(thread_call_param_t arg, thread_call_param_t result)
 {
@@ -393,7 +406,13 @@ static void fg_thread(thread_call_param_t arg, thread_call_param_t result)
  uint32_t tlb[128] = {0};
  if (g4_tlb(tlb) || fg_access_failed) { fg_fail("initial TLB sync", 5); goto out; }
  printf("FUXI GPU: ready, BGRA strided rects + one fence, 4 cached backings, 220 MHz, async one-in-flight, no timer sleep\n");
+ /* Finish all ABI-only MMIO/table setup before the display can submit.
+  * Publication may race userspace, so it follows the release of ready. */
+ int publish_abi = fg_abi_enabled && fg_abi_init();
+ if (fg_abi_enabled && !publish_abi)
+  printf("FUXI GPU ABI: initialization failed, service withheld\n");
  __atomic_store_n(&fg_state, 1, __ATOMIC_RELEASE);
+ if (publish_abi) fuxi_gpu_abi_publish();
  out: return;
 }
 void fuxi_gpu_start(uint64_t fb, unsigned width, unsigned height, unsigned pitch)
@@ -402,6 +421,12 @@ void fuxi_gpu_start(uint64_t fb, unsigned width, unsigned height, unsigned pitch
  (void)PE_parse_boot_argn("fuxigpu", &enable, sizeof(enable));
  if (enable != 1 || fg_started) return;
  fg_started = 1; fg_limit = 17;
+ (void)PE_parse_boot_argn("fuxigpuabi", &fg_abi_enabled, sizeof(fg_abi_enabled));
+ fg_abi_enabled = fg_abi_enabled == 1;
+ if (fg_abi_enabled && !(fg_ring_lock = IOLockAlloc())) {
+  fg_abi_enabled = 0;
+  printf("FUXI GPU ABI: no ring mutex, service withheld\n");
+ }
  (void)PE_parse_boot_argn("fuxigpu_stage", &fg_limit, sizeof(fg_limit));
  (void)PE_parse_boot_argn("fuxigpu_fail", &fg_force, sizeof(fg_force));
  if ((fg_limit != 13 && fg_limit != 16 && fg_limit != 17) ||
@@ -455,6 +480,7 @@ static void fg_clean(uintptr_t source, unsigned pitch, unsigned sx, unsigned sy,
  * A completed fence wins over a late timer/deadline. */
 int fuxi_gpu_poll(struct fg_times *t)
 {
+ FG_GUARD;
  if (!fg_busy) return 1;
  int err = fg_access_failed || g3_faulted();
  if (!err && g3_read(G3_FENCE_PA+64) == fg_magic && g3_gr(0x806) == g3_wptr &&
@@ -475,7 +501,8 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
     unsigned pitch, unsigned sx, unsigned sy, unsigned dx, unsigned dy,
     unsigned width, unsigned height, struct fg_times *t)
 {
- if (!fuxi_gpu_ready() || fg_busy || slot >= FG_CACHE_SLOTS || fg_generation[slot] != generation) return 0;
+ FG_GUARD;
+ if (!fuxi_gpu_ready() || fg_busy || fg_client_busy || slot >= FG_CACHE_SLOTS || fg_generation[slot] != generation) return 0;
  if (!width || !height || width > 1080 || height > 2400 || dx > 1080-width || dy > 2400-height ||
      (source & 3) || (pitch & 3) || pitch > 131008 || ((uint64_t)sx+width)*4 > pitch ||
      length+(source&4095) > FG_SOURCE_BYTES ||
@@ -512,4 +539,5 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
  fg_busy = 1;
  return 2; /* submitted; source is owned until poll retires this fence */
 }
+#include "fuxi_gpu_abi_backend.inc"
 #endif

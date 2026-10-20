@@ -1,0 +1,315 @@
+/* NativeAdrenoABI v1 userspace lane. No Apple accelerator/Metal impersonation.
+ * ABI and framing credit: UniXNU NativeAdreno contributors (MIT).
+ * See NativeAdrenoABI.h and LICENSE.NativeAdreno for copied material.
+ */
+#include <pexpert/arm64/board_config.h>
+#if defined(FUXI)
+#include <IOKit/IOService.h>
+#include <IOKit/IOPlatformExpert.h>
+#include <IOKit/IOUserClient.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IOLib.h>
+#include <IOKit/IOLocks.h>
+#include <kern/clock.h>
+#include "fuxi_gpu_abi.h"
+#include "fuxi_abi_wire.h"
+
+/* A physical-range view must OWN its wired backing until its last mapping is
+ * destroyed. IOConnectUnmapMemory64 looks up this same descriptor again.
+ * Releasing a BO with a forgotten CPU mapping can then never free live PTEs.
+ * Kernel and client mappings both use Normal NC/write-combine, avoiding a
+ * cached alias of memory the GPU accesses noncoherently. */
+class FuxiAdrenoBoView : public IOGeneralMemoryDescriptor {
+ OSDeclareDefaultStructors(FuxiAdrenoBoView)
+ IOBufferMemoryDescriptor *backing_ = nullptr;
+public:
+ bool bind(IOBufferMemoryDescriptor *backing, IOAddressRange *ranges, unsigned count) {
+  if (!initWithOptions(ranges,count,0,nullptr,
+      kIODirectionInOut|kIOMemoryTypePhysical64|kIOMemoryMapperNone,nullptr)) return false;
+  backing_=backing; backing_->retain(); return true;
+ }
+ void free() override {
+  IOBufferMemoryDescriptor *backing=backing_;
+  /* Tear down physical views/pager before releasing the backing. */
+  IOGeneralMemoryDescriptor::free();
+  if (backing) { backing->complete(); backing->release(); }
+ }
+};
+OSDefineMetaClassAndStructors(FuxiAdrenoBoView,IOGeneralMemoryDescriptor)
+
+static IOLock *openLock;
+static bool connected;
+class FuxiAdrenoUserClient : public IOUserClient {
+ OSDeclareDefaultStructors(FuxiAdrenoUserClient)
+ enum {MaxBos=64};
+ struct Bo {
+  IOBufferMemoryDescriptor *memory;
+  FuxiAdrenoBoView *view;
+  uint64_t handle, bytes, allocated, iova;
+  uint32_t token, leases, metadataBytes;
+  char metadata[64];
+ } bos_[MaxBos] = {};
+ IOLock *lock_ = nullptr;
+ bool live_ = false;
+ uint64_t nextHandle_ = 1, wired_ = 0, lastFence_ = 0, firstFence_ = 0;
+ uint32_t nextToken_ = 1;
+ bool queues_[8] = {true};
+ Bo *find(uint64_t handle) {
+  for (auto &b:bos_) if (handle && b.handle==handle) return &b;
+  return nullptr;
+ }
+ IOReturn wait(uint64_t fence, uint64_t ns) {
+  if (!fence || !firstFence_ || fence<firstFence_ || fence>lastFence_) return kIOReturnBadArgument;
+  /* The hardware watchdog is independent and always bounds ownership at
+   * 100 ms. A shorter user timeout does not itself lose the context. */
+  uint64_t ticks=0;
+  nanoseconds_to_absolutetime(ns>1000000000ULL ? 1000000000ULL : ns,&ticks);
+  uint64_t deadline=mach_absolute_time()+ticks;
+  for (;;) {
+   int s=fuxi_gpu_abi_poll(fence);
+   if (!s) return kIOReturnSuccess;
+   if (s<0) return (s==-3 || s==-4) ? kIOReturnTimeout : kIOReturnIOError;
+   if (mach_absolute_time()>=deadline) return kIOReturnTimeout;
+   IOSleep(1);
+  }
+ }
+ IOReturn drop(Bo &b) {
+  if (b.iova) {
+   int s=fuxi_gpu_abi_unmap(b.iova,b.bytes);
+   if (s) return s==1 ? kIOReturnBusy : kIOReturnIOError;
+  }
+  wired_-=b.allocated;
+  b.view->release(); /* view owns the matched prepare + backing retain */
+  b.memory->release();
+  bzero(&b,sizeof(b));
+  return kIOReturnSuccess;
+ }
+ IOReturn allocate(const NativeAdrenoAbiBoAlloc &r, NativeAdrenoAbiBoAllocReply &out) {
+  if (!fg_abi_alloc_valid(r.bytes,r.align_log2,r.contiguous)) return kIOReturnBadArgument;
+  uint64_t allocated=(r.bytes+16383)&~UINT64_C(16383);
+  if (allocated>FG_ABI_MAX_BYTES-wired_ || nextToken_==UINT32_MAX) return kIOReturnNoResources;
+  Bo *b=nullptr;
+  for (auto &candidate:bos_) if (!candidate.handle) { b=&candidate; break; }
+  if (!b) return kIOReturnNoResources;
+  uint64_t mask=((UINT64_C(1)<<FG_ABI_PA_BITS)-1)&~((UINT64_C(1)<<r.align_log2)-1);
+  IOOptionBits options=kIODirectionInOut|kIOMemoryMapperNone|kIOMemoryKernelUserShared|kIOMapWriteCombineCache;
+  /* Contiguous-first, with a wired scattered fallback unless required. */
+  IOBufferMemoryDescriptor *memory=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+      kernel_task,options|kIOMemoryPhysicallyContiguous,allocated,mask);
+  if (!memory && !r.contiguous) memory=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,options,allocated,mask);
+  if (!memory) return kIOReturnNoMemory;
+  if (memory->prepare()!=kIOReturnSuccess) { memory->release(); return kIOReturnNoMemory; }
+  unsigned capacity=(unsigned)(allocated/16384), count=0;
+  IOAddressRange *ranges=IONewData(IOAddressRange,capacity);
+  FuxiAdrenoBoView *view=new FuxiAdrenoBoView;
+  bool valid=ranges && view && memory->getBytesNoCopy() && memory->getLength()==allocated;
+  uint64_t first=0;
+  for (uint64_t off=0;valid && off<allocated;off+=16384) {
+   IOByteCount length=0;
+   uint64_t pa=memory->getPhysicalSegment(off,&length,kIOMemoryMapperNone);
+   valid=pa && !(pa&16383) && length>=16384 && pa<(UINT64_C(1)<<FG_ABI_PA_BITS) &&
+       (!off ? !(pa&((UINT64_C(1)<<r.align_log2)-1)) : !r.contiguous || pa==first+off);
+   if (!valid) break;
+   if (!off) first=pa;
+   if (count && ranges[count-1].address+ranges[count-1].length==pa) ranges[count-1].length+=16384;
+   else ranges[count++]={pa,16384};
+  }
+  if (valid) {
+   bzero(memory->getBytesNoCopy(),allocated); /* includes 16K mapping tail */
+   valid=view->bind(memory,ranges,count);
+  }
+  if (ranges) IODeleteData(ranges,IOAddressRange,capacity);
+  if (!valid) {
+   if (view) view->release();
+   memory->complete(); memory->release(); return kIOReturnNoMemory;
+  }
+  b->memory=memory; b->view=view; b->bytes=r.bytes; b->allocated=allocated;
+  b->handle=nextHandle_++; b->token=nextToken_++; wired_+=allocated;
+  out.handle=b->handle;
+  return kIOReturnSuccess;
+ }
+ IOReturn run(unsigned method, const void *in, void *out) {
+  if (method==NativeAdrenoMethodQuery) {
+   *static_cast<NativeAdrenoAbiParams *>(out)={1,31,FG_ABI_PA_BITS,0,FG_ABI_MAX_BYTES}; return kIOReturnSuccess;
+  }
+  if (method==NativeAdrenoMethodGetDeviceInfo) {
+   /* A740 C510v2, SM8550 UBWC4; programmed UCHE ranges are checked at
+    * publication. Catalog/UBWC configuration provenance is in metal.md. */
+   *static_cast<NativeAdrenoAbiDeviceInfo *>(out)={0x43050a01,3u<<20,0x1000000,
+       0x1fffffffff000ULL,FG_ABI_VA_START,FG_ABI_VA_SIZE,16,6,1,4,NativeAdrenoDeviceClientIova,0};
+   return kIOReturnSuccess;
+  }
+  if (method==NativeAdrenoMethodWaitFence) {
+   const auto &r=*static_cast<const NativeAdrenoAbiWaitFence *>(in); return wait(r.fence,r.timeout_ns);
+  }
+  if (method==NativeAdrenoMethodBoCpuUnmap) {
+   const auto &r=*static_cast<const NativeAdrenoAbiBoCpuUnmap *>(in);
+   Bo *b=find(r.handle);
+   if (!b || r.reserved || b->token!=r.token || !b->leases) return kIOReturnBadArgument;
+   --b->leases; return kIOReturnSuccess;
+  }
+  if (method==NativeAdrenoMethodBoFree) {
+   Bo *b=find(static_cast<const NativeAdrenoAbiBoFree *>(in)->handle);
+   if (!b) return kIOReturnBadArgument;
+   if (b->leases) return kIOReturnBusy;
+   return drop(*b);
+  }
+  if (!fuxi_gpu_abi_available()) return kIOReturnNotReady;
+  if (method==NativeAdrenoMethodBoAlloc)
+   return allocate(*static_cast<const NativeAdrenoAbiBoAlloc *>(in),*static_cast<NativeAdrenoAbiBoAllocReply *>(out));
+  if (method==NativeAdrenoMethodBoMap) {
+   const auto &r=*static_cast<const NativeAdrenoAbiBoMap *>(in);
+   Bo *b=find(r.handle);
+   if (!b || b->iova || !fg_abi_map_valid(r.iova,b->bytes,r.permissions,r.writeback,r.shareability,r.reserved))
+    return kIOReturnBadArgument;
+   uint64_t deadline; clock_interval_to_deadline(150,NSEC_PER_MSEC,&deadline);
+   int s;
+   do {
+    s=fuxi_gpu_abi_map(r.iova,(uintptr_t)b->memory->getBytesNoCopy(),b->bytes,r.permissions,r.writeback,r.shareability);
+    if (s!=1 || mach_absolute_time()>=deadline) break;
+    IOSleep(1);
+   } while (true);
+   if (s) return s==1 ? kIOReturnBusy : kIOReturnBadArgument;
+   b->iova=r.iova; static_cast<NativeAdrenoAbiBoMapReply *>(out)->iova=r.iova; return kIOReturnSuccess;
+  }
+  if (method==NativeAdrenoMethodBoCpuMap) {
+   Bo *b=find(static_cast<const NativeAdrenoAbiBoCpuMap *>(in)->handle);
+   if (!b || b->leases==UINT32_MAX) return kIOReturnBadArgument;
+   ++b->leases;
+   *static_cast<NativeAdrenoAbiBoCpuMapReply *>(out)={b->token,0,b->allocated}; return kIOReturnSuccess;
+  }
+  if (method==NativeAdrenoMethodSubmit) {
+   const auto &r=*static_cast<const NativeAdrenoAbiSubmit *>(in);
+   if (!r.buffer_count || r.buffer_count>16 || r.reserved || r.queue>=8 || !queues_[r.queue]) return kIOReturnBadArgument;
+   if (r.wait_fence) { IOReturn s=wait(r.wait_fence,r.wait_timeout_ns); if (s) return s; }
+   uint64_t iova[16], bytes[16];
+   for (unsigned i=0;i<r.buffer_count;i++) {
+    const auto &ib=r.buffers[i]; Bo *b=find(ib.handle);
+    if (!b || !b->iova || !fg_abi_ib_valid(b->iova,b->bytes,ib.iova,ib.bytes)) return kIOReturnBadArgument;
+    iova[i]=ib.iova; bytes[i]=ib.bytes;
+   }
+   uint64_t deadline; clock_interval_to_deadline(150,NSEC_PER_MSEC,&deadline);
+   for (;;) {
+    uint64_t fence=0;
+    int s=fuxi_gpu_abi_submit(iova,bytes,r.buffer_count,&fence);
+    if (!s) { if (!firstFence_) firstFence_=fence; lastFence_=fence; static_cast<NativeAdrenoAbiSubmitReply *>(out)->fence=fence; return kIOReturnSuccess; }
+    if (s<0) return kIOReturnIOError;
+    if (mach_absolute_time()>=deadline) return kIOReturnBusy;
+    IOSleep(1); /* Never hold the ring mutex during scheduler waits. */
+   }
+  }
+  if (method==NativeAdrenoMethodSetMetadata || method==NativeAdrenoMethodGetMetadata) {
+   const auto &r=*static_cast<const NativeAdrenoAbiMetadata *>(in); Bo *b=find(r.handle);
+   if (!b || r.reserved || r.bytes>64) return kIOReturnBadArgument;
+   if (method==NativeAdrenoMethodSetMetadata) { bcopy(r.text,b->metadata,r.bytes); b->metadataBytes=r.bytes; }
+   else {
+    auto &reply=*static_cast<NativeAdrenoAbiMetadata *>(out); reply={}; reply.handle=r.handle;
+    reply.bytes=r.bytes<b->metadataBytes ? r.bytes : b->metadataBytes;
+    bcopy(b->metadata,reply.text,reply.bytes);
+   }
+   return kIOReturnSuccess;
+  }
+  if (method==NativeAdrenoMethodCreateQueue || method==NativeAdrenoMethodCloseQueue) {
+   const auto &r=*static_cast<const NativeAdrenoAbiQueue *>(in);
+   if (method==NativeAdrenoMethodCreateQueue) {
+    if (r.queue) return kIOReturnBadArgument;
+    for (unsigned i=1;i<8;i++) if (!queues_[i]) { queues_[i]=true; static_cast<NativeAdrenoAbiQueueReply *>(out)->queue=i; return kIOReturnSuccess; }
+    return kIOReturnNoResources;
+   }
+   if (!r.queue || r.queue>=8 || !queues_[r.queue]) return kIOReturnBadArgument;
+   if (lastFence_ && fuxi_gpu_abi_poll(lastFence_)==1) return kIOReturnBusy;
+   queues_[r.queue]=false; return kIOReturnSuccess;
+  }
+  return kIOReturnUnsupported;
+ }
+public:
+ bool initWithTask(task_t task, void *securityID, UInt32 type) override {
+  if (!IOUserClient::initWithTask(task,securityID,type)) return false;
+  lock_=IOLockAlloc(); return lock_!=nullptr;
+ }
+ bool mount() {
+  IOLockLock(openLock);
+  bool ok=!connected && fuxi_gpu_abi_available();
+  if (ok) live_=connected=true;
+  IOLockUnlock(openLock); return ok;
+ }
+ IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *a,
+     IOExternalMethodDispatch *, OSObject *, void *) override {
+  if (!a || selector<1 || selector>16) return kIOReturnUnsupported;
+  if (a->scalarInputCount || a->scalarOutputCount || a->asyncWakePort ||
+      a->structureInputDescriptor || a->structureOutputDescriptor ||
+      a->structureInputSize!=fg_abi_input_size(selector) || a->structureOutputSize!=fg_abi_output_size(selector) ||
+      (a->structureInputSize && !a->structureInput) || (a->structureOutputSize && !a->structureOutput)) return kIOReturnBadArgument;
+  IOLockLock(lock_);
+  if (a->structureOutputSize) bzero(a->structureOutput,a->structureOutputSize);
+  IOReturn s=live_ ? run(selector,a->structureInput,a->structureOutput) : kIOReturnNotOpen;
+  IOLockUnlock(lock_); return s;
+ }
+ IOReturn clientMemoryForType(UInt32 token, IOOptionBits *options, IOMemoryDescriptor **memory) override {
+  if (!options || !memory) return kIOReturnBadArgument;
+  *memory=nullptr;
+  IOLockLock(lock_);
+  if (live_) for (auto &b:bos_) if (b.handle && b.token==token && b.leases) {
+   b.view->retain(); *memory=b.view; *options=kIOMapAnywhere|kIOMapWriteCombineCache; break;
+  }
+  IOLockUnlock(lock_); return *memory ? kIOReturnSuccess : kIOReturnNotFound;
+ }
+ IOReturn clientClose() override {
+  if (!lock_) return kIOReturnSuccess;
+  IOLockLock(lock_);
+  bool wasLive=live_;
+  if (live_) {
+   if (lastFence_) (void)wait(lastFence_,200000000);
+   for (auto &b:bos_) if (b.handle) {
+    /* If drain failed, deliberately keep view, prepare and buffer references
+     * until reset. A root daemon crash cannot release pages into live DMA. */
+    if (drop(b)!=kIOReturnSuccess) IOLog("FUXI GPU ABI: quarantined BO %llu until reset\n",b.handle);
+   }
+   live_=false;
+   IOLockLock(openLock); connected=false; IOLockUnlock(openLock);
+  }
+  IOLockUnlock(lock_);
+  if (wasLive) terminate(); return kIOReturnSuccess;
+ }
+ void free() override {
+  (void)clientClose();
+  if (lock_) IOLockFree(lock_);
+  IOUserClient::free();
+ }
+};
+OSDefineMetaClassAndStructors(FuxiAdrenoUserClient,IOUserClient)
+
+/* Name matches Turnip's direct unsandboxed backend. Type 0 is its default;
+ * 0x4147 is the NativeAdreno plugin/raw-test open type. */
+class NativeAdrenoGpuPublished : public IOService {
+ OSDeclareDefaultStructors(NativeAdrenoGpuPublished)
+public:
+ IOReturn newUserClient(task_t task, void *securityID, UInt32 type,
+     OSDictionary *, IOUserClient **handler) override {
+  if (!handler) return kIOReturnBadArgument;
+  *handler=nullptr;
+  if (type!=0x4147 && type!=0) return kIOReturnUnsupported;
+  if (IOUserClient::clientHasPrivilege(securityID,kIOClientPrivilegeAdministrator)!=kIOReturnSuccess) return kIOReturnNotPrivileged;
+  auto *uc=new FuxiAdrenoUserClient;
+  if (!uc) return kIOReturnNoMemory;
+  if (!uc->initWithTask(task,securityID,type)) { uc->release(); return kIOReturnNoMemory; }
+  if (!uc->attach(this)) { uc->release(); return kIOReturnNoResources; }
+  if (!uc->start(this) || !uc->mount()) { uc->detach(this); uc->release(); return kIOReturnBusy; }
+  *handler=uc; return kIOReturnSuccess;
+ }
+};
+OSDefineMetaClassAndStructors(NativeAdrenoGpuPublished,IOService)
+extern "C" void fuxi_gpu_abi_publish(void)
+{
+ openLock=IOLockAlloc();
+ auto *service=new NativeAdrenoGpuPublished;
+ if (!openLock || !service) { if (service) service->release(); return; }
+ if (!service->init() || !service->attach(IOService::getPlatform()) || !service->start(IOService::getPlatform())) {
+  service->release(); return;
+ }
+ service->setName("NativeAdrenoGpu");
+ service->setProperty("NativeAdrenoABI",1ULL,32);
+ service->registerService(); /* retained for boot lifetime */
+ IOLog("FUXI GPU ABI: NativeAdrenoGpuPublished v1, open 0x4147, root only, watchdog 100 ms\n");
+}
+#endif

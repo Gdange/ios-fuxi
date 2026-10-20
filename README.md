@@ -70,6 +70,8 @@ You need an unlocked bootloader, a rooted recovery for installing the root file,
 
 ## Credits
 
+- **[UniXNU](https://github.com/UniXNU/UniXNU) / NativeAdreno contributors**: MIT NativeAdreno wire ABI and A7xx BR/BV submission framing; retained notice in `xnu/fuxi-adreno/LICENSE.NativeAdreno`. Their sheng board work also informed the GPU port.
+
 - **[ios-sweet](https://github.com/dipa-studio/ios-sweet) by [dipa-studio](https://github.com/dipa-studio)**: the original project this repository is forked from. The XNU port, the iOS userland bring-up, the kernel patches up to 0081 and most of the tooling come from it.
 - **Claude Opus 5.5 ([Anthropic](https://www.anthropic.com))**: AI pair engineer on the Xiaomi 13 bring-up: loader, XNU patches, drivers, thermal work and device testing.
 - **[OpenAI Codex](https://openai.com/codex)**: the GPU lane: GMU memory setup, firmware loading, HFI startup, GX power-up and the command-processor probe stages.

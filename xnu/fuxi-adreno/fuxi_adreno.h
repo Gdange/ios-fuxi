@@ -2,7 +2,8 @@
 #define FUXI_ADRENO_H
 #define FG_CACHE_SLOTS 4u
 /* Timings in mach absolute ticks, CPU uses scheduler runtime (excludes sleep).
- * Protected by SweetSurface's cache lock. No userspace submit interface. */
+ * Surface ownership uses SweetSurface's cache lock. When the ABI is
+ * enabled, a second shared mutex serializes ring and SMMU control. */
 struct fg_times {
  uint64_t pin, lookup, map, clean, submit, wait, unmap, cpu;
  unsigned attempts, hits, misses, sleeps, blocks, groups;
