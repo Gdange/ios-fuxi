@@ -5,11 +5,37 @@
 #import <objc/message.h>
 #include <unistd.h>
 #include <dlfcn.h>
+#include <mach-o/dyld.h>
+#include <mutex>
+#include "ClientGate.hpp"
 #ifndef FUXI_MTL_BACKEND_HEADER
 #define FUXI_MTL_BACKEND_HEADER "Backend.hpp"
 #endif
 #include FUXI_MTL_BACKEND_HEADER
 extern "C" void _objc_msgForward(void);
+#ifndef FUXI_MTL_CLIENTS_CONF
+#define FUXI_MTL_CLIENTS_CONF "/usr/local/share/fuxi/metal-clients.conf"
+#endif
+static fuxi::ClientMode clientMode=fuxi::ClientMode::deny;
+static char clientProcess[64]="unknown";
+#ifndef FUXI_MTL_READ_CLIENTS
+#define FUXI_MTL_READ_CLIENTS fuxi::readClients
+#endif
+static void checkClient() {
+ static std::once_flag once;
+ std::call_once(once,[]{
+  // dyld's executable path, never argv[0] (exec-swap preserves daemon argv).
+  char path[4096];uint32_t size=sizeof(path);
+  if(!_NSGetExecutablePath(path,&size)) {
+   const char *name=strrchr(path,'/');name=name?name+1:path;
+   if(fuxi::clientName(name))memcpy(clientProcess,name,strlen(name)+1);
+  }
+  clientMode=FUXI_MTL_READ_CLIENTS(FUXI_MTL_CLIENTS_CONF,clientProcess);
+  if(clientMode==fuxi::ClientMode::census)clientMode=fuxi::ClientMode::deny;
+  fprintf(stderr,"FUXI MTL: gate %s %s\n",clientMode==fuxi::ClientMode::deny?"deny":"allow",clientProcess);
+  if(clientMode==fuxi::ClientMode::census)fprintf(stderr,"FUXI MTL: census enabled %s (no GPU)\n",clientProcess);
+ });
+}
 static void unsupported(id object, SEL selector) {
  fprintf(stderr,"FUXI MTL: unsupported %s %s\n",class_getName(object_getClass(object)),sel_getName(selector));
 }
@@ -140,6 +166,8 @@ static FuxiOwner *owner(id obj) {return (FuxiOwner *)objc_getAssociatedObject(ob
 @implementation FuxiDeviceMethods
 - (id)init {unsupported(self,_cmd);[self release];return nil;}
 - (id)initWithAcceleratorPort:(uint32_t)port {
+ checkClient();
+ if(clientMode==fuxi::ClientMode::deny) {[self release];return nil;}
  if(geteuid()!=0 || !port || owner(self)) {[self release];return nil;}
  void *io=dlopen("/System/Library/Frameworks/IOKit.framework/IOKit",RTLD_NOW|RTLD_LOCAL);
  auto getID=io?(int(*)(uint32_t,uint64_t *))dlsym(io,"IORegistryEntryGetRegistryEntryID"):nullptr;

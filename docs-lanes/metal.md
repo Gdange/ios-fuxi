@@ -1,6 +1,41 @@
+# Metal lane M5a: process safety gate
+
+2026-10-20. The coordinator reports **M4 observed PASS**: native metaclass
+matching, system Metal discovery (528-byte base and subclass), 64 KiB fill,
+completion handlers, copy with sentinel edges, 16 reuse rounds and done PASS;
+no panic, with the home screen continuing on the CPU path. backboardd and
+SpringBoard also loaded the M4 bundle. They must not receive a transfer-only
+device during normal UI operation.
+
+The plugin now checks `/usr/local/share/fuxi/metal-clients.conf` before any
+IOKit lookup or Turnip construction. The installed default contains only
+`fuxi-metal-smoke`. It compares the actual dyld executable basename, independent
+of exec-swap's preserved daemon argv. Missing, unreadable, linked, oversized,
+untrusted or writable-by-others files deny access. Names match exactly;
+comments/blank lines are allowed. Policy is cached until process exit and logs
+one `FUXI MTL: gate allow <proc>` or `FUXI MTL: gate deny <proc>` per process.
+Staging installs the policy root:wheel **0:0 0644**.
+
+Nil-init verification, same iOS 16.7 cache SHA256 documented below:
+`_MTLRegisterDevices` calls `initWithAcceleratorPort:` at `0x181b14580`;
+its nil branch at `0x181b14584` goes directly to `0x181b14594`, releases the
+service at `0x181b14598`, and advances the iterator at `0x181b145a0`.
+`_MTLAddDevice` at `0x181b1458c` is skipped. This is an explicit supported
+absence path, not a call through nil into registration. The default-device
+array initializes once; no initializer-failure retry loop is present there.
+
+Native Mac gate tests passed under ASan/UBSan: 64 denied initialization
+attempts return nil with one policy read/log, before IOKit/backend access;
+exact names, malformed input, NULs, conflicts, missing/untrusted/writable files
+and symlinks fail closed. Existing frontend and smoke tests passed. The arm64
+iOS 16.0 plugin and smoke were built, ad-hoc signed, signature-verified and
+audited. No kernel changes, phone access, mounted-root edit or push.
+
+---
+
 # Metal lane M4: native discovery and transfer-only frontend
 
-2026-10-20. **Built, signed and host-tested; device acceptance pending.** M3
+2026-10-20. **Observed PASS on device, coordinator report above.** M3
 passed the coordinator's metal3 device run (report below). M4 adds a native
 `IOAcceleratorES` discovery metaclass, the `FuxiMetal.bundle` Objective-C++
 frontend and the root `fuxi-metal-smoke` executable. The executable calls the

@@ -19,6 +19,12 @@ def main():
         def call(command):subprocess.run(command,check=True)
         call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/FrontendTests.mm'),*frameworks,'-o',str(d/'frontend')])
         env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0')
+        call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/GateFrontendTests.mm'),*frameworks,'-o',str(d/'gate')])
+        gate=subprocess.run([str(d/'gate'),'daemon-argv'],env=env,text=True,capture_output=True,check=True,timeout=10)
+        assert gate.stderr.count('FUXI MTL: gate deny gate-test')==1,gate.stderr
+        print(gate.stdout,end='')
+        call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/ClientGateTests.cpp'),'-o',str(d/'policy')])
+        subprocess.run([str(d/'policy')],env=env,check=True,timeout=10)
         subprocess.run([str(d/'frontend')],env=env,check=True,timeout=15)
         call(['xcrun','clang',*flags,'-DMTLCreateSystemDefaultDevice=FuxiTestCreateDevice','-Dobjc_getClass=FuxiTestGetClass',
             '-Dgeteuid=FuxiTestGeteuid','-Dalarm=FuxiTestAlarm','-DFUXI_MTL_CONF="'+str(conf)+'"',

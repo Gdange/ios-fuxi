@@ -1,0 +1,27 @@
+#include "ClientGate.hpp"
+#include <cassert>
+#include <string>
+static fuxi::ClientMode parse(std::string text,const char *name="fuxi-metal-smoke") {
+ size_t n=text.size();text.push_back(0);return fuxi::parseClients(text.data(),n,name);
+}
+int main() {
+ using M=fuxi::ClientMode;
+ assert(parse("fuxi-metal-smoke\n")==M::allow);
+ assert(parse("fuxi-metal-smoke\n","backboardd")==M::deny);
+ assert(parse("# comment\n\tfuxi-metal-smoke \r\n")==M::allow);
+ assert(parse("census backboardd\n","backboardd")==M::census);
+ assert(parse("backboardd\ncensus backboardd\n","backboardd")==M::deny);
+ assert(parse("fuxi-metal-smoke\nbad name\n")==M::deny);
+ assert(parse(std::string("fuxi-metal-smoke\n\0",18))==M::deny);
+ assert(parse("fuxi-metal-smoke-extra\n")==M::deny);
+ assert(parse("")==M::deny);
+ assert(parse("fuxi-metal-smoke\n","../fuxi-metal-smoke")==M::deny);
+ char path[]="/tmp/fuxi-client-policy-XXXXXX";int fd=mkstemp(path);assert(fd>=0);
+ const char *data="fuxi-metal-smoke\n";assert(write(fd,data,strlen(data))==(ssize_t)strlen(data));close(fd);
+ assert(fuxi::readClients(path,"fuxi-metal-smoke")== (geteuid()==0?M::allow:M::deny));
+ chmod(path,0666);assert(fuxi::readClients(path,"fuxi-metal-smoke")==M::deny);
+ chmod(path,0600);std::string link=std::string(path)+"-link";assert(!symlink(path,link.c_str()));
+ assert(fuxi::readClients(link.c_str(),"fuxi-metal-smoke")==M::deny);unlink(link.c_str());unlink(path);
+ assert(fuxi::readClients(path,"fuxi-metal-smoke")==M::deny);
+ puts("PASS: exact clients, census/conflicts, malformed/NUL, missing/untrusted/writable/symlink policy fail closed");
+}

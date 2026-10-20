@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage M4 into an already mounted writable root. No mounting or phone access."""
+"""Stage Metal into an already mounted writable root. No mounting or phone access."""
 import argparse
 import os
 from pathlib import Path
@@ -28,18 +28,34 @@ def macho(path,kind):
     if pos!=32+total or not signed or not minimum:raise ValueError('requires signed iOS 16.0 artifact')
 
 
-def stage(root,icd,bundle,smoke,conf):
+def validate_clients(path):
+    raw=path.read_bytes()
+    if len(raw)>8192 or b'\0' in raw:raise ValueError('invalid client config')
+    seen={}
+    for line in raw.split(b'\n'):
+        line=line.strip(b' \t\r')
+        if not line or line.startswith(b'#'):continue
+        mode='allow'
+        if line.startswith(b'census '):mode='census';line=line[7:].lstrip(b' \t')
+        if not re.fullmatch(rb'[A-Za-z0-9_.-]{1,63}',line):raise ValueError('invalid client name')
+        if line in seen and seen[line]!=mode:raise ValueError('conflicting client modes')
+        seen[line]=mode
+
+
+def stage(root,icd,bundle,smoke,conf,clients=Path(__file__).with_name('metal-clients.conf')):
     if os.geteuid()!=0:raise PermissionError('run as root to set root:wheel 0:0')
     root=root.resolve()
     if not (root/'System/Library').is_dir():raise ValueError('expected mounted iOS root')
     if not re.fullmatch(rb'[ \t\r\n]*[0-3][ \t\r\n]*',conf.read_bytes()) or conf.stat().st_size>31:
         raise ValueError('config must contain max stage 0..3')
+    validate_clients(clients)
     info=plistlib.loads((bundle/'Info.plist').read_bytes())
     if any(info.get(k)!=v for k,v in {'CFBundleExecutable':'FuxiMetal','NSPrincipalClass':'FuxiMTLDevice','CFBundleIdentifier':'org.fuxi.metal'}.items()):
         raise ValueError('unexpected plugin plist')
     macho(icd,6);macho(bundle/'FuxiMetal',6);macho(smoke,2)
     artifacts=[(icd,'usr/local/lib/libvulkan_freedreno.dylib',0o755),
-        (smoke,'usr/local/bin/fuxi-metal-smoke',0o755),(conf,'usr/local/share/fuxi/metal-smoke.conf',0o644)]
+        (smoke,'usr/local/bin/fuxi-metal-smoke',0o755),
+        (clients,'usr/local/share/fuxi/metal-clients.conf',0o644),(conf,'usr/local/share/fuxi/metal-smoke.conf',0o644)]
     for src in ('FuxiMetal','Info.plist','_CodeSignature/CodeResources'):
         source=bundle/src
         if not source.is_file() or source.is_symlink():raise ValueError('missing/linked bundle member')
@@ -64,4 +80,5 @@ if __name__=='__main__':
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('root',type=Path);ap.add_argument('icd',type=Path);ap.add_argument('bundle',type=Path);ap.add_argument('smoke',type=Path)
     ap.add_argument('--conf',type=Path,default=Path(__file__).with_name('metal-smoke.conf'))
-    a=ap.parse_args();stage(a.root,a.icd,a.bundle,a.smoke,a.conf)
+    ap.add_argument('--clients',type=Path,default=Path(__file__).with_name('metal-clients.conf'))
+    a=ap.parse_args();stage(a.root,a.icd,a.bundle,a.smoke,a.conf,a.clients)

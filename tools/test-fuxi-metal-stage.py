@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate M4 staging on a temporary root with real signed artifacts."""
+"""Validate Metal staging on a temporary root with real signed artifacts."""
 import argparse
 import importlib.util
 from pathlib import Path
@@ -16,11 +16,12 @@ def main():
         d=Path(tmp);root=d/'root';(root/'System/Library').mkdir(parents=True)
         icd=a.out/'libvulkan_freedreno.dylib';bundle=a.out/'FuxiMetal.bundle';smoke=a.out/'fuxi-metal-smoke'
         conf=d/'conf';conf.write_bytes(b'3\n')
-        def stage():m.stage(root,icd,bundle,smoke,conf)
+        clients=d/'clients';clients.write_bytes(b'fuxi-metal-smoke\ncensus backboardd\n')
+        def stage():m.stage(root,icd,bundle,smoke,conf,clients)
         with patch.object(m.os,'geteuid',return_value=0),patch.object(m.os,'chown') as chown:
             stage();stage()
             for src,rel,mode in ((icd,'usr/local/lib/libvulkan_freedreno.dylib',0o755),(smoke,'usr/local/bin/fuxi-metal-smoke',0o755),
-                (conf,'usr/local/share/fuxi/metal-smoke.conf',0o644),(bundle/'FuxiMetal','System/Library/Extensions/FuxiMetal.bundle/FuxiMetal',0o755),
+                (conf,'usr/local/share/fuxi/metal-smoke.conf',0o644),(clients,'usr/local/share/fuxi/metal-clients.conf',0o644),(bundle/'FuxiMetal','System/Library/Extensions/FuxiMetal.bundle/FuxiMetal',0o755),
                 (bundle/'Info.plist','System/Library/Extensions/FuxiMetal.bundle/Info.plist',0o644),
                 (bundle/'_CodeSignature/CodeResources','System/Library/Extensions/FuxiMetal.bundle/_CodeSignature/CodeResources',0o644)):
                 p=root/rel;assert p.read_bytes()==src.read_bytes() and p.stat().st_mode&0o777==mode
@@ -30,6 +31,11 @@ def main():
                 try:stage();raise AssertionError('bad config accepted')
                 except ValueError:pass
             conf.write_bytes(b'3\n')
+            for raw in (b'x\0',b'census x y',b'census backboardd\nbackboardd',b'x'*8193,b'../bad'):
+                clients.write_bytes(raw)
+                try:stage();raise AssertionError('bad clients accepted')
+                except ValueError:pass
+            clients.write_bytes(b'fuxi-metal-smoke\n')
             target=root/'usr/local/bin/fuxi-metal-smoke';target.unlink();target.symlink_to(d/'escape')
             try:stage();raise AssertionError('escaping symlink accepted')
             except ValueError:pass

@@ -17,6 +17,7 @@ cp tools/fuxi-metal/Info.plist "$bundle/Info.plist"
  -install_name /System/Library/Extensions/FuxiMetal.bundle/FuxiMetal \
  -framework Foundation -framework Metal -o "$bundle/FuxiMetal"
 "$cc" "${flags[@]}" tools/fuxi-metal-smoke.m -framework Foundation -framework Metal -o "$out/fuxi-metal-smoke"
+cp tools/metal-clients.conf "$out/metal-clients.conf"
 cp tools/metal-smoke.conf "$out/metal-smoke.conf"
 for binary in "$bundle" "$out/fuxi-metal-smoke"; do
  codesign -f -s - "$binary"
@@ -24,5 +25,5 @@ for binary in "$bundle" "$out/fuxi-metal-smoke"; do
 done
 python3 tools/audit-fuxi-metal.py "$bundle/FuxiMetal" "$out/fuxi-metal-smoke"
 shasum -a 256 "$bundle/FuxiMetal" "$bundle/Info.plist" "$bundle/_CodeSignature/CodeResources" \
- "$out/fuxi-metal-smoke" "$out/metal-smoke.conf" > "$out/M4-SHA256SUMS"
-cat "$out/M4-SHA256SUMS"
+ "$out/fuxi-metal-smoke" "$out/metal-smoke.conf" "$out/metal-clients.conf" > "$out/M5a-SHA256SUMS"
+cat "$out/M5a-SHA256SUMS"
