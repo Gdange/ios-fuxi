@@ -1,3 +1,150 @@
+# Metal lane, milestone 2a: route the existing raw test and observe it
+
+2026-10-20, branch `codex-metal2`, base `b978770` (0098i integration plus
+Wi-Fi M3/M4). Native build and all ten host test scripts pass. **This image has
+not been booted by this lane.** The coordinator reports that 0098i reached
+GPU stage 16 PASS, valid PERF temperatures and iOS userland, but never exec'd
+the staged raw test. Stage 16 is not a userspace ABI test result.
+
+## Patch 0100 and repeat handling
+
+Apply `0100-sweet-execswap-gpu-abi-trace.patch` after 0099 (and 0095/0098).
+0098 is unchanged; `sync-fuxi-metal2.py` maintains the canonical helper and
+client delta. `sync-fuxi-adreno-shared.py --check` checks both generations.
+The only Mac tree used was `ci-lane-metal2`, created with the requested APFS
+clone of `ci-integ98`; 0099 and 0100 applied without fuzz. All 32 affected
+native source files match a clean 0098i + 0099 + 0100 result, including the
+m7c/m7d governor and default-off Wi-Fi sources. Logs/manifests are under
+`xnu/out-fuxi-metal2a`. No phone/root-image access, push or binary rebuild.
+
+`sweetexecswap=<name>:<absolute path>` substitutes the original executable
+pathname after copyin and before namei, permissions, activation and signing.
+It accepts one basename (1..31 bytes) and one non-root absolute target within
+a 192-byte buffer; rejects truncation, lists, whitespace and extra colons.
+Initialization and the eight-line boot log quota use a mutex. Without the
+boot argument it changes no executable path. argv/env keep their original
+userspace segment. A private unused image flag (0x10000) carries substitution
+through activation, suppressing the late sweetnoexec check for this exec.
+If the original name is also blocked, the routing line gains
+` (wins over sweetnoexec)`. Other sweetnoexec entries retain their behavior.
+No fallback to the original daemon occurs if the replacement fails.
+
+The current signed test stays byte-identical (SHA below). For exactly
+`bluetoothd:/usr/local/bin/fuxi-gpu-abi-test`, opens of type 0x4147 by the test
+process (its actual exec basename, as exposed through truncated p_comm) are
+marked diagnostic. After successful WaitFence, the kernel reads that client's
+64 KiB BO at IOVA 0x20000000: word at +0x1000 must be 0xa740cafe, and every one
+of 256 BGRA pixels at +0x2000 must be 0xff336699. It counts at most one verified
+round per connection. Two successful rounds allow the existing binary's
+close/reopen sequence, then refuse later diagnostic opens with kIOReturnBusy.
+Other clients/types and boots without that exact swap configuration have no
+round quota. This is a diagnostic signature check, not proof that stdout said
+PASS or that a Metal/Vulkan client works. Later respawns exit quickly with the
+existing binary's open-failure exit status; the kernel explains the refusal.
+
+A single boot-wide budget of 64 `FUXI ABI:` lines covers open, query, device
+info, alloc, GPU/CPU map, submit, wait, result, cleanup and refusal, including
+pid and IOReturn. It works with bluetoothd's inherited stdout even if /dev/null.
+The original independent 100 ms GPU watchdog and quarantine remain intact.
+
+## launchd finding and future root edit
+
+Inspected only the supplied `launchd.bin` (SHA256
+`12370e5ee35bf28ae479b6c4b4455f4f4693ab803e37c5eb3032537c18cac61c`), using
+strings, embedded configuration parsing and arm64 disassembly. Addresses below
+are unslid and specific to this binary; Apple analysis outputs remain ignored.
+
+* Embedded `Bootstrap.Paths` enumerates `/System/Library/LaunchDaemons`,
+  LaunchAngels, AppleInternal, Nano and DeveloperMode directories. It omits
+  `/Library/LaunchDaemons`. `SystemRoots` likewise omits `/Library`.
+* At 0x100019c08..0x100019c40, `LaunchDaemons` is accepted as an XPC dictionary;
+  0x100019f68..0x100019fc8 installs its entries into the cache. Merely adding
+  a key is not itself a bootstrap request.
+* The directory loader at 0x100019638..0x1000196f8 checks the configured path
+  arrays and enumerates cached entries under the requested directory. Its
+  callback at 0x100019e0c..0x100019e64 tests the entry's prefix before creating
+  the load object. The prefix helper at 0x100016210 uses strlen/strncmp.
+  Thus the old `/Library/LaunchDaemons/...` key is outside the default boot
+  directory selection. This explains the observed absence of any exec attempt;
+  confirmation of the corrected job still requires the next root edit/boot.
+* ProgramArguments-only jobs are accepted (including embedded boot jobs).
+  The supplied job has no `_LimitLoadTo*` restrictions. There is no evidence
+  here that missing POSIXSpawnType or a mandatory Program key caused this skip.
+
+`stage-fuxi-gpu-abi-test.py` now writes both the file and cache key at
+`/System/Library/LaunchDaemons/org.fuxi.gpu-abi-test.plist`, explicitly sets
+Program as well as ProgramArguments, and migrates/removes the legacy key/file.
+It preserves unrelated jobs and validates the input before migration.
+**This fix is committed for the next offline root edit; it was not staged.**
+
+## Build, artifacts and expected device evidence
+
+`build-fuxi-metal2-images.sh BASE_0098I_ARTIFACT_DIR` uses the same mkpayload
+and loader/boot-v4 packing as 0098i, with its exact external GMU/SQE/zap blobs.
+The ADT is byte-identical. The 463-byte command line is precisely 0098i's line
+with `bluetoothd,` removed from sweetnoexec and
+` sweetexecswap=bluetoothd:/usr/local/bin/fuxi-gpu-abi-test` appended.
+`fuxigpuabi=1` stays on; `fuxiwlan` is absent/off, with patch 0099 still linked.
+The build requires the same private toolchain/firmware environment as 0098i.
+
+All host scripts passed: adreno-cache, adreno-mapping, adreno, gpu-probe,
+memory, metal, metal2, perf, scm (including final native instruction audit),
+and metal-artifacts (including firmware, raw signed Mach-O, geometry, symbols,
+recovery table, exact command line/ADT and hashes). New ASan/UBSan tests compile
+the actual parser/exec helper and result/mount/trace methods, checking parse
+once, default-off, overlap logging, eight/64-line limits, failed pixels, two
+rounds, repeat refusal, unrelated clients and stage migration/removal.
+These are host checks, not device qualification.
+
+Expected success sequence (N is the test PID, unchanged across its reopen):
+
+```text
+SWEET EXECSWAP: bluetoothd -> /usr/local/bin/fuxi-gpu-abi-test pid N
+exec fuxi-gpu-abi-test
+FUXI ABI: open pid N rc 0x00000000
+FUXI ABI: query pid N rc 0x00000000
+FUXI ABI: device-info pid N rc 0x00000000
+FUXI ABI: alloc pid N rc 0x00000000
+FUXI ABI: map pid N rc 0x00000000
+FUXI ABI: cpu-token pid N rc 0x00000000
+FUXI ABI: cpu-map pid N rc 0x00000000
+FUXI ABI: submit pid N rc 0x00000000
+FUXI ABI: wait pid N rc 0x00000000
+FUXI ABI: result pid N rc 0x00000000 mem 0xa740cafe bad-pixels 0 rounds 1/2
+FUXI ABI: cpu-unmap pid N rc 0x00000000
+FUXI ABI: free pid N rc 0x00000000
+FUXI ABI: close pid N rc 0x00000000
+```
+
+Then open/alloc/map/cpu-token/cpu-map/submit/wait/result/cleanup repeat, with
+`rounds 2/2` (no second query/device-info in the current binary). A later
+bluetoothd respawn, with a new PID M, should log the routing and exec again,
+then:
+
+```text
+FUXI ABI: open refused pid M rc 0xe00002d5 already passed 2/2 rounds this boot
+FUXI ABI: open pid M rc 0xe00002d5
+```
+
+Routing stops logging after eight substitutions; ABI tracing stops after 64
+lines. Any nonzero step rc, nonzero bad-pixels, missing second round, watchdog
+or fault must be retained as failure evidence. Do not infer a PASS from exec
+or service publication alone.
+
+| Artifact | SHA256 |
+| --- | --- |
+| `xnu/out-fuxi-metal2a/kernel.development.fuxi` | `247d669f7aa563e7bd03435e4d0268a3e557728b54146a6ae5f23141ec2781a1` |
+| `xnu/out-fuxi-metal2a/kernel.development.fuxi.unstripped` | `71c87cfe4170c4ae5cc7ce3b20d77146cec4d15087c0086c709bc5bec886764d` |
+| `xnu/out-fuxi-metal2a/fuxi.adt` | `39aacea4d7db372314bdc7928a66271b3b5cc2bd878bec4d9cfe2f5191e83533` |
+| `shim/out/fuxi-metal2a-payload.bin` | `f281445725dfcc30a36194c071418e0155e504432378847710b4ee4f4e383dfb` |
+| `shim/out/fuxi-metal2a-boot.img` | `b8c441ee639f0b2d125398d6748296d38625bac22262a9ca05faa439f6942056` |
+| `shim/out/fuxi-metal2a-loader.elf` | `8385bb46c6346fa31788b48751e38ba9c2bcbe8fd70979a3fa06ceac4b9f6e25` |
+| `tools/out/fuxi-gpu-abi-test` (unchanged) | `fc04e8157061a21d6f713197625010006e28b77b56c01cddf1d38ffd5cd85ae1` |
+
+The complete artifact manifest is `xnu/out-fuxi-metal2a/SHA256SUMS`.
+
+---
+
 # Metal lane, milestone 1: NativeAdreno userspace ABI
 
 2026-10-20, branch `codex-metal1`, based on `fuxi-bringup` `8dae9f4`.

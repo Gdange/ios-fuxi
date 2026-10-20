@@ -56,7 +56,8 @@ def main():
         for name in SHARED:
             folder = 'xnu/fuxi-adreno' if name.startswith('fuxi_') else 'shim/fuxi-probe'
             assert added_file(name) == (ROOT/folder/name).read_text(), f'{name} differs after 0098'
-        print('PASS: 0096 + 0098 driver/shared sources match canonical files')
+        subprocess.run(['python3', str(ROOT/'tools/sync-fuxi-metal2.py'), '--check'], check=True)
+        print('PASS: 0096 + 0098 + 0100 driver/shared sources match canonical files')
         return
     original, parts = patch_files()
     for name in SHARED:

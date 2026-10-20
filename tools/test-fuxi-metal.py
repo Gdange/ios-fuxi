@@ -252,12 +252,15 @@ def main():
         conf=tree/'iokit/conf/files.arm64';conf.parent.mkdir(parents=True,exist_ok=True)
         conf.write_text(sync.CONFIG_BASE)
         subprocess.run(['patch','-s','-p1','--fuzz=0','-i', str(ROOT/'xnu/patches/0098-fuxi-native-adreno-abi.patch')],cwd=tree,check=True)
+        delta=(ROOT/'xnu/patches/0100-sweet-execswap-gpu-abi-trace.patch').read_text()
+        delta=delta[delta.index('--- a/bsd/kern/sweet_execswap.h'):]
+        subprocess.run(['patch','-s','-p1','--fuzz=0'],input=delta,text=True,cwd=tree,check=True)
         for path, name in sync.FILES.items():
             assert (tree/path).read_bytes()==(HEADERS/name).read_bytes(),path
         for name in ('gpu.c','fuxi_adreno.c','fuxi_adreno.h'):
             folder=HEADERS if name.startswith('fuxi_') else ROOT/'shim/fuxi-probe'
             assert (tree/'bsd/dev'/name).read_bytes()==(folder/name).read_bytes(),name
-        print('PASS: clean 0098 patch application and canonical source bytes')
+        print('PASS: clean 0098 + 0100 ABI/helper patch application and canonical source bytes')
 
 
 if __name__ == '__main__':

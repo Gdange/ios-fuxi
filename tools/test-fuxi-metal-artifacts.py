@@ -20,6 +20,7 @@ def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--base', type=Path, required=True)
     ap.add_argument('--out', type=Path, default=Path('xnu/out-fuxi-metal1'))
+    ap.add_argument('--lane', choices=('metal1','metal2a'), default='metal1')
     ap.add_argument('--nm', default='llvm-nm-18')
     ap.add_argument('--firmware', type=Path)
     ap.add_argument('--sqe', type=Path)
@@ -42,11 +43,17 @@ def main():
     begin=symbols['_fuxi_gpu_access_begin'];stop=symbols['_fuxi_gpu_access_end']
     assert sum(a>=begin and b==stop and c>stop for a,b,c in entries)==2
     print('PASS: native ABI/service symbols, no built-in IOAcceleratorES/IOGPUFamily, linked MMIO recovery')
-    payload=Path('shim/out/fuxi-metal1-payload.bin').read_bytes()
-    image=Path('shim/out/fuxi-metal1-boot.img').read_bytes()
+    payload=Path(f'shim/out/fuxi-{args.lane}-payload.bin').read_bytes()
+    image=Path(f'shim/out/fuxi-{args.lane}-boot.img').read_bytes()
     assert payload[:8]==b'SWEETXNU'
     cmdline=payload[72:680].split(b'\0')[0]
-    assert cmdline==args.base.joinpath('cmdline.txt').read_bytes().strip()+b' fuxigpuabi=1'
+    basecmd=args.base.joinpath('cmdline.txt').read_bytes().strip()
+    if args.lane=='metal2a':
+        expected=basecmd.replace(b'sweetnoexec=bluetoothd,',b'sweetnoexec=')+b' sweetexecswap=bluetoothd:/usr/local/bin/fuxi-gpu-abi-test'
+        assert b'fuxigpuabi=1' in expected.split() and not any(a.startswith(b'fuxiwlan=') for a in expected.split())
+        assert '_fuxi_wlan_init' in symbols and b'SWEET EXECSWAP:' in raw and b'FUXI ABI: result' in raw
+    else: expected=basecmd+b' fuxigpuabi=1'
+    assert cmdline==expected and len(cmdline)<608
     vb,entry,ao,an,ke,pb,ms=struct.unpack_from('<7Q',payload,16)
     assert (pb,ms)==(0x8c0000000,0x13e000000) and ke-vb<=ms-32768
     tree_bytes=payload[ao:ao+an]
@@ -58,7 +65,7 @@ def main():
     size=struct.unpack_from('<I',image,8)[0];arm=image[4096:4096+size]
     assert arm[56:60]==b'ARM\x64' and struct.unpack_from('<Q',arm,16)[0]==len(arm)
     assert arm.count(payload)==1
-    print('PASS: boot-v4/Image/payload geometry, full RAM bounds, exact 0097b ADT and cmdline + fuxigpuabi=1')
+    print('PASS: boot-v4/Image/payload geometry, full RAM bounds, unchanged base ADT and exact lane cmdline')
     tool=Path('tools/out/fuxi-gpu-abi-test').read_bytes()
     magic,cpu,sub,_,count=struct.unpack_from('<5I',tool)
     assert (magic,cpu,sub)==(0xfeedfacf,0x100000c,0)
@@ -75,7 +82,7 @@ def main():
     firmware=[args.firmware,args.sqe,args.zap]
     if any(firmware):
         assert all(firmware),'provide all three firmware inputs'
-        loader=Path('shim/out/fuxi-metal1-loader.elf').read_bytes()
+        loader=Path(f'shim/out/fuxi-{args.lane}-loader.elf').read_bytes()
         for path in firmware: assert loader.count(path.read_bytes())==1,path.name
         print('PASS: exact external GMU/SQE/zap blobs appear once in loader ELF')
     for line in args.out.joinpath('SHA256SUMS').read_text().splitlines():

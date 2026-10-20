@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Generate/check the 0098 NativeAdreno patch; 0096 remains standalone.
 
-0096 remains the baseline. 0098 contains the delta to canonical driver/shared
+0096 remains the baseline. The published 0098 client snapshot stays frozen;
+0100 contains its tracing/guard delta, checked by sync-fuxi-metal2.py.
+0098 contains the delta to canonical driver/shared
 sources plus ABI files and IOKit registration; 0097 is orthogonal.
 """
 import argparse
@@ -31,6 +33,14 @@ def baseline(name):
 CONFIG_BASE = '\n'*13 + 'iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp\niokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp\niokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp\niokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp\niokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp\niokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp\niokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp\n'
 
 
+def metal1_client():
+    patch = (ROOT/'xnu/patches/0098-fuxi-native-adreno-abi.patch').read_text()
+    block = next(p for p in re.split(r'(?=^--- a/)', patch, flags=re.M)
+                 if p.startswith('--- a/iokit/Kernel/arm/FuxiAdrenoUserClient.cpp\n'))
+    return ''.join(line[1:] for line in block.splitlines(True)
+                   if line.startswith('+') and not line.startswith('+++'))
+
+
 def content():
     line = 'iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp\n'
     changed = CONFIG_BASE.replace(line, line+'iokit/Kernel/arm/FuxiAdrenoUserClient.cpp                         optional iokitcpp\n')
@@ -41,7 +51,7 @@ def content():
         patch += ''.join(difflib.unified_diff(baseline(name).splitlines(True),
             (folder/name).read_text().splitlines(True), fromfile=f'a/bsd/dev/{name}', tofile=f'b/bsd/dev/{name}'))
     for target, source in FILES.items():
-        patch += ''.join(difflib.unified_diff([], (BASE/source).read_text().splitlines(True),
+        patch += ''.join(difflib.unified_diff([], (metal1_client() if source == 'FuxiAdrenoUserClient.cpp' else (BASE/source).read_text()).splitlines(True),
             fromfile=f'a/{target}', tofile=f'b/{target}'))
     return patch
 

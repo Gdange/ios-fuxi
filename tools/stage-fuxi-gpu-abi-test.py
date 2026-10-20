@@ -13,12 +13,13 @@ import shutil
 import struct
 
 LABEL = 'org.fuxi.gpu-abi-test'
-JOB = f'/Library/LaunchDaemons/{LABEL}.plist'
+LEGACY_JOB = f'/Library/LaunchDaemons/{LABEL}.plist'
+JOB = f'/System/Library/LaunchDaemons/{LABEL}.plist'
 BINARY = '/usr/local/bin/fuxi-gpu-abi-test'
 
 
 def job(watchdog=False):
-    return dict(Label=LABEL, ProgramArguments=[BINARY]+(['--watchdog'] if watchdog else []),
+    return dict(Label=LABEL, Program=BINARY, ProgramArguments=[BINARY]+(['--watchdog'] if watchdog else []),
                 UserName='root', RunAtLoad=True, KeepAlive=False,
                 ProcessType='Background', StandardOutPath='/dev/console',
                 StandardErrorPath='/dev/console')
@@ -31,13 +32,18 @@ def stage(root, binary=None, watchdog=False, remove=False):
     assert isinstance(jobs, dict)
     target = root/BINARY.lstrip('/')
     plist = root/JOB.lstrip('/')
+    if not remove:
+        assert binary and binary.is_file(), 'supply the signed iOS test binary'
+        assert struct.unpack('<3I', binary.read_bytes()[:12]) == (0xfeedfacf, 0x100000c, 0), 'arm64 Mach-O required'
+    # iOS bootstrap enumerates only configured system daemon directories.
+    # Migrate the old cache key/file so future root edits cannot duplicate it.
+    jobs.pop(LEGACY_JOB, None)
+    (root/LEGACY_JOB.lstrip('/')).unlink(missing_ok=True)
     if remove:
         jobs.pop(JOB, None)
         target.unlink(missing_ok=True)
         plist.unlink(missing_ok=True)
     else:
-        assert binary and binary.is_file(), 'supply the signed iOS test binary'
-        assert struct.unpack('<3I', binary.read_bytes()[:12]) == (0xfeedfacf, 0x100000c, 0), 'arm64 Mach-O required'
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(binary, target)
         os.chmod(target, 0o755)
