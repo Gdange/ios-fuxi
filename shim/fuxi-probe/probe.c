@@ -416,6 +416,8 @@ static void ts_gpio(unsigned n, unsigned func, unsigned pull, unsigned ma, int o
 /* Lane-audio (milestone 1): snapshot, firmware staging and ADSP PAS boot on
  * requests 0x5a/0x5b; see audio.c and docs-lanes/audio.md. */
 #include "audio.c"
+/* Lane-wlan: read-only WCN7850/PCIe0/BT-UART snapshot on request 0x5c (wlan.c). */
+#include "wlan.c"
 
 /* SE4 and wrapper registers hang the bus (SoC reset) while wrapper1's AHB
  * clocks are gated: touch them only with m_ahb running (s_ahb is under
@@ -1227,6 +1229,13 @@ ud_setup(void)
         } else if ((index >= 1 && index <= 16) || index == G_STAGE_8A) {
             gpu_probe(index);
             memcpy(data, gpu_report, sizeof(gpu_report)); n=sizeof(gpu_report);
+        } else ok = false;
+    } else if (type == 0xc0 && req == 0x5c && value == 0x574c && !monitor_report[MON_LAUNCH]) {
+        /* 'WL': index 1 = read-only snapshot, 0x100 = re-read last report. */
+        unsigned index = st[4] | (unsigned)st[5] << 8;
+        if (index == 1) wlan_snapshot();
+        if (index == 1 || index == 0x100) {
+            memcpy(data, wlan_report, sizeof(wlan_report)); n=sizeof(wlan_report);
         } else ok = false;
     } else if (type == 0xc0 && req == 0x54 && value >= 1 && value <= 60) {
         /* Host-requested reset deadline: now + value minutes (bounded, never disabled). */
