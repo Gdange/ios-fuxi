@@ -152,8 +152,65 @@ def decode_m3(r):
     return '\n'.join(o)
 
 
+MHI_STATE = ['RESET', 'READY', 'M0', 'M1', 'M2', 'M3', 'M3_FAST', 'BHI']
+MHI_EE = ['PBL', 'SBL', 'AMSS', 'RDDM', 'WFW', 'PTHRU', 'EDL', 'FP']
+M4_STEPS = {14: 'iATU1 MEM + root-port window', 15: 'endpoint BAR0 assignment',
+            16: 'MHI/BHI register read'}
+
+
+def decode_m4(r):
+    """XNU milestone-4 report (bsd/dev/fuxi_wlan.c wl4_report)."""
+    o = [f'magic={r[0]:#x} limit={r[1]} last_step={r[2]} result={r[3]:#x}']
+    for s in range(1, 17):
+        c = r[40 + s]
+        if c:
+            name = M4_STEPS.get(s, 'M3 step (see m3 decode)')
+            o.append(f'  step {s:2} {"OK  " if c == 0x1000 | s else f"FAIL reason {c & 0xff}"} {name}')
+    if r[4] or r[8]:
+        o.append(f'  iATU1 ctrl2={r[4]:#x} base={r[5]:#x} limit={r[6]:#x} target={r[7]:#x}  '
+                 f'RC mem window={r[8]:#x} pref={r[9]:#x} cmd/status={r[10]:#x}')
+    if r[11]:
+        o.append(f'  BAR0 sizing readback={r[11]:#x} size={r[12]:#x} assigned={r[15] << 32 | (r[14] & ~0xf):#x} '
+                 f'EP cmd/status {r[13]:#x} -> {r[16]:#x}')
+    if any(r[20:30]):
+        cfg, ctrl, st = r[22], r[28], r[29]
+        o.append(f'  MHI REGLEN={r[20]:#x} MHIVER={r[21]:#x} MHICFG={cfg:#x} (nhwer {cfg >> 24} ner {(cfg >> 16) & 255} '
+                 f'nhwch {(cfg >> 8) & 255} nch {cfg & 255})')
+        o.append(f'  CHDBOFF={r[23]:#x} ERDBOFF={r[24]:#x} BHIOFF={r[25]:#x} BHIEOFF={r[26]:#x} DEBUGOFF={r[27]:#x}')
+        s = (st >> 8) & 255
+        o.append(f'  MHICTRL={ctrl:#x} MHISTATUS={st:#x} state={MHI_STATE[s] if s < 8 else ("SYS_ERR" if s == 255 else s)} '
+                 f'ready={st & 1} syserr={(st >> 2) & 1}')
+    if any(r[30:38]):
+        ee = r[32]
+        o.append(f'  BHI version {r[31]}.{r[30]} EXECENV={ee:#x} ({MHI_EE[ee] if ee < 8 else "?"}) STATUS={r[33]:#x} '
+                 f'ERRCODE={r[34]:#x} ERRDBG={r[35]:#x} {r[36]:#x} {r[37]:#x}')
+    if r[38]:
+        o.append(f'  after: RC cmd/status={r[38]:#x} EP cmd/status={r[39]:#x}')
+    return '\n'.join(o)
+
+
+def from_xnu_log(path):
+    """Rebuild the m3/m4 reports from 'FUXI WLAN: m3 r[  8] ...' console lines."""
+    reports = {'m3': [0] * 128, 'm4': [0] * 64}
+    seen = set()
+    for line in path.read_text(errors='replace').splitlines():
+        at = line.find('FUXI WLAN: ')
+        if at < 0:
+            continue
+        f = line[at + 11:].replace('r[', ' ').replace(']', ' ').split()
+        if len(f) == 10 and f[0] in reports:
+            base = int(f[1])
+            for j, w in enumerate(f[2:]):
+                if base + j < len(reports[f[0]]):
+                    reports[f[0]][base + j] = int(w, 16)
+            seen.add(f[0])
+    return reports, seen
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--xnu-log', type=Path,
+                    help='decode the FUXI WLAN m3/m4 dump lines of an XNU console log (fuxiwlan=1)')
     ap.add_argument('--m3', type=int, metavar='LIMIT', choices=range(1, 14),
                     help='run gated M3 steps 1..LIMIT (writes hardware; see docs-lanes/wlan-bt.md)')
     ap.add_argument('--m3-report', action='store_true', help='re-read the M3 report')
@@ -162,6 +219,15 @@ def main():
     ap.add_argument('--save', type=Path)
     ap.add_argument('--decode', type=Path)
     args = ap.parse_args()
+    if args.xnu_log:
+        reports, seen = from_xnu_log(args.xnu_log)
+        if not seen:
+            raise SystemExit('no "FUXI WLAN: m3/m4 r[...]" lines found')
+        if 'm3' in seen:
+            print(decode_m3(reports['m3']))
+        if 'm4' in seen:
+            print(decode_m4(reports['m4']))
+        return 0
     if args.decode:
         blob = args.decode.read_bytes()
     else:

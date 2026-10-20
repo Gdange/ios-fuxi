@@ -1,0 +1,1097 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@
+ bsd/dev/fuxi_adreno.c			standard
+ bsd/dev/fuxi_perf.c			standard
+ bsd/dev/fuxi_keys.c			standard
++bsd/dev/fuxi_wlan.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,6 +54,7 @@
+ extern void sweet_touch_init(void);
+ extern void fuxi_touch_init(void);
+ extern void fuxi_keys_init(void);
++extern void fuxi_wlan_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -858,6 +859,8 @@
+ 	fuxi_touch_init();
+ 	/* Power / volume keys (bsd/dev/fuxi_keys.c, SPMI arbiter v7). */
+ 	fuxi_keys_init();
++	/* WCN7850 PCIe0/MHI probe, boot-arg fuxiwlan (bsd/dev/fuxi_wlan.c). */
++	fuxi_wlan_init();
+ #else
+ 	sweet_log_start();
+ 	sweet_sample_start();
+--- a/bsd/dev/fuxi_wlan.c
++++ b/bsd/dev/fuxi_wlan.c
+@@ -0,0 +1,539 @@
++/*
++ * FUXI WLAN (lane-wlan milestone 4): WCN7850 power-up, PCIe0 link, BAR0
++ * assignment and a read-only MHI/BHI register dump from XNU.
++ * Gated by boot-arg fuxiwlan (default 0 = do nothing):
++ *   fuxiwlan=1      run all 16 steps
++ *   fuxiwlan=2..16  stop after that step (bisecting a hang or reset)
++ * No firmware is loaded, no MHI state change is requested, the endpoint's
++ * bus mastering stays off and no interrupt is enabled.
++ *
++ * Steps 1..13 are the loader's milestone-3 sequence, compiled from an exact
++ * copy of shim/fuxi-probe/wlan.c (bsd/dev/wlan.c, FUXI_WLAN_XNU). Every write
++ * there is documented against Linux and the live DT in that file and in
++ * docs-lanes/wlan-bt.md section 7; it passed on the phone (Gen2 x2 link,
++ * endpoint 17cb:1107, BAR0 64-bit non-prefetchable 2 MiB).
++ * This file supplies the loader helpers (usb_rd/ts_wr/ts_gpio/rh_send and
++ * the fault-contained accessors) over kernel mappings, then adds:
++ *  14  outbound iATU region 1, type MEM, for the live-DT ranges entry
++ *      <0x02000000 0 0x60300000 0 0x60300000 0 0x3d00000>
++ *      (dw_pcie_prog_outbound_atu; unrolled region n at ATU base + n*0x200);
++ *      root-port memory window 0x60400000-0x605fffff, empty prefetchable
++ *      window, command IO|MEM|MASTER|SERR (dw_pcie_setup_rc / pci bridge
++ *      window setup).
++ *  15  endpoint BAR0 = 0x60400000 (2 MiB aligned, inside the window),
++ *      BAR1 (upper half) = 0, command |= MEMORY only (no bus master).
++ *  16  read MHI registers at BAR0 (drivers/bus/mhi/common.h: MHIREGLEN 0x00,
++ *      MHIVER 0x08, MHICFG 0x10, CHDBOFF 0x18, ERDBOFF 0x20, BHIOFF 0x28,
++ *      BHIEOFF 0x2c, DEBUGOFF 0x30, MHICTRL 0x38, MHISTATUS 0x48) and the
++ *      BHI block at BHIOFF (BHIVERSION 0x00/0x04, EXECENV 0x28, STATUS 0x2c,
++ *      ERRCODE 0x30, ERRDBG1..3 0x34..0x3c). BHI_SERIALNU is never read.
++ *      ath12k (mhi.c) points mhi_ctrl->regs at BAR0, so the MHI block is at
++ *      offset 0.
++ * All device accesses go through fuxi_gpu_access (synchronous aborts are
++ * recovered); after the first fault every later write is refused.
++ */
++#if defined(FUXI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <string.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <vm/vm_kern.h>
++#include <vm/pmap.h>
++
++extern kern_return_t thread_terminate(thread_t);
++extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t,
++    uint64_t, vm_prot_t, vm_prot_t, unsigned, boolean_t, unsigned, void *);
++/* Fault-contained aligned access, osfmk/arm64/machine_routines_asm.s. */
++extern unsigned fuxi_gpu_access(uintptr_t, uint64_t *, unsigned, unsigned);
++void fuxi_wlan_init(void);
++
++#define rsr(r) ({ uint64_t rsr_v_; __asm__ volatile("mrs %0, " r : "=r"(rsr_v_)); rsr_v_; })
++#define delay fw_delay
++static void fw_delay(unsigned us) { delay_for_interval(us, NSEC_PER_USEC); }
++
++/* ---- kernel mappings (16 KiB aligned; same scheme as fuxi_adreno.c:
++ * kernel_map VA only, fallible page-table expansion, never the 8 MiB
++ * io_map submap). Kept for the boot: the endpoint stays decoded. */
++struct fw_window { uint64_t pa, size; uintptr_t va; };
++static struct fw_window fw_windows[] = {
++	{0x00100000, 0x80000, 0},   /* GCC: votes, GDSCs, PCIe0 RCGs/CBCRs/BCRs */
++	{0x00898000, 0x4000, 0},    /* QUP2 SE6 (BT UART), gated reads only */
++	{0x008c0000, 0x4000, 0},    /* QUP2 wrapper */
++	{0x01c00000, 0x8000, 0},    /* PCIe0 PARF 0x1c00000 + QMP PHY 0x1c06000 */
++	{0x01fd4000, 0x4000, 0},    /* TCSR clkref 0x1fd5100 */
++	{0x0f14c000, 0x18000, 0},   /* TLMM tiles gpio76..96 */
++	{0x17a20000, 0x4000, 0},    /* apps RSC DRV2 + TCS */
++	{0x60000000, 0x4000, 0},    /* PCIe0 DBI, ELBI 0xf20, iATU 0x1000 */
++	{0x60100000, 0x4000, 0},    /* config window (iATU region 0, CFG0) */
++	{0x60400000, 0x4000, 0},    /* endpoint BAR0, first 16 KiB (MHI/BHI) */
++	{0x81c60000, 0x20000, 0},   /* cmd-db (reserved DDR) */
++};
++#define FW_NWIN (sizeof(fw_windows) / sizeof(fw_windows[0]))
++static uint64_t fw_mapped_bytes;
++
++static kern_return_t
++fw_map_window(struct fw_window *w)
++{
++	vm_offset_t va = 0;
++	if (!w->size || (w->pa & PAGE_MASK) || (w->size & PAGE_MASK) || w->va) {
++		return KERN_INVALID_ARGUMENT;
++	}
++	kern_return_t kr = kmem_alloc(kernel_map, &va, w->size,
++	    KMA_VAONLY | KMA_KOBJECT | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT);
++	if (kr != KERN_SUCCESS) {
++		return kr;
++	}
++	for (vm_size_t off = 0; off < w->size; off += PAGE_SIZE) {
++		kr = pmap_enter_options_addr(kernel_pmap, va + off, w->pa + off,
++		    VM_PROT_READ | VM_PROT_WRITE, VM_PROT_NONE, VM_WIMG_IO, TRUE,
++		    PMAP_OPTIONS_NOWAIT, NULL);
++		if (kr != KERN_SUCCESS) {
++			pmap_remove(kernel_pmap, va, va + w->size);
++			kmem_free(kernel_map, va, w->size);
++			return kr;
++		}
++	}
++	w->va = va;
++	fw_mapped_bytes += w->size;
++	return KERN_SUCCESS;
++}
++
++/* ---- fault-contained 32-bit access by physical address ---- */
++static unsigned fw_faults, fw_unmapped, fw_refused, fw_logged;
++static uint32_t fw_fault_esr;
++static uint64_t fw_fault_far;
++
++static uintptr_t
++fw_va(uint64_t pa)
++{
++	for (unsigned i = 0; i < FW_NWIN; i++) {
++		struct fw_window *w = &fw_windows[i];
++		if (w->va && pa >= w->pa && pa - w->pa <= w->size - 4) {
++			return w->va + (uintptr_t)(pa - w->pa);
++		}
++	}
++	return 0;
++}
++
++static unsigned
++fw_access(uint64_t pa, uint64_t *v, unsigned wr)
++{
++	uintptr_t va = fw_va(pa);
++	if (!va || (pa & 3)) {
++		if (fw_unmapped++ < 4) {
++			printf("FUXI WLAN: no window for PA %#llx\n", pa);
++		}
++		fw_faults++;
++		return 1;
++	}
++	if (wr && fw_faults) {
++		if (fw_refused++ < 4) {
++			printf("FUXI WLAN: write PA %#llx refused after a fault\n", pa);
++		}
++		return 1;
++	}
++	unsigned bad = fuxi_gpu_access(va, v, wr, 0);
++	if (bad) {
++		fw_fault_esr = (uint32_t)rsr("esr_el1");
++		fw_fault_far = pa;
++		fw_faults++;
++		if (fw_logged++ < 8) {
++			printf("FUXI WLAN: access fault PA %#llx %s ESR %#x\n", pa,
++			    wr ? "write" : "read", fw_fault_esr);
++		}
++	}
++	return bad;
++}
++
++/* Loader-helper equivalents for bsd/dev/wlan.c. */
++#define probe_fault_esr fw_fault_esr
++#define probe_fault_far fw_fault_far
++#define TS_TLMM 0x0f100000UL
++#define RH_DRV_PA 0x17a20000UL
++#define RH_TCS_PA 0x17a20d00UL
++
++static uint32_t
++usb_rd(uintptr_t base, uint32_t off)
++{
++	uint64_t v = 0;
++	if (fw_access((uint64_t)base + off, &v, 0)) {
++		return 0xffffffffu;
++	}
++	return (uint32_t)v;
++}
++
++static void
++ts_wr(uintptr_t base, uint32_t off, uint32_t value)
++{
++	uint64_t v = value;
++	__asm__ volatile("dmb oshst" ::: "memory");
++	(void)fw_access((uint64_t)base + off, &v, 1);
++}
++
++static uint32_t
++fw_safe_rd32(uint64_t pa, uint32_t *faulted)
++{
++	uint64_t v = 0;
++	*faulted = fw_access(pa, &v, 0);
++	return (uint32_t)v;
++}
++
++static unsigned
++fw_safe_wr32(uint64_t pa, uint32_t value)
++{
++	uint64_t v = value;
++	return fw_access(pa, &v, 1);
++}
++#define probe_safe_rd32 fw_safe_rd32
++#define probe_safe_wr32 fw_safe_wr32
++
++/* TLMM CTL: pull [1:0], func [5:2], drive [8:6] = mA/2-1, OE [9]; as probe.c. */
++static void
++ts_gpio(unsigned n, unsigned func, unsigned pull, unsigned ma, int out)
++{
++	uintptr_t c = TS_TLMM + 0x1000u * n;
++	if (out >= 0) {
++		ts_wr(c, 4, out ? 2u : 0u);
++	}
++	ts_wr(c, 0, (usb_rd(c, 0) & ~0x3ffu) | pull | (func << 2) | ((ma / 2 - 1) << 6) |
++	    (out >= 0 ? 0x200u : 0u));
++}
++
++/* One write-with-response command in ACTIVE TCS t (RSC v3 layout,
++ * rpmh_rsc_reg_offset_ver_3_0); identical to probe.c rh_send. No other XNU
++ * code drives the fuxi apps RSC. 0 on proven completion; on timeout the TCS
++ * is left quarantined and wlan.c stops at that step. */
++#define RH_STRIDE 0x2a0u
++#define RH_WAIT   0x20u
++#define RH_CTRL   0x24u
++#define RH_IDLE   0x28u
++#define RH_EN     0x2cu
++#define RH_MSGID  0x34u
++#define RH_ADDR   0x38u
++#define RH_DATA   0x3cu
++#define RH_CSTAT  0x40u
++static uint32_t rh_rd(uint32_t off) { return usb_rd(RH_TCS_PA, off); }
++static void
++rh_wr(uint32_t off, uint32_t v)
++{
++	ts_wr(RH_TCS_PA, off, v);
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++static uint32_t
++rh_send(unsigned t, uint32_t addr, uint32_t data)
++{
++	uint32_t b = t * RH_STRIDE, bit = 1u << t;
++	if (rh_rd(b + RH_IDLE) == 0 || rh_rd(b + RH_CTRL) || rh_rd(b + RH_EN) ||
++	    rh_rd(b + RH_WAIT) || (rh_rd(4) & bit) || fw_faults) {
++		return 1;
++	}
++	uint32_t irq_en = rh_rd(0);
++	rh_wr(0, irq_en & ~bit);
++	rh_wr(b + RH_MSGID, 8u | (1u << 8) | (1u << 16));
++	rh_wr(b + RH_ADDR, addr);
++	rh_wr(b + RH_DATA, data);
++	rh_wr(b + RH_WAIT, 1);
++	rh_wr(b + RH_EN, 1);
++	rh_wr(b + RH_CTRL, 0);
++	rh_wr(b + RH_CTRL, 1u << 16);
++	rh_wr(b + RH_CTRL, (1u << 16) | (1u << 24));
++	uint32_t st = 0;
++	for (unsigned us = 0; us < 100000; us++) {
++		st = rh_rd(b + RH_CSTAT);
++		if (rh_rd(b + RH_IDLE) && (st & 0x10100) == 0x10100) {
++			break;
++		}
++		fw_delay(1);
++	}
++	if ((st & 0x10100) != 0x10100) {
++		return 2 | (st << 12);
++	}
++	rh_wr(b + RH_CTRL, 1u << 16);
++	rh_wr(b + RH_CTRL, 0);
++	rh_wr(b + RH_EN, 0);
++	rh_wr(b + RH_WAIT, 0);
++	rh_wr(8, bit);
++	rh_wr(0, (rh_rd(0) & ~bit) | (irq_en & bit));
++	return 0;
++}
++
++#define FUXI_WLAN_XNU 1
++#include "wlan.c"
++
++/* ---- milestone 4 ---- */
++#define WL4_MAGIC   0x574c0004u
++#define WL4_STEPS   16u
++#define WL_ATU1     0x60001200ull  /* unrolled outbound region 1 */
++#define WL_MEM_LO   0x60300000u    /* live DT ranges, 32-bit non-prefetchable */
++#define WL_MEM_HI   0x63ffffffu
++#define WL_BAR0     0x60400000u
++#define WL_BAR0_END 0x605fffffu
++#define WL_EPCFG    0x60100000ull
++static uint32_t wl4_report[64];
++
++static const char *
++wl_mhi_state(uint32_t s)
++{
++	static const char *n[8] = {"RESET", "READY", "M0", "M1", "M2", "M3", "M3_FAST", "BHI"};
++	return s < 8 ? n[s] : (s == 0xff ? "SYS_ERR" : "?");
++}
++
++static const char *
++wl_mhi_ee(uint32_t e)
++{
++	static const char *n[8] = {"PBL", "SBL", "AMSS", "RDDM", "WFW", "PTHRU", "EDL", "FP"};
++	return e < 8 ? n[e] : "?";
++}
++
++/* 0 on success or a nonzero reason. */
++static int
++wl4_step(unsigned step)
++{
++	uint32_t *r = wl4_report, *m3 = wl3_report;
++	switch (step) {
++	case 14: { /* MEM outbound + root-port window */
++		wl_pwr(WL_ATU1 + 0x08, WL_MEM_LO); wl_pwr(WL_ATU1 + 0x0c, 0);
++		wl_pwr(WL_ATU1 + 0x10, WL_MEM_HI); wl_pwr(WL_ATU1 + 0x20, 0);
++		wl_pwr(WL_ATU1 + 0x14, WL_MEM_LO); wl_pwr(WL_ATU1 + 0x18, 0);
++		wl_pwr(WL_ATU1 + 0x00, 0);         /* type MEM */
++		wl_pwr(WL_ATU1 + 0x04, 1u << 31);  /* enable */
++		unsigned i;
++		for (i = 0; i < 5; i++) {
++			if (wl_prd(WL_ATU1 + 0x04) & (1u << 31)) {
++				break;
++			}
++			delay(9000);
++		}
++		r[4] = wl_prd(WL_ATU1 + 0x04);
++		r[5] = wl_prd(WL_ATU1 + 0x08);
++		r[6] = wl_prd(WL_ATU1 + 0x10);
++		r[7] = wl_prd(WL_ATU1 + 0x14);
++		/* type-1 header: memory base/limit [15:4]/[31:20] = addr[31:20] */
++		wl_pwr(WL_DBI + 0x20, ((WL_BAR0_END >> 16) & 0xfff0u) << 16 | ((WL_BAR0 >> 16) & 0xfff0u));
++		wl_pwr(WL_DBI + 0x24, 0x0000fff0u); /* prefetchable window empty */
++		wl_pwr(WL_DBI + 0x28, 0);
++		wl_pwr(WL_DBI + 0x2c, 0);
++		wl_pwr(WL_DBI + 0x04, (wl_prd(WL_DBI + 0x04) & 0xffffu) | 0x107u);
++		r[8] = wl_prd(WL_DBI + 0x20);
++		r[9] = wl_prd(WL_DBI + 0x24);
++		r[10] = wl_prd(WL_DBI + 0x04);
++		printf("FUXI WLAN: iATU1 MEM %#x-%#x -> %#x ctrl2 %#x; RC window %#x pref %#x cmd/status %#x\n",
++		    r[5], r[6], r[7], r[4], r[8], r[9], r[10]);
++		if (wl3_faults) {
++			return 1;
++		}
++		if (!(r[4] & (1u << 31)) || r[5] != WL_MEM_LO || r[6] != WL_MEM_HI) {
++			return 2;
++		}
++		return (r[10] & 6u) == 6u ? 0 : 3;
++	}
++	case 15: { /* BAR0 assignment */
++		uint32_t rb = m3[87], size = ~(rb & ~0xfu) + 1u;
++		r[11] = rb;
++		r[12] = size;
++		/* step 13 must have found a 64-bit non-prefetchable memory BAR0 of
++		 * at most 2 MiB with an all-ones upper half (sizes below 4 GiB). */
++		if ((rb & 0xfu) != 0x4u || !size || size > 0x200000u || (size & (size - 1)) ||
++		    m3[88] != 0xffffffffu) {
++			printf("FUXI WLAN: BAR0 readback %#x/%#x unexpected; not assigning\n", rb, m3[88]);
++			return 1;
++		}
++		uint32_t cmd = wl_prd(WL_EPCFG + 0x04);
++		r[13] = cmd;
++		wl_pwr(WL_EPCFG + 0x04, cmd & 0xffffu & ~7u);   /* decode off while moving */
++		wl_pwr(WL_EPCFG + 0x10, WL_BAR0);
++		wl_pwr(WL_EPCFG + 0x14, 0);
++		r[14] = wl_prd(WL_EPCFG + 0x10);
++		r[15] = wl_prd(WL_EPCFG + 0x14);
++		wl_pwr(WL_EPCFG + 0x04, (cmd & 0xffffu & ~7u) | 2u); /* MEMORY only */
++		r[16] = wl_prd(WL_EPCFG + 0x04);
++		printf("FUXI WLAN: BAR0 size %#x assigned %#llx (readback %#x %#x) cmd/status %#x -> %#x\n",
++		    size, (uint64_t)r[15] << 32 | (r[14] & ~0xfu), r[14], r[15], cmd, r[16]);
++		if (wl3_faults) {
++			return 2;
++		}
++		if ((r[14] & ~0xfu) != WL_BAR0 || r[15] != 0) {
++			return 3;
++		}
++		return (r[16] & 7u) == 2u ? 0 : 4;
++	}
++	case 16: { /* MHI + BHI, read-only */
++		static const uint16_t mo[10] = {0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x2c, 0x30, 0x38, 0x48};
++		static const uint16_t bo[8] = {0x00, 0x04, 0x28, 0x2c, 0x30, 0x34, 0x38, 0x3c};
++		for (unsigned i = 0; i < 10; i++) {
++			r[20 + i] = wl_prd((uint64_t)WL_BAR0 + mo[i]);
++		}
++		if (wl3_faults) {
++			return 1;
++		}
++		uint32_t cfg = r[22], st = r[29], ctrl = r[28], bhi = r[25];
++		printf("FUXI WLAN: MHI REGLEN %#x MHIVER %#x MHICFG %#x (nhwer %u ner %u nhwch %u nch %u)\n",
++		    r[20], r[21], cfg, cfg >> 24, (cfg >> 16) & 0xffu, (cfg >> 8) & 0xffu, cfg & 0xffu);
++		printf("FUXI WLAN: MHI CHDBOFF %#x ERDBOFF %#x BHIOFF %#x BHIEOFF %#x DEBUGOFF %#x\n",
++		    r[23], r[24], r[25], r[26], r[27]);
++		printf("FUXI WLAN: MHICTRL %#x (state %u, reset %u) MHISTATUS %#x (state %s, ready %u, syserr %u)\n",
++		    ctrl, (ctrl >> 8) & 0xffu, (ctrl >> 1) & 1u, st, wl_mhi_state((st >> 8) & 0xffu),
++		    st & 1u, (st >> 2) & 1u);
++		if (r[20] == 0xffffffffu && r[21] == 0xffffffffu) {
++			return 2;               /* BAR not decoded / link down */
++		}
++		if (bhi < 0x40 || bhi > 0x4000u - 0x40u || (bhi & 3)) {
++			printf("FUXI WLAN: BHIOFF %#x outside the mapped 16 KiB; BHI not read\n", bhi);
++			return 3;
++		}
++		for (unsigned i = 0; i < 8; i++) {
++			r[30 + i] = wl_prd((uint64_t)WL_BAR0 + bhi + bo[i]);
++		}
++		printf("FUXI WLAN: BHI version %u.%u EXECENV %#x (%s) STATUS %#x (%u) ERRCODE %#x ERRDBG %#x %#x %#x\n",
++		    r[31], r[30], r[32], wl_mhi_ee(r[32]), r[33], r[33] >> 30, r[34], r[35], r[36], r[37]);
++		/* Root-port status after BAR traffic (received master/target abort). */
++		r[38] = wl_prd(WL_DBI + 0x04);
++		r[39] = wl_prd(WL_EPCFG + 0x04);
++		printf("FUXI WLAN: RC cmd/status %#x EP cmd/status %#x\n", r[38], r[39]);
++		return wl3_faults ? 4 : 0;
++	}
++	}
++	return 0xff;
++}
++
++static void
++fw_dump(const char *tag, const uint32_t *r, unsigned words)
++{
++	for (unsigned i = 0; i < words; i += 8) {
++		unsigned any = 0;
++		for (unsigned j = 0; j < 8; j++) {
++			any |= r[i + j];
++		}
++		if (any) {
++			printf("FUXI WLAN: %s r[%3u] %08x %08x %08x %08x %08x %08x %08x %08x\n", tag, i,
++			    r[i], r[i + 1], r[i + 2], r[i + 3], r[i + 4], r[i + 5], r[i + 6], r[i + 7]);
++		}
++	}
++}
++
++static void
++fw_m3_summary(unsigned s)
++{
++	const uint32_t *r = wl3_report;
++	switch (s) {
++	case 1:
++		printf("FUXI WLAN: cmd-db %#x %#x %#x %#x %#x %#x %#x %#x GPLL0 %#x\n",
++		    r[20], r[21], r[22], r[23], r[24], r[25], r[26], r[27], r[28]);
++		break;
++	case 9:
++		printf("FUXI WLAN: PHY ready after %u us pcs_status %#x\n", r[62], r[63]);
++		break;
++	case 11:
++		printf("FUXI WLAN: link LTSSM %#x LNKCTL/STA %#x (gen%u x%u DLLLA %u) %u ms\n",
++		    r[69], r[70], (r[70] >> 16) & 0xfu, (r[70] >> 20) & 0x3fu, (r[70] >> 29) & 1u, r[68]);
++		break;
++	case 12:
++		printf("FUXI WLAN: endpoint id %#x class/rev %#x cmd/status %#x tries %u\n",
++		    r[75], r[77], r[80], r[76]);
++		break;
++	case 13:
++		printf("FUXI WLAN: BAR0 orig %#x/%#x sizing readback %#x/%#x\n", r[81], r[82], r[87], r[88]);
++		break;
++	}
++}
++
++static void
++fw_run(unsigned limit)
++{
++	uint32_t *r4 = wl4_report;
++	r4[0] = WL4_MAGIC;
++	r4[1] = limit;
++	for (unsigned s = 1; s <= limit; s++) {
++		uint64_t t0 = mach_absolute_time(), ns = 0;
++		unsigned faults0 = fw_faults;
++		int e;
++		if (s <= WL3_STEPS) {
++			wlan_m3(s);    /* runs only step s: earlier ones are in wl3_done */
++			e = (int)(wl3_report[3] & 0xffu);
++			if (wl3_report[3]) {
++				e = e ? e : 0xfe;
++			}
++		} else {
++			wl_mark(s);
++			wl3_faults = 0;
++			e = wl4_step(s);
++			wl3_report[124] += wl3_faults;
++		}
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		/* A fault in a plain (usb_rd/ts_wr) access also ends the run. */
++		if (!e && fw_faults != faults0) {
++			e = 0xfd;
++		}
++		r4[2] = s;
++		r4[40 + s] = e ? (s << 8 | (unsigned)e) : 0x1000u | s;
++		printf("FUXI WLAN: step %u %s code %#x (%llu ms, faults %u)\n", s, e ? "FAILED" : "ok",
++		    r4[40 + s], ns / 1000000ull, fw_faults);
++		if (!e && s <= WL3_STEPS) {
++			fw_m3_summary(s);
++		}
++		if (e) {
++			r4[3] = s << 8 | (unsigned)e;
++			printf("FUXI WLAN: stopped at step %u reason %u ESR %#x FAR %#llx; reboot to retry\n",
++			    s, e, fw_fault_esr, fw_fault_far);
++			goto out;
++		}
++	}
++	printf("FUXI WLAN: %u steps done; no firmware loaded, bus master off\n", limit);
++out:
++	/* Shared GCC vote registers (touch and GPU also read-modify-write
++	 * 0x52008/0x52000 without a common lock): show the final values. */
++	printf("FUXI WLAN: GCC votes 0x52000 %#x 0x52008 %#x gdsc-collapse 0x52020 %#x\n",
++	    usb_rd(WL_GCC, 0x52000), usb_rd(WL_GCC, 0x52008), usb_rd(WL_GCC, 0x52020));
++	fw_dump("m3", wl3_report, 128);
++	fw_dump("m4", wl4_report, 64);
++}
++
++static void
++fw_thread(void *arg, wait_result_t result)
++{
++	unsigned limit = (unsigned)(uintptr_t)arg;
++	(void)result;
++	for (unsigned i = 0; i < FW_NWIN; i++) {
++		kern_return_t kr = fw_map_window(&fw_windows[i]);
++		if (kr != KERN_SUCCESS) {
++			printf("FUXI WLAN: map PA %#llx bytes %#llx failed %d\n",
++			    fw_windows[i].pa, fw_windows[i].size, kr);
++			goto out;
++		}
++	}
++	printf("FUXI WLAN: mapped %llu bytes in %u windows; running steps 1..%u\n",
++	    fw_mapped_bytes, (unsigned)FW_NWIN, limit);
++	fw_run(limit);
++out:
++	printf("FUXI WLAN: thread exit\n");
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++fuxi_wlan_init(void)
++{
++	static bool started;
++	int arg = 0;
++	thread_t thread;
++	if (started) {
++		return;
++	}
++	started = true;
++	if (!PE_parse_boot_argn("fuxiwlan", &arg, sizeof(arg)) || arg <= 0) {
++		return;
++	}
++	unsigned limit = (arg == 1 || arg > (int)WL4_STEPS) ? WL4_STEPS : (unsigned)arg;
++	printf("FUXI WLAN: enabled (fuxiwlan=%d), WCN7850 power-up + PCIe0 + MHI read, limit %u\n",
++	    arg, limit);
++	if (kernel_thread_start(fw_thread, (void *)(uintptr_t)limit, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("FUXI WLAN: kernel_thread_start failed\n");
++	}
++}
++#endif /* FUXI */
+--- a/bsd/dev/wlan.c
++++ b/bsd/dev/wlan.c
+@@ -0,0 +1,523 @@
++/* Lane-wlan (milestone 1): read-only WCN7850 / PCIe0 / BT-UART snapshot on
++ * request 0x5c, value 0x574c ('WL'), index 1. Included from probe.c after
++ * gpu.c (uses probe_safe_rd32). No register writes of any kind.
++ *
++ * Sources (see docs-lanes/wlan-bt.md):
++ *  GCC offsets      research/gcc-kalama.c (base 0x100000)
++ *  TCSR clkref      tcsrcc-sm8550.c tcsr_pcie_0_clkref_en 0x15100 (base 0x1fc0000)
++ *  PCIe0 regs       live DT qcom,pcie@1c00000 (parf 0x1c00000, phy 0x1c06000,
++ *                   dm_core 0x60000000), mainline pcie-qcom.c PARF offsets
++ *  GDSCs            live DT qcom,gdsc@16b004 / @16c000, collapse vote 0x152020
++ *  BT UART          live DT qcom,qup_uart@898000 (QUP2 SE6), wrapper 0x8c0000
++ *  GPIOs            cnss: wlan-en 80, bt-en 81, sw-ctrl 82, wlan-sw-ctrl 83,
++ *                   uart 76-79; pcie0 perst 94, clkreq 95, wake 96
++ *  cmd-db           reserved aop_cmd_db_region 0x81c60000 + 0x20000
++ *
++ * Gating (touch-lane lesson: an unclocked peripheral read hangs the NoC and
++ * resets the SoC; probe_safe_rd32 only recovers synchronous aborts):
++ *  PARF   read only when pcie_0 GDSC reports on and cfg_ahb CBCR is running
++ *  PHY    additionally phy GDSC on and aux CBCR running
++ *  DBI    additionally slv_axi CBCR running
++ *  SE6    read only when wrap2 m_ahb CBCR is running
++ */
++#define WL_GCC    0x00100000UL
++#define WL_TCSR   0x01fc0000UL
++#define WL_TLMM   TS_TLMM
++#define WL_PARF   0x01c00000ULL
++#define WL_PHY    0x01c06000ULL
++#define WL_DBI    0x60000000ULL
++#define WL_QUP2   0x008c0000ULL
++#define WL_SE6    0x00898000ULL
++#define WL_CMDDB  0x81c60000UL
++#define WL_CMDDB_BYTES 0x20000u
++#define WL_MAGIC  0x574c0001u
++
++static uint32_t wlan_report[128];
++
++static uint32_t wl_srd(uint64_t pa, unsigned *faults)
++{
++ uint32_t f = 0, v = probe_safe_rd32(pa, &f);
++ if (f) (*faults)++;
++ return v;
++}
++static int wl_on(uint32_t cbcr) { return !(cbcr & 0x80000000u); }
++static uint8_t wl_cdb8(uint32_t off) { return (uint8_t)(usb_rd(WL_CMDDB, off & ~3u) >> ((off & 3u) * 8)); }
++static uint32_t wl_cdb16(uint32_t off) { return wl_cdb8(off) | (uint32_t)wl_cdb8(off + 1) << 8; }
++
++/* cmd-db resource address by 8-byte name; 0 when absent or malformed. */
++static uint32_t wl_cmddb_addr(const char *name)
++{
++ for (unsigned s = 0; s < 8; s++) {
++  uint32_t row = 8 + s * 16;
++  if (!wl_cdb16(row)) break;
++  uint32_t at = 144 + wl_cdb16(row + 2), n = wl_cdb16(row + 6);
++  if (at > WL_CMDDB_BYTES || n > (WL_CMDDB_BYTES - at) / 24) return 0;
++  for (uint32_t i = 0; i < n; i++) {
++   uint32_t e = at + i * 24; unsigned j;
++   for (j = 0; j < 8 && name[j]; j++) if (wl_cdb8(e + j) != (uint8_t)name[j]) break;
++   if (j < 8 && (name[j] || wl_cdb8(e + j))) continue;
++   return wl_cdb16(e + 16) | wl_cdb16(e + 18) << 16;
++  }
++ }
++ return 0;
++}
++
++static void wlan_snapshot(void)
++{
++ uint32_t *r = wlan_report;
++ unsigned faults = 0, n;
++ memset(r, 0, sizeof(wlan_report));
++ r[0] = WL_MAGIC; r[2] = 1;
++ /* GCC branch votes and GDSC collapse vote (always-on GCC block). */
++ r[4] = usb_rd(WL_GCC, 0x52000); r[5] = usb_rd(WL_GCC, 0x52008);
++ r[6] = usb_rd(WL_GCC, 0x52010); r[7] = usb_rd(WL_GCC, 0x52020);
++ static const uint32_t pcie_cbcr[] = {0x6b020, 0x6b02c, 0x6b038, 0x6b03c, 0x6b048,
++                                      0x6b01c, 0x6b054, 0x1003c, 0x1004c, 0x10030};
++ for (n = 0; n < 10; n++) r[8 + n] = usb_rd(WL_GCC, pcie_cbcr[n]);
++ r[19] = usb_rd(WL_GCC, 0x6b004); r[20] = usb_rd(WL_GCC, 0x6b008);
++ r[21] = usb_rd(WL_GCC, 0x6c000); r[22] = usb_rd(WL_GCC, 0x6c004);
++ static const uint32_t bcr[] = {0x6b000, 0x6c01c, 0x6c014, 0x6c020, 0x6c028};
++ for (n = 0; n < 5; n++) r[23 + n] = usb_rd(WL_GCC, bcr[n]);
++ r[28] = usb_rd(WL_GCC, 0x6b070);
++ r[29] = usb_rd(WL_GCC, 0x6b074); r[30] = usb_rd(WL_GCC, 0x6b078);
++ r[31] = usb_rd(WL_GCC, 0x6b058); r[32] = usb_rd(WL_GCC, 0x6b05c);
++ r[33] = usb_rd(WL_TCSR, 0x15100);
++ r[34] = usb_rd(WL_GCC, 0x233cc); r[35] = usb_rd(WL_GCC, 0x233d0);
++ r[36] = usb_rd(WL_GCC, 0x233d4); r[37] = usb_rd(WL_GCC, 0x23004);
++ r[38] = usb_rd(WL_GCC, 0x1e754);
++ /* SE6 RCG: CMD, CFG, DFSR, 8 DFS perf levels with M and N. */
++ r[39] = usb_rd(WL_GCC, 0x1e760); r[40] = usb_rd(WL_GCC, 0x1e764);
++ r[41] = usb_rd(WL_GCC, 0x1e774);
++ for (n = 0; n < 8; n++) {
++  r[42 + n] = usb_rd(WL_GCC, 0x1e77c + 4 * n);
++  r[50 + n] = usb_rd(WL_GCC, 0x1e7bc + 4 * n);
++  r[58 + n] = usb_rd(WL_GCC, 0x1e7fc + 4 * n);
++ }
++ /* TLMM CFG and IN_OUT: gpio76..83, then 94..96. */
++ for (n = 0; n < 8; n++) {
++  r[66 + n] = usb_rd(WL_TLMM + 0x1000u * (76 + n), 0);
++  r[74 + n] = usb_rd(WL_TLMM + 0x1000u * (76 + n), 4);
++ }
++ for (n = 0; n < 3; n++) {
++  r[82 + n] = usb_rd(WL_TLMM + 0x1000u * (94 + n), 0);
++  r[85 + n] = usb_rd(WL_TLMM + 0x1000u * (94 + n), 4);
++ }
++ r[88] = usb_rd(RH_DRV_PA, 0); r[89] = usb_rd(RH_DRV_PA, 0xc);
++ /* cmd-db: header magic, then the RPMh addresses the later stages would vote. */
++ r[90] = usb_rd(WL_CMDDB, 4);
++ if (r[90] == 0x0c0330db) {
++  static const char names[10][8] = {"ldob15", "smpe4", "smpg2", "smpg4", "smpg5",
++                                    "smpg6", "ldoe1", "ldoe3", "clka1", "vrm.wlan"};
++  for (n = 0; n < 10; n++) {
++   char nm[9]; memcpy(nm, names[n], 8); nm[8] = 0;
++   r[91 + n] = wl_cmddb_addr(nm);
++  }
++ }
++ /* Gated PCIe0 reads. */
++ int core_on = (r[19] & 0x80000000u) && wl_on(r[10]);
++ if (core_on) {
++  r[101] |= 1;
++  r[102] = wl_srd(WL_PARF + 0x1b0, &faults);  /* LTSSM */
++  r[103] = wl_srd(WL_PARF + 0x40, &faults);   /* PHY_CTRL */
++  r[104] = wl_srd(WL_PARF + 0x1000, &faults); /* DEVICE_TYPE */
++  r[105] = wl_srd(WL_PARF + 0x224, &faults);  /* INT_ALL_STATUS */
++  r[106] = wl_srd(WL_PARF + 0x350, &faults);  /* DBI_BASE_ADDR_V2 */
++  r[107] = wl_srd(WL_PARF + 0x634, &faults);  /* ATU_BASE_ADDR */
++  if ((r[21] & 0x80000000u) && wl_on(r[11])) {
++   r[101] |= 2;
++   r[108] = wl_srd(WL_PHY + 0x214, &faults);  /* PCS status (bit6 PHYSTATUS) */
++   r[109] = wl_srd(WL_PHY + 0x240, &faults);  /* power down control */
++  }
++  if (wl_on(r[8])) {
++   r[101] |= 4;
++   r[110] = wl_srd(WL_DBI + 0x0, &faults);    /* RC vendor/device */
++   r[111] = wl_srd(WL_DBI + 0x18, &faults);   /* bus numbers */
++   r[112] = wl_srd(WL_DBI + 0x80, &faults);   /* PCIe cap LNKCTL/LNKSTA */
++  }
++ }
++ /* Gated QUP2 SE6 reads. */
++ if (wl_on(r[34])) {
++  r[101] |= 8;
++  r[113] = wl_srd(WL_QUP2 + 0x4, &faults);    /* QUP HW version */
++  r[114] = wl_srd(WL_SE6 + 0x68, &faults);    /* FW_REVISION_RO (proto 15:8, UART 2) */
++  r[115] = wl_srd(WL_SE6 + 0x40, &faults);    /* GENI_STATUS */
++  r[116] = wl_srd(WL_SE6 + 0x48, &faults);    /* M_CLK_CFG */
++  r[117] = wl_srd(WL_SE6 + 0x7c, &faults);    /* CLK_SEL */
++  r[118] = wl_srd(WL_SE6 + 0x908, &faults);   /* IOS (bit1 low = CTS asserted) */
++  r[119] = wl_srd(WL_SE6 + 0xe24, &faults);   /* HW_PARAM_0 */
++  r[120] = wl_srd(WL_SE6 + 0x258, &faults);   /* DMA_MODE_EN */
++ }
++ r[124] = faults;
++ r[125] = probe_fault_esr;
++ r[3] = 1;   /* snapshot complete */
++}
++
++/* ===================================================================
++ * Milestone 3: gated WCN7850 power-up + PCIe0 link + endpoint config read.
++ * Request 0x5c 'WL', index 0x300 + limit (limit 1..13 = last step to run);
++ * index 0x3ff re-reads the M3 report. Steps already completed in this boot
++ * are skipped; after any failure every later request only returns the
++ * report (reboot to retry). Each step stores its number in r[2] before it
++ * touches hardware and paints "WLAN M3 STEP nn" on the scanout when the
++ * probe-03 geometry is present, so a hang or reset can be attributed (or
++ * bisected by running increasing limits).
++ *
++ * Write sources (docs-lanes/wlan-bt.md section 7 has the full table):
++ *  2  RPMh VRM votes, rail order = pwrseq-qcom-wcn.c wcn7850 (vdd, vddio,
++ *     vddaon, vdddig, vddrfa1p2, vddrfa1p8); voltages = live DT
++ *     chip_cfg@1 qcom,vdd-wlan-*-config inside each regulator's live-DT
++ *     min/max; addresses = cmd-db, checked against the OrangeFox dump first.
++ *  3  WLAN_EN gpio80 = live DT cnss_wlan_en_active (gpio, pull-up, 16 mA,
++ *     output high); 50 ms = pwrseq wcn7850 pwup_delay_ms.
++ *  4  PHY rails ldoe1 880 mV / ldoe3 1200 mV = live DT vreg-0p9/vreg-1p2,
++ *     order = qmp_phy_vreg_l (vdda-phy, vdda-pll).
++ *  5  PERST# gpio94 low (pcie0_perst_default, qcom_ep_reset_assert),
++ *     CLKREQ# gpio95 func 1 pull-up, WAKE# gpio96 input pull-up, 2 mA.
++ *  6  GDSCs: gcc-sm8550.c pcie_0_gdsc / pcie_0_phy_gdsc (VOTABLE,
++ *     POLL_CFG_GDSCR, RETAIN_FF_ENABLE) in gdsc.c gdsc_enable order.
++ *  7  Clocks: sm8550.dtsi pcie0 + pcie0_phy clock lists, rchng 100 MHz
++ *     (assigned-clock-rates), aux 19.2 MHz (live DT clock-frequency).
++ *  8  pcie-qcom.c qcom_pcie_init_2_7_0 (BCR pulse, PARF programming).
++ *  9  phy-qcom-qmp-pcie.c qmp_pcie_init + qmp_pcie_power_on with the
++ *     sm8550_qmp_gen3x2 tables (identical to the live-DT qcom,phy-sequence
++ *     body plus RXEQEVAL_TIME 0x6f4).
++ * 10  qcom_ep_reset_deassert: 100 ms, PERST# high, 1 ms.
++ * 11  qcom_pcie_2_3_2_ltssm_enable; dw_pcie_wait_for_link (DLLLA), 1 s bound.
++ * 12  dw_pcie_setup_rc bus numbers; dw_pcie_prog_outbound_atu CFG0 region 0;
++ *     endpoint 01:00.0 dword 0 (expect 0x110717cb), CRS/all-ones retry 1 s.
++ * 13  Standard BAR sizing on the endpoint (all-ones write, read, restore);
++ *     the command register is untouched, so decode stays disabled.
++ */
++#define WL3_MAGIC 0x574c0003u
++#define WL3_STEPS 13u
++static uint32_t wl3_report[128];
++static unsigned wl3_done, wl3_failed;
++static unsigned wl3_faults;
++
++static void wl_wr(uintptr_t base, uint32_t off, uint32_t v) { ts_wr(base, off, v); }
++static void wl_set(uintptr_t base, uint32_t off, uint32_t bits) { wl_wr(base, off, usb_rd(base, off) | bits); }
++static void wl_clr(uintptr_t base, uint32_t off, uint32_t bits) { wl_wr(base, off, usb_rd(base, off) & ~bits); }
++static uint32_t wl_prd(uint64_t pa) { return wl_srd(pa, &wl3_faults); }
++static void wl_pwr(uint64_t pa, uint32_t v) { if (probe_safe_wr32(pa, v)) wl3_faults++; }
++static uint64_t wl_now_us(void) { return rsr("cntpct_el0") * 1000000ull / rsr("cntfrq_el0"); }
++
++static void wl_mark(unsigned step)
++{
++ wl3_report[2] = step;
++ __asm__ volatile("dsb sy" ::: "memory");
++#ifdef FUXI_WLAN_XNU
++ /* XNU copy (bsd/dev/wlan.c via xnu/patches/0099): log, no scanout paint. */
++ printf("FUXI WLAN: step %u\n", step);
++#else
++ if (usb_rd(0xae05000, 0x14) != 0xb8000000 || usb_rd(0xae05000, 0x24) != 4320 ||
++     usb_rd(0xae05000, 0x00) != ((2400u << 16) | 1080u) ||
++     usb_rd(0xae05000, 0x30) != 0x237ff) return;
++ volatile uint32_t *fb = (volatile uint32_t *)0xb8000000UL;
++ char text[] = "WLAN M3 STEP 00";
++ text[13] = (char)('0' + step / 10); text[14] = (char)('0' + step % 10);
++ for (unsigned y = 1700; y < 1780; y++)
++  for (unsigned x = 0; x < 1080; x++) fb[y * 1080 + x] = 0xff402010;
++ for (unsigned c = 0; text[c]; c++) {
++  const unsigned char *glyph = font8x16[(unsigned char)text[c] - 32];
++  for (unsigned gy = 0; gy < 16; gy++)
++   for (unsigned gx = 0; gx < 8; gx++)
++    if (glyph[gy] & (0x80u >> gx))
++     for (unsigned sy = 0; sy < 4; sy++)
++      for (unsigned sx = 0; sx < 4; sx++)
++       fb[(1708 + gy * 4 + sy) * 1080 + 48 + c * 32 + gx * 4 + sx] = 0xffffffff;
++ }
++ __asm__ volatile("dsb sy" ::: "memory");
++#endif
++}
++
++/* RPMh VRM: +0 voltage (mV), +4 enable. Linux rpmh-regulator sends the
++ * voltage before the enable. 0 when both commands completed. */
++static uint32_t wl_vrm(uint32_t addr, uint32_t mv)
++{
++ uint32_t e = rh_send(0, addr, mv);
++ if (!e) e = rh_send(0, addr + 4, 1) << 8;
++ return e;
++}
++
++static int wl_poll_clr(uintptr_t base, uint32_t off, uint32_t mask, unsigned us)
++{
++ for (unsigned i = 0; i < us; i++) { if (!(usb_rd(base, off) & mask)) return 1; delay(1); }
++ return !(usb_rd(base, off) & mask);
++}
++
++/* GDSC enable per gdsc.c (VOTABLE + POLL_CFG_GDSCR + RETAIN_FF_ENABLE);
++ * 1500 us = live DT qcom,gds-timeout. */
++static uint32_t wl_gdsc(uint32_t gdscr, uint32_t vote_bit, uint32_t *polls)
++{
++ wl_clr(WL_GCC, 0x52020, vote_bit);
++ unsigned i;
++ for (i = 0; i < 1500; i++) { if (usb_rd(WL_GCC, gdscr + 4) & (1u << 16)) break; delay(1); }
++ *polls = i;
++ if (!(usb_rd(WL_GCC, gdscr + 4) & (1u << 16))) return 1;
++ delay(1);
++ wl_set(WL_GCC, gdscr, 1u << 11);
++ return 0;
++}
++
++/* clk-rcg2: CFG (hid 4:0, src 10:8, mode 13:12) then CMD_UPDATE, 500 us. */
++static int wl_rcg(uint32_t rcgr, uint32_t cfg)
++{
++ if ((usb_rd(WL_GCC, rcgr + 4) & 0x371fu) == cfg) return 1;
++ wl_wr(WL_GCC, rcgr + 4, (usb_rd(WL_GCC, rcgr + 4) & ~0x371fu) | cfg);
++ wl_set(WL_GCC, rcgr, 1);
++ return wl_poll_clr(WL_GCC, rcgr, 1, 500);
++}
++
++/* Branch is running if CLK_OFF is clear; a branch under hardware clock
++ * gating (CBCR bit 1) may legitimately read OFF at idle. */
++static int wl_branch_ok(uint32_t cbcr_off)
++{
++ for (unsigned i = 0; i < 500; i++) {
++  uint32_t v = usb_rd(WL_GCC, cbcr_off);
++  if (!(v & 0x80000000u) || (v & 2u)) return 1;
++  delay(1);
++ }
++ return 0;
++}
++
++/* sm8550_qmp_gen3x2 serdes/tx/rx/pcs/pcs_misc tables as absolute offsets
++ * from the PHY base (qmp_pcie_offsets_v5). Equal to the live-DT
++ * qcom,phy-sequence body; 0x6f4 = RXEQEVAL_TIME is mainline-only. */
++static const uint16_t wl_phy_tbl[][2] = {
++ {0xc0,0x1},{0xcc,0x62},{0xd0,0x2},{0x60,0xf8},{0x64,0x1},{0x0,0x93},{0x4,0x1},{0xe0,0x90},
++ {0xe4,0x82},{0xf4,0x7},{0x70,0x2},{0x10,0x2},{0x74,0x16},{0x14,0x16},{0x78,0x36},{0x18,0x36},
++ {0x110,0x8},{0xbc,0xa},{0x120,0x42},{0x80,0x4},{0x84,0xd},{0x20,0xa},{0x24,0x1a},{0x88,0x41},
++ {0x28,0x34},{0x90,0xab},{0x94,0xaa},{0x98,0x1},{0x30,0x55},{0x34,0x55},{0x38,0x1},{0x140,0x14},
++ {0x164,0x34},{0x3c,0x1},{0x1c,0x4},{0x174,0x16},{0x1bc,0xf},{0x170,0xa0},
++ {0x11a4,0x38},{0x10dc,0x11},{0x1160,0xbf},{0x1164,0xbf},{0x1168,0xb7},{0x116c,0xea},{0x115c,0x3f},
++ {0x1174,0x5c},{0x1178,0x9c},{0x117c,0x1a},{0x1180,0x89},{0x1170,0xdc},{0x1188,0x94},{0x118c,0x5b},
++ {0x1190,0x1a},{0x1194,0x89},{0x10cc,0x0},{0x1008,0x9},{0x1014,0x5},{0x104c,0x8},{0x1050,0x8},
++ {0x10d8,0xf},{0x1118,0x1c},{0x10f8,0x7},{0x11f8,0x8},
++ {0xe84,0x15},{0xe90,0x3f},{0xee4,0x2},{0xe40,0x6},{0xe3c,0x18},
++ {0x19a4,0x38},{0x18dc,0x11},{0x1960,0xbf},{0x1964,0xbf},{0x1968,0xb7},{0x196c,0xea},{0x195c,0x3f},
++ {0x1974,0x5c},{0x1978,0x9c},{0x197c,0x1a},{0x1980,0x89},{0x1970,0xdc},{0x1988,0x94},{0x198c,0x5b},
++ {0x1990,0x1a},{0x1994,0x89},{0x18cc,0x0},{0x1808,0x9},{0x1814,0x5},{0x184c,0x8},{0x1850,0x8},
++ {0x18d8,0xf},{0x1918,0x1c},{0x18f8,0x7},{0x19f8,0x8},
++ {0x1684,0x15},{0x1690,0x3f},{0x16e4,0x2},{0x1640,0x6},{0x163c,0x18},
++ {0x2dc,0x5},{0x388,0x77},{0x398,0xb},{0x3e0,0xf},{0x3d0,0x8c},
++ {0x6a4,0x1e},{0x6f4,0x27},{0x60c,0x1d},{0x614,0x7},{0x620,0xc1},{0x694,0x0},
++};
++
++/* PCI Express capability offset in the RC's DBI; 0 if absent. */
++static uint32_t wl_pcie_cap(void)
++{
++ uint32_t p = wl_prd(WL_DBI + 0x34) & 0xfc;
++ for (unsigned i = 0; i < 48 && p >= 0x40; i++) {
++  uint32_t v = wl_prd(WL_DBI + p);
++  if ((v & 0xff) == 0x10) return p;
++  p = (v >> 8) & 0xfc;
++ }
++ return 0;
++}
++
++/* Returns 0 on success or a nonzero reason; the caller encodes step<<8. */
++static int wl3_step(unsigned step)
++{
++ uint32_t *r = wl3_report;
++ uint32_t polls = 0;
++ switch (step) {
++ case 1: { /* precheck, read-only */
++  static const uint32_t expect[8] = {0x40a00, 0x40200, 0x40400, 0x40500, 0x44000, 0x40600, 0x43900, 0x43a00};
++  wlan_snapshot();
++  if (wlan_report[90] != 0x0c0330db) return 1;
++  for (unsigned i = 0; i < 8; i++) {
++   r[20 + i] = wlan_report[91 + i];
++   if (wlan_report[91 + i] != expect[i]) return 2;
++  }
++  uint32_t id = usb_rd(RH_DRV_PA, 0), cfg = usb_rd(RH_DRV_PA, 0xc);
++  if (((id >> 16) & 0xff) != 3 || ((cfg >> 12) & 0x3f) < 3) return 3;
++  r[28] = usb_rd(WL_GCC, 0x0);           /* GPLL0 mode: bit 31 lock */
++  return (r[28] & 0x80000000u) ? 0 : 4;
++ }
++ case 2: { /* WCN rails in pwrseq order: s5g l15b s2g s4e s4g s6g */
++  static const uint16_t mv[6] = {1000, 1800, 980, 952, 1350, 1900};
++  static const uint8_t idx[6] = {4, 0, 2, 1, 3, 5};
++  for (unsigned i = 0; i < 6; i++) {
++   r[29 + i] = wl_vrm(r[20 + idx[i]], mv[i]);
++   if (r[29 + i]) return 1 + (int)i;
++   delay(1000);
++  }
++  return 0;
++ }
++ case 3: { /* WLAN_EN high */
++  uintptr_t sw = WL_TLMM + 0x1000u * 82, wsw = WL_TLMM + 0x1000u * 83;
++  r[36] = usb_rd(sw, 4); r[37] = usb_rd(wsw, 4);
++  ts_gpio(80, 0, 3, 16, 1);
++  delay(50000);
++  r[38] = usb_rd(WL_TLMM + 0x1000u * 80, 0); r[39] = usb_rd(WL_TLMM + 0x1000u * 80, 4);
++  r[40] = usb_rd(sw, 4); r[41] = usb_rd(wsw, 4);
++  return (r[39] & 2) ? 0 : 1;
++ }
++ case 4: /* PCIe PHY rails: vdda-phy l1e, vdda-pll l3e */
++  r[35] = wl_vrm(r[26], 880);
++  if (r[35]) return 1;
++  r[42] = wl_vrm(r[27], 1200);
++  if (r[42]) return 2;
++  delay(1000);
++  return 0;
++ case 5: /* PERST# asserted, CLKREQ#, WAKE# */
++  ts_gpio(94, 0, 1, 2, 0);
++  ts_gpio(95, 1, 3, 2, -1);
++  ts_gpio(96, 0, 3, 2, -1);
++  delay(1000);
++  r[43] = usb_rd(WL_TLMM + 0x1000u * 94, 4); r[44] = usb_rd(WL_TLMM + 0x1000u * 96, 4);
++  return (r[43] & 2) ? 1 : 0;
++ case 6:
++  if (wl_gdsc(0x6b004, 1u << 0, &polls)) { r[45] = polls; return 1; }
++  r[45] = polls;
++  if (wl_gdsc(0x6c000, 1u << 3, &polls)) { r[46] = polls; return 2; }
++  r[46] = polls;
++  r[47] = usb_rd(WL_GCC, 0x6b004); r[48] = usb_rd(WL_GCC, 0x6c000);
++  return 0;
++ case 7: { /* clocks */
++  static const uint32_t cb[8] = {0x6b038, 0x6b020, 0x6b02c, 0x6b03c, 0x6b01c, 0x1003c, 0x1004c, 0x6b054};
++  if (!wl_rcg(0x6b074, 0x000)) return 1;           /* aux: XO 19.2 MHz */
++  if (!wl_rcg(0x6b058, 0x605)) return 2;           /* rchng: GPLL0 even (300 MHz) / 3 */
++  wl_set(WL_GCC, 0x52008, (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 5));
++  wl_set(WL_GCC, 0x52000, (1u << 12) | (1u << 19) | (1u << 22));
++  wl_set(WL_TCSR, 0x15100, 1);
++  uint32_t bad = 0;
++  for (unsigned i = 0; i < 8; i++) {
++   if (!wl_branch_ok(cb[i])) bad |= 1u << i;
++   r[49 + i] = usb_rd(WL_GCC, cb[i]);
++  }
++  r[57] = bad;
++  return bad ? 3 : 0;
++ }
++ case 8: /* core reset + PARF (qcom_pcie_init_2_7_0) */
++  wl_set(WL_GCC, 0x6b000, 1); delay(1000);
++  wl_clr(WL_GCC, 0x6b000, 1); delay(1000);
++  wl_pwr(WL_PARF + 0x1000, 4);
++  wl_pwr(WL_PARF + 0x40, wl_prd(WL_PARF + 0x40) & ~1u);
++  wl_pwr(WL_PARF + 0x350, 0x60000000u); wl_pwr(WL_PARF + 0x354, 0);
++  wl_pwr(WL_PARF + 0x634, 0x60001000u); wl_pwr(WL_PARF + 0x638, 0);
++  wl_pwr(WL_PARF + 0x358, 0); wl_pwr(WL_PARF + 0x35c, 0x80000000u);
++  wl_pwr(WL_PARF + 0x0, wl_prd(WL_PARF + 0x0) & ~(1u << 29));
++  wl_pwr(WL_PARF + 0x174, wl_prd(WL_PARF + 0x174) | (1u << 4));
++  wl_pwr(WL_PARF + 0x20, wl_prd(WL_PARF + 0x20) & ~(1u << 5));
++  wl_pwr(WL_PARF + 0x1a8, wl_prd(WL_PARF + 0x1a8) | (1u << 31));
++  r[58] = wl_prd(WL_PARF + 0x1000); r[59] = wl_prd(WL_PARF + 0x40);
++  r[60] = wl_prd(WL_PARF + 0x350); r[61] = wl_prd(WL_PARF + 0x634);
++  return (wl3_faults || (r[58] & 0xf) != 4) ? 1 : 0;
++ case 9: { /* QMP PHY */
++  unsigned i;
++  wl_set(WL_GCC, 0x6c01c, 1); delay(250);
++  wl_clr(WL_GCC, 0x6c01c, 1); delay(10);
++  wl_pwr(WL_PHY + 0x240, wl_prd(WL_PHY + 0x240) | 3u);       /* SW_PWRDN|REFCLK_DRV_DSBL */
++  for (i = 0; i < sizeof(wl_phy_tbl) / sizeof(wl_phy_tbl[0]); i++)
++   wl_pwr(WL_PHY + wl_phy_tbl[i][0], wl_phy_tbl[i][1]);
++  wl_wr(WL_GCC, 0x6b070, usb_rd(WL_GCC, 0x6b070) & ~3u);     /* pipe mux: PHY pipe */
++  wl_set(WL_GCC, 0x52008, 1u << 4);                          /* pipe branch vote */
++  wl_pwr(WL_PHY + 0x200, wl_prd(WL_PHY + 0x200) & ~1u);      /* SW_RESET release */
++  wl_pwr(WL_PHY + 0x244, wl_prd(WL_PHY + 0x244) | 3u);       /* SERDES|PCS start */
++  delay(1000);
++  for (i = 0; i < 10000; i += 10) { if (!(wl_prd(WL_PHY + 0x214) & (1u << 6))) break; delay(10); }
++  r[62] = i; r[63] = wl_prd(WL_PHY + 0x214);
++  r[64] = usb_rd(WL_GCC, 0x6b048); r[65] = usb_rd(WL_GCC, 0x6b070);
++  if (wl3_faults) return 1;
++  return (r[63] & (1u << 6)) ? 2 : 0;
++ }
++ case 10: /* PERST# deassert */
++  delay(100000);
++  ts_gpio(94, 0, 1, 2, 1);
++  delay(1000);
++  r[66] = usb_rd(WL_TLMM + 0x1000u * 94, 4);
++  return (r[66] & 2) ? 0 : 1;
++ case 11: { /* LTSSM + link */
++  uint32_t cap = wl_pcie_cap(), lnk = 0, lt = 0;
++  uint64_t t0, seen0 = 0, seen1 = 0;
++  r[67] = cap;
++  if (!cap || wl3_faults) return 1;
++  wl_pwr(WL_PARF + 0x1b0, wl_prd(WL_PARF + 0x1b0) | (1u << 8));
++  t0 = wl_now_us();
++  for (;;) {
++   lt = wl_prd(WL_PARF + 0x1b0);
++   unsigned s = lt & 0x3f;
++   if (s < 32) seen0 |= 1ull << s; else seen1 |= 1ull << (s - 32);
++   lnk = wl_prd(WL_DBI + cap + 0x10);
++   if (lnk & (1u << 29)) break;
++   if (wl_now_us() - t0 > 1000000 || wl3_faults) break;
++   delay(100);
++  }
++  r[68] = (uint32_t)((wl_now_us() - t0) / 1000);
++  r[69] = lt; r[70] = lnk; r[71] = (uint32_t)seen0; r[72] = (uint32_t)seen1;
++  r[73] = wl_prd(WL_PARF + 0x224);
++  if (wl3_faults) return 2;
++  return (lnk & (1u << 29)) ? 0 : 3;
++ }
++ case 12: { /* endpoint config space through iATU CFG0 */
++  const uint64_t a = 0x60001000ull;  /* unrolled outbound region 0 */
++  uint64_t t0;
++  uint32_t id;
++  unsigned i, tries = 0;
++  delay(100000);
++  wl_pwr(WL_DBI + 0x18, (wl_prd(WL_DBI + 0x18) & 0xff000000u) | 0x00ff0100u);
++  wl_pwr(a + 0x08, 0x60100000u); wl_pwr(a + 0x0c, 0);
++  wl_pwr(a + 0x10, 0x601fffffu); wl_pwr(a + 0x20, 0);
++  wl_pwr(a + 0x14, 1u << 24);    wl_pwr(a + 0x18, 0);
++  wl_pwr(a + 0x00, 4);           /* type CFG0 */
++  wl_pwr(a + 0x04, 1u << 31);    /* enable */
++  for (i = 0; i < 5; i++) { if (wl_prd(a + 0x04) & (1u << 31)) break; delay(9000); }
++  r[74] = wl_prd(a + 0x04);
++  if (!(r[74] & (1u << 31)) || wl3_faults) return 1;
++  t0 = wl_now_us();
++  do {
++   id = wl_prd(0x60100000ull);
++   tries++;
++   if (id != 0xffffffffu && id != 0xffff0001u && id != 0) break;
++   delay(10000);
++  } while (wl_now_us() - t0 < 1000000 && !wl3_faults);
++  r[75] = id; r[76] = tries;
++  r[77] = wl_prd(0x60100008ull); r[78] = wl_prd(0x6010000cull);
++  r[79] = wl_prd(0x6010002cull); r[80] = wl_prd(0x60100004ull);
++  if (wl3_faults) return 2;
++  return id == 0x110717cbu ? 0 : 3;
++ }
++ case 13: /* BAR sizing: r[81+b] original, r[87+b] all-ones readback */
++  for (unsigned b = 0; b < 6; b++) {
++   uint64_t at = 0x60100010ull + 4 * b;
++   uint32_t orig = wl_prd(at);
++   wl_pwr(at, 0xffffffffu);
++   r[87 + b] = wl_prd(at);
++   wl_pwr(at, orig);
++   r[81 + b] = orig;
++   if (!(orig & 1) && ((orig >> 1) & 3) == 2 && b < 5) {   /* 64-bit memory BAR */
++    uint32_t ohi = wl_prd(at + 4);
++    wl_pwr(at + 4, 0xffffffffu);
++    r[88 + b] = wl_prd(at + 4);
++    wl_pwr(at + 4, ohi);
++    r[82 + b] = ohi;
++    b++;
++   }
++  }
++  return wl3_faults ? 1 : 0;
++ }
++ return 0xff;
++}
++
++static void wlan_m3(unsigned limit)
++{
++ uint32_t *r = wl3_report;
++ r[0] = WL3_MAGIC; r[1] = limit;
++ if (wl3_failed || limit < 1 || limit > WL3_STEPS) return;
++ for (unsigned s = 1; s <= limit; s++) {
++  if (wl3_done & (1u << s)) continue;
++  wl_mark(s);
++  wl3_faults = 0;
++  uint64_t t0 = wl_now_us();
++  int e = wl3_step(s);
++  r[100 + s] = (uint32_t)((wl_now_us() - t0) / 1000);   /* ms per step */
++  r[3 + s] = e ? (s << 8 | (unsigned)e) : 0x1000u | s;
++  r[124] += wl3_faults;
++  r[125] = probe_fault_esr;
++  r[126] = (uint32_t)probe_fault_far;
++  if (e) { wl3_failed = 1; r[3] = s << 8 | (unsigned)e; return; }
++  wl3_done |= 1u << s;
++ }
++ r[3] = 0;
++}

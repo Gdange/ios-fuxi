@@ -218,3 +218,175 @@ Recommendation:
 - Use the USB CDC-ECM `en` interface for IP now.
 - For Wi-Fi, do A→B→C as the next milestones. Each is testable on its own: firmware boots, QMI ready, then a firmware version reply.
 - Then build D with E1 for a first wireless IP connection. Consider E2 only after E1 works.
+
+Section 9 revises these estimates after the prior-art study.
+
+## 9. Prior art: OpenBSD qwz(4) and itlwm (study, 2026-10-20)
+
+The sources were fetched read-only into `research/external/`, which is gitignored and never committed. Nothing was built or run.
+
+| Source | Revision |
+|---|---|
+| openbsd/src (GitHub mirror) | 49330ea2bbd4, 2026-10-20 |
+| OpenIntelWireless/itlwm | 53c51c2cdd6e, 2024-06-09 (v2.4.0) |
+
+### Licenses (facts, from the file headers)
+
+| File | Lines | License | Reusable here? |
+|---|---|---|---|
+| `sys/dev/ic/qwz.c` 1.92 | 25197 | ISC (S. Sperling 2023) **and** BSD-3-Clause-Clear (Linux Foundation, QuIC) | yes; keep both notices |
+| `sys/dev/pci/if_qwz_pci.c` 1.21 | 4251 | ISC **and** BSD-3-Clause-Clear | yes; keep both notices |
+| `sys/dev/ic/qwzreg.h` 1.19 | 13947 | BSD-3-Clause-Clear only | yes |
+| `sys/dev/ic/qwzvar.h` 1.30 | 2242 | BSD-3-Clause-Clear only | yes |
+| OpenBSD `sys/net80211` | about 25k | BSD/ISC | yes (not fetched yet) |
+| itlwm, every file | | GPL-2.0, including the OpenBSD-derived files, which carry a GPL header above the BSD one | **no**, pattern reference only |
+
+BSD-3-Clause-Clear grants no patent licence. It is permissive, but it is not plain ISC.
+
+### qwz scope (facts)
+
+From qwz.4 and the attach code:
+- Station (BSS) mode only.
+- WEP, WPA1 and WPA2, with CCMP in hardware.
+- PMF and background scan.
+- HT rates only (MCS 0–7); VHT, HE and EHT are not enabled.
+
+It loads `qwz-wcn7850-hw2.0-{amss,board-2,m3}`. From qwz.c:
+- **M3 is mandatory.** `qwz_loadfirmware(sc, QWZ_FW_M3, "m3")` runs in the QMI bring-up, and a failure aborts it (qwz.c:7002).
+- Board data comes only from a `board-2` TLV container (magic "QCA-ATH12K-BOARD"). The board IE and the regdb IE are looked up by a name built from the PCI IDs and the QMI chip and board IDs.
+- All coherent DMA memory comes from `qwz_dmamem_alloc`: one physically contiguous segment, `bus_dmamem_alloc_range(..., 0, 0xffffffff)`, so **below 4 GiB** (qwz.c:25124). That memory holds:
+  - MHI contexts and rings;
+  - HAL SRNGs and CE pipes;
+  - the AMSS image and its BHIe vector table;
+  - the M3 image;
+  - one `fwmem` block that holds all the QMI target-memory segments (several MiB, size known only at runtime).
+- Interrupts: it tries 32 MSI vectors, then **falls back to a single MSI** and polls every source from one handler (if_qwz_pci.c:747). Single MSI is our first target.
+
+itlwm's structure (facts):
+- `itlwm/`: an IOEthernetController with Intel HALs (`hal_iwm/iwn/iwx`).
+- `AirportItlwm/`: macOS IO80211. Not applicable to iOS 16.
+- `itl80211/`: the compat layer plus a 2021 snapshot of OpenBSD net80211. That snapshot is too old for qwz (no `IEEE80211_C_ADDBA_OFFLOAD`).
+
+### What qwz needs from the OS, and where it comes from on our XNU
+
+| qwz needs (OpenBSD API) | itlwm on macOS | Fuxi XNU (in-kernel, no kexts) |
+|---|---|---|
+| `bus_space_read_4/write_4` on BAR0 (the driver does its own windowing) | IOMemoryMap | **done in M4**: BAR0 assigned and mapped by our own code |
+| `pci_conf_*`, `pci_get_capability`, `pci_mapreg_*`, `pci_set_powerstate` | IOPCIDevice (IOPCIFamily) | our iATU CFG0 accessors (M3/M4). A 50-line `pci_*` shim over them |
+| `pci_intr_map_msi`, `pci_intr_establish`; the MSI address and data are read back from the endpoint capability | IOPCIDevice MSI + IOInterruptEventSource | **missing**: DWC iMSI (PCIE_MSI_ADDR/INTR0 at DBI 0x820+) or the qcom SPI-MSI block from the live DT. GIC SPI routing through XNU's interrupt controller (no Fuxi GIC handler is registered yet). Polling first |
+| `bus_dmamem_alloc_range` (contiguous, <4 GiB), `bus_dmamap_load_mbuf`, `bus_dmamap_sync` | IOBufferMemoryDescriptor with a physical mask (signatures changed by hand) | **missing**: a contiguous carve-out below 4 GiB (DRAM starts at 0x80000000, so this is reachable) via `kmem_alloc_contig` with a max-address mask, or a loader-reserved ADT region. Cache maintenance on sync (`flush_dcache`/`invalidate_dcache`). Apps-SMMU state for PCIe0 SIDs 0x1400/0x1401 must be checked first (bypass or identity); this is a guess risk |
+| mbufs (`m_gethdr`, `MCLGET`, `m_adj`, `m_copydata`, `mtod`, ...) | wrapped over the KPI `mbuf_*` because a kext cannot see `struct mbuf` | **better than itlwm**: compiled into the kernel we have the real BSD `struct mbuf` and `m_*` functions (XNU's mbuf is BSD-derived); a thin macro layer |
+| `tsleep_nsec`/`wakeup`, `splnet`, rwlocks, refcnt | IOCommandGate, IOLock | `msleep`/`wakeup` exist in XNU BSD; `lck_mtx`/`lck_rw`; spl is a no-op under one driver mutex |
+| `task_*`, `taskq`, `timeout_*` | IOCommandGate, IOTimerEventSource | `thread_call` (and a dedicated kernel thread, as in M4) |
+| `loadfirmware()` | firmware compiled in as zlib blobs | loader-staged blobs (environment variables at build time, like the GPU firmware), or a `vn_open`/`vn_rdwr` read from the root fs after mount |
+| net80211, ifnet, bpf | itl80211 + IOEthernetInterface | vendor current OpenBSD net80211 with prefixed symbols (to avoid clashes with XNU's BSD net headers), then `ifnet_allocate`/`ether` KPIs for `en1` |
+
+### IOPCIFamily (facts)
+
+- The iPhone X 16.7 kernelcache **does contain** `com.apple.iokit.IOPCIFamily` 2.9, with IOPCIDevice, IOPCIBridge and IOPCIHostBridge classes. Users: AppleEmbeddedPCIE, AppleT8015PCIe, AppleBCMWLANBusInterfacePCIe, AppleBasebandPCI.
+- Our Fuxi XNU runs **no kexts**: drivers are compiled into the kernel.
+- `xnu-8796` source has no IOPCIFamily: only forward declarations in IOService.h, IOKit headers and DriverKit `.iig`.
+- IOPCIFamily is Apple OSS (APSL), so it could be built in-kernel. It would still need our own host-bridge driver, and it brings nothing that qwz needs which the 50-line config shim does not already give.
+- **Decision:** no IOPCIFamily. qwz gets a direct `pci_*` shim over our own host code.
+
+### Port plan and revised estimates (one experienced person)
+
+| Milestone | Content | Done when | Estimate (old in brackets) |
+|---|---|---|---|
+| M4 (this round) | XNU driver: M3 power/PCIe sequence, MEM iATU, BAR0 assignment, MHI/BHI register read | log shows MHIVER and EE = PBL (expected) | done, pending a device test |
+| M5 | DMA carve-out below 4 GiB, SMMU check, polled BHI download of AMSS (qwz `qwz_mhi_fw_load_bhi`/BHIe, rewritten minimally), MHI RESET→READY→M0 | EE goes PBL→SBL/AMSS and MHI reaches M0 | 1–2 weeks (part of A+B: 3–6 weeks) |
+| M6 | Compile qwz.c + if_qwz_pci.c in-kernel over a compat header (bus_dma/bus_space/pci/mbuf/sleep/task/timeout/loadfirmware), net80211 stubbed; MSI via DWC iMSI or polling; firmware: AMSS, a board-2 we build from the phone's bdwlan/regdb, M3 | qwz prints the firmware build ID and reaches `fw_ready` over QMI | 3–5 weeks (B+C: 4–7 weeks) |
+| M7 | Vendor current OpenBSD net80211; scan | scan results printed in the log | 2–4 weeks |
+| M8 | WPA2 station + `en1` ifnet + DHCP via configd, driven by a small private tool (no wifid) | ping over Wi-Fi | 3–6 weeks (D+E1: 2–4 months + 1 week) |
+| M9 (optional) | IO80211/wifid Settings integration | Settings shows networks | 1–3 months (unchanged) |
+
+Total to first IP over Wi-Fi: **about 2.5–4 months**, against 3.5–6 months for a from-scratch ath12k port. The data path (CE/HAL/DP), QMI and WMI are already in qwz. What is left for us is the platform layer, which is what M3/M4 started.
+
+Risks:
+- *Guess:* PCIe0 sits behind apps_smmu. If unmatched streams fault, device DMA fails silently.
+- No XNU GIC handler for Fuxi peripherals yet; polling works for bring-up.
+- Shared GCC vote registers: touch and the GPU also do read-modify-write on GCC 0x52008/0x52000 without a common lock. Adding a lock is a later cleanup; M4 logs the final values.
+- Firmware match (below).
+
+### Firmware notes (facts, then guesses)
+
+- `amss.bin` has `QC_IMAGE_VERSION_STRING=CI_WLAN.HMT.1.0-02352.5.1-QCAHMTSWPL_V1.0_V2.0_SILICON-2` (a 2022 CI build).
+- `amss20.bin` has `QC_IMAGE_VERSION_STRING=WLAN.HMT.1.0.c2-00058.3-QCAHMTSWPL_V1.0_V2.0_SILICONZ-1...`.
+- The endpoint reports PCI revision 1.
+- `phy_ucode.elf` and `phy_ucode20.elf` are 32-bit ELFs with e_machine 3.
+- *Guesses:*
+  - hw2.0 silicon uses the `*20` files (Android cnss2 picks them by chip version).
+  - Downstream cnss2 hands `phy_ucode*.elf` to the firmware through the same QMI M3 request that ath12k uses for `m3.bin`. If so, `phy_ucode20.elf` is our M3 image.
+  - The board file is `bdwlan.e<board-id>` for the board ID that QMI reports.
+  - All three are verified only at M6.
+
+## 10. Milestone 4: XNU driver (patch 0099, boot-arg `fuxiwlan`)
+
+Files:
+- `xnu/fuxi-wlan/fuxi_wlan.c`, which becomes `bsd/dev/fuxi_wlan.c`.
+- `bsd/dev/wlan.c`: an exact copy of `shim/fuxi-probe/wlan.c`, built with `FUXI_WLAN_XNU`, so steps 1–13 are the code that passed M3.
+- A hook after `fuxi_keys_init()` in `sweet_ufs.c`.
+- `xnu/patches/0099-fuxi-wlan.patch` holds all of it. Regenerate the patch's `wlan.c` copy whenever the loader's file changes.
+
+Gate: `fuxiwlan=0` or absent does nothing; `1` runs steps 1–16; `2`..`16` stops after that step, for bisection. The work runs in its own kernel thread.
+
+Mapping and access:
+- 11 windows, 16 KiB aligned, mapped with `kmem_alloc(KMA_VAONLY)` + `pmap_enter_options_addr(VM_WIMG_IO)`, the same scheme as fuxi_adreno.
+- Every access goes through `fuxi_gpu_access`, so synchronous aborts are recovered.
+- After the first fault, all writes are refused and the run stops.
+
+The XNU helpers equal the loader's `usb_rd/ts_wr/ts_gpio/rh_send` (apps RSC DRV2, ACTIVE TCS0; no other XNU code drives that RSC).
+
+New steps:
+
+| Step | Writes | Source |
+|---|---|---|
+| 14 | iATU outbound region 1 (unrolled, DBI+0x1200): type MEM, 0x60300000–0x63ffffff → PCI 0x60300000. RC memory window 0x60400000–0x605fffff (DBI 0x20 = 0x60506040), prefetchable window empty (0x24 = 0xfff0, 0x28/0x2c = 0), RC command IO\|MEM\|MASTER\|SERR | live-DT `ranges` (mem entry), `dw_pcie_prog_outbound_atu`, `dw_pcie_setup_rc`, PCI bridge window format |
+| 15 | endpoint command decode off, BAR0 = 0x60400000, BAR1 = 0, command = MEMORY only (bus master stays off) | standard PCI BAR assignment; the size comes from the M3 step-13 sizing (must be a 64-bit non-prefetchable BAR ≤ 2 MiB) |
+| 16 | none: reads BAR0 +0x00/08/10/18/20/28/2c/30/38/48 and BHI +0x00/04/28/2c/30/34/38/3c. BHI_SERIALNU (+0x40) is never read | `drivers/bus/mhi/common.h`; ath12k sets `mhi_ctrl->regs` = BAR0 |
+
+### Device test (coordinator)
+
+1. Boot `shim/out/fuxi-wlan-m4-boot.img`. The ADT is 0098i's and the cmdline is 0098i's plus `fuxiwlan=1`, 427 bytes.
+2. Capture the console from boot until `FUXI WLAN: thread exit`.
+3. Decode it with `python3 tools/fuxi-wlan-probe.py --xnu-log LOG`, which rebuilds the M3 and M4 reports from the `m3 r[..]`/`m4 r[..]` dump lines.
+4. On a hang or reset, the last `FUXI WLAN: step N` line is the step that was running. Re-test with `fuxiwlan=N-1`.
+
+Expected lines, in order. Values are those M3 measured; MHI values are guesses.
+```
+FUXI WLAN: enabled (fuxiwlan=1), WCN7850 power-up + PCIe0 + MHI read, limit 16
+FUXI WLAN: mapped 901120 bytes in 11 windows; running steps 1..16
+FUXI WLAN: step 1 ... FUXI WLAN: step 1 ok code 0x1001 (0 ms, faults 0)
+FUXI WLAN: cmd-db 0x40a00 0x40200 0x40400 0x40500 0x44000 0x40600 0x43900 0x43a00 GPLL0 0xe0000005
+  ... steps 2-8 ok ...
+FUXI WLAN: PHY ready after ~620 us pcs_status 0x86
+FUXI WLAN: link LTSSM 0x111 LNKCTL/STA 0xb0220008 (gen2 x2 DLLLA 1) 0 ms
+FUXI WLAN: endpoint id 0x110717cb class/rev 0x2800001 cmd/status 0x100000 tries 1
+FUXI WLAN: BAR0 orig 0x4/0x0 sizing readback 0xffe00004/0xffffffff
+FUXI WLAN: iATU1 MEM 0x60300000-0x63ffffff -> 0x60300000 ctrl2 0x80000000; RC window 0x60506040 pref 0xfff0 cmd/status 0x...107
+FUXI WLAN: BAR0 size 0x200000 assigned 0x60400000 (readback 0x60400004 0) cmd/status 0x100000 -> 0x100002
+FUXI WLAN: MHI REGLEN 0x... MHIVER 0x... MHICFG 0x... (nhwer .. ner .. nhwch .. nch ..)
+FUXI WLAN: MHI CHDBOFF 0x... ERDBOFF 0x... BHIOFF 0x... BHIEOFF 0x... DEBUGOFF 0x...
+FUXI WLAN: MHICTRL 0x0 (state 0, reset 0) MHISTATUS 0x... (state RESET, ready 0, syserr 0)
+FUXI WLAN: BHI version x.y EXECENV 0x0 (PBL) STATUS 0x0 (0) ERRCODE 0x0 ERRDBG ...
+FUXI WLAN: RC cmd/status 0x...107 EP cmd/status 0x...0002
+FUXI WLAN: 16 steps done; no firmware loaded, bus master off
+FUXI WLAN: GCC votes 0x52000 ... 0x52008 ... gdsc-collapse 0x52020 ...
+FUXI WLAN: m3 r[  0] 574c0003 ...
+FUXI WLAN: m4 r[  0] 574c0004 ...
+FUXI WLAN: thread exit
+```
+Guesses for step 16:
+- MHIVER around 0x01000000.
+- MHI state RESET (or READY), EE = PBL (0), since no image has been sent.
+- BHIOFF and BHIEOFF are small offsets inside the first 16 KiB. Anything else stops the step with reason 3 and a log line.
+- `MHIREGLEN = MHIVER = 0xffffffff` means BAR0 is not decoded (reason 2).
+
+How to read a failure:
+- **Steps 1–13:** same reasons as section 7.
+- **Step 14, reason 2:** iATU region 1 not enabled or not programmed.
+- **Step 14, reason 3:** RC command readback is missing MEM or MASTER.
+- **Step 15, reason 1:** the step-13 sizing was unexpected.
+- **Step 15, reason 3 or 4:** BAR or command readback mismatch.
+- **Step 16, reason 1 or 4:** an access fault (synchronous abort): check the ESR in the "stopped" line.
+- **Any step, reason 0xfd:** a fault in a plain access.

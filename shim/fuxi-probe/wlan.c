@@ -205,6 +205,10 @@ static void wl_mark(unsigned step)
 {
  wl3_report[2] = step;
  __asm__ volatile("dsb sy" ::: "memory");
+#ifdef FUXI_WLAN_XNU
+ /* XNU copy (bsd/dev/wlan.c via xnu/patches/0099): log, no scanout paint. */
+ printf("FUXI WLAN: step %u\n", step);
+#else
  if (usb_rd(0xae05000, 0x14) != 0xb8000000 || usb_rd(0xae05000, 0x24) != 4320 ||
      usb_rd(0xae05000, 0x00) != ((2400u << 16) | 1080u) ||
      usb_rd(0xae05000, 0x30) != 0x237ff) return;
@@ -223,6 +227,7 @@ static void wl_mark(unsigned step)
        fb[(1708 + gy * 4 + sy) * 1080 + 48 + c * 32 + gx * 4 + sx] = 0xffffffff;
  }
  __asm__ volatile("dsb sy" ::: "memory");
+#endif
 }
 
 /* RPMh VRM: +0 voltage (mV), +4 enable. Linux rpmh-regulator sends the
