@@ -29,15 +29,15 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,539 @@
+@@ -0,0 +1,994 @@
 +/*
-+ * FUXI WLAN (lane-wlan milestone 4): WCN7850 power-up, PCIe0 link, BAR0
++ * FUXI WLAN (lane-wlan milestones 4/5): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
 + * Gated by boot-arg fuxiwlan (default 0 = do nothing):
-+ *   fuxiwlan=1      run all 16 steps
-+ *   fuxiwlan=2..16  stop after that step (bisecting a hang or reset)
-+ * No firmware is loaded, no MHI state change is requested, the endpoint's
-+ * bus mastering stays off and no interrupt is enabled.
++ *   fuxiwlan=1      run all 28 steps
++ *   fuxiwlan=2..28  stop after that step (bisecting a hang or reset)
++ * Steps 17..28 probe DMA safety and load rootfs firmware through BHI/BHIe.
++ * No interrupts, channels or QMI are enabled; see docs-lanes/wlan-bt.md M5.
 + *
 + * Steps 1..13 are the loader's milestone-3 sequence, compiled from an exact
 + * copy of shim/fuxi-probe/wlan.c (bsd/dev/wlan.c, FUXI_WLAN_XNU). Every write
@@ -62,11 +62,15 @@
 + *      ath12k (mhi.c) points mhi_ctrl->regs at BAR0, so the MHI block is at
 + *      offset 0.
 + * All device accesses go through fuxi_gpu_access (synchronous aborts are
-+ * recovered); after the first fault every later write is refused.
++ * recovered); after a fault normal writes are refused. M5 cleanup permits
++ * only MHI reset, bus-master-off and PERST containment writes.
 + */
 +#if defined(FUXI)
 +#include <sys/param.h>
 +#include <sys/systm.h>
++#include <sys/fcntl.h>
++#include <sys/vnode.h>
++#include <sys/uio.h>
 +#include <string.h>
 +#include <kern/clock.h>
 +#include <kern/thread.h>
@@ -75,6 +79,9 @@
 +#include <pexpert/pexpert.h>
 +#include <vm/vm_kern.h>
 +#include <vm/pmap.h>
++#include <arm/caches_internal.h>
++
++extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
 +
 +extern kern_return_t thread_terminate(thread_t);
 +extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t,
@@ -89,7 +96,7 @@
 +
 +/* ---- kernel mappings (16 KiB aligned; same scheme as fuxi_adreno.c:
 + * kernel_map VA only, fallible page-table expansion, never the 8 MiB
-+ * io_map submap). Kept for the boot: the endpoint stays decoded. */
++ * io_map submap). Kept for the boot; M5 partial/failure paths assert PERST. */
 +struct fw_window { uint64_t pa, size; uintptr_t va; };
 +static struct fw_window fw_windows[] = {
 +	{0x00100000, 0x80000, 0},   /* GCC: votes, GDSCs, PCIe0 RCGs/CBCRs/BCRs */
@@ -97,6 +104,8 @@
 +	{0x008c0000, 0x4000, 0},    /* QUP2 wrapper */
 +	{0x01c00000, 0x8000, 0},    /* PCIe0 PARF 0x1c00000 + QMP PHY 0x1c06000 */
 +	{0x01fd4000, 0x4000, 0},    /* TCSR clkref 0x1fd5100 */
++	{0x15000000, 0x4000, 0},    /* apps SMMU GR0: read-only stream probe */
++	{0x60480000, 0x4000, 0},    /* EP internal register window (TCSR version) */
 +	{0x0f14c000, 0x18000, 0},   /* TLMM tiles gpio76..96 */
 +	{0x17a20000, 0x4000, 0},    /* apps RSC DRV2 + TCS */
 +	{0x60000000, 0x4000, 0},    /* PCIe0 DBI, ELBI 0xf20, iATU 0x1000 */
@@ -432,6 +441,443 @@
 +	return 0xff;
 +}
 +
++/* ---- milestone 5: polling only, no channel start or QMI ----
++ * Register/layout references (independent implementation): Linux MHI common.h,
++ * host/boot.c + pm.c, arm-smmu.h; OpenBSD if_qwz_pci.c READY/FBC sequence.
++ * All DMA addresses are PAs, so only proven apps-SMMU bypass is accepted.
++ */
++#define WL5_STEPS 28u
++#define WL_SMMU 0x15000000ull
++#define WL_CHUNK 0x80000u
++#define WL_FW_MAX 0x2000000u
++#define WL_SEQ_MASK 0x3fffffffu
++static uint32_t wl5_report[128];
++static uint32_t wl_bhi, wl_bhie, wl_fw_size, wl_seq;
++static const char *wl_fw_path;
++static bool wl_mhi_valid, wl_dma_started;
++struct wl_dma { vm_offset_t va; vm_size_t size; uint64_t pa; };
++static struct wl_dma wl_image, wl_vectors, wl_contexts;
++/* Packed MHI contexts are 44 bytes; the old research note's 40 was wrong. */
++struct wl_context {
++	uint32_t cfg, type, index;
++	uint64_t base, len, rp, wp;
++} __attribute__((packed));
++_Static_assert(sizeof(struct wl_context) == 44, "MHI context stride");
++struct wl_vector { uint64_t addr, size; };
++_Static_assert(sizeof(struct wl_vector) == 16, "BHIe vector stride");
++/* Within a single 16 KiB page: 128 disabled channels, two event contexts,
++ * command context, 512-byte control ring, 4 KiB data ring, 2 KiB command ring.
++ * Ring bases are aligned to their lengths. No transfer ring is created. */
++#define WL_ECTX 0x1800u
++#define WL_CCTX 0x1900u
++#define WL_ER0  0x1a00u
++#define WL_ER1  0x2000u
++#define WL_CR   0x3000u
++_Static_assert(128 * sizeof(struct wl_context) <= WL_ECTX, "channel array");
++_Static_assert(WL_CR + 2048 <= 16384, "context page");
++
++static void
++wl_sleep(unsigned ms)
++{
++	/* Yield this dedicated thread; root mount and other drivers must run. */
++	assert_wait_timeout((event_t)&wl5_report, THREAD_UNINT, ms, NSEC_PER_MSEC);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static int
++wl_dma_alloc(struct wl_dma *d, vm_size_t bytes)
++{
++	d->size = round_page(bytes);
++	kern_return_t kr = kmem_alloc_contig(kernel_map, &d->va, d->size,
++	    PAGE_MASK, (ppnum_t)(0xffffffffull >> PAGE_SHIFT), 0,
++	    KMA_DATA | KMA_ZERO | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT);
++	if (kr != KERN_SUCCESS) {
++		printf("FUXI WLAN: DMA allocation bytes %#llx below 4 GiB failed %d; need allocator-owned low DDR (high-RAM bus alias not assumed)\n", (uint64_t)d->size, kr);
++		return 1;
++	}
++	d->pa = ptoa_64(pmap_find_phys(kernel_pmap, d->va));
++	if (!d->pa || d->pa + d->size > 0x100000000ull) {
++		return 2;
++	}
++	/* Check every page rather than trusting the allocation's first PPN. */
++	for (vm_size_t off = 0; off < d->size; off += PAGE_SIZE) {
++		if (ptoa_64(pmap_find_phys(kernel_pmap, d->va + off)) != d->pa + off) {
++			return 3;
++		}
++	}
++	return 0;
++}
++
++static void
++wl_dma_clean(struct wl_dma *d)
++{
++	flush_dcache64(d->pa, (unsigned)d->size, TRUE);
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static void
++wl_dma_free(struct wl_dma *d)
++{
++	if (d->va) {
++		kmem_free(kernel_map, d->va, d->size);
++		bzero(d, sizeof(*d));
++	}
++}
++
++static uint32_t wl_mrd(uint32_t off) { return wl_prd((uint64_t)WL_BAR0 + off); }
++static void wl_mwr(uint32_t off, uint32_t v) { wl_pwr((uint64_t)WL_BAR0 + off, v); }
++static void
++wl_mwr64(uint32_t off, uint64_t v)
++{
++	wl_mwr(off + 4, (uint32_t)(v >> 32));
++	wl_mwr(off, (uint32_t)v);
++}
++
++static void
++wl5_status(unsigned step)
++{
++	if (!wl_mhi_valid) {
++		return;
++	}
++	uint32_t *r = wl5_report;
++	r[64] = wl_mrd(wl_bhi + 0x28); r[65] = wl_mrd(0x48);
++	r[66] = wl_mrd(0x38); r[67] = wl_mrd(wl_bhi + 0x2c);
++	r[68] = wl_mrd(wl_bhi + 0x30);
++	for (unsigned i = 0; i < 3; i++) { r[69 + i] = wl_mrd(wl_bhi + 0x34 + 4 * i); }
++	r[72] = wl_mrd(wl_bhie + 0x44); r[73] = wl_prd(WL_EPCFG + 4);
++	printf("FUXI WLAN: M5 step %u EE %#x (%s) MHISTATUS %#x (%s ready %u) MHICTRL %#x BHI %#x ERRCODE %#x ERRDBG %#x/%#x/%#x BHIE %#x EPcmd %#x\n",
++	    step, r[64], wl_mhi_ee(r[64]), r[65], wl_mhi_state((r[65] >> 8) & 255),
++	    r[65] & 1, r[66], r[67], r[68], r[69], r[70], r[71], r[72], r[73]);
++}
++
++static int
++wl_smmu_probe(void)
++{
++	uint32_t *r = wl5_report;
++	r[4] = wl_prd(WL_SMMU); r[5] = wl_prd(WL_SMMU + 0x20);
++	r[6] = wl_prd(WL_SMMU + 0x24);
++	printf("FUXI WLAN: apps_smmu sCR0 %#x ID0 %#x ID1 %#x (read-only)\n", r[4], r[5], r[6]);
++	if (fw_faults || r[4] == ~0u || r[5] == ~0u || r[6] == ~0u) { return 1; }
++	unsigned count = r[5] & 255, exid = !!(r[4] & 8);
++	if (!(r[5] & (1u << 27)) || !count || (r[4] & 1) ||
++	    (exid && !(r[5] & 256))) {
++		printf("FUXI WLAN: SMMU unsupported stream format or CLIENTPD; DMA safety unproven, stop\n");
++		return 2;
++	}
++	unsigned matches[2] = {0, 0};
++	bool all_bypass = !(r[4] & 0x400);
++	uint32_t types[2] = { (r[4] & 0x400) ? 2u : 1u, (r[4] & 0x400) ? 2u : 1u };
++	/* EXIDENABLE moves VALID to S2CR bit 10 and frees SMR mask bit 15. */
++	for (unsigned i = 0; i < count; i++) {
++		uint32_t smr = wl_prd(WL_SMMU + 0x800 + 4 * i);
++		uint32_t s2cr = wl_prd(WL_SMMU + 0xc00 + 4 * i);
++		if (fw_faults) { return 1; }
++		if (!(exid ? (s2cr & 0x400) : (smr & 0x80000000u))) { continue; }
++		if (((s2cr >> 16) & 3) != 1) { all_bypass = false; }
++		uint32_t mask = (smr >> 16) & (exid ? 0xffff : 0x7fff);
++		for (unsigned n = 0; n < 2; n++) {
++			unsigned sid = 0x1400 + n;
++			if (((sid ^ smr) & ~mask & 0xffff) != 0) { continue; }
++			matches[n]++; types[n] = (s2cr >> 16) & 3;
++			r[8 + 4 * n] = i; r[9 + 4 * n] = smr; r[10 + 4 * n] = s2cr;
++			if (matches[n] <= 4) {
++				printf("FUXI WLAN: SMMU SID %#x slot %u SMR %#x S2CR %#x CB %u\n", sid, i, smr, s2cr, s2cr & 255);
++			}
++		}
++	}
++	for (unsigned n = 0; n < 2; n++) {
++		r[11 + 4 * n] = types[n];
++		printf("FUXI WLAN: SMMU SID %#x %s (%u matches%s)\n", 0x1400 + n,
++		    matches[n] > 1 ? "AMBIGUOUS" : types[n] == 0 ? "TRANSLATED" : types[n] == 1 ? "BYPASS" : types[n] == 2 ? "FAULT" : "RESERVED",
++		    matches[n], matches[n] ? "" : ", sCR0.USFCFG default");
++	}
++	if (types[0] != 1 || types[1] != 1 || matches[0] > 1 || matches[1] > 1) {
++		printf("FUXI WLAN: SMMU DMA blocked: need owned apps-SMMU stream/context for SID 0x1401, identity mappings + TLB sync (and verify RC RID-to-SID); no SMMU writes in M5\n");
++		return 3;
++	}
++	/* DT describes the intended SID; a reset RC may have lost its RID table.
++	 * Validate the hardware lookup, or require bypass for every possible SID.
++	 * Qualcomm 1.9.0 uses CRC8 (poly 0x07), BDF in network byte order. */
++	r[22] = wl_prd(WL_PARF + 0x2c00); r[23] = wl_prd(WL_PARF + 0x234);
++	unsigned hash = 0;
++	for (unsigned byte = 0; byte < 2; byte++) {
++		hash ^= byte ? 0 : 1; /* RID 01:00.0 = 0x0100 */
++		for (unsigned bit = 0; bit < 8; bit++) {
++			hash = ((hash << 1) ^ ((hash & 0x80) ? 7 : 0)) & 255;
++		}
++	}
++	bool route = false;
++	for (unsigned i = 0; !(r[22] & 1) && i < 256; i++) {
++		uint32_t entry = wl_prd(WL_PARF + 0x2000 + 4 * hash);
++		if ((entry >> 16) == 0x100) {
++			r[24] = entry; route = ((entry >> 8) & 255) == 1; break;
++		}
++		if (!(entry & 255)) { break; }
++		hash = entry & 255;
++	}
++	printf("FUXI WLAN: RC RID 0x100 SID cfg %#x offset %#x entry %#x route %s all-stream-bypass %u\n",
++	    r[22], r[23], r[24], route ? "DT-0x1401" : "unproven", all_bypass);
++	if (fw_faults || r[22] == ~0u || r[23] == ~0u || (!route && !all_bypass)) {
++		printf("FUXI WLAN: SMMU DMA blocked: RC RID-to-SID unproven; need verified RID 0x100 to DT SID 0x1401 before DMA\n");
++		return 5;
++	}
++	return 0;
++}
++
++/* Disable both PCI message interrupt mechanisms, leaving the endpoint in
++ * polling mode even if a previous boot stage left a capability enabled. */
++static int
++wl_disable_irqs(void)
++{
++	unsigned p = wl_prd(WL_EPCFG + 0x34) & 0xff;
++	for (unsigned i = 0; p && i < 48; i++) {
++		if (p < 0x40 || p > 0xfc || (p & 3)) { return 1; }
++		uint32_t cap = wl_prd(WL_EPCFG + p), v = cap;
++		if ((cap & 255) == 5) { v &= ~(1u << 16); } /* MSI enable */
++		if ((cap & 255) == 0x11) { v = (v & ~(1u << 31)) | (1u << 30); } /* MSI-X enable/mask */
++		if (v != cap) {
++			wl_pwr(WL_EPCFG + p, v);
++			if (wl_prd(WL_EPCFG + p) != v) { return 2; }
++		}
++		p = (cap >> 8) & 255;
++	}
++	return p || fw_faults ? 3 : 0;
++}
++
++static int
++wl_read_firmware(void)
++{
++	vnode_t root = NULL, vp = NULL;
++	vfs_context_t ctx = vfs_context_kernel();
++	printf("FUXI WLAN: wait root <=120 s, firmware %s\n", wl_fw_path);
++	for (unsigned i = 0; i <= 1200; i++) {
++		root = vfs_rootvnode();
++		if (root) { break; }
++		if (i < 1200) { wl_sleep(100); }
++	}
++	if (!root) { return 1; }
++	vnode_put(root);
++	int e = vnode_open(wl_fw_path, FREAD | O_NOFOLLOW | O_NONBLOCK, 0, 0, &vp, ctx);
++	if (e) {
++		printf("FUXI WLAN: firmware open failed errno %d\n", e);
++		return 2;
++	}
++	struct vnode_attr a;
++	VATTR_INIT(&a); VATTR_WANTED(&a, va_data_size);
++	e = vnode_getattr(vp, &a, ctx);
++	if (e || vnode_vtype(vp) != VREG || !VATTR_IS_SUPPORTED(&a, va_data_size) ||
++	    a.va_data_size < WL_CHUNK || a.va_data_size > WL_FW_MAX) {
++		e = 3; goto close;
++	}
++	wl_fw_size = (uint32_t)a.va_data_size;
++	if (wl_dma_alloc(&wl_image, wl_fw_size)) { e = 4; goto close; }
++	int resid = 0;
++	e = vn_rdwr(UIO_READ, vp, (caddr_t)wl_image.va, (int)wl_fw_size, 0,
++	    UIO_SYSSPACE, 0,
++	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	if (e || resid) {
++		printf("FUXI WLAN: firmware read errno %d residual %d\n", e, resid);
++		e = 5; goto close;
++	}
++	/* Qualcomm images need not be native ARM ELFs. Check ident, header size,
++	 * version and bounded program table; do not reject vendor e_machine. */
++	const uint8_t *b = (const uint8_t *)wl_image.va;
++	uint16_t ehsize, phsize, phnum;
++	uint32_t version; memcpy(&version, b + 20, 4);
++	uint64_t phoff = 0;
++	if (version != 1 || memcmp(b, "\177ELF", 4) || (b[4] != 1 && b[4] != 2) || b[5] != 1 || b[6] != 1) { e = 6; goto close; }
++	if (b[4] == 1) {
++		uint32_t p; memcpy(&p, b + 28, 4); phoff = p;
++		memcpy(&ehsize, b + 40, 2); memcpy(&phsize, b + 42, 2); memcpy(&phnum, b + 44, 2);
++	} else {
++		memcpy(&phoff, b + 32, 8);
++		memcpy(&ehsize, b + 52, 2); memcpy(&phsize, b + 54, 2); memcpy(&phnum, b + 56, 2);
++	}
++	if (ehsize != (b[4] == 1 ? 52 : 64) || !phnum || phsize != (b[4] == 1 ? 32 : 56) ||
++	    phoff < ehsize || phoff > wl_fw_size || (uint64_t)phsize * phnum > wl_fw_size - phoff) { e = 6; goto close; }
++	wl_dma_clean(&wl_image);
++	wl5_report[17] = wl_fw_size; wl5_report[18] = (uint32_t)wl_image.pa;
++	printf("FUXI WLAN: firmware %s bytes %u ELF%u DMA %#llx cache-clean\n", wl_fw_path, wl_fw_size, b[4] == 1 ? 32 : 64, wl_image.pa);
++	e = 0;
++close:
++	(void)vnode_close(vp, FREAD, ctx);
++	return e;
++}
++
++/* Poll modes: BHI completion, READY, SBL/M0, BHIe completion, mission/M0.
++ * Error envs are never treated as success merely because EE >= SBL. */
++static int
++wl_poll(unsigned mode)
++{
++	for (unsigned i = 0; i <= 200; i++) {
++		uint32_t ee = wl_mrd(wl_bhi + 0x28), st = wl_mrd(0x48);
++		uint32_t bs = wl_mrd(wl_bhi + 0x2c), es = wl_mrd(wl_bhie + 0x44);
++		uint32_t ctrl = wl_mrd(0x38), state = (st >> 8) & 255;
++		if (fw_faults || (st & 4) || state == 255 || (bs >> 30) == 3 ||
++		    (es >> 30) == 3 || ee == 3 || ee == 6 || ee == ~0u) { return 1; }
++		if ((mode == 0 && ((bs >> 30) == 2 || ee == 1)) ||
++		    (mode == 1 && !(ctrl & 2) && (st & 1)) ||
++		    (mode == 2 && ee == 1 && state == 2) ||
++		    (mode == 3 && (es >> 30) == 2 && (es & WL_SEQ_MASK) == wl_seq) ||
++		    (mode == 4 && (ee == 2 || ee == 4 || ee == 7) && state == 2)) { return 0; }
++		if (i < 200) { wl_sleep(25); }
++	}
++	printf("FUXI WLAN: poll mode %u timeout 5000 ms\n", mode);
++	return 2;
++}
++
++static int
++wl5_step(unsigned s)
++{
++	switch (s) {
++	case 17:
++		/* M4 validated BHIOFF; independently validate all M5 block extents. */
++		wl_bhi = wl4_report[25]; wl_bhie = wl4_report[26];
++		if (wl_bhi < 0x40 || wl_bhi > 0x3fc0 || (wl_bhi & 3) ||
++		    wl_bhie < 0x40 || wl_bhie > 0x3f80 || (wl_bhie & 3)) { return 4; }
++		wl_mhi_valid = true;
++		return wl_smmu_probe();
++	case 18: {
++		uint32_t saved = wl_mrd(0x310c);
++		wl_mwr(0x310c, 0x40000036); /* EP internal TCSR, NOT host TCSR */
++		if (wl_mrd(0x310c) != 0x40000036) { return 1; }
++		uint32_t hw = wl_prd((uint64_t)WL_BAR0 + 0x80000);
++		wl_mwr(0x310c, saved);
++		wl5_report[16] = hw;
++		if (!hw || hw == ~0u || fw_faults) { return 2; }
++		wl_fw_path = ((hw >> 8) & 15) == 2 ?
++		    "/usr/local/share/fuxi/wlan/amss20.bin" : "/usr/local/share/fuxi/wlan/amss.bin";
++		printf("FUXI WLAN: TCSR_SOC_HW_VERSION %#x major %u minor %u firmware %s (vendor filename inference)\n", hw, (hw >> 8) & 15, hw & 255, wl_fw_path);
++		return 0;
++	}
++	case 19: return wl_read_firmware();
++	case 20: {
++		if (wl_disable_irqs()) { return 4; }
++		if (wl_mrd(wl_bhi + 0x28) != 0 || (wl_mrd(0x38) & 2) ||
++		    (wl_mrd(0x48) & 0xff04) || (wl_prd(WL_EPCFG + 4) & 4)) { return 1; }
++		unsigned n = (wl_fw_size + WL_CHUNK - 1) / WL_CHUNK;
++		if (wl_dma_alloc(&wl_vectors, n * sizeof(struct wl_vector)) ||
++		    wl_dma_alloc(&wl_contexts, 16384)) { return 2; }
++		struct wl_vector *v = (struct wl_vector *)wl_vectors.va;
++		for (unsigned i = 0; i < n; i++) {
++			unsigned off = i * WL_CHUNK;
++			v[i].addr = wl_image.pa + off;
++			v[i].size = MIN(WL_CHUNK, wl_fw_size - off);
++		}
++		struct wl_context *e = (struct wl_context *)(wl_contexts.va + WL_ECTX);
++		for (unsigned i = 0; i < 2; i++) {
++			e[i].type = 1; e[i].base = e[i].rp = wl_contexts.pa + (i ? WL_ER1 : WL_ER0);
++			e[i].len = i ? 4096 : 512; e[i].wp = e[i].base + e[i].len - 16;
++		}
++		struct wl_context *c = (struct wl_context *)(wl_contexts.va + WL_CCTX);
++		c->base = c->rp = c->wp = wl_contexts.pa + WL_CR; c->len = 2048;
++		wl_dma_clean(&wl_contexts); wl_dma_clean(&wl_vectors);
++		wl5_report[19] = n * sizeof(struct wl_vector);
++		wl5_report[20] = (uint32_t)wl_vectors.pa; wl5_report[21] = (uint32_t)wl_contexts.pa;
++		printf("FUXI WLAN: prepared %u vectors (%u bytes), 44-byte contexts, channels disabled; bus master off\n", n, wl5_report[19]);
++		return fw_faults ? 3 : 0;
++	}
++	case 21:
++		for (unsigned o = 0x60; o <= 0x70; o += 4) { wl_mwr(wl_bhie + o, 0); }
++		wl_mwr(wl_bhi + 0x20, 0); wl_mwr(wl_bhi + 0x2c, 0);
++		wl_mwr64(wl_bhi + 8, wl_image.pa); wl_mwr(wl_bhi + 0x10, WL_CHUNK);
++		wl_dma_clean(&wl_image);
++		if (fw_faults) { return 1; }
++		/* Only now, immediately before the first image doorbell, allow DMA.
++		 * Disable legacy INTx; MSI/MSI-X remain unconfigured/disabled. */
++		wl_pwr(WL_EPCFG + 4, (wl_prd(WL_EPCFG + 4) & 0xffff) | 0x404);
++		wl_dma_started = true;
++		if ((wl_prd(WL_EPCFG + 4) & 0x406) != 0x406 || fw_faults) { return 2; }
++		wl_seq = ((uint32_t)mach_absolute_time() & WL_SEQ_MASK) | 1;
++		wl_mwr(wl_bhi + 0x18, wl_seq);
++		printf("FUXI WLAN: BHI doorbell seq %#x bytes %#x bus master on\n", wl_seq, WL_CHUNK);
++		return fw_faults ? 3 : 0;
++	case 22: return wl_poll(0);
++	case 23: return wl_poll(1);
++	case 24: {
++		uint32_t erdb = wl_mrd(0x20);
++		if ((erdb & 7) || erdb < 0x100 || erdb > 0x3ff0 ||
++		    (wl_mrd(0x10) & 255) != 128) { return 1; }
++		wl_mwr64(0x58, wl_contexts.pa); wl_mwr64(0x60, wl_contexts.pa + WL_ECTX);
++		wl_mwr64(0x68, wl_contexts.pa + WL_CCTX);
++		wl_mwr64(0x80, 0); wl_mwr64(0x88, 0xffffffffull);
++		wl_mwr64(0x98, 0); wl_mwr64(0xa0, 0xffffffffull);
++		wl_mwr(0x10, (wl_mrd(0x10) & 0xffff) | (2u << 16));
++		wl_mwr64(erdb, wl_contexts.pa + WL_ER0 + 512 - 16);
++		wl_mwr64(erdb + 8, wl_contexts.pa + WL_ER1 + 4096 - 16);
++		return fw_faults ? 2 : 0;
++	}
++	case 25:
++		wl_mwr(0x38, (wl_mrd(0x38) & ~0xff00u) | 0x200);
++		return wl_poll(2);
++	case 26:
++		wl_dma_clean(&wl_image); wl_dma_clean(&wl_vectors);
++		wl_mwr64(wl_bhie + 0x2c, wl_vectors.pa);
++		wl_mwr(wl_bhie + 0x34, wl5_report[19]);
++		wl_seq = (wl_seq + 1) & WL_SEQ_MASK; if (!wl_seq) { wl_seq = 1; }
++		wl_mwr(wl_bhie + 0x3c, (wl_mrd(wl_bhie + 0x3c) & ~WL_SEQ_MASK) | wl_seq);
++		printf("FUXI WLAN: BHIe doorbell seq %#x full image %u vector bytes %u\n", wl_seq, wl_fw_size, wl5_report[19]);
++		return fw_faults ? 1 : 0;
++	case 27: return wl_poll(3);
++	case 28: {
++		int e = wl_poll(4);
++		if (!e) { printf("FUXI WLAN: M5 mission mode M0 confirmed (READY observed at step 23); no channels/QMI; DMA buffers retained\n"); }
++		return e;
++	}
++	}
++	return 0xff;
++}
++
++/* Cleanup is the only exception to the normal write-after-fault latch. These
++ * three containment destinations were mapped before bring-up. Keep each access
++ * fault-contained, and never clear the original fault counters. */
++static int
++wl_contain_wr(uint64_t pa, uint32_t value)
++{
++	uintptr_t va = fw_va(pa); uint64_t v = value;
++	if (!va) { return 1; }
++	__asm__ volatile("dsb sy" ::: "memory");
++	return (int)fuxi_gpu_access(va, &v, 1, 0);
++}
++
++static void
++wl5_abort(unsigned step)
++{
++	wl5_status(step);
++	int reset_bad = 0;
++	if (wl_mhi_valid) {
++		reset_bad = wl_contain_wr((uint64_t)WL_BAR0 + 0x38, 2);
++		for (unsigned i = 0; !reset_bad && i <= 40; i++) {
++			uint32_t ctrl = wl_mrd(0x38);
++			if (ctrl == ~0u) { reset_bad = 1; break; }
++			if (!(ctrl & 2)) { break; }
++			if (i == 40) { reset_bad = 1; break; }
++			wl_sleep(25);
++		}
++	}
++	/* PCI command upper word is W1C status: always write only low 16 bits. */
++	uint32_t cmd = wl_prd(WL_EPCFG + 4);
++	int bm_bad = wl_contain_wr(WL_EPCFG + 4, cmd & 0xffff & ~4u);
++	cmd = wl_prd(WL_EPCFG + 4); bm_bad |= cmd == ~0u || !!(cmd & 4);
++	/* gpio94 was configured as an output at step 5; clear only its OUT bit. */
++	uint64_t perst = TS_TLMM + 0x1000ull * 94 + 4;
++	uint32_t io = wl_prd(perst);
++	int perst_bad = wl_contain_wr(perst, io & ~2u);
++	io = wl_prd(perst); perst_bad |= io == ~0u || !!(io & 2);
++	__asm__ volatile("dsb sy" ::: "memory");
++	wl_sleep(10); /* PERST assertion + outstanding transaction drain */
++	printf("FUXI WLAN: abort step %u MHI reset %s, bus master off %s, PERST asserted %s\n", step,
++	    reset_bad ? "unconfirmed" : "done", bm_bad ? "unconfirmed" : "yes", perst_bad ? "unconfirmed" : "yes");
++	/* No DMA buffer is ever returned to the allocator while containment is
++	 * unproven. This is a bounded leak on an MMIO fault, never a panic/UAF. */
++	if (!wl_dma_started || (!bm_bad && !perst_bad)) {
++		wl_dma_free(&wl_contexts); wl_dma_free(&wl_vectors); wl_dma_free(&wl_image);
++		printf("FUXI WLAN: abort buffers freed\n");
++	} else {
++		printf("FUXI WLAN: abort buffers quarantined until reboot (DMA containment unproven)\n");
++	}
++}
++
 +static void
 +fw_dump(const char *tag, const uint32_t *r, unsigned words)
 +{
@@ -479,6 +925,7 @@
 +	uint32_t *r4 = wl4_report;
 +	r4[0] = WL4_MAGIC;
 +	r4[1] = limit;
++	wl5_report[0] = 0x574c0005; wl5_report[1] = limit;
 +	for (unsigned s = 1; s <= limit; s++) {
 +		uint64_t t0 = mach_absolute_time(), ns = 0;
 +		unsigned faults0 = fw_faults;
@@ -492,7 +939,8 @@
 +		} else {
 +			wl_mark(s);
 +			wl3_faults = 0;
-+			e = wl4_step(s);
++			e = s <= WL4_STEPS ? wl4_step(s) : wl5_step(s);
++			if (s > WL4_STEPS) { wl5_status(s); }
 +			wl3_report[124] += wl3_faults;
 +		}
 +		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
@@ -501,20 +949,26 @@
 +			e = 0xfd;
 +		}
 +		r4[2] = s;
-+		r4[40 + s] = e ? (s << 8 | (unsigned)e) : 0x1000u | s;
++		uint32_t code = e ? (s << 8 | (unsigned)e) : 0x1000u | s;
++		if (s <= WL4_STEPS) { r4[40 + s] = code; }
++		wl5_report[2] = s; wl5_report[32 + s] = code;
 +		printf("FUXI WLAN: step %u %s code %#x (%llu ms, faults %u)\n", s, e ? "FAILED" : "ok",
-+		    r4[40 + s], ns / 1000000ull, fw_faults);
++		    code, ns / 1000000ull, fw_faults);
 +		if (!e && s <= WL3_STEPS) {
 +			fw_m3_summary(s);
 +		}
 +		if (e) {
 +			r4[3] = s << 8 | (unsigned)e;
++			wl5_report[3] = r4[3];
++			if (s >= 17) { wl5_abort(s); }
 +			printf("FUXI WLAN: stopped at step %u reason %u ESR %#x FAR %#llx; reboot to retry\n",
 +			    s, e, fw_fault_esr, fw_fault_far);
 +			goto out;
 +		}
 +	}
-+	printf("FUXI WLAN: %u steps done; no firmware loaded, bus master off\n", limit);
++	printf("FUXI WLAN: %u steps done\n", limit);
++	/* A deliberate partial M5 run also shuts down before releasing memory. */
++	if (limit >= 19 && limit < WL5_STEPS) { wl5_abort(limit); }
 +out:
 +	/* Shared GCC vote registers (touch and GPU also read-modify-write
 +	 * 0x52008/0x52000 without a common lock): show the final values. */
@@ -522,6 +976,7 @@
 +	    usb_rd(WL_GCC, 0x52000), usb_rd(WL_GCC, 0x52008), usb_rd(WL_GCC, 0x52020));
 +	fw_dump("m3", wl3_report, 128);
 +	fw_dump("m4", wl4_report, 64);
++	if (limit >= 17) { fw_dump("m5", wl5_report, 128); }
 +}
 +
 +static void
@@ -559,8 +1014,8 @@
 +	if (!PE_parse_boot_argn("fuxiwlan", &arg, sizeof(arg)) || arg <= 0) {
 +		return;
 +	}
-+	unsigned limit = (arg == 1 || arg > (int)WL4_STEPS) ? WL4_STEPS : (unsigned)arg;
-+	printf("FUXI WLAN: enabled (fuxiwlan=%d), WCN7850 power-up + PCIe0 + MHI read, limit %u\n",
++	unsigned limit = (arg == 1 || arg > (int)WL5_STEPS) ? WL5_STEPS : (unsigned)arg;
++	printf("FUXI WLAN: enabled (fuxiwlan=%d), WCN7850 power-up + PCIe0 + MHI firmware, limit %u\n",
 +	    arg, limit);
 +	if (kernel_thread_start(fw_thread, (void *)(uintptr_t)limit, &thread) == KERN_SUCCESS) {
 +		thread_deallocate(thread);

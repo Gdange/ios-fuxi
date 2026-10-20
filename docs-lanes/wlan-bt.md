@@ -3,6 +3,8 @@
 Status:
 - Milestone 1 (read-only snapshot): built.
 - Milestone 3 (gated power-up, PCIe0 link, endpoint ID and BAR sizes): built, not yet run on the device.
+- Milestone 4 (XNU PCIe0/BAR0/MHI read): passed on the device.
+- Milestone 5 (polled BHI/BHIe): implemented and built; device SMMU state unmeasured, low-DDR prerequisite documented in section 11.
 - Wi-Fi is the lane priority; Bluetooth (M2) waits.
 
 ## 1. Topology
@@ -390,3 +392,189 @@ How to read a failure:
 - **Step 15, reason 3 or 4:** BAR or command readback mismatch.
 - **Step 16, reason 1 or 4:** an access fault (synchronous abort): check the ESR in the "stopped" line.
 - **Any step, reason 0xfd:** a fault in a plain access.
+
+## 11. Milestone 5: polled BHI/BHIe firmware download
+
+Implemented in the existing `fuxi_wlan.c` and regenerated patch 0099. M4 steps
+1–16 are unchanged. `fuxiwlan=0`/absent is off, `1` runs through 28, and `N`
+(2–28) stops after N. Values above 28 retain the old "run all" convention.
+The new work runs in the same dedicated kernel thread; long waits yield it.
+No phone was accessed during M5 development. **Actual apps-SMMU state and
+firmware/READY/M0 success remain unmeasured**, pending the coordinator's run.
+M4's measured MHIVER is `0xdeadbeef`, REGLEN `0x100`, MHICFG `0x800080`,
+BHIOFF `0x100`, BHIEOFF `0x224`, EE PBL, MHISTATUS RESET, with no BHI errors.
+
+### DMA safety and the SMMU decision
+
+PCIe0 uses apps_smmu at `0x15000000`; DT assigns RC SID `0x1400`, endpoint
+01:00.0 SID `0x1401`. Step 17 reads sCR0/ID0/ID1 and all ID0.NUMSMRG SMR/S2CR
+pairs, including wildcard masks and EXIDENABLE's S2CR.EXIDVALID. It logs the
+matching slots, context bank and BYPASS/FAULT/TRANSLATED classification for
+both SIDs. An unmatched SID uses sCR0.USFCFG (bypass or fault). Multiple
+matches, unsupported formats, CLIENTPD, reserved types, inaccessible registers,
+or either SID not bypassing stop the run before firmware allocation or BME.
+A translated stream is rejected even if it might happen to be identity mapped.
+
+The DT route also needs the RC hardware table to survive reset: step 17 reads
+PARF BDF_TO_SID_CFG/SID_OFFSET and traverses the CRC8 lookup for RID `0x0100`.
+It requires the enabled table to yield relative SID 1 (DT's `0x1401`), or
+requires every valid SMMU entry and the unmatched-stream policy to bypass so
+that an unknown emitted SID cannot change DMA interpretation. An unproven
+route with any translated/faulting stream also stops at 17. No RC SID table
+or SMMU register is written by this probe.
+
+The GPU lane targets a separate GPU SMMU and owns its context/stream slots.
+That code does **not** establish apps-SMMU ownership, secure-firmware policy,
+or a safe identity/bypass stream for PCIe0. M5 therefore performs **no SMMU
+writes**. If 17 stops, the next platform work must establish the actual RC
+RID-to-SID route and reserve apps-SMMU stream slots/context banks for these
+SIDs without replacing another client's wildcard match. For translation,
+map the allocated image, vectors, all context/ring pages at the device IOVAs,
+set context TTBR/TCR/MAIR/SCTLR and stream S2CR consistently, clean page tables,
+and complete the relevant context/global TLB invalidation and sync. Confirm
+secure ownership and Qualcomm bypass quirks first. Never clear global USFCFG
+or CLIENTPD to make a single Wi-Fi client work. This is a separate milestone.
+
+### Known low-memory prerequisite in the requested base packing
+
+The inherited loader passes `physBase=0x8c0000000`, `memSize=0x13e000000`
+to XNU (both above 4 GiB), rather than advertising an allocator-owned low-DDR
+pool. Thus **step 19's physical allocation below 4 GiB is expected to fail
+with this exact base packing**, even if step 17 proves bypass. The allocation
+failure explicitly reports the need for allocator-owned low DDR. No high-PA
+truncation or unverified RAM bus alias is used. To execute the later DMA
+steps, a platform follow-up must reserve and expose a suitable low-DDR pool
+to XNU (with bootloader/secure/reserved-memory exclusions proved), or design
+an apps-SMMU IOVA mapping for high XNU RAM; the latter changes the requested
+physical-bypass policy and requires separate validation. M5 preserves the
+specified base ADT and packing rather than inventing either arrangement.
+
+### Steps and bounds
+
+Each M5 step logs EE, MHISTATUS/state/READY, MHICTRL, BHI STATUS/ERRCODE/
+ERRDBG1–3, BHIe TXVECSTATUS and endpoint command. SERIALNU is never read.
+Every device access is fault-contained. Polls are 25 ms apart, up to 5 s each;
+root availability is polled every 100 ms for at most 120 s.
+
+| Step | Action / expected result |
+|---|---|
+| 17 | Read-only apps-SMMU and RC route probe; continue only with proven physical-address DMA bypass. |
+| 18 | Save BAR0 window selector +0x310c; select 0x40000036; read endpoint-internal TCSR_SOC_HW_VERSION at BAR0+0x80000; restore selector. Major [11:8] == 2 selects `amss20.bin`, otherwise `amss.bin`; log minor [7:0]. Reject zero/all-ones/faulted reads. This is **not** the host TCSR address. |
+| 19 | Wait for `vfs_rootvnode()`, release its iocount, open selected root file read-only/no-follow/nonblocking. Require regular file, 512 KiB–32 MiB, exact read, little-endian ELF32/64 ident/version/header/program-table bounds. Allocate page-rounded physically contiguous memory below 4 GiB with `kmem_alloc_contig` max PPN; verify every PPN and cache-clean the allocation. |
+| 20 | Require PBL, RESET state, RESET bit clear, no SYSERR and BME off; mask PCI MSI/MSI-X. Allocate low contiguous vector and context pages. Build full-image 512 KiB chunks plus final remainder. All 128 channels disabled; two valid event contexts and an empty command context/ring. Cache-clean vectors/contexts. |
+| 21 | Zero BHIe RX registers, INTVEC=0, BHI STATUS=0; image address high then low, size=512 KiB. Cache-clean image, then enable BME (and mask INTx) immediately before nonzero BHI sequence doorbell. |
+| 22 | Poll BHI SUCCESS or exact SBL EE; errors, RDDM/EDL/SYSERR abort. |
+| 23 | Poll MHICTRL.RESET clear and MHISTATUS.READY=1. This records READY before M0. |
+| 24 | Set channel/event/command context bases high then low; control/data base=0, limits=0xffffffff; MHICFG NER=2/NHWER=0; ring both event WP doorbells. No command or channel doorbells. |
+| 25 | Request MHICTRL.MHISTATE=M0, then poll exact SBL + M0. |
+| 26 | Re-clean image/vectors; BHIe TX vector address high then low, size=table **bytes**; preserve upper doorbell bits and ring a new nonzero sequence. |
+| 27 | Poll BHIe XFER_COMPL with the matching sequence number. |
+| 28 | Poll mission EE (AMSS/WFW/FP) and M0; retain all DMA buffers for potential firmware paging. No channels/QMI. |
+
+MHI contexts have three u32 plus four u64 fields: **44-byte packed stride**,
+not the 40 bytes in the earlier private research notes. The single 16 KiB
+context allocation contains channel array at +0, event contexts at +0x1800,
+command context +0x1900, event ring 0 +0x1a00 (512 bytes), event ring 1 +0x2000
+(4096 bytes), command ring +0x3000 (2048 bytes). Ring bases meet ring-length
+alignment. Events can land in valid memory while the host polls registers;
+the host does not consume events or reuse these buffers while running.
+
+### Failure, timeout and deliberate partial stops
+
+A failed M5 step snapshots status, requests MHI RESET and polls reset clear
+for up to 1 s, clears endpoint BME with readback, asserts PERST# with readback,
+waits 10 ms for reset/transaction drain, then frees the buffers. A synchronous
+fault normally latches off all writes; only these three containment addresses
+are allowed fault-contained cleanup writes after the latch. The original fault
+state is preserved. If DMA started and BME-off/PERST cannot both be confirmed,
+buffers are quarantined until reboot instead of risking DMA into freed pages.
+No panic path is introduced. Successful partial stops 19–27 run the same
+shutdown before freeing; 17/18 leave the M4 endpoint quiescent with BME off.
+Reboot for every change of limit; there is no resume in one XNU boot.
+
+### Firmware staging on the root filesystem
+
+Use the coordinator's existing `firmware_mnt/image/kiwi` files, never kernel
+embedding or files tracked by git. Stage both alternatives before testing:
+
+| Source basename | Root destination | Owner | Mode |
+|---|---|---|---|
+| `amss20.bin` | `/usr/local/share/fuxi/wlan/amss20.bin` | root:wheel (0:0) | 0644 |
+| `amss.bin` | `/usr/local/share/fuxi/wlan/amss.bin` | root:wheel (0:0) | 0644 |
+
+The existing vendor copies pass the step-19 ELF/header/size rules:
+- `amss20.bin`: 5,890,112 bytes, SHA256 `cc25a432aa19e71e8503b424c9a52be952f6dd1d2f93f38f1ff754f748d97667`.
+- `amss.bin`: 7,458,880 bytes, SHA256 `c42e06f534c07ffdaec3b265ff1e38b312741e35eb5fb21b5ca77995fab8d688`.
+
+Directories `/usr/local/share/fuxi` and `wlan` should be root:wheel, 0755.
+No board data, regdb, Data*.msc, phy_ucode*.elf or m3.bin is loaded in M5;
+those belong to the later QMI milestone. Upstream qwz/ath12k call the hw2.0
+image `amss.bin`; the phone vendor's `amss20.bin` association with major 2 is
+still an **explicit packaging inference**, not proved by CNSS source. M5 logs
+this choice and does not automatically retry another file after DMA failure.
+Non-major-2's `amss.bin` choice follows the requested vendor naming policy,
+not a claim that other WCN7850 silicon versions are supported by upstream.
+
+### Expected console and safe bisection
+
+```
+FUXI WLAN: apps_smmu sCR0 ... ID0 ... ID1 ... (read-only)
+FUXI WLAN: SMMU SID 0x1400 BYPASS (...)
+FUXI WLAN: SMMU SID 0x1401 BYPASS (...)
+FUXI WLAN: RC RID 0x100 SID cfg ... offset ... entry ... route ...
+FUXI WLAN: TCSR_SOC_HW_VERSION ... major 2 minor ... firmware /usr/local/share/fuxi/wlan/amss20.bin (vendor filename inference)
+FUXI WLAN: firmware ... bytes ... ELF32 DMA ... cache-clean
+FUXI WLAN: BHI doorbell seq ... bytes 0x80000 bus master on
+FUXI WLAN: M5 step 23 EE ... MHISTATUS ... (READY ready 1) ...
+FUXI WLAN: M5 step 25 EE 0x1 (SBL) MHISTATUS 0x200 (M0 ready 0) ...
+FUXI WLAN: BHIe doorbell seq ... full image ... vector bytes ...
+FUXI WLAN: M5 mission mode M0 confirmed (READY observed at step 23); no channels/QMI; DMA buffers retained
+FUXI WLAN: M5 step 28 EE 0x2 (AMSS) MHISTATUS ... (M0 ready ...) ...
+FUXI WLAN: 28 steps done
+FUXI WLAN: m5 r[...]
+FUXI WLAN: thread exit
+```
+
+Values after DMA are expectations, not device observations. MHISTATUS.READY
+may clear in M0; a step-23 success is the recorded READY proof. On blocked DMA:
+`FUXI WLAN: SMMU DMA blocked: ...`, `step 17 FAILED`, then the abort line and
+`stopped at step 17 ...`. No firmware is opened and BME is never enabled.
+
+Coordinator order, one fresh boot per limit: **16 → 17 → 18 → 19 → 20 → 21 →
+22 → 23 → 24 → 25 → 26 → 27 → 28 → 1**. Step 21 is the first DMA; 25 first
+requests M0; 26 first rings BHIe. Stop on the first failure/reset. If a step
+hangs, the last `FUXI WLAN: step N` is the active one; reboot with N-1. A
+partial run that starts DMA shuts down on reaching its requested limit.
+Decode captured logs offline with `tools/fuxi-wlan-probe.py --xnu-log LOG`;
+it accepts m3/m4/m5 report dumps and labels all new steps. Raw text retains
+per-step status and containment results.
+
+### Build and source references
+
+Build only the dedicated native WLAN tree using its configured IIG cache and
+`bash build-fuxi-native.sh xnu`. Copy stripped/unstripped kernel outputs into
+`xnu/out-fuxi-wlan5/`. `tools/build-fuxi-wlan5-images.sh BASE_METAL2A_ARTIFACT_DIR`
+copies the base ADT unchanged and appends exactly ` fuxiwlan=1` to the base
+cmdline (asserting fewer than 608 bytes), then uses mkpayload and the existing
+loader/header-v4 packing with the same private GPU firmware/toolchain inputs.
+Outputs are `shim/out/fuxi-wlan-m5-{payload.bin,boot.img,loader.elf}` and
+`xnu/out-fuxi-wlan5/SHA256SUMS`; none are committed.
+
+Register and sequence references (independent implementation, no imported
+third-party driver code): [Linux arm-smmu register definitions](https://github.com/torvalds/linux/blob/master/drivers/iommu/arm/arm-smmu/arm-smmu.h),
+[Qualcomm SMMU quirks](https://github.com/torvalds/linux/blob/master/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c),
+[Qualcomm RC RID lookup](https://github.com/torvalds/linux/blob/master/drivers/pci/controller/dwc/pcie-qcom.c),
+[Linux MHI context ABI](https://github.com/torvalds/linux/blob/master/drivers/bus/mhi/common.h),
+[MHI firmware loading](https://github.com/torvalds/linux/blob/master/drivers/bus/mhi/host/boot.c),
+[MHI state transitions](https://github.com/torvalds/linux/blob/master/drivers/bus/mhi/host/pm.c),
+[OpenBSD qwz PCI MHI/FBC sequence](https://github.com/openbsd/src/blob/master/sys/dev/pci/if_qwz_pci.c).
+
+M5 validation: `python3 tools/test-fuxi-wlan-m5.py` compiles the actual M5 C
+block against fake MMIO/VFS/DMA with ASan/UBSan. It covers the full download
+sequence, 44-byte context stride, vector remainder, cache/BME/doorbell order,
+SMMU wildcard/EXID/default/ambiguous/translated/fault paths, RC route gating,
+all poll deadlines, RDDM/EDL/SYSERR rejection, wrong BHIe sequence, root/file/
+allocation failures, MSI/MSI-X masking, ordered cleanup and buffer quarantine.
+It also round-trips a synthetic M5 console report through the decoder. Native
+XNU build passed; the existing M4 device log still decodes correctly. These
+checks do not establish hardware DMA or firmware success.

@@ -189,9 +189,56 @@ def decode_m4(r):
     return '\n'.join(o)
 
 
+M5_STEPS = {
+    17: 'read-only apps-SMMU + RC RID-to-SID safety probe',
+    18: 'windowed endpoint TCSR version + firmware selection',
+    19: 'root wait + checked ELF into contiguous low DMA memory',
+    20: 'vectors + disabled MHI contexts; mask PCI interrupts',
+    21: 'BHI registers + bus master on + 512 KiB doorbell',
+    22: 'poll BHI completion', 23: 'poll RESET clear + READY',
+    24: 'MHI context bases, low DMA limits, event doorbells',
+    25: 'request M0 + poll SBL/M0', 26: 'BHIe full-image vector doorbell',
+    27: 'poll matching BHIe completion', 28: 'poll mission EE + M0',
+}
+
+
+def decode_m5(r):
+    o = [f'magic={r[0]:#x} limit={r[1]} last_step={r[2]} result={r[3]:#x}']
+    for step, name in M5_STEPS.items():
+        code = r[32 + step]
+        if code:
+            result = 'OK' if code == (0x1000 | step) else f'FAIL reason {code & 255}'
+            o.append(f'  step {step:2} {result} {name}')
+    if r[2] >= 17:
+        o.append(f'  SMMU sCR0={r[4]:#x} ID0={r[5]:#x} ID1={r[6]:#x}')
+        classification_valid = r[49] == (0x1000 | 17) or (r[49] & 255) in (3, 5)
+        if classification_valid:
+            for n in range(2):
+                i = 8 + 4 * n
+                kind = ['TRANSLATED', 'BYPASS', 'FAULT', 'RESERVED'][r[i + 3] & 3]
+                o.append(f'  SID {0x1400 + n:#x} type={kind} last-slot={r[i]} SMR={r[i + 1]:#x} S2CR={r[i + 2]:#x} '
+                         '(use text lines for match counts/probe validity)')
+        else:
+            o.append('  SMMU classification incomplete; inspect the original probe failure lines')
+        o.append(f'  RC SID cfg={r[22]:#x} offset={r[23]:#x} RID entry={r[24]:#x}')
+    if r[16]:
+        o.append(f'  TCSR={r[16]:#x} major={(r[16] >> 8) & 15} minor={r[16] & 255} '
+                 f'firmware={"amss20.bin" if (r[16] >> 8) & 15 == 2 else "amss.bin"}')
+    if r[17]:
+        o.append(f'  image={r[17]} bytes PA={r[18]:#x} vector-bytes={r[19]} vector-PA={r[20]:#x} context-PA={r[21]:#x}')
+    ee, status = r[64], r[65]
+    state = (status >> 8) & 255
+    o.append(f'  final snapshot EE={MHI_EE[ee] if ee < 8 else ee} MHISTATUS={status:#x} '
+             f'state={MHI_STATE[state] if state < 8 else state} READY={status & 1} '
+             f'MHICTRL={r[66]:#x} BHI={r[67]:#x} ERRCODE={r[68]:#x} '
+             f'ERRDBG={r[69]:#x}/{r[70]:#x}/{r[71]:#x} BHIE={r[72]:#x} EPcmd={r[73]:#x}')
+    o.append('  Per-step status and abort containment are in the original FUXI WLAN text lines.')
+    return '\n'.join(o)
+
+
 def from_xnu_log(path):
-    """Rebuild the m3/m4 reports from 'FUXI WLAN: m3 r[  8] ...' console lines."""
-    reports = {'m3': [0] * 128, 'm4': [0] * 64}
+    """Rebuild the m3/m4/m5 reports from 'FUXI WLAN: m3 r[  8] ...' console lines."""
+    reports = {'m3': [0] * 128, 'm4': [0] * 64, 'm5': [0] * 128}
     seen = set()
     for line in path.read_text(errors='replace').splitlines():
         at = line.find('FUXI WLAN: ')
@@ -210,7 +257,7 @@ def from_xnu_log(path):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--xnu-log', type=Path,
-                    help='decode the FUXI WLAN m3/m4 dump lines of an XNU console log (fuxiwlan=1)')
+                    help='decode the FUXI WLAN m3/m4/m5 dump lines of an XNU console log (fuxiwlan=1)')
     ap.add_argument('--m3', type=int, metavar='LIMIT', choices=range(1, 14),
                     help='run gated M3 steps 1..LIMIT (writes hardware; see docs-lanes/wlan-bt.md)')
     ap.add_argument('--m3-report', action='store_true', help='re-read the M3 report')
@@ -222,11 +269,13 @@ def main():
     if args.xnu_log:
         reports, seen = from_xnu_log(args.xnu_log)
         if not seen:
-            raise SystemExit('no "FUXI WLAN: m3/m4 r[...]" lines found')
+            raise SystemExit('no "FUXI WLAN: m3/m4/m5 r[...]" lines found')
         if 'm3' in seen:
             print(decode_m3(reports['m3']))
         if 'm4' in seen:
             print(decode_m4(reports['m4']))
+        if 'm5' in seen:
+            print(decode_m5(reports['m5']))
         return 0
     if args.decode:
         blob = args.decode.read_bytes()
