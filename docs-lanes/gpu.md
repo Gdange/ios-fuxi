@@ -15,7 +15,7 @@ SMMU ID0/1/2 = `0x4c017e18 / 0x40000016 / 0x5511` (24 SMRs, 22 CBs,
 These are observations copied from the handoff, not new device results.
 
 Reference: the supplied Linux msm tree under
-`/hdd2/googlebookos-port/artifacts/source/kernel-guest-3a7d1771d492/drivers/gpu/drm/msm/`,
+`linux-6.12/drivers/gpu/drm/msm/`,
 `adreno/a6xx_gmu.c` (memory_probe/fw_load/fw_start/start/rpmh_init),
 `a6xx_hfi.c` + `.h` (queue layouts, messages, ARC votes, A740 BW table),
 `a6xx_gpu.c` (OOB lifetime), `registers/adreno/a6xx_gmu.xml`, plus
@@ -381,13 +381,13 @@ With GMU embedded but SQE omitted, stage11 is available and stage12 returns
 without embedded firmware (stage8 returns802).
 
 ```sh
-FUXI_GMU_FIRMWARE=/hdd2/fuxi-ios/research/firmware/gpu/sheng-firmware/gmu_gen70200.bin \
-FUXI_SQE_FIRMWARE=/hdd2/fuxi-ios/research/firmware/gpu/sheng-firmware/a740_sqe.fw \
-CLANG=/hdd2/pixelos/prebuilts/clang/host/linux-x86/clang-r547379/bin/clang \
-LLD=/hdd2/pixelos/prebuilts/clang/host/linux-x86/clang-r547379/bin/ld.lld \
+FUXI_GMU_FIRMWARE=$FW/gmu_gen70200.bin \
+FUXI_SQE_FIRMWARE=$FW/a740_sqe.fw \
+CLANG=$LLVM/clang \
+LLD=$LLVM/ld.lld \
 OBJCOPY=/usr/bin/llvm-objcopy-18 READELF=/usr/bin/llvm-readelf-18 \
-NM=/usr/bin/llvm-nm-18 MKBOOTIMG=/hdd2/fuxi-ios/research/mkbootimg/mkbootimg.py \
-bash shim/fuxi-loader/build.sh /hdd2/fuxi-ios/shim/out/fuxi-integ1-payload.bin
+NM=/usr/bin/llvm-nm-18 MKBOOTIMG=$MKBOOTIMG_DIR/mkbootimg.py \
+bash shim/fuxi-loader/build.sh shim/out/fuxi-integ1-payload.bin
 ```
 
 The M2 artifact/history remains in Device results and git history. Current M3

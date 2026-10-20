@@ -2,7 +2,7 @@
 # Thermal lane runner (derived from research/run-ios-0091d.py). Kernel/payload 0091d,
 # loader shim/out/lane-thermal/fuxi-xnu-boot.img (adds request 0x57) and the monitor
 # copy shim/out/lane-thermal/fuxi-xnu-monitor.py (adds --thermal-*, --monitor-idle, --cpu-*).
-# The device serial comes from FUXI_SERIAL (kept out of git). Run from /hdd2/fuxi-ios:
+# The device serial comes from FUXI_SERIAL (kept out of git). Run from the repository root:
 #   sudo FUXI_SERIAL=... python3 shim/out/lane-thermal/run-ios-thermal.py OUT --loader-only [monitor args]
 #       Android -> loader only (no XNU); the loader resets the phone at its 90 s deadline.
 #   sudo FUXI_SERIAL=... python3 shim/out/lane-thermal/run-ios-thermal.py OUT [monitor args]
@@ -60,7 +60,7 @@ finally:
 ''' % LANE
 cmd = ['docker', 'run', '--rm', '--device', node,
        '--mount', 'type=bind,src=/usr,dst=/usr,readonly', '--mount', 'type=bind,src=/lib,dst=/lib,readonly',
-       '--mount', 'type=bind,src=/lib64,dst=/lib64,readonly', '--mount', 'type=bind,src=/hdd2/fuxi-ios,dst=/work',
+       '--mount', 'type=bind,src=/lib64,dst=/lib64,readonly', '--mount', f'type=bind,src={Path(__file__).resolve().parents[1]},dst=/work',
        '--workdir', '/work', '--env', 'PYTHONPATH=/work/research/venv/lib/python3.12/site-packages',
        '--entrypoint', '/usr/bin/python3', 'gbl-chainload-build:latest', '-c', code, out, json.dumps(extra)]
 raise SystemExit(subprocess.run(cmd).returncode)

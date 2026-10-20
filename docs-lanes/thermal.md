@@ -112,12 +112,12 @@ in the same loop. Before the handoff, `probe_main` on cpu0 also busy-polls, but 
   caches).
 
 Artifacts (gitignored):
-`/hdd2/fuxi-ios/shim/out/lane-thermal/{fuxi-xnu-boot.img,fuxi-xnu-monitor.py,run-ios-thermal.py}`.
+`shim/out/lane-thermal/{fuxi-xnu-boot.img,fuxi-xnu-monitor.py,run-ios-thermal.py}`.
 The boot image is the 0091d payload plus this loader. SHA-256 values are in the commit message
 and the final report.
 
 ## Test plan (coordinator, serial device access)
-Run all commands from `/hdd2/fuxi-ios` as root, with `FUXI_SERIAL` set.
+Run all commands from the repository root as root, with `FUXI_SERIAL` set.
 1. **T1, loader only, safe** (phone in Android; resets itself at 90 s):
    `python3 shim/out/lane-thermal/run-ios-thermal.py research/device/thermal-01 --loader-only --thermal-probe --monitor-idle 2 --thermal-test 30`
    Expect five `thermal probe stage ... ok` lines, three LUT lines (MHz, mV), the
