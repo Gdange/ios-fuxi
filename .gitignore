@@ -9,3 +9,5 @@ xnu/out/
 xnu/out-*/
 __pycache__/
 .claude/worktrees/
+# Lane userspace tools and private analysis output
+tools/out/
