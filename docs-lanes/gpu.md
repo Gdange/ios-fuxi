@@ -1,3 +1,172 @@
+# Milestone 6d — present CPU cost
+
+Branch `codex-gpu-m6d`, based on M6c `1bc3668`. **0096e built natively and
+verified offline; device performance and correctness acceptance are pending.**
+This section supersedes the pending 0096d device status below. No phone access
+or push; `AGENTS.md`, `NOTES.md`, and `FUXI.md` are unchanged.
+
+## 0096d device result (coordinator)
+
+`research-log/ios-0096d-01-gpu.txt` is private/untracked. With `fuxigpu=1`,
+all SCM calls returned x0=0 on CPU0, zap loaded, TRUST=0 and self-test pixels
+passed. The log reached `ready, BGRA row blits + fence, 220 MHz, polling` and
+SpringBoard ran. First interval:
+
+```text
+SWEET FB: stats 600 frames in 146872 ms, copy avg 13553 us max 17555 us, 628 swaps, 28 not shown
+FUXI GPU: presents GPU 597 CPU 0, GPU avg 13613 us CPU avg 0 us
+```
+
+Functionality succeeded; performance did not. CPU memcpy on the same kernel
+family averages about 1250 us, max about 3000 us. The old full-screen GPU path
+encoded 2400 row blits, repeated setup/fence/wait 38 times, rebuilt page tables
+and did two TLB synchronizations per frame. The new code removes those repeated
+operations; which component dominated on hardware remains unmeasured.
+
+## Instrumentation and cache ownership
+
+Every 600-frame GPU stats line now includes average **elapsed** pin/cache
+lookup, physical-page lookup, SMMU table construction plus TLB sync, cache
+clean, encode/submit, completion wait and unmap times. Cold lookup uses one
+`pmap_find_phys` per XNU 16 KiB page; a fixed 1025-entry PFN array separates
+lookup from NC table-store timing. No allocation occurs for that array.
+`thread_get_runtime_self()` measures actual scheduler CPU runtime around the
+cache operation, including cleanup on failure and destruction/eviction costs,
+while excluding descheduled time. It is reported separately from elapsed wait.
+Split and CPU-time averages use attempted GPU copies as their denominator;
+`GPU avg` remains elapsed time per GPU-presented frame. Current GPU eligibility
+is a single enabled layer, so successful copies and GPU frames coincide.
+
+`SweetSurface.cpp` owns a four-entry LRU protected by a fallible `IOLock`.
+The key includes the surface pointer, IOBuffer pointer, source address/length
+and XNU's `getPreparationID()` physical-page-list generation. A miss retains
+and prepares the descriptor once, checks its preparation ID, and maps it.
+A hit checks that ID without a page walk, prepare/complete or TLB operation.
+The accepted buffers are wired kernel IOBuffer allocations with default cached
+user mappings (`SweetSurface` creation uses no pageable/purgeable option).
+Their extra preparation stays held for the entire cached mapping lifetime.
+Source/length/object/preparation changes retire the old mapping first. Slot
+reuse also gets a monotonically increasing submission generation.
+
+Each slot has a disjoint 16 MiB IOVA window, 64 MiB total, with fixed reserved
+L3 storage. Physically contiguous aligned 2 MiB spans use L2 blocks; complete
+aligned 64 KiB spans use the architected contiguous hint, otherwise 4 KiB
+leaves. A 4 KiB SMMU granule has no 16 KiB block format. L2 entries start invalid;
+release/eviction clears them and completes TLBSYNC before reuse, preserving
+break-before-make. The bounded cache retains at most four backing descriptors;
+it adds no surface backing allocation.
+
+`SweetSurface::free()` retires its weak cache key before releasing pixels.
+The framebuffer's retained surface covers the synchronous copy, and the cache
+lock serializes destruction, eviction and submission. A failed unmap sync or
+present disables the GPU and uses the existing GBIF drain/reset/SID-fault
+containment. If draining fails, the descriptor AND preparation remain
+quarantined until reset. CPU fallback, opt-out and startup diagnostics remain.
+
+## Rect blits, cleaning and waiting
+
+The panel pitch is 4320 bytes. Mesa's
+[A7xx register definitions](https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa/+/6a7d3020a781a191e21c35ed9410d9da73e0de4a/src/freedreno/registers/adreno/a6xx.xml)
+encode the destination pitch in 64-byte units; rounding 4320 down would corrupt
+rows. The required split is **even/odd row classes**, with destination pitch
+8640: two rect blits cover a normal full screen, in one submission with one
+fence. Source pitches with smaller alignment use up to sixteen classes to
+make both strides representable. Base alignment is handled by X phases.
+Mesa's [blitter](https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa/+/63350a034b2bc4e862115b783493f151da012850/src/gallium/drivers/freedreno/a6xx/fd6_blitter.cc)
+uses a 16K dimension limit; all these rects are far smaller. The normal frame
+uses 97 command dwords, with at most 419 for unusual dword pitches, inside the
+8192-word ring. There is one setup and one final cache-flush/fence sequence.
+Multi-layer records use the CPU path to preserve one GPU submission per frame.
+
+The CPU-rendered source is cached, so cleaning cannot be skipped. Only cache
+lines intersecting copied rows are cleaned. Touching intervals are merged;
+1080-pixel rows with 4352-byte pitch become one clean range because each row's
+32-byte padding shares the final cache line. Narrow crops use separate ranges.
+`CleanPoC_DcacheRegion_Force` avoids `flush_dcache64`'s repeated VA-to-PA walks,
+page-sized barriers and invalidation. Final native disassembly confirms its
+**DC CVAC** loop on this generic ARM64 target. No Apple-coherent no-op is assumed.
+
+Completion checks the fence, rptr, wptr, idle and faults. After an immediate
+check, each pending check uses `assert_wait_deadline` / `thread_block` for
+250 us, with no per-frame busy-spin loop. A pending job has a 1/60-second
+counter deadline and an 80-check ceiling, then permanent CPU fallback and
+isolation. Scheduler delays can extend wall time; an already-completed fence
+is accepted on wake. No IRQ delivery is enabled.
+
+Saved live Fuxi DT identifies `qcom,kgsl-3d0@3d00000`, `kgsl_3d0_irq`,
+`interrupts=<0 300 4>`: level-high SPI 300, GIC INTID 332. A7xx RBBM interrupt
+bits are CP_RB_DONE_TS=17 and CP_CACHE_FLUSH_TS=20. The current `pe_fiq.c`
+initializes timer/IPI delivery; `sleh_irq` delegates other INTIDs to the generic
+CPU interrupt handler. Fuxi touch, keys and UFS use polling, and no GPU DT nub,
+SPI routing/registration or GPU interrupt handler exists. This build chooses
+scheduler sleeping without introducing an unverified GIC integration.
+
+Present stays synchronous on the framebuffer workloop, including the sleeping
+wait, before `fuxi_display_kick`. The swap API records IDs and VSYNC notifications;
+it provides no producer-release fence for an asynchronous DMA ownership
+contract. No early return, extra in-flight frame or deferred ID lookup is added.
+The display timer can still be delayed by a slow GPU or scheduler wakeup.
+
+The clock stays **220 MHz**. There is no split device measurement justifying a
+550–680 MHz DCVS vote yet. Reconsider only if completion remains GPU-bound
+while cache/CPU costs meet the target; do not mask encoding overhead with heat.
+
+## Validation, artifacts and acceptance
+
+Native build exit 0 in **`ci-lane-gpu6` only**. The complete patch applies to the
+integration baseline; all twelve resulting files match native inputs.
+ASan/UBSan tests compile the actual C submit/map/clean/sleep functions and C++
+cache. They cover 1022 pixel-exact full/cropped/unaligned copies, 1000 hot
+submits without lookup/TLB work, ring wraps, independent slots/generations,
+2 MiB blocks/64 KiB hints, exact clean coverage, delayed completion through
+three sleeps, deadline/fault fallback, LRU eviction, preparation-ID changes,
+release, preparation/map failures and failed-drain quarantine. Existing ten
+window/2144 page-failure startup tests, native SCM instruction audit and exact
+external GMU/SQE/zap probe models pass. Models do not execute real DMA or prove
+physical cache/SMMU/display coherency or scheduler latency.
+
+```sh
+python3 tools/test-fuxi-adreno.py
+python3 tools/test-fuxi-adreno-cache.py
+python3 tools/test-fuxi-scm.py --kernel xnu/out-fuxi-0096e/kernel.development.fuxi.unstripped
+python3 tools/sync-fuxi-adreno-shared.py --check
+```
+
+Boot-v4/Image/payload layout, linked abort recovery, 768 MiB memory bounds and
+exact external firmware are verified. ADT identity, root extents and seven
+CPUs match integ1; only RAM reservation properties change. Command line is
+**exactly integ1 plus ` fuxigpu=1`**. Binaries, firmware, logs and sidecars are
+external/gitignored.
+
+| Artifact | SHA256 |
+| --- | --- |
+| `xnu/out-fuxi-0096e/kernel.development.fuxi` | `a2bfd375a097f7615c024a75d9feebb056d0704bcde0d38b86cd12c266387bcd` |
+| `xnu/out-fuxi-0096e/kernel.development.fuxi.unstripped` | `271d534da98f467ddbfc1bbea01beef9f75549618fdd5212c53f6abf59edbf8e` |
+| `shim/out/fuxi-0096e-payload.bin` | `1f6f80abeaf95c29b015725528b2898c3ad80925ebcce80cc75b5d47c20fc216` |
+| `shim/out/fuxi-0096e-boot.img` | `9cfd7a0161d29da1561dfb826f3f68e8de22d328155f3196e3da5addb78a5fda` |
+
+Expected **shape**, with measured numbers substituted after a coordinator boot:
+
+```text
+FUXI GPU: ready, BGRA strided rects + one fence, 4 cached backings, 220 MHz, sleep/poll
+SWEET FB: stats 600 frames in ... ms, copy avg ... us max ... us, ... swaps, ... not shown
+FUXI GPU: presents GPU ... CPU ..., GPU avg ... us CPU avg ... us, split pin ... lookup ... map+TLB ... clean ... submit ... wait ... unmap ... us, GPU CPU-time ... us, cache hit ... miss ..., sleeps ..., 2M ... 64K ...
+```
+
+After warm-up expect almost all hits and near-zero lookup/map/unmap averages
+when CA reuses its surfaces. Acceptance requires pixel correctness, no fault
+fallback, **GPU CPU-time well below 1000 us** and GPU completion within a frame.
+Elapsed `wait` includes sleeping and must not be read as CPU consumption.
+If `clean` dominates CPU cost, investigate source cache policy; if wait dominates
+elapsed time, investigate hardware bandwidth/clock using these measurements.
+
+Risks: larger/strided rects, cached translations and block/contiguous descriptors
+are new hardware paths; they require device validation. Cache cleaning may still
+exceed the CPU-time target; no measured improvement is claimed for 0096e. Timer
+stall/wakeup jitter, tearing on live scanout, producer ownership violations and
+late DMA after a failed drain remain possible. The prior SMC-stall and hardware
+abort risks remain. No 0096e device boot or thermal result is claimed.
+
 # Milestone 6c — emit the SCM instruction in XNU
 
 Branch `codex-gpu-m6c`, based on `e289e5f` (M6b).

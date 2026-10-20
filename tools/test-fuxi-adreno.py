@@ -17,7 +17,7 @@ spec.loader.exec_module(sync)
 
 
 def function(source, name):
-    match = re.search(r'^(?:static )?(?:unsigned|uint32_t|uintptr_t|kern_return_t|int|void) ' + name + r'\([^;]*?\)\s*\{', source, re.M)
+    match = re.search(r'^(?:static )?(?:unsigned|uint32_t|uintptr_t|kern_return_t|int|bool|void) ' + name + r'\([^;]*?\)\s*\{', source, re.M)
     assert match, name
     depth, end = 1, match.end()
     while depth:
@@ -34,6 +34,7 @@ PREFIX = r'''
 #include <string.h>
 typedef unsigned ppnum_t;
 #define PAGE_SHIFT 14
+#define PAGE_SIZE (1u<<PAGE_SHIFT)
 #define PAGE_MASK 16383u
 #define FALSE 0
 #define FG_SOURCE_VA 0x50000000u
@@ -45,8 +46,18 @@ typedef unsigned ppnum_t;
 #define GPU_REG_BASE 0x3d00000u
 #define GPU_SMMU_BASE 0x3da0000u
 #define SMMU_S2CR(i) (0xc00+4*(i))
-static uint64_t model_leaves[4096];
-#define G_PTR(pa) ((uintptr_t)((pa)==FG_SOURCE_TABLE ? model_leaves : NULL))
+#define FG_CACHE_SLOTS 4u
+#define FG_SOURCE_L3 8u
+struct fg_times {
+ uint64_t pin, lookup, map, clean, submit, wait, unmap, cpu;
+ unsigned attempts, hits, misses, sleeps, blocks, groups;
+};
+static struct fg_times times;
+static uint64_t fg_generation[4], model_l2[512];
+static ppnum_t fg_ppns[FG_SOURCE_BYTES/PAGE_SIZE+1];
+static uint64_t model_leaves[16384];
+static volatile uint64_t *fg_l2(void) { return model_l2; }
+#define G_PTR(pa) ((uintptr_t)((uint8_t *)model_leaves+(pa)-FG_SOURCE_TABLE))
 static unsigned fg_state=1, fg_force, fg_seq, fg_access_failed, g3_wptr;
 static unsigned g3_slot[2]={1,2};
 static uint64_t fg_deadline, ticks;
@@ -55,11 +66,13 @@ static uint64_t model_counter(const char *r) { return strcmp(r,"cntfrq_el0") ? +
 static int fg_expired(void) { return model_counter("ticks") >= fg_deadline; }
 static void delay(unsigned n) { ticks+=n; }
 static unsigned mode, fail_tlb, tlbs, isolated, doorbells, ring[8192], rptr, wptr, fence;
-static unsigned cache_clean, pending, maxwords, wrap_count, checks;
+static uint64_t completion;
+static unsigned cache_clean, pending, maxwords, wrap_count, checks, lookups, contiguous_pa;
+static uint64_t clean_bytes;
 static unsigned gbif, reset_held, faulted_sids;
 static uint8_t *source_buf, *panel;
 static unsigned expected_pages[4096], paddr_missing;
-static unsigned pdst[64*1080], pdata[64*1080];
+static unsigned pdst[2400*1080], pdata[2400*1080];
 static void fg_fail(const char *why, unsigned code) { (void)why; (void)code; fg_state=2; }
 static unsigned fg_access(uint64_t pa, uint64_t *v, unsigned wr, unsigned wide)
 {
@@ -73,22 +86,23 @@ static unsigned fg_access(uint64_t pa, uint64_t *v, unsigned wr, unsigned wide)
  isolated=1;
  return 0;
 }
-static void g_zero(uint64_t pa,unsigned n) { assert(pa==FG_SOURCE_TABLE && n==32768); memset(model_leaves,0,n); }
 #define kernel_pmap 0
 static ppnum_t pmap_find_phys(int map, uintptr_t va)
 {
  (void)map; assert(va>=(uintptr_t)source_buf && va<(uintptr_t)source_buf+FG_SOURCE_BYTES);
+ lookups++;
  if(paddr_missing) return 0;
+ if(contiguous_pa) return 128+((va-(uintptr_t)source_buf)>>14);
  return 1+3*((va-(uintptr_t)source_buf)>>14); /* deliberately discontiguous 16K pages */
 }
-static void flush_dcache64(uint64_t va,unsigned n,int phys)
+static void CleanPoC_DcacheRegion_Force(uint64_t va,uint64_t n)
 {
- assert(!phys && va>=(uintptr_t)source_buf && va+n<=(uintptr_t)source_buf+FG_SOURCE_BYTES);
- cache_clean=1;
+ assert(va>=(uintptr_t)source_buf && va+n<=(uintptr_t)source_buf+FG_SOURCE_BYTES);
+ cache_clean=1; clean_bytes+=n;
 }
 static int g4_tlb(uint32_t *d) { (void)d; return ++tlbs==fail_tlb ? 0xe03 : 0; }
 static unsigned g3_gr(unsigned reg) { return reg==0x806 ? rptr : reg==0x807 ? wptr : reg==0x210 && mode==6 ? 2 : 0; }
-static unsigned g3_read(uint64_t pa) { assert(pa==G3_FENCE_PA+64); return fence; }
+static unsigned g3_read(uint64_t pa) { assert(pa==G3_FENCE_PA+64); return mode==8 && ticks<completion ? 0 : fence; }
 static int g3_faulted(void) { return mode==4 && doorbells; }
 static void g3_emit(uint32_t value)
 {
@@ -96,17 +110,29 @@ static void g3_emit(uint32_t value)
  ring[(g3_wptr++)&8191]=value;
 }
 static int g3_gw(unsigned reg, unsigned value);
+static uint64_t mach_absolute_time(void) { return ++ticks; }
+typedef uintptr_t event_t;
+#define NSEC_PER_USEC 1000
+#define THREAD_UNINT 0
+#define THREAD_CONTINUE_NULL 0
+static void clock_interval_to_deadline(unsigned n,unsigned scale,uint64_t *d) { assert(scale==1000); *d=ticks+n; }
+static uint64_t sleep_deadline;
+static int assert_wait_deadline(event_t ev,int interruptible,uint64_t d) { assert(ev==(uintptr_t)&fg_seq && !interruptible); sleep_deadline=d; return 0; }
+static int thread_block(int continuation) { assert(!continuation && sleep_deadline>ticks); ticks=sleep_deadline; return 0; }
+static int fuxi_gpu_ready(void) { return fg_state==1; }
 '''
 MODEL = r'''
 static uint32_t translated_pixel(unsigned va)
 {
  assert(va>=FG_SOURCE_VA && va<FG_SOURCE_VA+FG_SOURCE_BYTES);
- uint64_t pte=model_leaves[(va-FG_SOURCE_VA)/4096];
+ unsigned offva=va-FG_SOURCE_VA;
+ uint64_t desc=model_l2[((FG_SOURCE_VA>>21)&511)+offva/0x200000];
+ uint64_t pte=(desc&3)==1 ? (desc&0xffffff000ULL)+(offva&0x1ff000)+(desc&0xffc)+3 : model_leaves[offva/4096];
  assert((pte&0xfff)==(3|(3u<<6)|(3u<<8)|(1u<<10)));
- uint64_t pa=(pte&~4095ULL)|(va&4095);
+ uint64_t pa=(pte&0xffffff000ULL)|(va&4095);
  unsigned pn=(pa>>14)-1;
- assert(pn%3==0);
- unsigned off=(pn/3)*16384+(pa&16383);
+ assert(contiguous_pa || pn%3==0);
+ unsigned off=(contiguous_pa ? (pa>>14)-128 : pn/3)*16384+(pa&16383);
  assert(off<FG_SOURCE_BYTES);
  uint32_t got; memcpy(&got,source_buf+off,4); return got;
 }
@@ -114,13 +140,13 @@ static int g3_gw(unsigned reg,unsigned value)
 {
  assert(reg==0x807 && value<8192 && cache_clean);
  doorbells++;
+ if(mode==8) completion=ticks+700;
  if(mode==2 || mode==7) { wptr=value; return 1; } /* missing fence/stall */
  if(mode==5) { fg_access_failed=1; return 0; }
  unsigned total=(value-rptr)&8191;
  if(value<rptr) wrap_count++;
  if(total>maxwords) maxwords=total;
- assert(total && total<64*32+128);
- for(unsigned i=0;i<4096;i++) assert(!!model_leaves[i]==!!expected_pages[i]);
+ assert(total && total<16*32+128);
  uint32_t regs[0xc000]={0};
  unsigned pos=rptr, left=total, br=0, blits=0, fences=0;
  while(left) {
@@ -140,17 +166,18 @@ static int g3_gw(unsigned reg,unsigned value)
     assert(br && n==1 && a[0]==3 && regs[G4_SP_SRC_INFO]==0x500430);
     assert(regs[G4_RB_BLIT]==0x10f03000 && regs[G4_GRAS_BLIT]==0x10f03000);
     unsigned sx=regs[0x8401]>>8, ex=regs[0x8402]>>8;
-    unsigned dx=regs[0x8405], bx=regs[0x8406];
-    assert(!(regs[0x8403]|regs[0x8404]) && bx>=dx && ex-sx==bx-dx);
-    assert(regs[0xb2c1]==((ex+1)|1u<<15));
-    assert((regs[0xb2c4]>>9)*64 >= (ex+1)*4);
-    assert(regs[0x8c1a]*64 >= (bx+1)*4);
+    unsigned dx=regs[0x8405]&65535, bx=regs[0x8406]&65535;
+    unsigned h=(regs[0x8406]>>16)+1;
+    assert(!regs[0x8403] && regs[0x8404]==(h-1)<<8 && bx>=dx && ex-sx==bx-dx);
+    assert(regs[0xb2c1]==((ex+1)|h<<15));
+    unsigned sp=(regs[0xb2c4]>>9)*64, dp=regs[0x8c1a]*64;
+    assert(sp >= (ex+1)*4 && dp >= (bx+1)*4);
     assert(!((regs[0xb2c2]|regs[0x8c18])&63));
-    for(unsigned x=0;x<=bx-dx;x++) {
-     assert(pending<64*1080);
-     unsigned dst=regs[0x8c18]+(dx+x)*4-G4_FB_VA;
+    for(unsigned y=0;y<h;y++) for(unsigned x=0;x<=bx-dx;x++) {
+     assert(pending<2400*1080);
+     unsigned dst=regs[0x8c18]+y*dp+(dx+x)*4-G4_FB_VA;
      assert(dst<4320*2400);
-     pdst[pending]=dst; pdata[pending++]=translated_pixel(regs[0xb2c2]+(sx+x)*4);
+     pdst[pending]=dst; pdata[pending++]=translated_pixel(regs[0xb2c2]+y*sp+(sx+x)*4);
     }
     blits++;
    } else if(op==0x46 && n==1 && a[0]==26) {
@@ -162,7 +189,7 @@ static int g3_gw(unsigned reg,unsigned value)
    } else assert((op==0x26 && n==0) || (op==0x65 && n==1 && a[0]==12) || (op==0x46 && n==1));
   }
  }
- assert(blits && blits<=64 && fences==1);
+ assert(blits && blits<=16 && fences==1);
  rptr=wptr=value;
  return 1;
 }
@@ -170,7 +197,7 @@ static void reset(void)
 {
  fg_state=1; fg_force=fg_seq=fg_access_failed=mode=fail_tlb=tlbs=isolated=doorbells=0;
  g3_wptr=rptr=wptr=8190; fence=cache_clean=pending=gbif=reset_held=faulted_sids=paddr_missing=0;
- ticks=0; memset(model_leaves,0,sizeof model_leaves); memset(panel,0x6b,4320*2400+64);
+ ticks=lookups=contiguous_pa=0; clean_bytes=0; memset(&times,0,sizeof(times)); memset(fg_generation,0,sizeof(fg_generation)); memset(model_l2,0,sizeof(model_l2)); memset(model_leaves,0,sizeof model_leaves); memset(panel,0x6b,4320*2400+64);
 }
 static void page_fixture(unsigned off,unsigned pitch,unsigned sx,unsigned sy,unsigned w,unsigned h)
 {
@@ -184,7 +211,11 @@ static void copy_case(unsigned off,unsigned pitch,unsigned sx,unsigned sy,unsign
 {
  unsigned len=(sy+h)*pitch;
  page_fixture(off,pitch,sx,sy,w,h);
- assert(fuxi_gpu_copy((uintptr_t)source_buf+off,len,pitch,sx,sy,dx,dy,w,h)==1);
+ assert(fuxi_gpu_map(0,1,(uintptr_t)source_buf+off,len,&times)==1);
+ unsigned before=doorbells;
+ assert(fuxi_gpu_copy(0,1,(uintptr_t)source_buf+off,len,pitch,sx,sy,dx,dy,w,h,&times)==1);
+ assert(doorbells==before+1);
+ assert(fuxi_gpu_unmap(0,&times));
  for(unsigned y=0;y<2400;y++) for(unsigned x=0;x<1080;x++) {
   uint32_t got,expected=0x6b6b6b6b;
   memcpy(&got,panel+y*4320+x*4,4);
@@ -192,7 +223,7 @@ static void copy_case(unsigned off,unsigned pitch,unsigned sx,unsigned sy,unsign
    memcpy(&expected,source_buf+off+(sy+y-dy)*pitch+(sx+x-dx)*4,4);
   assert(got==expected);
  }
- for(unsigned i=0;i<4096;i++) assert(!model_leaves[i]);
+ for(unsigned i=0;i<8;i++) assert(!model_l2[((FG_SOURCE_VA>>21)&511)+i]);
  for(unsigned i=0;i<64;i++) assert(panel[4320*2400+i]==0x6b);
  checks++;
 }
@@ -201,7 +232,13 @@ int main(void)
  source_buf=aligned_alloc(16384,FG_SOURCE_BYTES); panel=malloc(4320*2400+64);
  assert(source_buf && panel);
  for(unsigned i=0;i<FG_SOURCE_BYTES;i++) source_buf[i]=(i*13u+(i>>12)*17u)&255;
- reset(); copy_case(0,4320,0,0,0,0,1080,2400); /* 38 chunks, many ring wraps */
+ reset(); copy_case(0,4320,0,0,0,0,1080,2400); /* one submission, two strided rects */
+ assert(maxwords==97);
+ for(unsigned pitch=4324;pitch<=4336;pitch=(pitch==4324 ? 4328 : 4336)) {
+  reset();copy_case(0,pitch,0,0,0,0,1080,2400);
+  if(pitch==4336) break;
+ }
+ assert(maxwords==419);
  for(unsigned phase=0;phase<16;phase++) {
   reset(); copy_case(phase*4,5008,17,3,19,7,1057,2311);
  }
@@ -212,23 +249,54 @@ int main(void)
   memset(panel,0x6b,4320*2400+64);
   copy_case((i%16)*4,4320,3,2,7,6,65,70);
  }
- reset(); assert(fuxi_gpu_copy((uintptr_t)source_buf,4096,4320,0,0,0,0,1080,2400)==0 && !doorbells);
- reset(); assert(fuxi_gpu_copy((uintptr_t)source_buf,FG_SOURCE_BYTES+1ULL,4320,0,0,0,0,1,1)==0);
- reset(); page_fixture(0,4320,0,0,10,10); paddr_missing=1;
- assert(fuxi_gpu_copy((uintptr_t)source_buf,4320*10,4320,0,0,0,0,10,10)==0 && fg_state==2 && !doorbells);
+ /* Contiguous physical backing exercises real 2M blocks and 64K hints. */
+ reset(); contiguous_pa=1; copy_case(0,4352,0,0,0,0,1080,2400);
+ assert(times.blocks>0 && times.groups>0);
+ /* A thousand hot copies: no remapping, lookups, TLB sync or unmap. */
+ reset(); assert(fuxi_gpu_map(0,42,(uintptr_t)source_buf,4352*2400,&times));
+ unsigned hot_lookups=lookups, hot_tlbs=tlbs;
+ for(unsigned i=0;i<1000;i++)
+  assert(fuxi_gpu_copy(0,42,(uintptr_t)source_buf,4352*2400,4352,3,2,7,6,65,70,&times)==1);
+ assert(lookups==hot_lookups && tlbs==hot_tlbs && doorbells==1000);
+ assert(!fuxi_gpu_copy(0,41,(uintptr_t)source_buf,4352*2400,4352,0,0,0,0,1,1,&times));
+ assert(!fuxi_gpu_copy(0,42,(uintptr_t)source_buf,4096,4320,0,0,0,0,1080,2400,&times));
+ assert(!fuxi_gpu_copy(0,42,(uintptr_t)source_buf,FG_SOURCE_BYTES+1ULL,4320,0,0,0,0,1,1,&times));
+ assert(fuxi_gpu_unmap(0,&times));
+ reset(); paddr_missing=1;
+ assert(!fuxi_gpu_map(0,1,(uintptr_t)source_buf,4320*10,&times) && fg_state==2 && !doorbells);
  for(unsigned m=1;m<=7;m++) {
-  reset(); page_fixture(0,4320,0,0,10,10);
-  if(m==1) fail_tlb=1; else if(m==3) fail_tlb=2; else mode=m;
-  int result=fuxi_gpu_copy((uintptr_t)source_buf,4320*10,4320,0,0,0,0,10,10);
+  reset(); assert(fuxi_gpu_map(0,1,(uintptr_t)source_buf,4320*10,&times));
+  if(m==1) { fail_tlb=2; assert(fuxi_gpu_unmap(0,&times)); assert(fg_state==2); continue; }
+  if(m==3) continue;
+  mode=m;
+  int result=fuxi_gpu_copy(0,1,(uintptr_t)source_buf,4320*10,4320,0,0,0,0,10,10,&times);
   assert(result==(m==7 ? -1 : 0) && fg_state==2);
-  assert(ticks<60000); /* bounded total frame and bounded isolation */
+  assert(ticks<22000); /* one frame deadline + bounded isolation */
   if(doorbells) assert(isolated && gbif==2 && reset_held==1 && faulted_sids==2);
   unsigned before=doorbells;
-  assert(fuxi_gpu_copy((uintptr_t)source_buf,4320*10,4320,0,0,0,0,10,10)==0 && doorbells==before);
+  assert(fuxi_gpu_copy(0,1,(uintptr_t)source_buf,4320*10,4320,0,0,0,0,10,10,&times)==0 && doorbells==before);
  }
- reset(); page_fixture(0,4320,0,0,10,10); fg_force=2;
- assert(fuxi_gpu_copy((uintptr_t)source_buf,4320*10,4320,0,0,0,0,10,10)==0 && isolated);
- printf("PASS: %u pixel-exact copies, cropped phases, noncontiguous 16K/4K mappings, full panel, 1000 frames, %u wraps, bounded failures/quarantine/no retry\n",checks,wrap_count);
+ reset(); assert(fuxi_gpu_map(0,1,(uintptr_t)source_buf,4320*10,&times)); fg_force=2;
+ assert(!fuxi_gpu_copy(0,1,(uintptr_t)source_buf,4320*10,4320,0,0,0,0,10,10,&times) && isolated);
+ reset(); assert(fuxi_gpu_map(0,1,(uintptr_t)source_buf,4352*10,&times)); mode=8;
+ assert(fuxi_gpu_copy(0,1,(uintptr_t)source_buf,4352*10,4352,0,0,0,0,10,10,&times)==1);
+ assert(times.sleeps==3 && times.wait>=750 && !isolated);
+ /* Independent windows and generations; unmapping one preserves the others. */
+ reset();
+ for(unsigned slot=0;slot<4;slot++) {
+  assert(fuxi_gpu_map(slot,slot+1,(uintptr_t)source_buf,4352*2400,&times));
+  assert(!fuxi_gpu_map(slot,slot+9,(uintptr_t)source_buf,4352*2400,&times));
+ }
+ assert(fuxi_gpu_unmap(1,&times));
+ assert(!fg_generation[1] && fg_generation[0]==1 && fg_generation[2]==3 && fg_generation[3]==4);
+ for(unsigned slot=0;slot<4;slot++) for(unsigned i=0;i<8;i++)
+  assert(!!model_l2[((FG_SOURCE_VA>>21)&511)+slot*8+i]==(slot!=1));
+ /* Only cache lines intersecting the selected rows may be cleaned. */
+ reset(); fg_clean((uintptr_t)source_buf,4352,0,0,1080,2400);
+ assert(clean_bytes==4352ULL*2400);
+ clean_bytes=0; fg_clean((uintptr_t)source_buf,4352,17,3,10,10);
+ assert(clean_bytes==640);
+ printf("PASS: %u pixel-exact copies, cropped phases, noncontiguous 16K/4K mappings, full panel, hot cache, blocks/hints, exact clean ranges, one submit/frame, %u wraps, sleeping timeout/quarantine\n",checks,wrap_count);
  free(source_buf);free(panel);return 0;
 }
 '''
@@ -238,6 +306,7 @@ def main():
     subprocess.run(['python3', str(ROOT / 'tools/sync-fuxi-adreno-shared.py'), '--check'], check=True)
     subprocess.run(['python3', str(ROOT / 'tools/test-fuxi-adreno-mapping.py')], check=True)
     subprocess.run(['python3', str(ROOT / 'tools/test-fuxi-scm.py')], check=True)
+    subprocess.run(['python3', str(ROOT / 'tools/test-fuxi-adreno-cache.py')], check=True)
     probe = sync.added_file('gpu.c')
     adapter = sync.added_file('fuxi_adreno.c')
     windows = [(int(a, 16), int(b, 16)) for a, b in re.findall(r'\{(0x[0-9a-f]+),(0x[0-9a-f]+),0\}', adapter)]
@@ -250,7 +319,7 @@ def main():
         for b, m in windows[i+1:]:
             assert a + n <= b or b + m <= a, 'overlapping platform mappings'
     functions = ''.join(function(probe, n) for n in ('g3_parity', 'g3_pkt7', 'g4_pkt4', 'g4_reg', 'g4_event', 'g4_wfi', 'g4_setup', 'g4_end'))
-    functions += ''.join(function(adapter, n) for n in ('fg_isolate', 'fg_row', 'fuxi_gpu_copy'))
+    functions += ''.join(function(adapter, n) for n in ('fg_isolate', 'fuxi_gpu_unmap', 'fuxi_gpu_map', 'fg_rect', 'fg_clean', 'fg_sleep', 'fuxi_gpu_copy'))
     functions = re.sub(r'__asm__ volatile\([^;]*\);', ';', functions)
     constants = '\n'.join(line for line in sync.added_file('gpu-a740.h').splitlines() if line.startswith('#define G4_'))
     with tempfile.TemporaryDirectory() as d:

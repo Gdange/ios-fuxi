@@ -27,6 +27,8 @@ extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
 extern processor_t cpu_to_processor(int);
 extern processor_t thread_bind(processor_t);
 extern wait_result_t thread_block(thread_continue_t);
+extern wait_result_t assert_wait_deadline(event_t, wait_interrupt_t, uint64_t);
+extern uint64_t thread_get_runtime_self(void);
 /* ARM64 pmap_paddr_t is uint64_t; the typedef is private to Mach headers. */
 extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t,
     uint64_t, vm_prot_t, vm_prot_t, unsigned, boolean_t, unsigned, void *);
@@ -187,8 +189,20 @@ static void fg_scm_call(uint64_t ret[4], unsigned slot, unsigned step,
 #define FG_SOURCE_VA 0x50000000u
 #define FG_SOURCE_BYTES 0x01000000u
 #define FG_SOURCE_TABLE (G3_PT + 0x10000)
-/* Eight fixed L3 pages, each covers 2 MiB. Installed once; only leaves change
- * with the GPU idle. No per-frame table allocation or leaked old mappings. */
+#define FG_SOURCE_L3 8u
+_Static_assert(FG_SOURCE_TABLE + FG_CACHE_SLOTS*FG_SOURCE_L3*4096 <= G3_PT+0x100000,
+    "source tables exceed reserved GPU table pool");
+/* Four disjoint 16 MiB windows. 4K SMMU granules support 2 MiB blocks or
+ * 64 KiB contiguous leaf groups, NOT 16 KiB block descriptors. */
+static uint64_t fg_generation[FG_CACHE_SLOTS];
+/* One transient PFN list, serialized by the surface cache lock. Keep lookup
+ * and actual NC SMMU table stores in separate timing buckets. */
+static ppnum_t fg_ppns[FG_SOURCE_BYTES/PAGE_SIZE+1];
+static volatile uint64_t *fg_l2(void)
+{
+ volatile uint64_t *root = (volatile uint64_t *)G_PTR(G3_PT);
+ return (volatile uint64_t *)G_PTR(root[1] & ~4095ULL);
+}
 static volatile unsigned fg_state; /* 0 disabled/starting, 1 ready, 2 permanently failed */
 static unsigned fg_started, fg_limit, fg_force, fg_seq;
 int fuxi_gpu_ready(void) { return __atomic_load_n(&fg_state, __ATOMIC_ACQUIRE) == 1; }
@@ -234,15 +248,96 @@ static int fg_isolate(void)
 }
 static int fg_source_tables(void)
 {
- volatile uint64_t *root = (volatile uint64_t *)G_PTR(G3_PT);
- volatile uint64_t *l2 = (volatile uint64_t *)G_PTR(root[1] & ~4095ULL);
+ volatile uint64_t *l2 = fg_l2();
  if (!l2 || g3_next > 16) return 0;
- for (unsigned i = 0; i < 8; i++) {
+ for (unsigned i = 0; i < FG_CACHE_SLOTS*FG_SOURCE_L3; i++) {
   unsigned slot = ((FG_SOURCE_VA >> 21) & 511) + i;
   if (l2[slot]) return 0;
-  l2[slot] = (FG_SOURCE_TABLE + i*4096) | 3;
+  /* Leave L2 invalid: first map and eviction obey break-before-make. */
  }
- g_zero(FG_SOURCE_TABLE, 8*4096);
+ g_zero(FG_SOURCE_TABLE, FG_CACHE_SLOTS*FG_SOURCE_L3*4096);
+ return 1;
+}
+/* The SweetSurface cache lock serializes map/copy/unmap, including destruction.
+ * Caller holds a retained, prepared IOBuffer for this mapping generation.
+ * IOBuffer pages cannot migrate while prepared; reprepare/replacement gets a
+ * new generation. No PFN scan or TLB invalidation on a cache hit. */
+int fuxi_gpu_unmap(unsigned slot, struct fg_times *t)
+{
+ if (slot >= FG_CACHE_SLOTS) return 0;
+ uint64_t start = mach_absolute_time();
+ volatile uint64_t *l2 = fg_l2();
+ unsigned first = ((FG_SOURCE_VA >> 21) & 511) + slot*FG_SOURCE_L3;
+ for (unsigned i = 0; i < FG_SOURCE_L3; i++) {
+  l2[first+i] = 0;
+ }
+ uint32_t tlb[128] = {0};
+ int err = g4_tlb(tlb);
+ fg_generation[slot] = 0;
+ if (t) t->unmap += mach_absolute_time()-start;
+ if (err || fg_access_failed) {
+  fg_fail("cached unmap TLB sync", err);
+  return fg_isolate();
+ }
+ return 1;
+}
+int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,
+    uint64_t length, struct fg_times *t)
+{
+ if (!fuxi_gpu_ready() || slot >= FG_CACHE_SLOTS || !generation || fg_generation[slot] || !length ||
+     length > FG_SOURCE_BYTES || length+(source&4095) > FG_SOURCE_BYTES) return 0;
+ uint64_t start = mach_absolute_time();
+ volatile uint64_t *leaves = (volatile uint64_t *)G_PTR(FG_SOURCE_TABLE+slot*32768);
+ volatile uint64_t *l2 = fg_l2();
+ unsigned first = ((FG_SOURCE_VA >> 21) & 511) + slot*FG_SOURCE_L3;
+ unsigned pages = (length+(source&4095)+4095)/4096;
+ uintptr_t base = source & ~(uintptr_t)4095;
+ uintptr_t first_page = base & ~(uintptr_t)PAGE_MASK;
+ for (uintptr_t va = first_page; va < base+(uintptr_t)pages*4096; va += PAGE_SIZE) {
+  ppnum_t ppn = pmap_find_phys(kernel_pmap, va);
+  if (!ppn) {
+   t->lookup += mach_absolute_time()-start;
+   fg_fail("unmapped prepared source page", 7); return 0;
+  }
+  fg_ppns[(va-first_page)>>PAGE_SHIFT] = ppn;
+ }
+ t->lookup += mach_absolute_time()-start;
+ start = mach_absolute_time();
+ for (unsigned i = 0; i < pages; i++) {
+  uintptr_t va = base+(uintptr_t)i*4096;
+  ppnum_t ppn = fg_ppns[(va-first_page)>>PAGE_SHIFT];
+  uint64_t pa = ((uint64_t)ppn << PAGE_SHIFT) | (va & PAGE_MASK);
+  if (pa >= (1ULL<<36)) return 0;
+  leaves[i] = pa | 3 | (3u<<6) | (3u<<8) | (1u<<10);
+ }
+ for (unsigned i = pages; i < 4096; i++) leaves[i] = 0;
+ for (unsigned i = 0; i < FG_SOURCE_L3; i++) {
+  unsigned at = i*512;
+  uint64_t pa = leaves[at] & 0x0000000ffffff000ULL;
+  unsigned contiguous = at+512 <= pages && !(pa & 0x1fffff);
+  for (unsigned j = 1; contiguous && j < 512; j++)
+   if ((leaves[at+j] & 0x0000000ffffff000ULL) != pa+(uint64_t)j*4096) contiguous = 0;
+  if (contiguous) {
+   l2[first+i] = (leaves[at] & ~3ULL) | 1; /* 2 MiB block */
+   t->blocks++;
+  } else {
+   /* Architected 16-entry contiguous hint only for aligned, complete groups. */
+   for (unsigned j = at; j+16 <= pages && j < at+512; j += 16) {
+    uint64_t p = leaves[j] & 0x0000000ffffff000ULL;
+    unsigned ok = !(p & 65535);
+    for (unsigned k = 1; ok && k < 16; k++)
+     if ((leaves[j+k] & 0x0000000ffffff000ULL) != p+(uint64_t)k*4096) ok = 0;
+    if (ok) { for (unsigned k = 0; k < 16; k++) leaves[j+k] |= 1ULL<<52; t->groups++; }
+   }
+   l2[first+i] = (FG_SOURCE_TABLE+slot*32768+i*4096) | 3;
+  }
+ }
+ uint32_t tlb[128] = {0};
+ int err = g4_tlb(tlb);
+ t->map += mach_absolute_time()-start;
+ if (err || fg_access_failed) { fg_fail("cached source TLB sync", err); return 0; }
+ fg_generation[slot] = generation;
+ t->misses++;
  return 1;
 }
 static thread_call_data_t fg_init_call;
@@ -296,7 +391,7 @@ static void fg_thread(thread_call_param_t arg, thread_call_param_t result)
      !fg_source_tables()) { fg_fail("scanout geometry/mapping", 4); goto out; }
  uint32_t tlb[128] = {0};
  if (g4_tlb(tlb) || fg_access_failed) { fg_fail("initial TLB sync", 5); goto out; }
- printf("FUXI GPU: ready, BGRA row blits + fence, 220 MHz, polling\n");
+ printf("FUXI GPU: ready, BGRA strided rects + one fence, 4 cached backings, 220 MHz, sleep/poll\n");
  __atomic_store_n(&fg_state, 1, __ATOMIC_RELEASE);
  out: return;
 }
@@ -321,95 +416,96 @@ void fuxi_gpu_start(uint64_t fb, unsigned width, unsigned height, unsigned pitch
  (void)thread_call_enter_delayed(&fg_init_call, deadline);
 }
 
-/* Validated one-row variant of g4_blit: neither surface pitch is rounded down.
- * Each row has its own 64-byte base and X phase, including arbitrary crop X.
- * Nearest inclusive coordinates, BGRA/WXYZ, no blending/scaling/rotation. */
-static void fg_row(unsigned src, unsigned dst, unsigned width)
+/* Inclusive nearest coordinates. Splitting is required by the destination's
+ * 64-byte pitch unit: 4320 is not representable but 2*4320 is. Interleave row
+ * classes, with enough classes to align BOTH pitches. Full screen uses two
+ * blits, arbitrary dword pitches need at most sixteen. No per-row WFI/setup. */
+static void fg_rect(unsigned src, unsigned dst, unsigned pitch,
+    unsigned width, unsigned height, unsigned stride)
 {
  unsigned sx = (src & 63)/4, dx = (dst & 63)/4;
  g3_emit(g4_pkt4(G4_SP_SRC_INFO, 5));
- g3_emit(0x00500430); g3_emit((width+sx) | 1u<<15);
- g3_emit(src & ~63u); g3_emit(0); g3_emit(((width+sx)*4+63)/64 << 9);
+ g3_emit(0x00500430); g3_emit((width+sx) | height<<15);
+ g3_emit(src & ~63u); g3_emit(0); g3_emit((pitch*stride/64) << 9);
  g3_emit(g4_pkt4(G4_RB_DST_INFO, 4));
- g3_emit(0x430); g3_emit(dst & ~63u); g3_emit(0); g3_emit(((width+dx)*4+63)/64);
+ g3_emit(0x430); g3_emit(dst & ~63u); g3_emit(0); g3_emit(4320*stride/64);
  g3_emit(g4_pkt4(G4_GRAS_SRC_X, 6));
- g3_emit(sx<<8); g3_emit((sx+width-1)<<8); g3_emit(0); g3_emit(0);
- g3_emit(dx); g3_emit(dx+width-1);
+ g3_emit(sx<<8); g3_emit((sx+width-1)<<8); g3_emit(0); g3_emit((height-1)<<8);
+ g3_emit(dx); g3_emit((dx+width-1) | (height-1)<<16);
  g4_event(63); g3_emit(g3_pkt7(0x2c, 1)); g3_emit(3); g4_wfi();
 }
-int fuxi_gpu_copy(uintptr_t source, uint64_t length, unsigned pitch,
-    unsigned sx, unsigned sy, unsigned dx, unsigned dy, unsigned width, unsigned height)
+/* Use XNU's forced PoC clean (CVAC on generic ARM64), never invalidate CPU
+ * rendered data. Merge touching cache-line intervals; typical full-width
+ * 4352-byte surfaces have only 32 bytes padding and clean as ONE range. */
+static void fg_clean(uintptr_t source, unsigned pitch, unsigned sx, unsigned sy,
+    unsigned width, unsigned height)
 {
- if (__atomic_load_n(&fg_state, __ATOMIC_ACQUIRE) != 1) return 0;
- if (!width || !height || width > 1080 || height > 2400 || dx > 1080-width || dy > 2400-height ||
-     (source & 3) || (pitch & 3) || ((uint64_t)sx+width)*4 > pitch ||
-     length > FG_SOURCE_BYTES || ((uint64_t)sy+height-1)*pitch+((uint64_t)sx+width)*4 > length)
-  return 0;
- /* A single display workloop serializes callers. Its retained, prepared
-  * descriptor owns every source page until fence+idle and unmap+TLBSYNC. */
- unsigned baseoff = source & 4095;
- if (length + baseoff > FG_SOURCE_BYTES) return 0;
- volatile uint64_t *leaves = (volatile uint64_t *)G_PTR(FG_SOURCE_TABLE);
- g_zero(FG_SOURCE_TABLE, 8*4096);
+ uintptr_t begin = 0, end = 0;
  for (unsigned y = 0; y < height; y++) {
-  uint64_t begin = baseoff + (uint64_t)(sy+y)*pitch + sx*4;
-  uint64_t end = begin + width*4;
-  for (uint64_t off = begin & ~4095ULL; off < end; off += 4096) {
-   uintptr_t va = (source & ~(uintptr_t)4095) + off;
-   ppnum_t ppn = pmap_find_phys(kernel_pmap, va);
-   if (!ppn) { fg_fail("unmapped prepared source page", 7); return 0; }
-   uint64_t pa = ((uint64_t)ppn << PAGE_SHIFT) | (va & PAGE_MASK);
-   /* Source read-only/unprivileged, Normal NC, inner-shareable, AF. */
-   leaves[off/4096] = pa | 3 | (3u<<6) | (3u<<8) | (1u<<10);
-  }
+  uintptr_t row = source+(uint64_t)(sy+y)*pitch+sx*4;
+  uintptr_t a = row & ~(uintptr_t)63, b = (row+width*4+63) & ~(uintptr_t)63;
+  if (end && a > end) { CleanPoC_DcacheRegion_Force(begin, end-begin); end = 0; }
+  if (!end) begin = a;
+  end = b;
  }
- uint64_t start = (uint64_t)sy*pitch+sx*4, span = (uint64_t)(height-1)*pitch+width*4;
- flush_dcache64(source+start, (unsigned)span, FALSE);
- uint32_t tlb[128] = {0};
- int err = g4_tlb(tlb);
- if (err) { fg_fail("source TLB sync", err); return 0; }
- /* One 50 ms wall deadline covers the ENTIRE frame, including all batches.
-  * Each wait is also bounded by 5000 iterations in the shared probe helper. */
- fg_deadline = rsr("cntpct_el0") + rsr("cntfrq_el0")/20;
- unsigned submitted = 0;
- for (unsigned y = 0; y < height; y += 64) {
-  if (fg_expired() || g3_faulted()) { err = 0x601; break; }
-  unsigned rows = height-y < 64 ? height-y : 64;
-  /* Previous fence retired the ring. At most 64*32+128 <8192 words:
-   * modulo writes may cross the ring end but can never lap hardware. */
-  g4_setup();
-  for (unsigned j = 0; j < rows; j++) fg_row(FG_SOURCE_VA+baseoff+(sy+y+j)*pitch+sx*4,
-      G4_FB_VA+(dy+y+j)*4320+dx*4, width);
-  unsigned magic = ++fg_seq;
-  if (!magic) magic = ++fg_seq;
-  g4_end(G3_FENCE_VA+64, magic);
-  g3_wptr &= 8191;
-  __asm__ volatile("dsb sy" ::: "memory");
-  submitted = 1;
-  if (!g3_gw(0x807, g3_wptr)) { err = 0x602; break; }
-  if (fg_force == 2) { err = 0x6ff; break; }
-  unsigned polls;
-  /* Same fault/fence/rptr/idle gates, tightened to the per-frame deadline. */
-  for (polls = 0; polls < 5000; polls++) {
-   if (fg_expired() || (!(polls & 15) && g3_faulted())) { err = 0x603; break; }
-   if (g3_read(G3_FENCE_PA+64) == magic && g3_gr(0x806) == g3_wptr &&
-       g3_gr(0x807) == g3_wptr && !(g3_gr(0x210) & ~1u)) break;
-   delay(1);
-  }
-  if (err || polls == 5000 || fg_access_failed) { if (!err) err = 0x604; break; }
+ if (end) CleanPoC_DcacheRegion_Force(begin, end-begin);
+}
+static void fg_sleep(void)
+{
+ uint64_t deadline;
+ clock_interval_to_deadline(250, NSEC_PER_USEC, &deadline);
+ (void)assert_wait_deadline((event_t)&fg_seq, THREAD_UNINT, deadline);
+ (void)thread_block(THREAD_CONTINUE_NULL);
+}
+int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t length,
+    unsigned pitch, unsigned sx, unsigned sy, unsigned dx, unsigned dy,
+    unsigned width, unsigned height, struct fg_times *t)
+{
+ if (!fuxi_gpu_ready() || slot >= FG_CACHE_SLOTS || fg_generation[slot] != generation) return 0;
+ if (!width || !height || width > 1080 || height > 2400 || dx > 1080-width || dy > 2400-height ||
+     (source & 3) || (pitch & 3) || pitch > 131008 || ((uint64_t)sx+width)*4 > pitch ||
+     length+(source&4095) > FG_SOURCE_BYTES ||
+     ((uint64_t)sy+height-1)*pitch+((uint64_t)sx+width)*4 > length) return 0;
+ uint64_t start = mach_absolute_time();
+ fg_clean(source, pitch, sx, sy, width, height);
+ t->clean += mach_absolute_time()-start;
+ start = mach_absolute_time();
+ int err = 0;
+ if (g3_faulted()) { fg_fail("before present", 0x601); return 0; }
+ unsigned stride = 2;
+ while ((pitch*stride) & 63) stride *= 2;
+ /* XML has 15-bit dimensions; coordinates here are <2416 and strided pitch
+  * <2^21. At most 16*32+128 <8192 words; the retired ring cannot be lapped. */
+ g4_setup();
+ for (unsigned y = 0; y < stride && y < height; y++)
+  fg_rect(FG_SOURCE_VA+slot*FG_SOURCE_BYTES+(source&4095)+(sy+y)*pitch+sx*4,
+      G4_FB_VA+(dy+y)*4320+dx*4, pitch, width, (height-1-y)/stride+1, stride);
+ unsigned magic = ++fg_seq;
+ if (!magic) magic = ++fg_seq;
+ g4_end(G3_FENCE_VA+64, magic);
+ g3_wptr &= 8191;
+ __asm__ volatile("dsb sy" ::: "memory");
+ fg_deadline = rsr("cntpct_el0") + rsr("cntfrq_el0")/60;
+ if (!g3_gw(0x807, g3_wptr)) err = 0x602;
+ if (fg_force == 2) err = 0x6ff;
+ t->submit += mach_absolute_time()-start;
+ start = mach_absolute_time();
+ unsigned polls;
+ /* Check once immediately (small jobs), then yield the CPU every check.
+  * The original synchronous surface/swap ownership is preserved through the
+  * fence, rptr AND idle gates; no completion is signalled early to producers. */
+ for (polls = 0; !err && polls < 80; polls++) {
+  if (g3_read(G3_FENCE_PA+64) == magic && g3_gr(0x806) == g3_wptr &&
+      g3_gr(0x807) == g3_wptr && !(g3_gr(0x210) & ~1u)) break;
+  if (fg_expired() || g3_faulted()) { err = 0x603; break; }
+  fg_sleep(); t->sleeps++;
  }
+ t->wait += mach_absolute_time()-start;
+ if (!err && (polls == 80 || fg_access_failed || g3_faulted())) err = 0x604;
  if (err) {
   fg_fail("present fence/fault/deadline", err);
-  return submitted && !fg_isolate() ? -1 : 0;
- }
- /* Drop every transient source leaf only after all chunks have retired. */
- g_zero(FG_SOURCE_TABLE, 8*4096);
- err = g4_tlb(tlb);
- if (err || g3_faulted()) {
-  fg_fail("retirement TLB/fault", err);
   return !fg_isolate() ? -1 : 0;
  }
- __asm__ volatile("dsb sy" ::: "memory");
  return 1;
 }
 #endif
