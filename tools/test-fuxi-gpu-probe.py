@@ -35,15 +35,17 @@ static int firmware_success = 1, ack_mode, corrupt_readback, tlb_busy;
 static unsigned firmware_releases, mmio_writes;
 static int cp_mode; /* 1 stalled, 2 fault, 3 missing fence, 4 corrupt fence guard */
 static uint64_t abort_read, abort_write;
-static unsigned drop_sqe_base, start_fault, doorbells;
+static unsigned drop_sqe_base, start_fault, doorbells, sqe_controls;
 uint32_t probe_fault_esr;
 uint64_t probe_fault_far;
 uint32_t probe_safe_rd32(uint64_t pa, uint32_t *faulted)
 {
  *faulted = pa == abort_read;
  if (*faulted) { probe_fault_esr=0x96000010; probe_fault_far=pa; return 0xdeadfa17; }
- if (pa == GPU_REG_BASE+G3_STAT_DATA*4)
-  return 0xa7400000u | *(volatile uint32_t *)(uintptr_t)(GPU_REG_BASE+G3_STAT_ADDR*4);
+ const unsigned ports[3][2] = {{G3_STAT_ADDR,G3_STAT_DATA},{G3_BV_STAT_ADDR,G3_BV_STAT_DATA},{G3_AC_STAT_ADDR,G3_AC_STAT_DATA}};
+ for (unsigned j=0;j<3;j++)
+  if (pa == GPU_REG_BASE+ports[j][1]*4)
+   return (0xa7400000u+j*0x100) | *(volatile uint32_t *)(uintptr_t)(GPU_REG_BASE+ports[j][0]*4);
  return *(volatile uint32_t *)(uintptr_t)pa;
 }
 unsigned probe_safe_wr32(uint64_t pa, uint32_t v)
@@ -56,10 +58,15 @@ static void mock_write(uint64_t at, uint32_t val)
 {
  mmio_writes++;
  if (drop_sqe_base && at == GPU_REG_BASE+G3_SQE_BASE*4) *ptr(at)=0;
- if (start_fault && at == GPU_REG_BASE+G3_SQE_CNTL*4 && val==1) {
+ if (at == GPU_REG_BASE+G3_SQE_CNTL*4) sqe_controls++;
+ /* Model the suspected premature fetch explicitly, not SQE instructions.
+  * Both 3 and 1 contain enable bit0. A zero-base fetch is latched even if
+  * software later repairs INSTR_BASE; this models the observed signature. */
+ if (at == GPU_REG_BASE+G3_SQE_CNTL*4 && (val&1) &&
+     (start_fault || !*ptr(GPU_REG_BASE+G3_SQE_BASE*4))) {
   *ptr(GPU_SMMU_BASE+g_cb(g3_bank)+0x58)=0x402;
   *ptr(GPU_SMMU_BASE+g_cb(g3_bank)+0x68)=0xb0041;
-  *ptr(GPU_SMMU_BASE+g_stride+0x400+g3_bank*4)=1;
+  *ptr(GPU_SMMU_BASE+g_stride+0x400+g3_bank*4)=0;
   *ptr(GPU_REG_BASE+0x823*4)=0x80;
  }
  if (at == GPU_REG_BASE+0x807*4 && val) {
@@ -110,7 +117,7 @@ static void mock_write(uint64_t at, uint32_t val)
 }
 static void reset_model(void)
 {
- drop_sqe_base=start_fault=doorbells=0;
+ drop_sqe_base=start_fault=doorbells=sqe_controls=0;
  memset((void *)(uintptr_t)GPU_REG_BASE, 0, 0x100000);
  memset((void *)(uintptr_t)G_MEM, 0, G_MEM_SIZE);
  memset(gpu_report, 0, sizeof(gpu_report)); memset(gpu_extra, 0, sizeof(gpu_extra));
@@ -125,7 +132,7 @@ static void reset_model(void)
  *ptr(GPU_SMMU_BASE) = 0x2f0406;
  *ptr(GPU_GMU_CORE+0x5000*4) = 1;
  *ptr(GPU_GMU_CORE+(0x1c00+0xff8)*4) = 0x20010005;
- gpu_extra[0][0] = 0xa7400004;
+ gpu_extra[0][0] = 0xa7400005;
  assert(g_snapshot());
 }
 static void aux_fixture(void)
@@ -221,9 +228,24 @@ int main(int argc, char **argv)
  gpu_m2(12); assert(gpu_extra[5][3]==1 && gpu_extra[5][49]==G3_INIT_DWORDS && gpu_extra[5][43]);
  assert(gpu_extra[5][17]==_sqe_fw_end-_sqe_fw_start && gpu_extra[5][18]==_sqe_fw_end-_sqe_fw_start-4);
  assert(!memcmp((void *)(uintptr_t)G3_SQE_PA,_sqe_fw_start+4,gpu_extra[5][18]));
+ assert(sqe_controls==1 && gpu_extra[5][119]==7);
+ assert(gpu_extra[6][34]==0 && gpu_extra[6][35]==0);
+ assert(gpu_extra[6][44]==0 && gpu_extra[6][45]==G3_SQE_VA);
+ assert(gpu_extra[6][54]==1 && gpu_extra[6][55]==G3_SQE_VA);
+ unsigned prefix_words=gpu_extra[5][18]/4;
+ if(prefix_words>12) prefix_words=12;
+ assert(gpu_extra[5][109]==prefix_words);
+ assert(!memcmp(gpu_extra[5]+97,_sqe_fw_start+4,prefix_words*4));
  gpu_m2(13); assert(gpu_extra[5][4]==1 && gpu_extra[5][53]==G3_MAGIC && gpu_extra[5][56]==G3_FENCE_DWORDS);
  assert(gpu_extra[7][3]==3 && gpu_extra[7][4]==32 && gpu_extra[7][63]==51);
- for (unsigned i=0;i<51;i++) assert(gpu_extra[7][64+i]==(0xa7400000u|i));
+ for (unsigned i=0;i<51;i++) {
+  assert(gpu_extra[7][64+i]==(0xa7400000u|i));
+  for (unsigned stage=0;stage<2;stage++) {
+   assert(gpu_extra[9+stage][2]==51 && gpu_extra[9+stage][3]==51);
+   assert(gpu_extra[9+stage][16+i]==(0xa7400100u|i));
+   assert(gpu_extra[9+stage][67+i]==(0xa7400200u|i));
+  }
+ }
  before=mmio_writes; gpu_probe(13); gpu_probe(11); assert(before==mmio_writes);
  assert(gpu_extra[6][0]==12 && gpu_extra[6][64]==13 && gpu_gmu_started);
  FILE *f=fopen("report.bin","wb"); assert(f); gpu_report[0]=0xa740;
@@ -295,8 +317,26 @@ int main(int argc, char **argv)
  reset_model(); aux_fixture(); gpu_m2(11); start_fault=1;
  gpu_m2(13); assert(gpu_extra[5][3]==0xc06 && gpu_extra[5][60]==7);
  assert(!doorbells && gpu_extra[7][3]==2 && gpu_extra[7][5]==0x80);
- assert(gpu_extra[7][6]==0x402 && gpu_extra[7][40]==1);
+ assert(gpu_extra[7][6]==0x402 && gpu_extra[7][40]==0);
+ assert(gpu_extra[6][57]==0x80 && gpu_extra[6][63]==0x402);
  assert(!gpu_extra[5][6] && gpu_extra[6][2]==0);
+ /* Replay the old prefix in the causal model: CNTL3 at base0 latches the
+  * fault before pointer verification, with no final RUN or doorbell. */
+ reset_model(); aux_fixture(); gpu_m2(11);
+ assert(!g3_sqe() && !g3_hold_gx());
+ assert(g3_gw(G3_SQE_CNTL,3) && g3_hw_init() && !g3_verify_pointers());
+ assert(g3_faulted() && gpu_extra[7][3]==1 && !gpu_extra[5][59] && !doorbells);
+ assert(*ptr(GPU_REG_BASE+G3_SQE_BASE*4)==G3_SQE_VA);
+ /* Never take over a live engine or start after an unreadable checkpoint. */
+ reset_model(); aux_fixture(); gpu_m2(11); *ptr(GPU_REG_BASE+G3_SQE_CNTL*4)=1;
+ gpu_m2(13); assert(gpu_extra[5][3]==0xc0c && !sqe_controls && !doorbells);
+ assert(gpu_extra[7][3]==4 && gpu_extra[5][119]==1);
+ reset_model(); aux_fixture(); gpu_m2(11); abort_read=GPU_REG_BASE+G3_SQE_CNTL*4;
+ gpu_m2(13); assert(gpu_extra[5][3]==0xc05 && !sqe_controls && !doorbells);
+ /* Diagnostic abort stops that window and keeps the failure frozen. */
+ reset_model(); aux_fixture(); gpu_m2(11); abort_read=GPU_REG_BASE+G3_BV_STAT_DATA*4;
+ gpu_m2(13); assert(gpu_extra[5][3]==0xc05 && !gpu_extra[5][6]);
+ assert(gpu_extra[9][2]==0 && gpu_extra[9][3]==51 && gpu_extra[9][4]);
  puts("PASS: SMMU snapshot/ownership/readback, all icache PTEs, firmware load, HFI order/ACK/wrap/errors/timeouts, m3 mappings/CP packets/fence/abort/timeouts, one-shot GMU/handoff latch");
  return 0;
 }
@@ -338,11 +378,22 @@ def audit_linux(msm):
              'G3_BV_STAT_ADDR': 'CP_BV_SQE_STAT_ADDR', 'G3_BV_STAT_DATA': 'CP_BV_SQE_STAT_DATA',
              'G3_BV_RPTR_ADDR': 'CP_BV_RB_RPTR_ADDR',
              'G3_AC_STAT_ADDR': 'CP_SQE_AC_STAT_ADDR', 'G3_AC_STAT_DATA': 'CP_SQE_AC_STAT_DATA',
-             'G3_LPAC_CNTL': 'CP_LPAC_SQE_CNTL'}
+             'G3_LPAC_CNTL': 'CP_LPAC_SQE_CNTL',
+             'G3_MISC': 'CP_MISC_CNTL', 'G3_CHICKEN': 'CP_CHICKEN_DBG',
+             'G3_BV_UCODE_ADDR': 'CP_BV_SQE_UCODE_DBG_ADDR', 'G3_BV_UCODE_DATA': 'CP_BV_SQE_UCODE_DBG_DATA',
+             'G3_AC_UCODE_ADDR': 'CP_SQE_AC_UCODE_DBG_ADDR', 'G3_AC_UCODE_DATA': 'CP_SQE_AC_UCODE_DBG_DATA'}
     for macro, name in names.items():
         value = int(re.search(r'^#define ' + macro + r'\s+(0x[0-9a-f]+)', header, re.M)[1], 16)
         assert value == offsets[name], f'{macro}: Linux {name} offset drift'
-    print('PASS: Linux source audit: 54 HWCG pairs, 48 protection slots, 15 CP offsets')
+    driver = (msm / 'adreno/a6xx_gpu.c').read_text()
+    cold = driver.split('static int hw_init(struct msm_gpu *gpu)', 1)[1].split('static int a6xx_hw_init', 1)[0]
+    controls = re.findall(r'gpu_write\(gpu, REG_A6XX_CP_SQE_CNTL, (\d+)\)', cold)
+    assert controls == ['1'] and cold.index('REG_A6XX_CP_SQE_INSTR_BASE') < cold.index('REG_A6XX_CP_SQE_CNTL')
+    assert 'REG_A6XX_RBBM_SW_RESET_CMD' not in cold
+    firmware = (msm / 'adreno/adreno_gpu.c').read_text().split('struct drm_gem_object *adreno_fw_create_bo', 1)[1].split('int adreno_hw_init', 1)[0]
+    assert 'memcpy(ptr, &fw->data[4], fw->size - 4)' in firmware
+    assert 'MSM_BO_WC | MSM_BO_GPU_READONLY' in firmware
+    print('PASS: Linux source audit: 54 HWCG pairs, 48 protection slots, 21 CP offsets; cold SQE order and firmware copy')
 
 
 def main():
@@ -391,12 +442,16 @@ def main():
                                 check=True, capture_output=True, text=True).stdout
         assert 'SQE_STAT count=51' in report and 'BR=0xa7400000/a7400001' in report
         assert '70c80004 0000004b' in report and 'SQElo: before_RUN=0x40000000' in report
+        assert 'OOB/pre-setup: SQE_CNTL=0x0 SQEbase=0000000000000000' in report
+        assert 'configured/pre-RUN: SQE_CNTL=0x0 SQEbase=0000000040000000' in report
+        assert 'immediate/post-RUN: SQE_CNTL=0x1' in report
+        assert 'BV SQE_STAT count=51' in report and 'LPAC SQE_STAT count=51' in report
         import runpy
         decoder = runpy.run_path(str(ROOT / 'tools/fuxi-gpu-probe.py'))
         client = decoder['fault_client']
         assert client(0, 0) == 'CP' and client(3, 9) == 'BV_SP' and client(8, 7) == 'LPAC_TP'
         assert decoder['bit_names'](0x80, decoder['CP_BITS']) == 'BR_ILLEGAL_INSTR'
-        print('PASS: ten-page offline Python decoder')
+        print('PASS: twelve-page offline Python decoder')
 
 
 if __name__ == '__main__':

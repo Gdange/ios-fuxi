@@ -1,3 +1,175 @@
+# Lane: GPU A740 — milestone 3c, 2026-10-20
+
+Current branch remains `codex-gpu-m3b`, continuing merged commit `86753f3`.
+This M3c handoff supersedes the M3b instructions below. No phone access.
+
+## M3c diagnosis: cold SQE control ordering
+
+The coordinator's fresh M3b boot (`c645f6d7...a53`) passed stages1–11, then
+stage12 returned `c06`, step7, **phase1, SQE_started=0**, wptr0, polls0.
+Offline decoding of the supplied private report confirms CP_INT `80`
+(BR_ILLEGAL_INSTR), GPU CB2 FSR `402`, FAR0, FSYNR `b0041/0`, SID0/MID0.
+All programmed pointers read back correctly; frozen SQE_CNTL is1. The CPU
+payload matches the source firmware, but instruction debug words are0.
+
+The important correction is that this failure precedes the intended final
+`SQE_CNTL=1` write, not just the PM4 doorbell. M3b wrote **SQE_CNTL=3 before
+hw_init and INSTR_BASE**. Linux uses3 only to halt an already-running SQE in
+`a6xx_recover`; cold `hw_init` writes the base/ring/shadows first, then1.
+The supplied XML does not document the control bits or latch timing, so the
+precise effect of cold-writing3 is not established. The snapshot is compatible
+with an early enable/reset and a latched zero-base instruction fetch; later
+base readback cannot prove what address was used for that earlier fetch.
+
+Ranked against the supplied Linux source and exact sheng firmware:
+
+1. **Our recovery command used during cold initialization.** Strongest new
+   lead: phase1/started0, only prior control write3, frozen control1, FAR0 and
+   BR illegal instruction. M3c removes that write. It makes one control write,
+   value1, after programming/verifying all pointers and a `dsb sy` barrier.
+   This is a candidate hardware fix, not a claimed device success.
+2. **Instruction state/base latched by that early control write.** Closely
+   related to1. Linux prescribes no CP reset between INSTR_BASE and RUN in
+   cold `hw_init`. Adding SW_RESET after the base would depart from Linux and
+   disturb the experiment. M3c reads SW_RESET/MISC/CHICKEN at three checkpoints
+   but performs no speculative reset or new halt sequence.
+3. **Multi-section layout / missing BV or LPAC pointer.** The image has
+   repeated section-like headers (table below), but Linux `a6xx_ucode_load`
+   calls `adreno_fw_create_bo` unchanged for A7xx. That helper allocates
+   `fw->size-4` with WC/GPU_READONLY, copies `fw->data[4:]` at BO offset0 and
+   never patches section pointers. `msm_gem_vma_init` requests PAGE_SIZE IOVA
+   alignment; there is no SQE-specific 64KiB rule in this path. Our IOVA and PA
+   are already 64KiB aligned. No separate BV instruction-base register is
+   defined in the supplied XML; cold A740 writes only the shared base830/831.
+   BR, rather than BV/LPAC, reports illegal instruction. Keep the full copied
+   payload and unmapped IOVA0; new full BV/AC sweeps can test this residual lead.
+4. **Other missing Linux setup, firmware/platform or translation behavior.**
+   The prior complete hw_init comparison remains applicable. Linux A740 does
+   not cold-write CP_MISC, CP_CHICKEN, CP_CONTEXT_SWITCH_SMMU_INFO, AQE/LPAC
+   instruction bases, BV ring base, or an IFPC/power-up list before RUN.
+   Preemption is not enabled here. Rendering/performance setup is still omitted.
+   Neither the source audit nor native model proves real GPU DMA/cache state.
+
+Reference locations in the supplied `kernel-guest-3a7d1771d492` msm tree:
+`adreno/adreno_gpu.c:554` (BO copy), `adreno/a6xx_gpu.c:780` (ucode),
+`:880` (cold hw_init), `:1137` (base), `:1170` (RUN), `:1266` (recovery halt),
+`:1822` (SW reset helper), `msm_gem_vma.c:137` (alignment),
+`adreno/a6xx_gpu_state.h:411` (BR/BV/AC indexed window bounds), and
+`registers/adreno/a6xx.xml` (register offsets). The offline audit now checks
+cold ordering and firmware-copy expressions in addition to 54 HWCG pairs,
+48 protection slots and 21 named offsets.
+
+### Firmware inspection
+
+Same sheng SQE SHA256 `6d38046654333a6a5a4ee77ab67abc24e3c0c5c68237513afe98e94da8fc9fcc`,
+75380 file bytes /75376 copied bytes (`499c` dwords). File word0 is0, and
+payload word1 is `0100499c`: its low24 bits equal the complete copied word
+count. These are raw observations, not a newly assumed loader format.
+Repeated `0174xxxx` prefixes and following words in the copied payload:
+
+| Payload dword index | First words | Interpretation limit |
+|---|---|---|
+| 0 | `01740168 0100499c` | Outer prefix / total size match |
+| 2 | `01740139 01002458 01013fa0 b8020000` | First section-like header |
+| 24d8 | `01740139 01001b78 01000000 b8020000` | Second section-like header |
+| 40d0 | `01740055 01000848 b8020000 70030007` | Third section-like header |
+
+This supports a composite image, but does not establish which internal engine
+owns each section or how it locates it. Linux does no section splitting.
+The newer linux-firmware image also starts with zero plus a total-size prefix
+and comparable repeated headers. M3c keeps the exact tested sheng inputs;
+no firmware substitution, header reinsertion or guessed section-base writes.
+
+### M3c report v5 and bounded diagnostics
+
+**Use the updated host tool: 12 pages /6144 bytes, selectors100..10b.**
+Page1/page6/extended signatures become `a7400005`; the decoder still accepts
+v2/v3/v4 saved reports. Page6[97..108] holds up to12 raw payload prefix words,
+[109] their count; [119] is checkpoint-valid mask (bits0/1/2). File word0
+remains at page6[19]. Existing packet sizes stay7 /11 dwords for init/fence.
+
+Page7 stage12 record now uses its previously reserved words34..63 for three
+10-word checkpoints: OOB held before CP setup, configured before RUN, immediately
+after RUN. Each is:
+```
+SQE_CNTL, INSTR_BASE low/high, CP_INT, RBBM_STATUS, CP_HW_FAULT,
+RBBM_SW_RESET_CMD, CP_MISC_CNTL, CP_CHICKEN_DBG, GPU_CB_FSR
+```
+The first checkpoint has phase4 (cold entry). A defined fault there stops with
+`c06`; unreadable MMIO stops with `c05`; nonzero initial SQE_CNTL stops with
+new `c0c`, without taking over or resetting the engine. Pointer verification
+still uses phase1, RUN/wptr0 phase2, doorbell phase3. Set phase2 immediately
+before the sole RUN write; `SQE_started=1` means that write succeeded. A
+checkpoint records sequential samples, not an atomic hardware snapshot.
+
+New pages10/11 are frozen stage12/stage13 pipe diagnostics,128 u32 each:
+```
+[0] a7400005 [1] stage [2:3] BV/AC SQE_STAT word counts [4] MMIO abort count
+[5:8] BV raw UCODE_DBG indices0..3 [9:12] AC raw UCODE_DBG indices0..3
+[13:15] reserved0
+[16:66] BV SQE_STAT indices0..50 [67:117] AC SQE_STAT indices0..50
+[118:121] raw AQE_INSTR_BASE_0/1 low/high pairs (not enabled/programmed)
+[122:124] CP_MISC / BR_CHICKEN / BV_CHICKEN
+[125] APERTURE_CNTL_CD [126:127] CONTEXT_SWITCH_SMMU_INFO low/high
+```
+All added MMIO uses abort-recovering wrappers. New indexed sweeps stop their
+window on an abort and restore selectors; each is capped at Linux's0x33 words.
+Unsupported/sentinel register reads remain raw evidence. No fault clear, SMMU
+resume, IOVA0 mapping, additional engine enable, or error-path retry is added.
+Stage13 preserves the stage12 checkpoints; report fetches copy frozen RAM only.
+
+### M3c coordinator test order
+
+1. Fresh boots: stage7, stage8a ownership review, stage10 regression.
+2. Fresh stage11: PASS, unchanged buffers/context,3 tables, no defined faults.
+3. Fresh stage12, save **all12 pages** with the updated tool. On `c0c` or
+   phase4 failure inspect OOB/pre-setup before any CP control write. On phase1
+   failure compare configured/pre-RUN with OOB/pre-setup; RUN has not occurred.
+   On step7/phase2 compare the immediate post-RUN checkpoint and BR/BV/AC
+   PCs/status/debug words. No PM4 doorbell has occurred. Do not retry that boot.
+   PASS requires result1/step6, rptr/wptr7, trust0 and no defined faults.
+4. Only after12 passes, fresh stage13: fence `a740f00d`, rptr/wptr11, guards
+   intact, both frozen stage records. Stop climbing on failure/reset.
+5. Same-boot11->12->13 with report fetches and a delay before13; repeated13
+   and `--read-reports` preserve results without new MMIO. Retain the permanent
+   request49 handoff-refusal check. Device runs belong to the coordinator.
+
+### M3c build handoff
+
+Firmware-enabled loader, explicitly empty-firmware loader and standalone probe:
+**PASS, zero warnings**, clang-r547379. Loader `-Werror`, C relocation checks,
+link and Image size/header checks pass; final firmware ELF has no relocations.
+Native UBSan model passes with synthetic inputs and the exact sheng GMU/SQE.
+The model covers the old early-control fault sequence, sole delayed RUN,
+preexisting live SQE refusal, checkpoint MMIO abort, full BV/AC sweeps and a
+bounded diagnostic read abort, alongside existing ownership/HFI/fence checks.
+Linux source audit and twelve-page decoder pass. The supplied private M3b
+v4 report still decodes offline. These checks do not execute SQE instructions
+or establish the hardware effect of control3. No phone access or M3c device run.
+
+Artifact (gitignored), **20,881,408 B**:
+`shim/out/lane-gpu/fuxi-gpu-m3c-boot.img`.
+SHA256: `943bb50e54012f6c0c997e2d4322b302eb98c9eb421deb94ae578ca0313f08be`.
+Kernel Image: 20,873,296 B. Independent artifact inspection verifies boot
+header v4, Image geometry, zero ramdisk/padding, exact embedded GMU/SQE bytes
+and unchanged integ1 payload SHA256:
+`800b9ea17ce18f1872c0533d5ef13f916c490eb7b1524e677fc2555378f00d66`.
+
+Firmware ELF geometry: `_gpu_fw_start/end=0x11534/0x21a50` (66844 B),
+`_sqe_fw_start/end=0x21a50/0x340c4` (75380 B),
+`_bss_start/end=0x38000/0x68000`, `_payload_start=0x78000`,
+`_image_end=0x13e8050`. The image and firmware-enabled ELF were saved in the
+ignored lane output before the empty-firmware verification build. The saved
+lane artifact contains both exact firmware inputs. No firmware, dump, ELF,
+boot image or local absolute input path is committed. The handoff commit is
+the commit containing this section on `codex-gpu-m3b`.
+
+Next action: coordinator follows the M3c test order above using the updated
+12-page host tool. The leading cold-control hypothesis still needs device
+confirmation.
+
+---
+
 # Lane: GPU A740 — milestone 3b, 2026-10-20
 
 Branch `codex-gpu-m3b`, based on published main containing M3 `7ed3102`.

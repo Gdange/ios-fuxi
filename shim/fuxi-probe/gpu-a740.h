@@ -6,15 +6,21 @@
 #define G3_RPTR_ADDR     0x0804
 #define G3_SQE_CNTL      0x0808
 #define G3_SQE_BASE      0x0830
+#define G3_MISC          0x0840
+#define G3_CHICKEN       0x0841
 #define G3_APRIV         0x0844
 #define G3_STAT_ADDR     0x0908
 #define G3_STAT_DATA     0x0909
 #define G3_APERTURE_HOST 0x0a00
 #define G3_BV_STAT_ADDR  0x0a87
 #define G3_BV_STAT_DATA  0x0a88
+#define G3_BV_UCODE_ADDR 0x0a85
+#define G3_BV_UCODE_DATA 0x0a86
 #define G3_BV_RPTR_ADDR  0x0a98
 #define G3_AC_STAT_ADDR  0x0b29
 #define G3_AC_STAT_DATA  0x0b2a
+#define G3_AC_UCODE_ADDR 0x0b27
+#define G3_AC_UCODE_DATA 0x0b28
 #define G3_LPAC_CNTL     0x0b81
 #define G3_INIT_DWORDS   7u
 #define G3_FENCE_DWORDS  (G3_INIT_DWORDS + 4u)
