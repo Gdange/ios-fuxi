@@ -218,9 +218,25 @@ static void g_live(void)
   e[95] = g_rd(G_HFI_PA, 72 + 40); e[96] = g_rd(G_HFI_PA, 72 + 44);
  }
 }
+uint32_t probe_safe_rd32(uint64_t pa, uint32_t *faulted);
+extern uint32_t probe_fault_esr; extern uint64_t probe_fault_far;
+/* Snapshot read that survives a synchronous abort (hypervisor/TZ-owned
+ * windows). page1[48] fault count, [49] first ESR, [50] first offset,
+ * [51] SMR/S2CR fault mask, [52] per-bank CB fault mask. */
+static uint32_t g_srd(uint32_t off, uint32_t bit, unsigned word)
+{
+ uint32_t f, v = probe_safe_rd32(GPU_SMMU_BASE + off, &f);
+ if (f) {
+  uint32_t *p = gpu_extra[1];
+  if (!p[48]++) { p[49] = probe_fault_esr; p[50] = off; }
+  p[word] |= bit;
+ }
+ return v;
+}
 static int g_snapshot(void)
 {
  uint32_t *e = gpu_extra[0];
+ for (unsigned i = 48; i < 53; i++) gpu_extra[1][i] = 0;
  uint32_t id0 = g_rd(GPU_SMMU_BASE, SMMU_ID0), id1 = g_rd(GPU_SMMU_BASE, SMMU_ID1);
  uint32_t id2 = g_rd(GPU_SMMU_BASE, SMMU_ID2);
  g_stride = (id1 >> 31) ? 65536 : 4096;
@@ -234,19 +250,19 @@ static int g_snapshot(void)
      !(id2 & (1u << 12)) || ((id2 >> 4) & 15) < 1 ||
      (g_rd(GPU_SMMU_BASE, SMMU_SCR0) & 1)) { e[2] = 0x801; return 0; }
  for (unsigned i = 0; i < g_nsmr; i++) {
-  gpu_extra[1][i * 2] = g_rd(GPU_SMMU_BASE, SMMU_SMR(i));
-  gpu_extra[1][i * 2 + 1] = g_rd(GPU_SMMU_BASE, SMMU_S2CR(i));
+  gpu_extra[1][i * 2] = g_srd(SMMU_SMR(i), 1u << i, 51);
+  gpu_extra[1][i * 2 + 1] = g_srd(SMMU_S2CR(i), 1u << i, 51);
  }
  for (unsigned b = 0; b < g_ncb; b++) {
   uint32_t *d = &gpu_extra[2 + b / 8][(b % 8) * 16];
   unsigned cb = g_cb(b);
   /* Spare words in the stream page retain implementation context controls. */
-  gpu_extra[1][64 + b] = g_rd(GPU_SMMU_BASE, cb + 4); /* ACTLR */
-  gpu_extra[1][88 + b] = g_rd(GPU_SMMU_BASE, cb + 0x34); /* CONTEXTIDR */
-  d[0] = g_rd(GPU_SMMU_BASE, g_stride + b * 4);
-  d[1] = g_rd(GPU_SMMU_BASE, g_stride + 0x800 + b * 4);
+  gpu_extra[1][64 + b] = g_srd(cb + 4, 1u << b, 52); /* ACTLR */
+  gpu_extra[1][88 + b] = g_srd(cb + 0x34, 1u << b, 52); /* CONTEXTIDR */
+  d[0] = g_srd(g_stride + b * 4, 1u << b, 52);
+  d[1] = g_srd(g_stride + 0x800 + b * 4, 1u << b, 52);
   static const unsigned offs[14] = {0,0x10,0x20,0x24,0x28,0x2c,0x30,0x38,0x3c,0x58,0x60,0x64,0x68,0x6c};
-  for (unsigned i = 0; i < 14; i++) d[2 + i] = g_rd(GPU_SMMU_BASE, cb + offs[i]);
+  for (unsigned i = 0; i < 14; i++) d[2 + i] = g_srd(cb + offs[i], 1u << b, 52);
  }
  e[9] = g_rd(GPU_SMMU_BASE, SMMU_GFSR);
  gpu_snapshot_valid = 1; e[1] = 1;
@@ -329,6 +345,7 @@ static int g_select_context(void)
  g_slot = g_nsmr;
  for (unsigned i = 0; i < g_nsmr; i++) {
   unsigned smr = gpu_extra[1][2*i], s2cr = gpu_extra[1][2*i+1];
+  if (gpu_extra[1][51] & (1u << i)) continue; /* unreadable: neither free nor ours */
   if (!(smr & (1u << 31))) { if (g_slot == g_nsmr) g_slot = i; continue; }
   unsigned mask = (smr >> 16) & 0x7fff;
   if (((smr ^ 5) & ~mask & 0x7fff) == 0) { e[2] = 0x804; return 0; }
@@ -340,14 +357,15 @@ static int g_select_context(void)
  g_bank = g_ncb;
  unsigned s2banks = (g_rd(GPU_SMMU_BASE, SMMU_ID1) >> 16) & 255;
  for (unsigned b = s2banks ? s2banks : 1; b < g_ncb; b++)
-  if (!(used & (1u << b)) && !(gpu_extra[2+b/8][b%8*16+2] & 1)) { g_bank = b; break; }
+  if (!(used & (1u << b)) && !(gpu_extra[1][52] & (1u << b)) &&
+      !(gpu_extra[2+b/8][b%8*16+2] & 1)) { g_bank = b; break; }
  if (g_slot == g_nsmr || g_bank == g_ncb) { e[2] = 0x805; return 0; }
  /* ASIDs are shared across banks; avoid every enabled bank's two TTBR ASIDs. */
  for (g_asid = 1; g_asid < 256; g_asid++) {
   int used_asid = 0;
   for (unsigned b = 0; b < g_ncb; b++) {
    uint32_t *d = &gpu_extra[2+b/8][b%8*16];
-   if ((d[2] & 1) && ((d[5] >> 16) == g_asid || (d[7] >> 16) == g_asid)) used_asid = 1;
+   if ((gpu_extra[1][52] & (1u << b)) == 0 && (d[2] & 1) && ((d[5] >> 16) == g_asid || (d[7] >> 16) == g_asid)) used_asid = 1;
   }
   if (!used_asid) break;
  }
