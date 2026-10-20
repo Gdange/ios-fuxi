@@ -17,16 +17,23 @@ assert len(b)>=680 and b[:8]==b'SWEETXNU'
 assert b'DEVELOPMENT_ARM64_FUXI' in b, 'Payload is not a FUXI kernel'
 version,n=struct.unpack_from('<II',b,8)
 assert version==1 and 0<n<=32 and len(b)>=680+32*n
-assert struct.unpack_from('<QQ',b,56)==(0x8c0000000,0x40000000)
+assert struct.unpack_from('<Q',b,56)[0]==0x8c0000000
+assert struct.unpack_from('<Q',b,64)[0] in (0x40000000,0x30000000)
 for i in range(n):
  va,vs,off,sz=struct.unpack_from('<4Q',b,680+32*i)
  assert off<=len(b) and sz<=len(b)-off and sz<=vs
 PY
 # Optional local firmware input; only the ignored build directory receives bytes.
 # An empty section gives non-GPU builds the same symbols with size zero.
-python3 - "${FUXI_GMU_FIRMWARE:-}" "${FUXI_SQE_FIRMWARE:-}" "${FUXI_GPU_ZAP_MBN:-}" "$out/gpu-fw.S" <<'FWPY'
-import json, pathlib, sys
-gmu, sqe, zap, dst = sys.argv[1:]
+python3 - "$payload" "${FUXI_GMU_FIRMWARE:-}" "${FUXI_SQE_FIRMWARE:-}" "${FUXI_GPU_ZAP_MBN:-}" "$out/gpu-fw.S" <<'FWPY'
+import hashlib, json, pathlib, struct, sys
+payload, gmu, sqe, zap, dst = sys.argv[1:]
+reserved = struct.unpack_from("<Q", pathlib.Path(payload).read_bytes(), 64)[0] == 0x30000000
+pinned = {
+ "gpu": "1a2a419c39046d3141fc5fed5aa7f971de2db40cc7a1d89693c3e26fad64dd98",
+ "sqe": "6d38046654333a6a5a4ee77ab67abc24e3c0c5c68237513afe98e94da8fc9fcc",
+ "zap": "86e4c3f61d4ddbe581405f4cc496182cf385bee39aaefec61639a31d3619fd35",
+}
 lines = ['.section .gpu_fw,"a"']
 for src, name in ((gmu, 'gpu'), (sqe, 'sqe'), (zap, 'zap')):
     lines += ['.balign 4', f'.global _{name}_fw_start', f'_{name}_fw_start:']
@@ -34,6 +41,8 @@ for src, name in ((gmu, 'gpu'), (sqe, 'sqe'), (zap, 'zap')):
         path = pathlib.Path(src).resolve(strict=True)
         size = path.stat().st_size
         assert path.is_file() and 4 < size <= 0x100000 and size % 4 == 0, 'invalid firmware size'
+        if reserved:
+            assert hashlib.sha256(path.read_bytes()).hexdigest() == pinned[name], 'M6 requires the device-verified firmware'
         if name == 'sqe':
             assert size - 4 <= 0x20000, 'SQE exceeds reserved buffer'
         if name == 'zap':

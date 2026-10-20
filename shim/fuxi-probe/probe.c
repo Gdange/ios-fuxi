@@ -36,6 +36,8 @@ static uint32_t usb_rd(uintptr_t base, uint32_t off)
 static uint8_t dma_area[0x4000] __attribute__((aligned(0x4000)));
 static uintptr_t probe_fdt;
 static uint32_t probe_fdt_size;
+uint64_t probe_fdt_address(void) { return probe_fdt; }
+uint32_t probe_fdt_bytes(void) { return probe_fdt_size; }
 static struct {
  uint64_t magic, version, midr, mpidr, mmfr0, mmfr1, current_el, cntfrq, sctlr;
  uint64_t fdt_address, fdt_size, gsnpsid, gctl_before, dctl_before, dsts_before;

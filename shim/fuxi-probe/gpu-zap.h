@@ -101,7 +101,13 @@ static int g5_scm(uint32_t *d, uint32_t fn, unsigned info,
  s[0] = d[3]; s[1] = fn; s[2] = info;
  s[4] = a; s[5] = a>>32; s[6] = b; s[7] = b>>32;
  __asm__ volatile("dsb sy" ::: "memory");
+#ifdef FUXI_GPU_XNU
+ printf("FUXI GPU: PAS step %u fn %#x (enter)\n", d[3], fn);
+#endif
  uint64_t ret[4]; g5_smc_raw(ret, fn, info, a, b, c);
+#ifdef FUXI_GPU_XNU
+ printf("FUXI GPU: PAS fn %#x x0=%#llx x1=%#llx\n", fn, ret[0], ret[1]);
+#endif
  for (unsigned i = 0; i < 4; i++) { s[8+i*2] = ret[i]; s[9+i*2] = ret[i]>>32; }
  s[3] = 1;
  /* Query x1 is a boolean, not a service status. Record even false/unknown;
@@ -163,7 +169,11 @@ static int g5_pas(uint32_t *d, const uint8_t *fw, const struct g5_plan *p)
 }
 static int g5_run(uint32_t *d)
 {
-#if defined(FUXI_XNU_LOADER)
+#if defined(FUXI_GPU_XNU)
+ unsigned count;
+ const uint8_t *fw = fg_firmware(2, &count);
+ size_t bytes = count;
+#elif defined(FUXI_XNU_LOADER)
  extern const uint8_t _zap_fw_start[], _zap_fw_end[];
  const uint8_t *fw = _zap_fw_start;
  size_t bytes = (uintptr_t)_zap_fw_end-(uintptr_t)_zap_fw_start;

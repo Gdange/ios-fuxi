@@ -1,3 +1,184 @@
+# Milestone 6 — XNU GPU present copy
+
+Implemented on `codex-gpu-m6`, based on `0f827d9`, in the self-contained kernel
+patch `xnu/patches/0096-fuxi-adreno.patch`. **Built and checked offline; XNU
+hardware testing is pending.** No phone, USB, adb or fastboot access; no push.
+`AGENTS.md`, `NOTES.md`, and `FUXI.md` are unchanged. The coordinator's loader
+M4/M5 results at the end of this document remain the hardware baseline.
+
+## Behavior and ownership
+
+`fuxigpu=1` opts in; omitted/zero preserves CPU presents. After AppleCLCD
+registers, a kernel thread waits two seconds and runs the shared verified
+clocks/SMMU/GMU/HFI/GX/SQE/CP/fence/PAS/secure-exit/scratch clear+copy sequence.
+CPU frames continue during initialization. Only successful scratch validation
+and live scanout geometry permit real presents. No loader GPU probe is run
+before XNU. All returned failures permanently select the CPU path; no panic,
+retry or resource reclamation is requested by the driver.
+
+The source is a retained/prepared linear BGRA IOBuffer surface. XNU maps only
+4KiB pages intersecting copied rows, obtains their actual physical addresses
+from the16KiB kernel pmap, cleans CPU writes, and synchronizes GPU TLBs.
+The destination is the existing `0xb8000000` scanout,1080×2400, pitch4320.
+Independent64-byte bases and X phases preserve both pitches/crops. Fenced
+batches of at most64 rows reuse the32KiB ring only after rptr/wptr/idle retire;
+a full frame uses38 batches. Completion polls have an overall50ms frame
+counter deadline and5000×1us iteration limit per batch. Source mappings are
+removed/TLBSYNCed before descriptor completion. Other formats/memory kinds
+keep CPU copying. Layer order and the display's existing timer stay intact.
+
+Every600 frames, retain `SWEET FB: stats` and inspect
+`FUXI GPU: presents GPU N CPU N, GPU avg ... us CPU avg ... us`.
+Mixed-layer frames can count in both groups; no-copy frames count in neither. GPU timing includes pinning,
+mapping, cache cleaning, encoding and waiting; CPU timing covers its memcpy.
+No device speedup or thermal improvement is claimed yet.
+
+A timed-out/faulted submission requests bounded GBIF client/AXI drain,
+holds core reset, faults owned SID0/1 streams and resumes CPU copying. If drain
+ACK fails, one prepared source/reference stays quarantined until reset.
+A missing ACK leaves a possible late-scanout-write risk; this is not a proven
+reset/recovery implementation. GMU/GPU power votes and all scratch remain
+held. No IRQ delivery, suspend/resume, collapse, Metal or AGX interface.
+
+## Memory and firmware
+
+The opt-in `mkadt-fuxi.py --gpu-reserve` configuration admits only
+`[0x8c0000000,0x8f0000000)` to VM:768MiB instead of1GiB. ADT dram-size,
+payload geometry and both boot_args memory sizes agree. Scratch is the
+contiguous32MiB `[0x8f0000000,0x8f2000000)`, mapped uncached by XNU;
+the remaining224MiB above it is deliberately unused. Old1GiB payloads still
+work with GPU off; enabled GPU refuses a missing reservation before MMIO.
+This uses a smaller RAM span rather than assuming reserved-memory holes work.
+
+The loader only stages externally supplied, SHA256-pinned GMU/SQE/zap files
+into reserved slots starting at `0x8f1804000`, publishes a versioned header at
+`0x8f1800000`, then hands off cold hardware. XNU checks the reservation against
+actual VM bounds and validates sizes/FNV1a transfer checksums. PAS metadata at
+`0x8f1600000` is separate, contiguous and retained after init. Zap still uses
+Fuxi's `0x9b09a000` reservation. Firmware is never tracked.
+
+The GPU SMMU maps the proven private buffers and scratch self-test surfaces,
+scanout at IOVA`0x41000000` (rounded4KiB span), and sparse, read-only transient
+source leaves within IOVA`0x50000000..0x51000000` (16MiB cap). There is no
+identity mapping of XNU RAM. Contexts/ASIDs/stream slots are selected using the
+probe's live ownership checks, not hardcoded CB numbers. No secure SID2 or
+apps-SMMU changes. See `gpu-xnu-plan.md` for the full map/lifetime/failure audit.
+
+The register/PM4/PAS implementation stays canonical in
+`shim/fuxi-probe/gpu.c`, `gpu-a740.h`, and `gpu-zap.h`, with a shared handoff
+header. XNU's standalone patch contains exact snapshots. The adapter/API live
+in `xnu/fuxi-adreno`. Keep them synchronized with:
+
+```sh
+python3 tools/sync-fuxi-adreno-shared.py       # refresh 0096 snapshots
+python3 tools/sync-fuxi-adreno-shared.py --check
+```
+
+Mapped MMIO uses a private aligned access routine with XNU abort recovery;
+a narrowly scoped exception-handler addition also handles precise external
+aborts in that routine. Asynchronous SError/interconnect hangs remain hardware
+risks. PAS entry/return is logged; a synchronous SMC that never returns cannot
+be cancelled/timed out by EL1. Each call is attempted once, with no retries or
+WAITQ continuation. The timeouts cover software polling and returned errors.
+
+## Build and artifacts
+
+The native build used a private `ci-lane-gpu6` clone of `ci-integ`, with copied
+build outputs discarded before compiling to avoid stale absolute dependencies.
+No other build tree was changed. With build-host/root variables configured:
+
+```sh
+# On the native Apple Silicon build host, inside the build workspace:
+cp -c -R ci-integ ci-lane-gpu6
+cd ci-lane-gpu6
+rm -rf native-obj build  # only the newly created lane's copied outputs
+(cd xnu && patch -p1 < ../0096-fuxi-adreno.patch)
+XNU_IIG_CACHE="$IIG_CACHE" "$NATIVE_BUILD_TOOL" "$PWD/xnu" > kernel-gpu6.log 2>&1
+```
+
+Use `tools/build-fuxi-native.sh` and the matching IIG cache as before. The final
+native command exited0. Copy the stripped/unstripped kernel into
+`xnu/out-fuxi-0096/`. To preserve integration identity, CPUs and pinned root
+extents, extract its existing ADT and command line from the payload:
+
+```sh
+python3 - <<'PY'
+from pathlib import Path
+import struct
+p = Path('shim/out/fuxi-integ1-payload.bin').read_bytes()
+o, n = struct.unpack_from('<QQ', p, 32)
+Path('xnu/out-fuxi-0096/integ1.adt').write_bytes(p[o:o+n])
+Path('xnu/out-fuxi-0096/cmdline.txt').write_text(p[72:680].split(b'\0')[0].decode())
+PY
+python3 tools/mkadt-fuxi.py xnu/out-fuxi-0096/fuxi-0096.adt \
+  --live-fdt "$LIVE_FDT" --template xnu/out-fuxi-0096/integ1.adt --gpu-reserve
+python3 tools/mkpayload.py xnu/out-fuxi-0096/kernel.development.fuxi \
+  xnu/out-fuxi-0096/fuxi-0096.adt shim/out/fuxi-0096-payload.bin \
+  --cmdline "$(cat xnu/out-fuxi-0096/cmdline.txt) fuxigpu=1"
+FUXI_GMU_FIRMWARE="$FW/gmu_gen70200.bin" \
+FUXI_SQE_FIRMWARE="$FW/a740_sqe.fw" FUXI_GPU_ZAP_MBN="$ZAP/a740_zap.mbn" \
+CLANG="$LLVM/clang" LLD="$LLVM/ld.lld" \
+OBJCOPY=llvm-objcopy-18 READELF=llvm-readelf-18 NM=llvm-nm-18 \
+MKBOOTIMG="$MKBOOTIMG_DIR/mkbootimg.py" \
+  bash shim/fuxi-loader/build.sh shim/out/fuxi-0096-payload.bin
+cp shim/out/fuxi-loader/fuxi-xnu-boot.img shim/out/fuxi-0096-boot.img
+```
+
+Kernel/image hashes and companion image configurations:
+
+| Artifact | Embedded GPU args | SHA256 |
+| --- | --- | --- |
+| `xnu/out-fuxi-0096/kernel.development.fuxi` | `—` | `0ce80838a401e7870a3633c67890509cc8498ae22c07d23faf11a0339e7ee1e1` |
+| `xnu/out-fuxi-0096/kernel.development.fuxi.unstripped` | `—` | `42fd34aba534d61412a3c268cf9a7d03dc19783ef3be603960e6412d969a6907` |
+| `shim/out/fuxi-0096-boot.img` | `fuxigpu=1` | `bbea1f3438e475a66d2bb45be91ddeefedb19c7b24de04da59213c028dbeb946` |
+| `shim/out/fuxi-0096-cpu-boot.img` | `none` | `5a5cd939707d9b9a91c1987fde038cc3e0ec981e661e3d9f1a983bdb5706ee21` |
+| `shim/out/fuxi-0096-stage13-boot.img` | `fuxigpu=1 fuxigpu_stage=13` | `8fa49dfb42f20fa6f9605d5f524d9583eeefa585b06a7265155ed127cdd7b865` |
+| `shim/out/fuxi-0096-stage16-boot.img` | `fuxigpu=1 fuxigpu_stage=16` | `04fb3aeb49a50d9dbd36e703d4b5f47a2c25b8e2df9e1233fc2bca9d8b8d9784` |
+
+Images, payloads, ELF files, hash sidecars and build/test logs are ignored.
+The integration ADT comparison passed: only dram-size and the GPU reservation
+property changed; product identity, all root extents and seven CPUs match.
+Normal monitor delegation/request49 is still required to launch XNU; the new
+code does not change that host protocol. Never run a GPU probe before launch.
+
+## Validation and device test order
+
+Offline: native kernel link PASS; shared-source check and clean patch
+application PASS; exact external GMU/SQE/zap UBSan probe model PASS; standalone,
+firmware-enabled and empty-firmware loader builds PASS with zero warnings.
+The M6 model compiles actual0096 functions with ASan/UBSan and checks1018
+pixel-exact copies, full-panel38-batch submission, all16 base/X phases,
+noncontiguous16KiB/4KiB translations, sparse permissions,1000 repeated frames,
+333 ring wraps, bounds/pmap/TLBSYNC/fence/fault/access errors, bounded drain
+failure/quarantine and permanent fallback. It models GPU consumption; it does
+not execute firmware or validate real cache/SMMU/display behavior.
+
+```sh
+python3 tools/test-fuxi-adreno.py
+python3 tools/test-fuxi-gpu-probe.py --firmware "$FW/gmu_gen70200.bin" \
+  --sqe "$FW/a740_sqe.fw" --zap "$ZAP/a740_zap.mbn"
+```
+
+Coordinator acceptance, separate fresh boots in this order:
+
+1. `fuxi-0096-cpu-boot.img`:768MiB memory/allocator stress and GUI/touch/root
+   regression. No GPU stage logs; GPU0/CPU counts. Old1GiB GPU-off payload is
+   still supported for a separate compatibility check.
+2. `fuxi-0096-stage13-boot.img`: expect `through stage 13 PASS`, fence
+   `a740f00d`, then intentional `diagnostic stop` and continuing CPU frames.
+3. `fuxi-0096-stage16-boot.img`: PAS enter/return logs, real operations x0=x1=0
+   despite support x1=0; `through stage 16 PASS`, TRUST0, zap1/pixels1, then
+   diagnostic stop. Scratch only; no GPU scanout write yet.
+4. `fuxi-0096-boot.img`: `FUXI GPU: ready`, visible full/cropped updates and
+   increasing GPU counts across600+ frames. Inspect visual integrity/tearing,
+   layer order, ring reuse, off/on, long idle, CPU time and heat vs CPU image.
+5. Rebuild diagnostic payloads with `fuxigpu=1 fuxigpu_fail=1` (stop after
+   scratch) and `fuxigpu=1 fuxigpu_fail=2` (fail immediately after first present
+   doorbell). Expect `disabled permanently`, `GBIF drain ACK`, reset held,
+   SID0/1 faulted, continuing CPU frames and no further GPU submissions.
+   Missing ACK means source quarantine and residual late-write risk: capture
+   evidence and reset, without attempting same-boot GPU reuse.
+
 # Milestone 5b
 
 Branch `codex-gpu-m5b`, based on M5 `fd83647`. This note supersedes M5's

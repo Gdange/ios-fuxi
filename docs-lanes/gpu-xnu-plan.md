@@ -1,165 +1,154 @@
-# A740 into XNU: ownership and first accelerated present
+# A740 in XNU: milestone 6 implementation and acceptance
 
-This is an implementation plan, not an XNU driver or a device result. Loader
-M3d has verified GMU/HFI, GX, SQE/CP and a memory fence. M4's 2D sequence still
-needs coordinator device validation. Secure mode stays unchanged; TRUST=1 is
-reported, with no zap/PAS/SCM or secure SID2 work in this plan.
+Milestone 6 is implemented in `xnu/patches/0096-fuxi-adreno.patch` and built
+natively against the integration XNU 8796 tree (0093, 0095 and 0092 included).
+**XNU hardware acceptance is pending.** Loader milestones 1–5 have passed on
+the coordinator's device; that evidence does not prove the XNU mappings,
+cache transitions, ring reuse or failure isolation. This replaces the earlier
+migration proposal that predated the successful PAS/secure-exit device result.
 
-## 1. Reserve memory before permitting handoff
+## Ownership and physical memory
 
-The loader scratch is `[0x8f0000000,0x8f2000000)` (32 MiB), inside the current
-XNU RAM span `[0x8c0000000,0x900000000)`. Removing request49's lock alone would
-let XNU allocate live GMU instructions, HFI queues or GPU page tables.
+`tools/mkadt-fuxi.py --gpu-reserve` changes ADT `/chosen/dram-size` to
+`0x30000000` and adds `fuxi-gpu-memory=<0x8f0000000,0x02000000>`.
+The payload builder uses that ADT geometry; the loader copies it into both
+`boot_args.memSize` and `memSizeActual`. Thus VM sees
+`[0x8c0000000,0x8f0000000)` (768 MiB). This deliberately gives up the entire
+last 256 MiB of the previous 1 GiB window; only its first 32 MiB is GPU scratch.
+No reliance on a Linux reserved-memory binding or late removal of free pages.
+An ordinary, non-reserved payload remains supported and GPU defaults off.
 
-First implement a conservative boot configuration with usable RAM ending at
-`0x8f0000000`: `physBase=0x8c0000000`, `memSize=0x30000000`. Update the payload
-builder, loader payload validation and build script's matching geometry check,
-boot_args `memSize`/`memSizeActual`, and ADT RAM declaration together. Check
-kernel segments, ramdisk, ADT, stacks, USB monitor and topOfKernelData against
-that bound. This sacrifices the last 256 MiB of the old window but avoids
-assuming the current XNU bootstrap supports a hole. Do not just add a DT
-reserved-memory property and assume XNU honors Linux's binding.
+The loader checks segment/ADT/boot-argument bounds and reservation overlap with
+its image and live FDT before staging anything. It initializes **no GPU** at
+handoff. Its existing stage9/start latch still refuses request49 after a probe
+has started GMU; the monitor's existing launch gate stops GPU requests once
+XNU launches. Cold preconditions and SID ownership checks also reject a partly
+initialized probe. Never run loader stage8+ before an XNU GPU test.
 
-A later early-pmap/VM reservation can recover upper RAM: admit
-`[0x8c0000000,0x8f0000000)` and `[0x8f2000000,0x900000000)` only after proving
-no pmap bootstrap, compressor, VM free list, hibernation or DMA allocator can
-return a page in the hole. Use 16 KiB XNU alignment throughout (both reservation
-ends already qualify); GPU SMMU tables still use their separate 4 KiB granules.
+| Physical address/range | Retained use |
+| --- | --- |
+| `0x8f0000000..0x8f0100000` | GMU page-table pool |
+| `0x8f0100000..0x8f10fc000` | GMU instruction backing |
+| `0x8f1100000..0x8f1111000` | GMU data/log/HFI/debug |
+| `0x8f1200000..0x8f1300000` | GPU page-table pool; source L3s at pool+`0x10000..0x18000` |
+| `0x8f1300000..0x8f132a000` | SQE, 32 KiB ring, shadows and fences |
+| `0x8f1400000..0x8f1542000` | Scratch clear/copy self-test and guards, including gaps |
+| `0x8f1600000..0x8f1602000` | Dedicated contiguous PAS metadata, never reused after init |
+| `0x8f1800000..0x8f1804000` | Versioned cold firmware handoff |
+| `0x8f1804000`, `0x8f1904000`, `0x8f1a04000` | GMU/SQE/zap slots, each at most 1 MiB |
+| `0x9b09a000..0x9b09c000` | Existing Fuxi TZ zap reservation, outside XNU RAM |
+| `0xb8000000..0xb89e3400` | Existing live 1080×2400 scanout, pitch4320 |
 
-Retain the entire 32 MiB initially, including unused gaps, not only the current
-occupied pages. Current contents:
+XNU requires the ADT reservation, verifies `gPhysBase/gPhysSize`, validates the
+handoff and each firmware size/FNV1a checksum, then maps the reservation with
+`ml_io_map` (Device/uncached). It creates no cached alias. FNV detects transfer
+corruption; it is not authentication. Reserved-payload builds SHA256-pin the
+three exact device-verified firmware files. No firmware bytes are tracked.
+The existing framebuffer mapping is reused by the CPU; GPU writes use its PA,
+without a second CPU scanout mapping.
 
-| Physical range | Owner/use |
-|---|---|
-| `0x8f0000000` onward | GMU SMMU table pool |
-| `0x8f0100000..0x8f10fc000` | GMU icache backing (see firmware mappings) |
-| `0x8f1100000..0x8f1111000` | GMU data, log, HFI, debug buffers |
-| `0x8f1200000..0x8f1300000` | GPU SMMU table pool |
-| `0x8f1300000..0x8f1320000` | SQE firmware backing |
-| `0x8f1320000..0x8f132a000` | ring, rptr shadows, fence page |
-| `0x8f1400000..0x8f1442000` | M4 source and guard pages |
-| `0x8f1500000..0x8f1542000` | M4 destination and guard pages |
+## Shared bring-up and the kernel boundary
 
-The live scanout `[0xb8000000,0xb89e3400)` is outside this XNU RAM window.
-Keep it reserved separately, map it without a conflicting cache alias and map
-only its rounded 4 KiB span in the GPU domain. Never reclaim ABL scanout while
-MDSS is reading it. No display-controller ownership changes are needed for blits.
+`shim/fuxi-probe/gpu.c`, `gpu-a740.h`, `gpu-zap.h`, and `gpu-handoff.h` are the
+canonical shared source. Patch0096 contains exact snapshots so it applies to
+an external XNU tree without repository-relative build dependencies.
+`tools/sync-fuxi-adreno-shared.py --check` enforces equality, including the
+canonical adapter/API in `xnu/fuxi-adreno`. Run the script without `--check`
+after changing those files, then rebuild both targets.
 
-## 2. One IOKit service owns the hardware
+The shared code retains clocks/GDSC → GMU SMMU → firmware/HFI → GX → GPU SMMU
+→ SQE bases **before RUN** → CP init/fence → one-shot PAS13 →
+`CP_SET_SECURE_MODE 0` → scratch solid clear and patterned copy, including
+pixel/source/guard validation. PAS query booleans remain advisory; operational
+transport and service errors fail. XNU calls the same SMC sequence from EL1,
+using the physical uncached metadata address. Stage15's panel test is not run
+inside XNU: panel writes begin only with real presents after readiness.
 
-Add built-in `FuxiAdreno` (`IOService`) with an `IOWorkLoop`, command gate,
-completion timer and interrupt sources. Split portable table/HFI/PM4 encoding
-from register access; use checked IOMemoryMap accesses, bounded waits and a
-single device state machine. Port the proven cold ordering literally: allocate
-and verify mappings and SQE bytes, program bases and shadows, barrier, then the
-sole SQE RUN write. Do not use recovery's SQE_CNTL=3 in cold initialization.
+`AppleCLCD::start`, after registration, starts a kernel thread which sleeps
+two seconds before bring-up. CPU presents continue during initialization.
+The release/acquire readiness flag publishes all initialized state. There is
+one display workloop submitter; no raw PM4/user-client API or competing GPU
+owner, interrupts, runtime collapse, suspend/resume or retry path.
 
-First boot XNU with the loader GPU probe **never started** and request49's
-existing lock still in place for probe-started boots. Start the service from
-cold state after XNU is running; this avoids adopting unknown live firmware.
-Use externally supplied, hash-pinned GMU/SQE assets built into the kernel or a
-trusted early ramdisk. The buffers and firmware must outlive every DMA user.
+All register accesses use mapped apertures. A private aligned32/64-bit assembly
+routine joins XNU's copyio recovery table. A narrow FUXI exception-handler check
+also recovers precise external aborts **only within that routine**, since generic
+copyio recovers VM/alignment faults but otherwise panics. Scratch accesses are
+ordinary volatile uncached accesses to the verified reservation. Bring-up
+failures log stage/result codes and permanently select CPU copying; memory
+and power votes remain retained until reset.
 
-For eventual live adoption, define a versioned, checksummed reserved handoff
-record: reservation bounds, firmware hashes, CB/ASID/SMR ownership, full mapped
-ranges, HFI queue addresses/sequence/indices, ring pointers, fence values,
-GPU_SET/OOB state and power/clock votes. The monitor must stop touching GPU,
-SMMU and queues before publishing ownership. XNU verifies bounds/readbacks and
-idle completion before acknowledging adoption. Failure keeps the GPU pinned
-and unavailable until reset; no freeing or second initializer. Unlock handoff
-only after the RAM exclusion is proven and either this protocol works or the
-loader has never started the GPU. The USB monitor can remain otherwise active.
+## GPU domain and each present
 
-Own SID5 (GMU), SID0/1 (GPU) on the dedicated Adreno SMMU, leaving apps-SMMU and
-other devices alone. Keep the probe's selection and masked-SID collision checks;
-CB1/CB2 and ASID1/2 are observed selections, not general constants. Pin pages,
-flush CPU table writes before TLBIASID/TLBSYNC, poll bounded completion, and
-publish streams last. Never disable a context with pending GPU accesses.
-Read-only firmware/source mappings and unmapped guard holes remain useful.
+SID5/GMU and SID0/1/GPU selection is inherited from the probe's snapshot,
+masked-SID collision and live ownership checks; the observed CB1/CB2 and ASID1/2
+are not forced. CB0, SID2 and apps-SMMU remain untouched.
 
-XNU cached memory needs explicit ownership transitions: clean source/ring/PTE
-cache lines before GPU reads; invalidate GPU-written fence/readback lines before
-CPU reads, with proper barriers. Start with consistently uncached mappings of
-the fixed reservation to match the probe, then introduce coherent/cache-managed
-buffers with measured tests. Avoid cached/uncached aliases. Use a physically
-contiguous staging surface initially; later map pinned IOMemoryDescriptor pages
-into a contiguous GPU IOVA, rather than assuming XNU kernel VA is GPU VA/PA.
+The GPU domain maps only its SQE/ring/shadow/fences, scratch test surfaces,
+the scanout's rounded4KiB span at IOVA`0x41000000`, and transient source pages
+inside IOVA`0x50000000..0x51000000`. The source is read-only, destination RW;
+all are Normal NC in the GPU domain. Eight fixed L3 pages cover the source
+aperture. Only4KiB pages intersecting copied rows get leaves, so padding-only
+pages and unrelated surfaces stay unmapped. Page sharing within4KiB is inherent.
+No identity mapping of XNU RAM is installed.
 
-## 3. IRQ, power and failure ownership
+For an eligible linear BGRA IOBuffer surface, the caller retains and prepares
+the descriptor. XNU obtains actual physical pages from its wired kernel VA
+with16KiB `pmap_find_phys` pages and4KiB offsets; physical contiguity of a swap
+surface is not assumed. It cleans the CPU-written source span to PoC, publishes
+uncached PTEs and synchronizes the selected GPU ASID. Unsupported surfaces,
+formats or bounds use the existing CPU path without disabling the GPU.
 
-Supplied `sm8550.dtsi` candidates, to cross-check against Fuxi's live DT before
-enabling delivery (SPI numbers exclude the GIC's +32):
+Every row uses its own64-byte-aligned source/destination base and X phase.
+Neither4320-byte pitch is truncated to64-byte units. At most64 rows are
+submitted per batch, with the shared BR/CCU setup, resolve-clean, CACHE_CLEAN
+fence and WFI. A batch is smaller than the8192-dword ring; modulo stores and
+WPTR permit wrap, and the preceding fence/rptr/wptr/idle gate proves the ring
+retired before any reuse. Full2400-row frames take38 batches. A50ms frame
+counter deadline and5000-iteration/1us per-batch polls bound completion waits.
+After the final fence, source leaves are cleared and TLBSYNC finishes before
+`complete`/release. Successful fences include GPU cache writeback.
 
-| Source | DT SPI | GIC INTID |
-|---|---:|---:|
-| GPU RBBM | 300 | 332 |
-| GMU HFI | 304 | 336 |
-| GMU watchdog/error | 305 | 337 |
-| Adreno SMMU global | 673 | 705 |
-| SMMU CB0/CB1/CB2 | 677/678/679 | 709/710/711 |
+A present failure permanently disables submissions. The failure path requests
+GBIF client then AXI-arbiter halt with bounded ACK waits, holds GPU reset and
+faults the two owned GPU streams. CPU copying resumes. If draining fails, the
+prepared source descriptor/reference is deliberately leaked until reset so DMA
+cannot reach freed VM pages. **Missing drain ACK still leaves a hardware risk
+of late scanout writes; isolation is not device-proven.** There is no same-boot
+recovery attempt or release of scratch. Frame statistics report GPU and CPU
+present counts and average wall times every600 frames; mixed frames count in
+both groups; no-copy frames count in neither. GPU time includes pin/map/cache/submit/wait work; CPU time covers
+its copy. The existing aggregate logger retains full present time/max/drops.
 
-Route only owned banks; derive the complete CB-to-IRQ mapping from the actual
-resource list. Begin with polling and masked GPU interrupts as the probe does.
-Then add level-high GIC routing/EOI, acknowledge only serviced RBBM/GMU sources,
-and drain HFI on the workloop with a bounded budget. Use RBBM fence-completion
-interrupts once their event flag/clear path is verified; M4's fence has no IRQ
-request. SMMU fault handlers freeze FAR/FSYNR/SID and stop submissions. Do not
-clear/resume a stalled translation to continue an unknown job. Watchdog/timer
-failure fails fences and quarantines buffers until a proven reset path exists.
+## Acceptance and remaining boundaries
 
-Centralize CX/GX GDSCs, GPUCC PLL/RCGs and branch clocks, GCC GPU/SMMU/DDR votes,
-RPMh GX/CX/MX and DDR bandwidth votes, RSCC/PDC and GMU OOB in this service (or
-shared platform providers with reference-counted votes). Do not let another
-clock driver drop a loader vote. Start at the proven low HFI performance level,
-hold GPU_SET across submissions, and defer runtime collapse/IFPC and suspend.
-Add coordinated HFI idle/drain, fence retirement and power-down only after
-interrupts and reset recovery work; never release DDR/SMMU clocks before DMA
-stops. Persistent power is the first implementation's explicit limitation.
+Use the companion CPU, stage13, stage16 and full-present images documented in
+`gpu.md`. Fresh boot for every step; the loader probe must stay cold.
 
-## 4. Accelerate the existing framebuffer copy
+1. GPU off: confirm768MiB RAM, unchanged GUI/touch/root operation, CPU statistics
+   and allocation stress. Separately, old1GiB payload + GPU off must remain usable.
+2. `fuxigpu=1 fuxigpu_stage=13`: require through13 PASS, valid fence, no defined
+   CP/SMMU faults, then the intentional diagnostic stop and CPU-only presents.
+3. `fuxigpu=1 fuxigpu_stage=16`: require PAS transport/service0, advisory support
+   false accepted, TRUST0 and scratch clear/copy PASS, then diagnostic stop.
+4. `fuxigpu=1`: require ready, visible full-panel/cropped updates and increasing
+   GPU counts for600+ frames. Compare copy times and thermal behavior with CPU.
+   Check ring wrap, multiple surfaces/layers, display off/on and long idle.
+5. Fresh diagnostic boots: `fuxigpu_fail=1` stops after scratch validation;
+   `fuxigpu_fail=2` injects failure immediately after the first present doorbell.
+   Require permanent fallback, drain ACK/reset/stream-fault logs, continued CPU
+   updates and no further GPU submissions. Do not resume a failed GPU.
 
-The call site is `AppleCLCD::present` in `iokit/Kernel/arm/SweetFramebuffer.cpp`
-(patches0046/0056), after latest-swap coalescing and before the CPU layer copy.
-Keep the existing timer/present policy initially. Introduce a private kernel
-`copyBGRA(surface, sourceRect, destinationRect, completion)` API; no userspace
-raw PM4, IOVA or MMIO API. Validate bounds, pitch, nonoverlap and opaque copy
-semantics, retain the SweetSurface/IOMemoryDescriptor through fence completion,
-and queue jobs on the GPU workloop without blocking the vsync callback.
+Offline tests cover real emitted commands, page permissions/translation,
+noncontiguous sources, full-panel/cropped row phases,1000 frames/ring wrap,
+cache-clean invocation, malformed bounds, missing pages/TLBSYNC/fence/fault/
+deadline/access failures, failed-drain quarantine and no retry. They do not
+execute real SQE, SMMU, cache hardware or secure firmware.
 
-For each present, map or stage the pinned linear BGRA source, clean its CPU
-writes, encode the validated M4 blit state, append CACHE_CLEAN with a unique
-user32 fence, then ring the doorbell after barriers. At 4320-byte scanout pitch,
-use M4's aligned one-row destinations and X phase; do not truncate `4320>>6`.
-A full2400-row job exceeds the probe's 32 KiB ring. The driver must use bounded
-IB batches or larger ring management with rptr-based space accounting and
-sequence fences; keep surfaces retained across every chunk. Add multiple
-rectangles/batches only after one rectangle passes every-pixel readback.
-
-Deliver completion after the fence and coherency step, then unpin/unmap retired
-buffers and emit the existing notification at the appropriate completed-frame
-point. Preserve layer order; initial API supports copies only, no alpha blend,
-scaling or rotation. Unsupported formats/composition use the CPU path. On a GPU
-hang, stop and quarantine first; do not concurrently run CPU fallback onto an
-in-flight destination. Reclaim/retry only after reset guarantees DMA has ended.
-Keep ABL autorefresh; do not issue a competing manual MDSS START. CPU readback
-proves memory output; panel visibility/tearing still needs a physical check.
-
-## 5. What iOS gains, and the boundary
-
-This can offload SweetFramebuffer's surface-to-scanout copies while iOS and
-software renderers still produce pixels on CPU. It does not make Adreno an AGX
-GPU, accelerate arbitrary CoreAnimation composition, or implement Metal/OpenGL
-ES. Advertising `AGXAccelerator`/`IOAccelerator` names alone cannot satisfy
-Apple's user clients, IOSurface synchronization, command ABI or shader ISA.
-
-A custom native app could later use a deliberately small validated blit/compute
-API. Broader acceleration requires an Adreno userspace stack (Mesa Freedreno or
-Turnip plus its kernel memory/submit interfaces) and an iOS graphics translation
-or replacement path. Apple's precompiled AGX shaders and Metal runtime cannot
-submit unchanged to A740. Treat that as a separate substantial project after
-copy acceleration, memory safety, reset, suspend and multi-client isolation.
-
-Acceptance order: reserved-memory stress boot with GPU cold; XNU stages8..13;
-scratch every-pixel blit; one scanout rectangle; IRQ fence completion; repeated
-retained surfaces/presents; forced timeout/reset; full frame chunking; only then
-power management and multiple clients. Keep the loader lock for today's image.
+A synchronous SMC has no cancellable EL1 timeout: the implementation calls each
+service once with no retry/WAITQ continuation, logs entry/return, and handles
+returned errors. A firmware call that never returns, interconnect lockup or
+asynchronous SError cannot be made recoverable by these polling bounds. XNU
+power/performance/thermal behavior, bus isolation and repeated ring use require
+device evidence. This offloads framebuffer copies only; it is not AGX, Metal,
+GLES or general CoreAnimation rendering acceleration.

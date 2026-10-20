@@ -4,7 +4,10 @@
 #include <stdint.h>
 #include "console.h"
 #include "../fuxi-probe/monitor.h"
+#include "../fuxi-probe/gpu-handoff.h"
 void probe_main(uintptr_t fdt);
+uint64_t probe_fdt_address(void);
+uint32_t probe_fdt_bytes(void);
 
 #define BOOT_LINE_LENGTH	608
 #define PAGE_16K		0x4000UL
@@ -59,6 +62,32 @@ static void zero64(uintptr_t dst, uint64_t n)
 		d[i] = 0;
 }
 
+/* No GPU initialization here. Only a reduced-RAM payload authorizes staging.
+ * Publishing magic last makes a missing/partial firmware set fail closed. */
+static void stage_gpu_firmware(void)
+{
+ extern const uint8_t _gpu_fw_start[], _gpu_fw_end[];
+ extern const uint8_t _sqe_fw_start[], _sqe_fw_end[];
+ extern const uint8_t _zap_fw_start[], _zap_fw_end[];
+ volatile struct fg_handoff *h = (volatile struct fg_handoff *)FG_HANDOFF;
+ zero64(FG_HANDOFF, PAGE_16K);
+ h->version = 1; h->bytes = sizeof(*h);
+ h->base = FG_SCRATCH; h->size = FG_SCRATCH_SIZE;
+ for (unsigned i = 0; i < 3; i++) {
+  const uint8_t *start = i == 0 ? _gpu_fw_start : i == 1 ? _sqe_fw_start : _zap_fw_start;
+  uintptr_t end = i == 0 ? (uintptr_t)_gpu_fw_end : i == 1 ? (uintptr_t)_sqe_fw_end : (uintptr_t)_zap_fw_end;
+  unsigned n = end - (uintptr_t)start;
+  if (!n || n > FG_FW_SLOT) return;
+  /* Firmware is 4-byte aligned, not necessarily 8-byte padded. */
+  volatile uint32_t *dst = (volatile uint32_t *)(FG_FW_BASE + i * FG_FW_SLOT);
+  for (unsigned off = 0; off < n / 4; off++) dst[off] = ((const uint32_t *)start)[off];
+  h->fw_size[i] = n;
+  h->fw_hash[i] = fg_hash((const uint8_t *)dst, n);
+ }
+ __asm__ volatile("dsb sy" ::: "memory");
+ h->magic = FG_MAGIC;
+}
+
 static int magic_ok(const char *m)
 {
 	static const char want[] = "SWEETXNU";
@@ -81,7 +110,7 @@ static const char *loader_boot(void)
      p->nsegs == 0 || p->nsegs > 32 ||
      length < sizeof(*p) + p->nsegs * sizeof(struct payload_seg))
   return "bad embedded payload header";
- if (p->phys_base != 0x8c0000000ULL || p->mem_size != 0x40000000ULL ||
+ if (p->phys_base != 0x8c0000000ULL || (p->mem_size != 0x40000000ULL && p->mem_size != FG_RAM_SIZE) ||
      (p->virt_base & (0x2000000-1)) || (p->kernel_end & (PAGE_16K-1)) ||
      p->kernel_end < p->virt_base ||
      p->kernel_end - p->virt_base > p->mem_size - 2*PAGE_16K ||
@@ -108,6 +137,14 @@ static const char *loader_boot(void)
  }
  if (!entry_found) return "entry outside kernel segments";
 
+ /* Reject all loader/FDT overlap with the reservation before writing it. */
+ if (p->mem_size == FG_RAM_SIZE) {
+  if ((rd_start < FG_SCRATCH + FG_SCRATCH_SIZE && FG_SCRATCH < rd_end) ||
+      (probe_fdt_address() < FG_SCRATCH + FG_SCRATCH_SIZE &&
+       FG_SCRATCH < probe_fdt_address() + probe_fdt_bytes()))
+   return "GPU reservation overlaps loader/FDT";
+  stage_gpu_firmware();
+ }
  monitor_report[MON_STAGE]=5;
 	uint64_t pa_of_va_base = p->phys_base - p->virt_base;	/* pa = va + this */
 	con_hex2("PHYS", "base=", p->phys_base, "size=", p->mem_size);

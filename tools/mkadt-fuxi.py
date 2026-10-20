@@ -76,8 +76,8 @@ def root_extent_props(path, root_bytes):
             ('fuxi-root-blocks', struct.pack('<Q', root_bytes // 4096))]
 
 
-def build(ufs_readonly=False, root_props=(), smp=False):
-    mkadt.HIGH_PHYS_BASE, mkadt.HIGH_MEM_SIZE = PHYS_BASE, MEM_SIZE
+def build(ufs_readonly=False, root_props=(), smp=False, gpu_reserve=False):
+    mkadt.HIGH_PHYS_BASE, mkadt.HIGH_MEM_SIZE = PHYS_BASE, 0x30000000 if gpu_reserve else MEM_SIZE
     mkadt.GICD, mkadt.GICR, mkadt.GICR_SIZE = GICD, GICR, GICR_SIZE
     mkadt.FB, mkadt.FB_SIZE = FB, FB_SIZE
     mkadt.VTIMER_INTID = 27
@@ -94,6 +94,8 @@ def build(ufs_readonly=False, root_props=(), smp=False):
     setprop(chosen, 'system-firmware-version', b'fuxi-shim\0')
     setprop(chosen, 'unique-chip-id', struct.pack('<Q', 0x4655584900000001))
     chosen.props += [(k, 0, v) for k, v in root_props]
+    if gpu_reserve:
+        chosen.props.append(('fuxi-gpu-memory', 0, struct.pack('<2Q', 0x8f0000000, 0x02000000)))
     cpus = next(n for n in root.children if n.name == 'cpus')
     # MPIDR Aff1 = core. cpu@100 keeps running the loader's USB monitor, so XNU
     # gets core 0 and, with smp, cores 2-7 (logical IDs 0-6 in this order).
@@ -104,6 +106,18 @@ def build(ufs_readonly=False, root_props=(), smp=False):
     return root
 
 
+def reserve_gpu(root):
+    """Preserve an integration ADT's identity/root extents while excluding scratch."""
+    chosen = next(n for n in root.children if n.name == 'chosen')
+    if (struct.unpack('<Q', chosen.prop('dram-base'))[0] != PHYS_BASE or
+            struct.unpack('<Q', chosen.prop('dram-size'))[0] not in (MEM_SIZE, 0x30000000)):
+        raise ValueError('template ADT has unexpected RAM geometry')
+    setprop(chosen, 'dram-size', struct.pack('<Q', 0x30000000))
+    chosen.props = [(k, f, v) for k, f, v in chosen.props if k != 'fuxi-gpu-memory']
+    chosen.props.append(('fuxi-gpu-memory', 0, struct.pack('<2Q', 0x8f0000000, 0x02000000)))
+    return root
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('out', type=Path)
@@ -111,6 +125,8 @@ def main():
     ap.add_argument('--ufs-readonly',action='store_true',help='include UFS node for the opt-in, read-only kernel probe')
     ap.add_argument('--root-extents',type=Path,help='pinned-file extent JSON (bytes, userdata-relative); needs --root-bytes')
     ap.add_argument('--root-bytes',type=int,help='root image size in bytes')
+    ap.add_argument('--template', type=Path, help='preserve an existing integration ADT; requires --gpu-reserve')
+    ap.add_argument('--gpu-reserve', action='store_true', help='limit XNU RAM to 768 MiB and reserve M6 GPU scratch')
     ap.add_argument('--smp',action='store_true',help='add cores 2-7 (cpu@100 stays with the USB monitor)')
     args = ap.parse_args()
     try:
@@ -118,13 +134,22 @@ def main():
         if args.root_extents:
             args.ufs_readonly = True  # the extent root needs the UFS node
             root_props = root_extent_props(args.root_extents, args.root_bytes or 0)
-        validate_live(args.live_fdt,args.ufs_readonly)
-        blob = adt.serialize(build(args.ufs_readonly, root_props, args.smp))
+        if args.template:
+            if not args.gpu_reserve or args.root_extents:
+                raise ValueError('--template requires --gpu-reserve and preserves existing root extents')
+            root, _ = adt.parse(args.template.read_bytes())
+            root = reserve_gpu(root)
+        else:
+            root = build(args.ufs_readonly, root_props, args.smp, args.gpu_reserve)
+        has_ufs = any(n.name == 'fuxi-ufs' for n in root.children)
+        validate_live(args.live_fdt, has_ufs)
+        blob = adt.serialize(root)
     except (ValueError, KeyError, struct.error) as error:
         ap.exit(1, str(error) + '\n')
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_bytes(blob)
-    print(f'{args.out}: {len(blob)} bytes; RAM {PHYS_BASE:#x}+{MEM_SIZE:#x}; CPUs {"0,2-7" if args.smp else "0"}; UFS={"read-only probe" if args.ufs_readonly else "absent"}')
+    cpu_count = len(next(n for n in root.children if n.name == 'cpus').children)
+    print(f'{args.out}: {len(blob)} bytes; RAM {PHYS_BASE:#x}+{(0x30000000 if args.gpu_reserve else MEM_SIZE):#x}; CPUs {cpu_count}; UFS={"present" if has_ufs else "absent"}')
 
 
 if __name__ == '__main__':
