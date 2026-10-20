@@ -165,7 +165,7 @@ def main():
     if payload[:8] != b'SWEETXNU':
         ap.error('invalid payload')
     virt, _, _, _, _, phys, size = struct.unpack_from('<7Q', payload, 16)
-    if (phys, size) != (0x8c0000000, 0x40000000):
+    if phys != 0x8c0000000 or size not in (0x40000000, 0x30000000):  # 768 MiB = --gpu-reserve
         ap.error('unexpected Fuxi RAM window')
     offsets = {name: value - virt for name, value in symbols(args.kernel).items()}
     if any(not 0 <= off < size - 0x400000 for off in offsets.values()):
