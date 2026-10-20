@@ -1,3 +1,86 @@
+# Milestone 7d — use per-sensor VALID on TSENS v2
+
+**OBSERVED on fuxi-0097c (coordinator device result, 2026-10-20):** the
+bounded initialization retry succeeds after one retry, selecting cool
+1228800/1401600/1363200 kHz and high 1228800/2803200/2956800 kHz. Every stats
+window nevertheless reports `boosts 0 boosted 0 ms max temp -400 dC valid 0
+state cool`. The loader in the same boot reads valid CPU temperatures around
+48 C while TM_TRDY (`TM+0xe4`) is `0x8`, with bit 0 clear. The old
+`fp_temperature()` rejected both controllers before reading any sensor.
+
+Linux v6.12's [tsens-v2.c](https://github.com/torvalds/linux/blob/v6.12/drivers/thermal/qcom/tsens-v2.c#L84-L100)
+defines TRDY bit 0 but selects `get_temp_tsens_valid` for v2. In
+[tsens.c](https://github.com/torvalds/linux/blob/v6.12/drivers/thermal/qcom/tsens.c#L704-L759),
+that path polls each sensor's VALID and reads its signed temperature. The
+separate `get_temp_common` polls TRDY only for `VER_0`. Defining a TRDY field
+therefore does not make it a v2 temperature prerequisite. This does not
+establish the meaning of observed bit 3.
+
+0097d removes the TRDY read and gate. Each sample reads CPU STATUS words
+once, requiring bit 21 VALID and a signed 12-bit temperature within
+-400..1500 dC. It uses the hottest qualifying sensor only when at least
+14 of 18 qualify. Read errors, missing VALID and implausible values exclude
+individual sensors; fewer than 14 force cool. No previous temperature is
+reused. Unlike Linux's polling path, this worker skips invalid sensors and
+samples again on its existing 100 ms cadence. Entry <=60 C, continuation
+<=68 C, input-only entry, swap extension and 1500 ms hold remain unchanged.
+The logged `valid` is the quorum result (0/1), not a sensor count.
+
+The mapping is unchanged and checked against both the loader thermal section
+in `shim/fuxi-probe/probe.c` and `TSENS_NAMES`/`thermal_decode` in
+`tools/fuxi-xnu-monitor.py`. Loader slot `s` starts at zero and contains
+`TM+0xa0+4*s`; the host enumerates those same slots without a shift:
+
+| Controller / TM base | Sensor indices | STATUS offsets | Host names |
+| --- | --- | --- | --- |
+| TM0 / `0x0c271000` | 1..4 | `0xa4..0xb0` | `cpuss-0..3` |
+| TM0 / `0x0c271000` | 5..15 | `0xb4..0xdc` | `cpu-1-0..10` (gold/prime) |
+| TM1 / `0x0c272000` | 1..3 | `0xa4..0xac` | `cpu-0-0..2` (silver) |
+
+Index 0 is AOSS on each controller. TM1 indices 4..15 are non-CPU;
+TM2 is excluded. Governor read masks are exactly TM0 `0xfffe`, TM1 `0x000e`.
+
+Offline ASan/UBSan tests compile the actual governor routines. The saved
+0097c loader sample's decoded CPU temperatures (45.7..48.1 C) are reconstructed
+as VALID + temperature words, with TRDY `0x8`; these are not full captured
+STATUS words. The result is valid and hottest 481 dC. Actual worker tests
+show input starts boosting, swaps extend it, 681 dC cancels it, losing five
+sensors forces cool, and stats report a valid temperature. Other checks
+exercise every included/excluded sensor, the 14/13 quorum boundary, signed
+and implausible temperatures, returned read errors, and no TRDY access even
+when it would fault. The host decoder also receives a synthetic loader-format
+packet to verify every slot/name pairing. Existing init retries, votes, LUTs,
+thermal boundaries and actual XNU 16 KiB `io_map` tests pass.
+
+Native build exited 0 in **ci-lane-gpu6 only**; all sixteen clean-patch
+source inputs match the native tree. Both loader builds pass `-Werror` with
+zero warnings. Boot-v4/Image geometry, embedded kernel segments, linked abort
+recovery ranges and exact external firmware are verified. Both payloads retain
+0097c's command line and byte-identical ADT (full RAM, seven CPUs and pinned
+root identity). The CPU payload differs from the GPU payload in exactly one
+byte: `fuxigpu=0` instead of `=1`. Firmware and build artifacts remain ignored.
+No phone access or push was performed; 0097d runtime behavior awaits a device
+run.
+
+Reproduce the offline checks with:
+
+```sh
+python3 tools/test-fuxi-perf.py --xnu-tree "$XNU_SOURCE"
+```
+
+Artifacts and logs are ignored; `xnu/out-fuxi-0097d/SHA256SUMS` covers this set
+(paths are relative to the repository root):
+
+| Artifact | SHA256 |
+| --- | --- |
+| `xnu/out-fuxi-0097d/kernel.development.fuxi` | `40dd3dd3fcd4e6404025def00577831fdd435d2b90a598eb9677f77eea1b3792` |
+| `xnu/out-fuxi-0097d/kernel.development.fuxi.unstripped` | `81f47e71858ee936773622b51d93cff557f7da16b01c8db0961d79836781e179` |
+| `xnu/out-fuxi-0097d/fuxi.adt` | `39aacea4d7db372314bdc7928a66271b3b5cc2bd878bec4d9cfe2f5191e83533` |
+| `shim/out/fuxi-0097d-boot.img` | `de4cf8d86926a5b1e0bbd60bb835c37fbceb86d5b989572cd950fbea69981a57` |
+| `shim/out/fuxi-0097d-payload.bin` | `6cb07f9b11b831cffa3a15fab141ac136eba86918058e504131853705604d687` |
+| `shim/out/fuxi-0097d-cpu-boot.img` | `58aeb606af621eb225f533cb5fe4c0047f4e5615de587c9d888e3b27a9d9ae26` |
+| `shim/out/fuxi-0097d-cpu-payload.bin` | `19944d7aa894e3139a181a1a050cf93948e094066d5bba6df9b27612f88375c4` |
+
 # Milestone 7c — retry initialization while CPU domains come online
 
 **OBSERVED on fuxi-0097b (coordinator device result, 2026-10-20):** boot log
@@ -183,7 +266,7 @@ extend it; after **1500 ms without either**, the next sample requests cool.
 Swaps alone cannot start a boost. Every decision uses fresh TSENS data from
 TM0 sensors 1..15 (cpuss and gold/prime) and TM1 sensors 1..3 (silver), matching
 the thermal lane's CPU sensor inventory. At least 14 of 18 CPU sensors must
-be ready, VALID and plausible in the current sample (-40..150 C); the hottest of these is used. A smaller quorum
+be VALID and plausible in the current sample (-40..150 C); the hottest of these is used. A smaller quorum
 forces cool. A new boost requires hottest CPU <=60 C;
 an existing boost can continue through 68 C, but **above 68 C forces cool**.
 It cannot restart above 60 C. These are software votes sampled at 100 ms,
@@ -215,7 +298,7 @@ acceptance are separate: no phone test or thermal improvement is claimed.
 # Thermal lane (Fuxi, SM8550): measuring temperature and cooling iOS down
 
 Historical thermal-lane design notes follow. For device observations and current
-0097b behavior, see the milestone section above.
+0097d behavior, see the milestone sections above.
 Tags used below: **[DT]** read from the live FDT `research/device/probe-09/live.dtb`;
 **[src]** read from the XNU tree `research/ci-0081/xnu` or our patches; **[Linux]**
 the mainline `qcom-cpufreq-hw` / `tsens-v2` register layout, which I recalled and

@@ -2,6 +2,8 @@
 """Compile the governor's actual policy with boundary/LUT tests (offline)."""
 from pathlib import Path
 import argparse
+import ast
+import struct
 import importlib.util
 import re
 import subprocess
@@ -15,6 +17,30 @@ submit = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(submit)
 actual = (ROOT/'xnu/fuxi-perf/fuxi_perf.c').read_text()
 register_functions = ''.join(submit.function(actual, n) for n in ('fp_read','fp_vote','fp_temperature','fp_init_fail','fp_init_report','fp_initialize','fp_try_initialize','fp_update_votes','fp_worker','fuxi_perf_input','fuxi_perf_swap'))
+# Audit the loader's zero-based wire slots and execute the host decoder without
+# importing its USB dependencies. The C model below records the governor reads.
+probe = (ROOT/'shim/fuxi-probe/probe.c').read_text()
+assert 'for (unsigned s=0;s<th_nsens[c];s++) w[4+s]=usb_rd(th_tm[c],0xa0+4*s);' in probe
+host = ast.parse((ROOT/'tools/fuxi-xnu-monitor.py').read_text())
+nodes = [n for n in host.body if
+         (isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'TSENS_NAMES' for t in n.targets)) or
+         (isinstance(n, ast.FunctionDef) and n.name == 'thermal_decode')]
+namespace = {'struct': struct}
+exec(compile(ast.Module(body=nodes, type_ignores=[]), '<host thermal decoder>', 'exec'), namespace)
+names = namespace['TSENS_NAMES']
+expected = ['cpuss-%d' % i for i in range(4)] + ['cpu-1-%d' % i for i in range(11)] + ['cpu-0-%d' % i for i in range(3)]
+assert names[0][1:16] + names[1][1:4] == expected
+wire = [0] * 90
+wire[:2] = [0x31524854, 3]
+for d in range(2):
+    wire[7 + 20*d] = 8  # Observed TRDY, bit 0 clear.
+    for n in range(16):
+        wire[8 + 20*d + n] = (1 << 21) | (400 + 16*d + n)
+decoded = namespace['thermal_decode'](struct.pack('<90I', *wire))
+for d in range(2):
+    for n, name in enumerate(names[d]):
+        assert decoded['temps'][name] == (400 + 16*d + n) / 10
+print('PASS: loader STATUS(s)=0xa0+4*s from s=0; host names/decoder zero-based CPU mapping')
 TEST = r'''
 #include <stdint.h>
 #include <assert.h>
@@ -52,7 +78,7 @@ int main(void) {
   fp_percore[d]=0; assert(fp_vote(d,2)); assert(writes[d]==fp_cores[d]+1);
  }
  for(unsigned d=0;d<2;d++) {
-  regs[d+3][0xe4/4]=1;
+  regs[d+3][0xe4/4]=8;
   for(unsigned n=1;n<=(d?3:15);n++) regs[d+3][(0xa0+4*n)/4]=(1u<<21)|450;
  }
  int temp;
@@ -61,7 +87,7 @@ int main(void) {
  regs[4][(0xa0+4*3)/4]=450; assert(fp_temperature(&temp) && temp==681);
  regs[4][(0xa0+4*3)/4]=(1u<<21)|0xff6; /* -1 C, signed */
  assert(fp_temperature(&temp) && temp==681);
- regs[3][0xe4/4]=0;assert(!fp_temperature(&temp));
+ regs[3][0xe4/4]=0;assert(fp_temperature(&temp) && temp==681);
  /* Full init uses real frequency words/counts and stops after the first
   * repeated frequency. A fault at every later tail row must be irrelevant. */
  reset_init(); assert(fp_try_initialize(ticks) && log_count==1 && strstr(last_log,"ready"));
@@ -116,10 +142,10 @@ int main(void) {
   if(good) { assert(temp==550);assert(fp_want_boost(0,good,temp,2000,1999,0,1500)); }
   else assert(!fp_want_boost(1,good,temp,2000,1999,0,1500));
  }
- reset();regs[4][0xe4/4]=0;assert(fp_temperature(&temp) && temp==450); /* 15/18 */
- reset();regs[3][0xe4/4]=0;assert(!fp_temperature(&temp)); /* 3/18 */
+ reset();regs[4][0xe4/4]=0;assert(fp_temperature(&temp) && temp==450); /* TRDY is irrelevant */
+ reset();regs[3][0xe4/4]=0;assert(fp_temperature(&temp) && temp==450);
  reset();fault_block=4;fault_off=0xe4;assert(fp_temperature(&temp));
- reset();fault_block=3;fault_off=0xe4;assert(!fp_temperature(&temp));
+ reset();fault_block=3;fault_off=0xe4;assert(fp_temperature(&temp));
  reset();fault_block=3;fault_off=0xa4;assert(fp_temperature(&temp) && temp==450);
  for(unsigned d=0;d<2;d++) for(unsigned n=1;n<=(d?3:15);n++) {
   reset();regs[d+3][(0xa0+4*n)/4]=450;
@@ -136,6 +162,42 @@ int main(void) {
  regs[3][0xa4/4]=(1u<<21)|((-401)&0xfff);assert(fp_temperature(&temp) && temp==450);
  regs[3][0xa4/4]=(1u<<21)|1500;assert(fp_temperature(&temp) && temp==1500);
  regs[3][0xa4/4]=(1u<<21)|((-400)&0xfff);assert(fp_temperature(&temp) && temp==450);
+ /* 0097c loader sample: TRDY=0x8 and decoded CPU temperatures (dC).
+  * Reconstruct VALID+temperature; these are not captured full status words. */
+ reset();
+ const unsigned observed_temp[2][15]={
+  {477,477,473,469,465,465,473,457,465,469,457,461,481,469,477},
+  {475,475,479}
+ };
+ for(unsigned d=0;d<2;d++) {
+  regs[d+3][0xe4/4]=8;
+  for(unsigned n=1;n<=(d?3:15);n++)regs[d+3][(0xa0+4*n)/4]=(1u<<21)|observed_temp[d][n-1];
+ }
+ assert(fp_temperature(&temp) && temp==481);
+ assert(tsens_reads[0]==0xfffe && tsens_reads[1]==0xe);
+ assert(fp_want_boost(0,1,temp,2000,1999,0,1500));
+ /* Exercise actual worker entry, extension, hot cutoff, quorum loss and stats
+  * with TRDY bit 0 clear throughout. No input still cannot enter high. */
+ fp_worker(0,0);assert(fp_ready && !fp_boosted);
+ ticks=101;fuxi_perf_input();fp_worker(0,0);assert(fp_boosted && fp_boosts==1 && fp_max_temp==481);
+ ticks=1500;fuxi_perf_swap();ticks=1602;fp_worker(0,0);assert(fp_boosted);
+ regs[3][(0xa0+4*13)/4]=(1u<<21)|681;
+ ticks=1603;fp_worker(0,0);assert(!fp_boosted);
+ regs[3][(0xa0+4*13)/4]=(1u<<21)|481;
+ ticks=1604;fuxi_perf_input();fp_worker(0,0);assert(fp_boosted);
+ for(unsigned n=1;n<=5;n++)regs[3][(0xa0+4*n)/4]=480;
+ ticks=1605;fp_worker(0,0);assert(!fp_boosted); /* 13/18, no stale reuse */
+ for(unsigned n=1;n<=5;n++)regs[3][(0xa0+4*n)/4]=(1u<<21)|480;
+ ticks=10100;fp_worker(0,0);
+ assert(strstr(last_log,"stats boosts 2") && strstr(last_log,"max temp 681 dC valid 1 state cool"));
+ /* Each included CPU sensor must independently control the hottest sample.
+  * Every excluded AOSS/non-CPU sensor remains irrelevant, even at 150 C. */
+ for(unsigned d=0;d<2;d++) for(unsigned n=0;n<16;n++) {
+  reset();regs[d+3][(0xa0+4*n)/4]=(1u<<21)|1500;
+  assert(fp_temperature(&temp));
+  assert(temp==((n>=1 && n<=(d?3:15))?1500:450));
+  assert(tsens_reads[0]==0xfffe && tsens_reads[1]==0xe);
+ }
  /* Actual worker: reproduce 0097b's gold enable=2 during AP startup.
   * Frequent input/swaps must neither write votes nor accelerate retries. */
  reset_init();regs[1][0]=2;fp_worker(0,0);
@@ -218,11 +280,11 @@ int main(void) {
   fault_block=-1;fp_update_votes(1);assert(regs[1][0x320/4]==fp_cool[1]);
  }
 #undef printf
- puts("PASS: actual worker 60s retries/input gating/no-init-votes/domain enable loss and recovery; real 0097 LUTs/init failures/16K mappings/14-of-18 sensor quorum; LUT decode/duplicates/turbo/nonmonotonic selection, thermal 60/68 boundaries, input-only entry, swap extension, 1500 ms expiry, per-core vote/readback and signed/invalid CPU sensors");
+ puts("PASS: observed TRDY=8/48.1 C worker boost/hot cutoff/quorum/stats; exact CPU sensor read masks; actual worker 60s retries/input gating/no-init-votes/domain enable loss and recovery; real 0097 LUTs/init failures/16K mappings/14-of-18 sensor quorum; LUT decode/duplicates/turbo/nonmonotonic selection, thermal 60/68 boundaries, input-only entry, swap extension, 1500 ms expiry, per-core vote/readback and signed/invalid CPU sensors");
 }
 '''
 REGISTERS = r'''
-static uint32_t regs[5][1024], writes[3], lut_reads[3];
+static uint32_t regs[5][1024], writes[3], lut_reads[3], tsens_reads[2];
 static uintptr_t fp_epss[3]={0x1000,0x2000,0x3000},fp_tsens[2]={0x4000,0x5000};
 static const uint64_t fp_epss_pa[3]={0x17d91000,0x17d92000,0x17d93000};
 static const uint64_t fp_tsens_pa[2]={0xc271000,0xc272000};
@@ -276,6 +338,10 @@ static unsigned fuxi_gpu_access(uintptr_t address,uint64_t *v,unsigned wr,unsign
   off=(address&0x3fff)-offset;
  }
  assert(block<5 && off<0x1000 && !(off&3));
+ if(block>=3) {
+  assert(!wr && off>=0xa0 && off<0xe0); /* Never read TRDY, including on faults. */
+  tsens_reads[block-3]|=1u<<((off-0xa0)/4);
+ }
  if((int)block==fault_block && off==fault_off && (!fault_write_only || wr))return 1;
  if(block<3 && off>=0x100 && off<0x1a0) {
   unsigned row=(off-0x100)/4;lut_reads[block]++;
@@ -286,6 +352,7 @@ static unsigned fuxi_gpu_access(uintptr_t address,uint64_t *v,unsigned wr,unsign
  return 0;
 }
 static void reset(void) {
+ memset(tsens_reads,0,sizeof(tsens_reads));
  memset(regs,0,sizeof(regs));memset(writes,0,sizeof(writes));memset(lut_reads,0,sizeof(lut_reads));
  memset(fp_cool_khz,0,sizeof(fp_cool_khz));memset(fp_high_khz,0,sizeof(fp_high_khz));
  memset(fp_domain_failed,0,sizeof(fp_domain_failed));memset(fp_applied_valid,0,sizeof(fp_applied_valid));
@@ -301,7 +368,7 @@ static void reset(void) {
  }
  for(unsigned d=0;d<2;d++) {
   fp_tsens[d]=0x100000+0x4000*(d+3)+(fp_tsens_pa[d]&0x3fff);
-  regs[d+3][0xe4/4]=1;
+  regs[d+3][0xe4/4]=8;
   for(unsigned n=1;n<=(d?3:15);n++)regs[d+3][(0xa0+4*n)/4]=(1u<<21)|450;
  }
 }
