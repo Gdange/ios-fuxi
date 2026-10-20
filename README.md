@@ -22,6 +22,14 @@ The phone boots to the iOS home screen. You can use the touchscreen and the hard
 | GPU | Adreno A740 bring-up in the loader: the GMU firmware boots, the HFI handshake completes and the GPU core is powered. Command-processor stages are written but not yet tested on the device. No GPU driver in XNU yet |
 | Not working | Wi-Fi, Bluetooth, cellular, audio, camera, sensors, Face ID / SEP, GPU acceleration in iOS |
 
+### Milestone 7 memory layout
+
+The offline 0097 images select 5088 MiB of XNU RAM at `0x8c0000000`, with
+32 MiB at `0x9fe000000` reserved for GPU scratch, firmware and handoff. This
+uses the observed contiguous 5 GiB bank; upper-bank runtime validation is
+pending. `mkadt-fuxi.py --ram-layout 1g` preserves the old 1 GiB XNU window.
+See the [memory audit and address map](docs-lanes/memory.md).
+
 ## How it boots
 
 ```

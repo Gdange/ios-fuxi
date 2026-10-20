@@ -1,3 +1,10 @@
+# Milestone 7 — memory
+
+XNU now gets **5088 MiB**, with the last 32 MiB of the observed 5 GiB bank
+reserved for GPU scratch and the cold handoff. See [memory layout](memory.md)
+for addresses, XNU limit audit, USB offset extension and the `--ram-layout 1g`
+compatibility option. No device access or boot is claimed.
+
 # Milestone 6d — present CPU cost
 
 Branch `codex-gpu-m6d`, based on M6c `1bc3668`. **0096e built natively and

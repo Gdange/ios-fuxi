@@ -183,7 +183,7 @@ static uint32_t cdb32(const uint8_t *p) { return cdb16(p) | (uint32_t)cdb16(p + 
  * Fixed scratch in the loader-only XNU RAM window. Never part of .bss.
  * Firmware and tables must survive until reset once CM3 has been released.
  */
-#define G_MEM       0x8f0000000ULL
+#define G_MEM       0x9fe000000ULL
 #define G_MEM_SIZE  0x02000000u
 #define G_IC_PA     (G_MEM + 0x100000)
 #define G_DATA_PA   (G_MEM + 0x1100000)

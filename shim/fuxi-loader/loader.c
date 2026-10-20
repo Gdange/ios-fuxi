@@ -62,7 +62,7 @@ static void zero64(uintptr_t dst, uint64_t n)
 		d[i] = 0;
 }
 
-/* No GPU initialization here. Only a reduced-RAM payload authorizes staging.
+/* No GPU initialization here. The top-of-bank reservation is outside every accepted XNU window.
  * Publishing magic last makes a missing/partial firmware set fail closed. */
 static void stage_gpu_firmware(void)
 {
@@ -138,7 +138,7 @@ static const char *loader_boot(void)
  if (!entry_found) return "entry outside kernel segments";
 
  /* Reject all loader/FDT overlap with the reservation before writing it. */
- if (p->mem_size == FG_RAM_SIZE) {
+ { /* All supported layouts exclude the same top-of-bank scratch. */
   if ((rd_start < FG_SCRATCH + FG_SCRATCH_SIZE && FG_SCRATCH < rd_end) ||
       (probe_fdt_address() < FG_SCRATCH + FG_SCRATCH_SIZE &&
        FG_SCRATCH < probe_fdt_address() + probe_fdt_bytes()))

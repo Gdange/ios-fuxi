@@ -165,7 +165,7 @@ def main():
     if payload[:8] != b'SWEETXNU':
         ap.error('invalid payload')
     virt, _, _, _, _, phys, size = struct.unpack_from('<7Q', payload, 16)
-    if phys != 0x8c0000000 or size not in (0x40000000, 0x30000000):  # 768 MiB = --gpu-reserve
+    if phys != 0x8c0000000 or size not in (0x40000000, 0x30000000, 0x13e000000):
         ap.error('unexpected Fuxi RAM window')
     offsets = {name: value - virt for name, value in symbols(args.kernel).items()}
     if any(not 0 <= off < size - 0x400000 for off in offsets.values()):
@@ -194,7 +194,7 @@ def main():
             raise ValueError('RAM request outside XNU window')
         output = bytearray()
         for off in range(offset, offset + length, 512):
-            output.extend(request(0x47, min(512, offset + length - off), off & 0xffff, off >> 16))
+            output.extend(request(0x58 if off >= 0x100000000 else 0x47, min(512, offset + length - off), off & 0xffff, (off >> 16) & 0xffff))
         return bytes(output)
 
     report = request(0x40, 152)

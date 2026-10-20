@@ -18,7 +18,7 @@ assert b'DEVELOPMENT_ARM64_FUXI' in b, 'Payload is not a FUXI kernel'
 version,n=struct.unpack_from('<II',b,8)
 assert version==1 and 0<n<=32 and len(b)>=680+32*n
 assert struct.unpack_from('<Q',b,56)[0]==0x8c0000000
-assert struct.unpack_from('<Q',b,64)[0] in (0x40000000,0x30000000)
+assert struct.unpack_from('<Q',b,64)[0] in (0x40000000,0x13e000000)
 for i in range(n):
  va,vs,off,sz=struct.unpack_from('<4Q',b,680+32*i)
  assert off<=len(b) and sz<=len(b)-off and sz<=vs
@@ -28,7 +28,7 @@ PY
 python3 - "$payload" "${FUXI_GMU_FIRMWARE:-}" "${FUXI_SQE_FIRMWARE:-}" "${FUXI_GPU_ZAP_MBN:-}" "$out/gpu-fw.S" <<'FWPY'
 import hashlib, json, pathlib, struct, sys
 payload, gmu, sqe, zap, dst = sys.argv[1:]
-reserved = struct.unpack_from("<Q", pathlib.Path(payload).read_bytes(), 64)[0] == 0x30000000
+reserved = True  # Both supported windows exclude top-of-bank scratch.
 pinned = {
  "gpu": "1a2a419c39046d3141fc5fed5aa7f971de2db40cc7a1d89693c3e26fad64dd98",
  "sqe": "6d38046654333a6a5a4ee77ab67abc24e3c0c5c68237513afe98e94da8fc9fcc",
