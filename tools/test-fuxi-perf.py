@@ -14,7 +14,7 @@ spec = importlib.util.spec_from_file_location('submit', ROOT/'tools/test-fuxi-ad
 submit = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(submit)
 actual = (ROOT/'xnu/fuxi-perf/fuxi_perf.c').read_text()
-register_functions = ''.join(submit.function(actual, n) for n in ('fp_read','fp_vote','fp_temperature','fp_init_fail','fp_initialize'))
+register_functions = ''.join(submit.function(actual, n) for n in ('fp_read','fp_vote','fp_temperature','fp_init_fail','fp_init_report','fp_initialize','fp_try_initialize','fp_update_votes','fp_worker','fuxi_perf_input','fuxi_perf_swap'))
 TEST = r'''
 #include <stdint.h>
 #include <assert.h>
@@ -26,6 +26,7 @@ TEST = r'''
 #define R(l,n) ((1u<<30)|((n)<<16)|(l))
 #define REGISTER_FUNCTIONS
 int main(void) {
+ reset();
  uint32_t rows[40] = {R(26,4),R(73,4),R(60,4),R(146,1),R(140,4),R(140,4)};
  unsigned khz;
  assert(fp_level(rows,40,1401600,&khz)==1 && khz==1401600);
@@ -63,7 +64,7 @@ int main(void) {
  regs[3][0xe4/4]=0;assert(!fp_temperature(&temp));
  /* Full init uses real frequency words/counts and stops after the first
   * repeated frequency. A fault at every later tail row must be irrelevant. */
- reset(); assert(fp_initialize() && log_count==1 && strstr(last_log,"ready"));
+ reset_init(); assert(fp_try_initialize(ticks) && log_count==1 && strstr(last_log,"ready"));
  for(unsigned d=0;d<3;d++) {
   assert(lut_reads[d]==observed_count[d]+1);
   assert(fp_cool[d]==(d==2?6:8));
@@ -71,39 +72,39 @@ int main(void) {
   assert(fp_high_khz[d]==(d==0?1228800:d==1?2803200:2956800));
  }
  for(unsigned d=0;d<3;d++) for(unsigned i=observed_count[d]+1;i<40;i++) {
-  reset(); fault_block=d;fault_off=0x100+4*i;
-  assert(fp_initialize() && log_count==1 && strstr(last_log,"ready"));
+  reset_init(); fault_block=d;fault_off=0x100+4*i;
+  assert(fp_try_initialize(ticks) && log_count==1 && strstr(last_log,"ready"));
  }
  /* Every init failure emits exactly one line with the failed domain,
   * offset, value and access status. No init path may raise a vote. */
  for(unsigned d=0;d<5;d++) {
-  reset(); fail_map=d+1;
-  assert(!fp_initialize() && log_count==1 && strstr(last_log,d<3?"step=map":"step=tsens map"));
+  reset_init(); fail_map=d+1;
+  assert(!fp_try_initialize(ticks) && log_count==1 && strstr(last_log,d<3?"step=map":"step=tsens map"));
   assert(strstr(last_log,"value=0 access=0"));
  }
  for(unsigned d=0;d<3;d++) {
-  reset();regs[d][0]=2;
-  assert(!fp_initialize() && log_count==1 && strstr(last_log,"step=enable") && strstr(last_log,"value=0x2 access=1"));
-  reset();fault_block=d;fault_off=0;
-  assert(!fp_initialize() && log_count==1 && strstr(last_log,"step=enable") && strstr(last_log,"value=0xffffffff access=0"));
-  reset();fault_block=d;fault_off=0xb0;
-  assert(!fp_initialize() && log_count==1 && strstr(last_log,"step=dcvs"));
+  reset_init();regs[d][0]=2;
+  assert(!fp_try_initialize(ticks) && log_count==1 && strstr(last_log,"step=enable") && strstr(last_log,"value=0x2 access=1"));
+  reset_init();fault_block=d;fault_off=0;
+  assert(!fp_try_initialize(ticks) && log_count==1 && strstr(last_log,"step=enable") && strstr(last_log,"value=0xffffffff access=0"));
+  reset_init();fault_block=d;fault_off=0xb0;
+  assert(!fp_try_initialize(ticks) && log_count==1 && strstr(last_log,"step=dcvs"));
   for(unsigned i=0;i<=observed_count[d];i++) {
-   reset();fault_block=d;fault_off=0x100+4*i;
-   assert(!fp_initialize() && log_count==1 && strstr(last_log,"step=LUT"));
+   reset_init();fault_block=d;fault_off=0x100+4*i;
+   assert(!fp_try_initialize(ticks) && log_count==1 && strstr(last_log,"step=LUT"));
    char expect[64];snprintf(expect,sizeof(expect),"row=%u",i);assert(strstr(last_log,expect));
    snprintf(expect,sizeof(expect),"offset=%#x",fault_off);assert(strstr(last_log,expect));
    snprintf(expect,sizeof(expect),"domain=%s(%u)",fp_domain[d],d);assert(strstr(last_log,expect));
   }
-  reset();regs[d][0x100/4]=regs[d][0x104/4]=R(26,1);
-  assert(!fp_initialize() && log_count==1 && strstr(last_log,"step=level selection"));
+  reset_init();regs[d][0x100/4]=regs[d][0x104/4]=R(26,1);
+  assert(!fp_try_initialize(ticks) && log_count==1 && strstr(last_log,"step=level selection"));
  }
- reset();for(unsigned d=0;d<3;d++) {
+ reset_init();for(unsigned d=0;d<3;d++) {
   /* A full 40-row table needs no duplicate or read of slot 40. */
   for(unsigned i=0;i<40;i++) regs[d][0x100/4+i]=R(16+i,3);
   observed_tail_fault=0;
  }
- assert(fp_initialize());
+ assert(fp_try_initialize(ticks));
  unsigned khz2;assert(fp_level(rows,0,UINT32_MAX,&khz2)==-1 && !khz2);
  /* Quorum, read errors, signed/plausible limits and no stale hottest value. */
  for(unsigned invalid=0;invalid<=18;invalid++) {
@@ -135,8 +136,89 @@ int main(void) {
  regs[3][0xa4/4]=(1u<<21)|((-401)&0xfff);assert(fp_temperature(&temp) && temp==450);
  regs[3][0xa4/4]=(1u<<21)|1500;assert(fp_temperature(&temp) && temp==1500);
  regs[3][0xa4/4]=(1u<<21)|((-400)&0xfff);assert(fp_temperature(&temp) && temp==450);
+ /* Actual worker: reproduce 0097b's gold enable=2 during AP startup.
+  * Frequent input/swaps must neither write votes nor accelerate retries. */
+ reset_init();regs[1][0]=2;fp_worker(0,0);
+ assert(!fp_ready && fp_enabled && log_count==1 && strstr(last_log,"step=enable"));
+ assert(fp_retry_at==1100 && scheduled==1100 && maps==2);
+ for(unsigned t=101;t<1100;t++) {
+  ticks=t;fuxi_perf_input();fuxi_perf_swap();fp_worker(0,0);
+  assert(!fp_ready && !fp_retries && log_count==1 && maps==2);
+  assert(!writes[0] && !writes[1] && !writes[2]);
+  for(unsigned d=0;d<3;d++) assert(!fp_cool_khz[d]);
+ }
+ ticks=1100;fp_worker(0,0);assert(fp_retries==1 && maps==2 && log_count==1);
+ regs[1][0]=3;ticks=2100;fp_worker(0,0);
+ assert(fp_ready && fp_enabled && fp_retries==2 && maps==5 && log_count==2);
+ assert(strstr(last_log,"ready") && strstr(last_log,"after 2 retries"));
+ for(unsigned d=0;d<3;d++) assert(writes[d]);
+ /* Every init failure class recovers without a vote on the failed attempt. */
+ for(unsigned kind=0;kind<6;kind++) {
+  reset_init();
+  if(kind==0)fail_map=1;
+  if(kind==1)regs[2][0]=2;
+  if(kind==2){fault_block=2;fault_off=0xb0;}
+  if(kind==3){fault_block=1;fault_off=0x104;}
+  if(kind==4)regs[1][0x100/4]=regs[1][0x104/4]=R(26,1);
+  if(kind==5)fail_map=5;
+  fp_worker(0,0);assert(!fp_ready && log_count==1);
+  for(unsigned d=0;d<3;d++)assert(!writes[d] && !fp_cool_khz[d]);
+  fail_map=0;fault_block=-1;regs[2][0]=3;
+  memcpy(&regs[1][0x100/4],observed_rows[1],sizeof(observed_rows[1]));
+  ticks=1100;fp_worker(0,0);
+  assert(fp_ready && fp_retries==1 && log_count==2 && strstr(last_log,"after 1 retries"));
+ }
+ /* Exhaustion: initial + exactly 60 retries, two diagnostic lines total.
+  * The final diagnostic describes the latest failure, not the first one. */
+ reset_init();regs[1][0]=2;fp_worker(0,0);regs[1][0]=3;regs[2][0]=2;
+ for(unsigned n=1;n<=60;n++) {
+  ticks=100+1000*n;fp_worker(0,0);
+  assert(fp_retries==n && !fp_ready && log_count==(n==60?2:1));
+  assert(!writes[0] && !writes[1] && !writes[2]);
+ }
+ assert(!fp_enabled && maps==3 && strstr(last_log,"disabled after 60 retries"));
+ assert(strstr(last_log,"domain=prime(2)") && strstr(last_log,"value=0x2 access=1"));
+ regs[2][0]=3;ticks+=1000;fp_worker(0,0);fuxi_perf_input();
+ assert(!fp_ready && log_count==2 && !writes[0]);
+ /* Success on the last permitted retry; delayed calls cannot extend 60 s. */
+ reset_init();regs[1][0]=2;fp_worker(0,0);
+ for(unsigned n=1;n<60;n++){ticks=100+1000*n;fp_worker(0,0);}
+ regs[1][0]=3;ticks=60100;fp_worker(0,0);
+ assert(fp_ready && fp_retries==60 && log_count==2 && strstr(last_log,"after 60 retries"));
+ reset_init();regs[1][0]=2;fp_worker(0,0);
+ regs[1][0]=3;ticks=60101;fp_worker(0,0);
+ assert(!fp_enabled && !fp_ready && !fp_retries && log_count==2 && !writes[0]);
+ /* Runtime unchanged high policy must still notice a dropped enable.
+  * Only that domain loses boost; recovered domains receive cool only. */
+ reset_init();assert(fp_try_initialize(ticks));fp_update_votes(1);
+ unsigned old_writes[3];memcpy(old_writes,writes,sizeof(writes));
+ regs[1][0]=2;fp_update_votes(1);
+ assert(fp_domain_failed[1] && !fp_domain_failed[0] && !fp_domain_failed[2]);
+ assert(!memcmp(old_writes,writes,sizeof(writes)) && log_count==2);
+ fp_update_votes(1);assert(log_count==2 && writes[1]==old_writes[1]);
+ regs[1][0]=3;fp_update_votes(1);
+ assert(regs[1][0x320/4]==fp_cool[1] && writes[1]>old_writes[1]);
+ assert(regs[2][0x320/4]==fp_high[2] && log_count==2);
+ /* Failed enable reads also skip all writes, independently for each domain. */
+ for(unsigned d=0;d<3;d++) {
+  reset_init();assert(fp_try_initialize(ticks));fp_update_votes(1);
+  unsigned before=writes[d];fault_block=d;fault_off=0;fp_update_votes(1);
+  assert(fp_domain_failed[d] && writes[d]==before);
+  fault_block=-1;fp_update_votes(1);assert(regs[d][0x320/4]==fp_cool[d]);
+ }
+ /* Enable can fall between per-core writes; later writes must be skipped. */
+ reset_init();assert(fp_try_initialize(ticks));fp_percore[1]=1;drop_block=1;drop_after=1;
+ assert(!fp_vote(1,fp_high[1]) && writes[1]==1 && fp_domain_failed[1]);
+ assert(!(regs[1][0]&1));
+ /* A returned write/readback failure fails just this domain cool. */
+ for(unsigned wr=0;wr<2;wr++) {
+  reset_init();assert(fp_try_initialize(ticks));fault_block=1;fault_off=0x320;
+  fault_write_only=wr;fp_update_votes(1);
+  assert(fp_domain_failed[1] && !fp_domain_failed[0] && !fp_domain_failed[2]);
+  fault_block=-1;fp_update_votes(1);assert(regs[1][0x320/4]==fp_cool[1]);
+ }
 #undef printf
- puts("PASS: real 0097 LUTs/init failures/16K mappings/14-of-18 sensor quorum; LUT decode/duplicates/turbo/nonmonotonic selection, thermal 60/68 boundaries, input-only entry, swap extension, 1500 ms expiry, per-core vote/readback and signed/invalid CPU sensors");
+ puts("PASS: actual worker 60s retries/input gating/no-init-votes/domain enable loss and recovery; real 0097 LUTs/init failures/16K mappings/14-of-18 sensor quorum; LUT decode/duplicates/turbo/nonmonotonic selection, thermal 60/68 boundaries, input-only entry, swap extension, 1500 ms expiry, per-core vote/readback and signed/invalid CPU sensors");
 }
 '''
 REGISTERS = r'''
@@ -149,8 +231,24 @@ static unsigned fp_percore[3],fp_cool[3],fp_high[3],fp_cool_khz[3],fp_high_khz[3
 static const unsigned fp_cores[3]={3,4,1};
 static const unsigned fp_cool_cap[3]={1228800,1401600,1363200};
 static unsigned maps,fail_map,log_count,observed_tail_fault;
+static unsigned fp_domain_failed[3],fp_applied[3],fp_applied_valid[3];
+static uint64_t ticks,fp_retry_interval,fp_retry_at,fp_retry_end;
+static unsigned fp_attempted,fp_retries,fp_enabled,fp_ready;
+static struct { const char *step; unsigned domain,offset; uint64_t pa; uint32_t value; int access,row; } fp_diagnostic;
+static uint64_t fp_input,fp_swap,fp_hold,fp_last,fp_window,fp_window_start,fp_boost_time,fp_boosts;
+static int fp_max_temp,fp_boosted;
+typedef void *thread_call_param_t;
+static int fp_call;
+static uint64_t scheduled;
+#define NSEC_PER_MSEC 1
+static uint64_t mach_absolute_time(void) { return ticks; }
+static void absolutetime_to_nanoseconds(uint64_t t,uint64_t *ns) { *ns=t; }
+static void clock_interval_to_deadline(unsigned n,unsigned unit,uint64_t *t) { *t=ticks+n*unit; }
+static int thread_call_enter_delayed(int *call,uint64_t t) { (void)call;scheduled=t;return 0; }
+static int thread_call_enter(int *call) { (void)call;scheduled=ticks;return 0; }
 static int fault_block=-1;
-static unsigned fault_off;
+static unsigned fault_off,fault_write_only,drop_after;
+static int drop_block=-1;
 static char last_log[512];
 /* Model exactly io_map's trunc_page / round_page / start+offset contract;
  * use separate virtual 16K pages, even for aliases of the same physical page. */
@@ -178,18 +276,24 @@ static unsigned fuxi_gpu_access(uintptr_t address,uint64_t *v,unsigned wr,unsign
   off=(address&0x3fff)-offset;
  }
  assert(block<5 && off<0x1000 && !(off&3));
- if((int)block==fault_block && off==fault_off)return 1;
+ if((int)block==fault_block && off==fault_off && (!fault_write_only || wr))return 1;
  if(block<3 && off>=0x100 && off<0x1a0) {
   unsigned row=(off-0x100)/4;lut_reads[block]++;
   if(observed_tail_fault && row>observed_count[block])return 1;
  }
- if(wr) { assert(!maps && block<3);writes[block]++;regs[block][off/4]=*v; }
+ if(wr) { assert(block<3 && (regs[block][0]&1));writes[block]++;regs[block][off/4]=*v; if((int)block==drop_block && writes[block]==drop_after)regs[block][0]&=~1u; }
  else *v=regs[block][off/4];
  return 0;
 }
 static void reset(void) {
  memset(regs,0,sizeof(regs));memset(writes,0,sizeof(writes));memset(lut_reads,0,sizeof(lut_reads));
  memset(fp_cool_khz,0,sizeof(fp_cool_khz));memset(fp_high_khz,0,sizeof(fp_high_khz));
+ memset(fp_domain_failed,0,sizeof(fp_domain_failed));memset(fp_applied_valid,0,sizeof(fp_applied_valid));
+ fp_attempted=fp_retries=fp_ready=0;fp_enabled=1;fp_retry_interval=1000;fp_retry_at=fp_retry_end=0;ticks=100;
+ fp_input=fp_swap=fp_last=fp_window_start=fp_boost_time=fp_boosts=0;
+ fp_hold=1500;fp_window=10000;fp_max_temp=-400;fp_boosted=0;scheduled=0;
+ for(unsigned d=0;d<3;d++) fp_epss[d]=0x1000*(d+1);
+ drop_block=-1;drop_after=fault_write_only=0;
  maps=fail_map=log_count=0;fault_block=-1;fault_off=0;observed_tail_fault=1;
  for(unsigned d=0;d<3;d++) {
   regs[d][0]=3;regs[d][0xb0/4]=0x9b30;
@@ -200,6 +304,9 @@ static void reset(void) {
   regs[d+3][0xe4/4]=1;
   for(unsigned n=1;n<=(d?3:15);n++)regs[d+3][(0xa0+4*n)/4]=(1u<<21)|450;
  }
+}
+static void reset_init(void) {
+ reset();memset(fp_epss,0,sizeof(fp_epss));memset(fp_tsens,0,sizeof(fp_tsens));
 }
 '''
 TEST = TEST.replace('#define REGISTER_FUNCTIONS', REGISTERS + register_functions)

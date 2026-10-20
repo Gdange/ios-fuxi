@@ -1,3 +1,86 @@
+# Milestone 7c — retry initialization while CPU domains come online
+
+**OBSERVED on fuxi-0097b (coordinator device result, 2026-10-20):** boot log
+order is CPU1 `PSCI CPU_ON rc=0`, then:
+
+```text
+FUXI PERF: disabled, step=enable domain=gold(1) PA=0x17d92000 offset=0 value=0x2 access=1 row=-1
+```
+
+CPU2 through CPU6 subsequently report `PSCI CPU_ON rc=0`, followed by
+`FUXI GPU: ready, ... async one-in-flight, no timer sleep`. Silver passed;
+gold's enable bit 0 was clear when the governor initialized before its cores
+ran. Loader probes in other boots read `enable=0x3` after the cores run.
+This identifies an initialization timing failure on 0097b; it does not prove
+that the earlier 0097 failure came from a LUT-tail read.
+
+0097c uses bounded retries rather than coupling initialization to CPU-online
+accounting. Every failed initialization leaves **all hardware votes untouched**
+and publishes no partial policy. Successful MMIO mappings are cached across
+attempts. The worker retries once per second for at most 60 seconds (initial
+attempt plus at most 60 retries). Input-triggered calls obey the same timestamp
+gate and cannot accelerate or extend that window. Only the first failure and
+the final outcome are logged; the final failure carries the most recent full
+diagnostic. Example outcome shapes:
+
+```text
+FUXI PERF: init retry after 0 retries, step=enable domain=gold(1) PA=0x17d92000 offset=0 value=0x2 access=1 row=-1
+FUXI PERF: ready, LUT cool ... kHz high ... kHz, hold 1500 ms guard 60/68 C after 2 retries
+FUXI PERF: disabled after 60 retries, step=enable domain=gold(1) PA=0x17d92000 offset=0 value=0x2 access=1 row=-1
+```
+
+At runtime, the worker checks each domain's enable on every sample, including
+samples with no vote change, and again immediately before **each per-core
+write**. A clear bit or failed read skips writes to that domain and permanently
+removes its boost eligibility for this boot. If it becomes enabled again, only
+its known cool vote is requested. Vote/readback errors also fail that domain
+cool; unaffected domains retain their policy. Each domain failure logs once.
+These read-before-write checks cannot make a software read and a later hardware
+power transition atomic.
+
+Offline ASan/UBSan tests compile the actual worker, retry and MMIO functions.
+They cover the observed gold startup failure, every initialization failure
+class recovering, no votes or partial policy on failure, cached mappings,
+input/swaps during backoff, two-line diagnostic limits, timeout/latest
+failure, success at the final retry, late callbacks, unchanged high policy
+noticing enable loss, failed enable reads, recovery to cool, per-core enable
+loss between writes, and returned write/readback errors. Existing LUT,
+thermal quorum, boost/expiry and actual XNU 16 KiB `io_map` tests also pass.
+
+Native build exited 0 in **ci-lane-gpu6 only**; all sixteen clean-patch
+source inputs match the native tree. Offline GPU submit, memory/USB, external
+firmware-probe, SCM instruction/register and linked abort-recovery checks pass.
+Both loader builds pass `-Werror`; boot-v4/Image geometry and every embedded
+kernel segment are verified. ADT bytes, full RAM, seven CPUs and pinned root
+identity match 0097b. Both payloads preserve its command line and append exactly:
+
+```text
+sweetsample=backboardd,Preferences,PosterBoard sweetscan=PosterBoard,Preferences
+```
+
+The CPU payload differs in exactly one byte, `fuxigpu=0` instead of `=1`.
+Firmware remains external and untracked. No phone access or push was performed;
+0097c initialization and runtime behavior still need a device run.
+
+Reproduce the governor tests with:
+
+```sh
+python3 tools/test-fuxi-perf.py --xnu-tree "$XNU_SOURCE"
+```
+
+Artifacts and logs are ignored; `xnu/out-fuxi-0097c/SHA256SUMS` covers this set
+(paths are relative to the repository root):
+
+| Artifact | SHA256 |
+| --- | --- |
+| `xnu/out-fuxi-0097c/kernel.development.fuxi` | `9db8be7564c9c23b97aa007fb0a145beb3632a45766394075d867f858417400a` |
+| `xnu/out-fuxi-0097c/kernel.development.fuxi.unstripped` | `680eb5c273cef44d3d2334ae57ecfe543efcf655488da273f763605d7dfb695a` |
+| `xnu/out-fuxi-0097c/fuxi.adt` | `39aacea4d7db372314bdc7928a66271b3b5cc2bd878bec4d9cfe2f5191e83533` |
+| `shim/out/fuxi-0097c-boot.img` | `c70cd66b2b46c406cef5ee065b3b0aaed2286e5aecb0315332b79515ef219e96` |
+| `shim/out/fuxi-0097c-payload.bin` | `df4c8f11866976e8e2857ef813ae58b00060ff48ca6f5206a539c0c1ecc035e0` |
+| `shim/out/fuxi-0097c-cpu-boot.img` | `16eb95657bdd15dc350ef32bd4bccb5b0031c627f6913638809fb72d82b2756e` |
+| `shim/out/fuxi-0097c-cpu-payload.bin` | `af09a519e69db90e812d03ccae55de45c005219284a70a9c8a5e296449d5f3e8` |
+
 # Milestone 7b — init diagnostics and fresh-sensor quorum
 
 **OBSERVED on 0097 (coordinator device results, 2026-10-20):** SpringBoard runs
