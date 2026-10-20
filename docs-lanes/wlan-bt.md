@@ -1095,3 +1095,132 @@ undo before any fresh-boot step 21+ test. Host/build success proves no DMA.
 | `xnu/out-fuxi-wlan6c/kernel.development.fuxi` | `ea1bf3582173cda80b48dea738e4cfc547ec7b595e0277eef92926e9a3857fe1` |
 | `shim/out/fuxi-wlan-m6c-boot.img` | `17ae60ae0870778ce4cc1fe80859b981bf09586e224418edc038d0cddbbbcc3a` |
 | `shim/out/fuxi-wlan-m6c-s20-boot.img` | `498b5c26167eb48fc9af0aae6a840e4d94046de50e1a08476073c12fcb48fc7c` |
+
+## Milestone 6d — verify writable fields, retain raw readbacks
+
+This supersedes M6c's exact-word probe/configuration criterion. The supplied
+M6c s20 result rejected eight banks with the same TCR2 readback, `0x60`, after
+writing zero. That establishes the readback problem; it does not establish
+that those banks are unwritable. M6b's unnamed step-20 reason 4 could have
+been the same check, but that remains an inference. No M6d device run was
+performed by this lane.
+
+### Architectural and implementation evidence
+
+[Arm IHI 0062D.c §16.5.39, pp. 16-336–338](https://documentation-service.arm.com/static/5f900d34f86e16515cdc08fb)
+defines the SMMUv2 TCR2 fields: NSCFG1[30], SEP[17:15], NSCFG0[14], HD[11],
+HA[10], HAD1[9], HAD0[8], **TBI1[6], TBI0[5]**, AS[4], PASize[2:0]. Other
+positions are reserved. TBI controls top-byte ignoring for TTBR1/TTBR0;
+the specification limits its effect to address-translation operations that
+can supply full tagged addresses. These are named architectural fields,
+not universal RES1 bits. This lane uses untagged 32-bit IOVAs and no ATS.
+
+[MMU-500 r2p4 TRM, DDI 0517F §3.1](https://documentation-service.arm.com/static/5e908ca6c8052b1608761ab4)
+delegates architectural registers to the SMMU specification and directs
+software to ignore undefined bits on reads; its public register descriptions
+do not specify a Qualcomm TBI implementation. Concrete implementation
+evidence is [AMD UG1087's MMU-500 TCR2 description](https://docs.amd.com/r/en-US/ug1087-zynq-ultrascale-registers/SMMU_CB4_TCR2-SMMU500-Register?contentId=cRVpcVV~QxLqktcjeot3sQ):
+TBI1 and TBI0 are read-only, reset one, with register reset `0x60`. This
+corroborates the supplied behavior without claiming AMD's register map is
+the SM8550 contract. M6d therefore excludes both bits from comparisons.
+
+[Linux v6.12 arm-smmu.h](https://github.com/torvalds/linux/blob/v6.12/drivers/iommu/arm/arm-smmu/arm-smmu.h)
+defines `ARM_SMMU_TCR2_SEP` as [17:15], `ARM_SMMU_TCR2_AS` as bit 4 and
+`ARM_SMMU_TCR2_PASIZE` as [3:0]. Its constructor sets SEP/PASize, and AArch64
+setup adds AS; it defines no TBI controls. Linux's PASIZE macro includes
+reserved bit 3; M6d follows the architectural [2:0] field instead.
+[arm_smmu_write_context_bank](https://github.com/torvalds/linux/blob/v6.12/drivers/iommu/arm/arm-smmu/arm-smmu.c)
+writes TCR2 before TCR/TTBRs, with TBI bits zero, and performs no TCR2 read
+or readback verification. This statement concerns the reviewed generic
+initialization path, not every downstream debug/register-dump facility.
+
+### Per-register audit and behavior
+
+The following masks apply to the lane's Non-secure AArch64 stage-1 format.
+Field layouts follow IHI 0062D.c §§10.2, 16.5.30, 16.5.38–40 above.
+
+| Register | Compared mask / treatment |
+|---|---|
+| CB_TCR2, including probe | `0x38017`: SEP, AS, PASize; excludes `0x60`, Secure-only NSCFG and reserved positions. Add HAD[1:0] only with IDR2.HADS; HA/HD only with IDR1.HAFDBS support. Reject reserved HAFDBS encoding 2. |
+| GR1_CBAR, TYPE=1 | `0x00ffffff`; omit implementation-dependent v2 IRPTNDX storage. With VMID16 enabled, omit RES0 VMID[7:0] (`0x00ffff00`). |
+| GR1_CBA2R | VA64 (`0x1`); add VMID16[31:16] only when implemented and globally enabled. MONC is ignored for Non-secure banks; [15:2] are reserved. |
+| CB_TCR | `0xffffffbf`, excluding reserved bit 6 in AArch64 format. |
+| CB_TTBR0/1 low | `0xffffffe0`: both regions now have TnSZ=32, 4-KiB granule, four L1 entries and x=5. Check address bits [11:5] too; allocation alignment alone does not make them safe to ignore. |
+| CB_TTBR0/1 high | All ASID[15:0], plus implemented PA bits through min(IAS,OAS); `0xffff000f` on a 36-bit implementation. |
+| CB_MAIR0/1 | `0xffffffff`: every attribute byte is writable; no relaxation. |
+| CB_SCTLR | `0x7fdfc7f9`: omit reserved [31,21,13,11], optional ASIDPNE hint and long-descriptor UNK/SBOP AFE/TRE. M, fault, stall, interrupt and endian controls remain checked. |
+| CB_CONTEXTIDR | Ignored for AArch64 ASIDs; untouched. ASIDs remain in TTBR[63:48]. |
+| CB_ACTLR | Implementation tuning; untouched. |
+
+The [MMU-500 SCTLR integration reference](https://docs.amd.com/r/en-US/ug1087-zynq-ultrascale-registers/SMMU_CB5_SCTLR-SMMU500-Register?contentId=X0v~MEaZMBYXfMuBn6LauQ)
+also marks ASIDPNE read-only zero. Its optional private-namespace hint is
+excluded without weakening ASID isolation: the existing enabled-bank ASID
+collision checks remain mandatory. AFE/TRE writes stay Linux-compatible.
+M6d changes TCR from `0x803520` to `0x80a03520` solely to give the disabled
+TTBR1 region legal TG1=4-KiB and T1SZ=32 settings. EPD1 remains set; the
+active TTBR0 format and mapping are unchanged.
+
+Ordinary verification compares `(read & mask) == (wrote & mask)` and prints
+name, offset, written value, **full raw read**, mask and fault count on both
+success and failure. FSR keeps its separate W1C clear check; TLBI/TLBSYNC
+keep completion polling. Shared GR0 stream installation/restore and RC
+ownership checks retain their exact comparisons. SCTLR uses its mask at
+disable, enable, pre-DMA validation and cleanup. Cleanup still tolerates an
+already latched MMIO fault but rejects a new read fault, a writable-bit
+mismatch or an uncleared M bit, retaining allocations in quarantine.
+
+A masked-zero TCR2 probe still filters candidates rather than proving
+ownership: RAZ/WI can pass zero. All full-programming checks remain required
+before a stream is installed. A writable mismatch still rejects a candidate;
+a mismatch after claim still aborts without fallback. The eight-candidate
+bound, repeated ownership checks, DMA gating and undo order are unchanged.
+
+### Verification and artifacts
+
+Linux and native-Mac ASan/UBSan host suites pass. New cases cover TBI=one
+on all eight candidates (first eligible bank accepted), raw `0x60` and
+`0x38071` logs, every compared bit in the CB/GR1 programming sequence,
+ignored bits, zero writes, optional extension/VMID16 fields, RAZ/WI after
+probe acceptance, SCTLR pre-DMA/cleanup and stuck-M quarantine. Historical
+routing, mapping, bounded retry, fault, containment and decoder cases pass.
+Patch 0099 embeds the exact tested C sources. The native kernel build passed
+in `ci-lane-wlan`; this is build/host verification, not endpoint DMA proof.
+
+`tools/build-fuxi-wlan6d-images.sh BASE_METAL2A_ARTIFACT_DIR` consumes the
+stripped/unstripped kernels in `xnu/out-fuxi-wlan6d/`, preserves the M6c
+ADT/header/base command line and requires the same pinned GPU firmware via
+absolute environment paths. It packs `fuxiwlan=20` and `fuxiwlan=1` images.
+`python3 tools/test-fuxi-wlan-m6-artifacts.py --milestone m6d` verifies payload
+reconstruction, both boot headers, firmware hashes, `.gpu_fw=0x25ac8` and
+every entry in `xnu/out-fuxi-wlan6d/SHA256SUMS`. Private input, firmware,
+binaries and build logs remain ignored.
+
+Use the **s20 image first**, on a fresh boot. Expected templates if the
+reported TBI read behavior persists and writable fields program correctly:
+
+```text
+FUXI WLAN: M6d CB probe 1/8 CB ... SCTLR ... M=0 unreferenced; TCR2 zero
+FUXI WLAN: M6d SMMU readback CB ... CB_TCR2 probe offset ... wrote 0 read 0x60 mask 0x38017 faults 0
+FUXI WLAN: M6d CB ... probe accepted; claim pending full CB/GR1 readbacks
+FUXI WLAN: M6d SMMU readback CB ... CB_TCR2 offset ... wrote 0x38011 read 0x38071 mask 0x38017 faults 0
+FUXI WLAN: SMMU owned stage1 SMR ... CB ... TTBR ... IOVA ... readback verified
+FUXI WLAN: step 20 ok code 0x1014 (... ms, faults 0)
+FUXI WLAN: M6d SMMU undo CB ... CB_SCTLR offset ... wrote 0 read ... mask 0x7fdfc7f9 faults 0
+FUXI WLAN: SMMU undo SMR invalid, S2CR restored, CB disabled, TLBI synced
+FUXI WLAN: M6b RC undo bypass restored first, 256 owned entries zeroed
+FUXI WLAN: abort buffers freed
+```
+
+A writable-bit failure instead produces `M6d SMMU mismatch ... mask ...`:
+probe exhaustion remains `0x1406`, full configuration failure `0x1404`,
+and enable/fault/sync/stream failure `0x1405`. The s20 run must contain no
+BHI doorbell or bus-master-on line. Inspect all readbacks and complete undo
+before considering the full image; full-image transfer/M0 behavior remains
+unmeasured in this lane.
+
+| M6d artifact | SHA256 |
+|---|---|
+| `xnu/out-fuxi-wlan6d/kernel.development.fuxi` | `23524a3a3f9fc6d79256f43734f09b7731be097d89db2eb3d5c0244b2143387a` |
+| `xnu/out-fuxi-wlan6d/kernel.development.fuxi.unstripped` | `326a1d80d40242043482a95ef9aa4465a2fe461d74ab78525a76d75ebe49c125` |
+| `shim/out/fuxi-wlan-m6d-s20-boot.img` | `a4cd9c45f912eac1c8da1b097691e82d0db63b2704873a27ad5c0ea328c65838` |
+| `shim/out/fuxi-wlan-m6d-boot.img` | `ed23bd7105feaaa2515af63beb3febbd28bd9651dde0e8c1eb30a3cb59dd8a98` |

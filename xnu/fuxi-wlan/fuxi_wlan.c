@@ -654,7 +654,7 @@ wl_smmu_probe(void)
 	    !(r[7] & 0x1000) || !(r[7] & 15) || (r[7] & 15) > 5 ||
 	    !((r[7] >> 4) & 15) || ((r[7] >> 4) & 15) > 5 ||
 	    !wl_smr_count || !wl_cb_count || wl_cb_count > 128 ||
-	    ((r[6] >> 16) & 255) > wl_cb_count || ((r[7] >> 8) & 15) > 5 ||
+	    ((r[6] >> 16) & 255) > wl_cb_count || ((r[6] >> 24) & 3) == 2 || ((r[7] >> 8) & 15) > 5 ||
 	    wl_cb_base + ((uint64_t)wl_cb_count << wl_pgshift) > WL_SMMU + 0x100000) { return 1; }
 	bool referenced[128] = {false};
 	wl_slot = wl_smr_count; wl_cb = wl_cb_count;
@@ -695,27 +695,60 @@ wl_smmu_probe(void)
 	return wl_rc_route() ? 5 : 0;
 }
 
-/* Offsets are relative to the SMMU aperture, including GR1/CB page selection.
- * No retry loop here: at most eight probe failures and one claimed-bank error.
- * W1C/command registers must not use an equality-to-written-value check. */
+/* SMMUv2 IHI0062D.c 10.2 / 16.5: masks for our Non-secure AArch64
+ * stage-1 format. Ignore undefined/RO fields, not failures of writable bits.
+ * MMU-500 integrations can hardwire TCR2.TBI[1:0] to one (0x60).
+ * SCTLR.AFE/TRE are UNK/SBOP in long-descriptor formats. ASIDPNE is an
+ * optional hint (MMU-500 integrations can read zero); unique ASIDs are checked
+ * across all enabled banks, so correctness never relies on that hint.
+ * ACTLR is untouched. */
+#define WL_CB_SCTLR_MASK 0x7fdfc7f9u /* no reserved [31,21,13,11], ASIDPNE, AFE/TRE */
+#define WL_CB_TCR_MASK   0xffffffbfu /* AArch64: only bit 6 reserved */
+#define WL_CB_TTBR_LO_MASK 0xffffffe0u /* TnSZ=32, 4-KiB granule: x=5 */
+#define WL_CB_MAIR_MASK  0xffffffffu /* all eight attribute bytes are writable */
+
+static uint32_t
+wl_tcr2_mask(void)
+{
+	uint32_t mask = 0x38017; /* SEP, AS, PASize[2:0]; no TBI or Secure NSCFG */
+	if (wl5_report[7] & (1u << 28)) { mask |= 0x300; } /* HADS */
+	unsigned hafdbs = (wl5_report[6] >> 24) & 3;
+	if (hafdbs & 1) { mask |= 0x400; } /* HA */
+	if (hafdbs == 3) { mask |= 0x800; } /* HD */
+	return mask;
+}
+
+static uint32_t
+wl_ttbr_hi_mask(void)
+{
+	static const unsigned bits[] = {32, 36, 40, 42, 44, 48};
+	unsigned ias = wl5_report[7] & 15, oas = (wl5_report[7] >> 4) & 15;
+	/* Probe already bounded both encodings; S1/S2-bypass uses the smaller. */
+	return 0xffff0000u | (uint32_t)(((1ull << bits[MIN(ias, oas)]) - 1) >> 32);
+}
+
+/* Offsets include GR1/CB page selection. Log the complete raw read even on
+ * success, so ignored bits remain visible. W1C uses its own expected value;
+ * command registers use completion polling, never equality-to-write checks. */
 static int
 wl_smmu_verify(const char *name, uint64_t pa, uint32_t written,
     uint32_t readback, uint32_t expected, uint32_t mask)
 {
-	if (!fw_faults && (readback & mask) == expected) { return 0; }
-	if (wl_smmu_mismatches++ < 16) {
-		printf("FUXI WLAN: M6c SMMU mismatch CB %u %s offset %#x wrote %#x read %#x faults %u\n",
-		    wl_cb, name, (unsigned)(pa - WL_SMMU), written, readback, fw_faults);
+	bool mismatch = fw_faults || (readback & mask) != (expected & mask);
+	if (!mismatch || wl_smmu_mismatches++ < 16) {
+		printf("FUXI WLAN: M6d SMMU %s CB %u %s offset %#x wrote %#x read %#x mask %#x faults %u\n",
+		    mismatch ? "mismatch" : "readback", wl_cb, name,
+		    (unsigned)(pa - WL_SMMU), written, readback, mask, fw_faults);
 	}
-	return 1;
+	return mismatch;
 }
 
 static int
-wl_smmu_wr(const char *name, uint64_t pa, uint32_t v)
+wl_smmu_wr(const char *name, uint64_t pa, uint32_t v, uint32_t mask)
 {
 	wl_pwr(pa, v);
 	uint32_t readback = wl_prd(pa);
-	return wl_smmu_verify(name, pa, v, readback, v, ~0u);
+	return wl_smmu_verify(name, pa, v, readback, v, mask);
 }
 
 /* Return 0 only for a presently disabled, unreferenced stage-1 candidate with
@@ -753,7 +786,7 @@ wl_smmu_candidate(unsigned candidate, uint32_t *ctl)
 /* Zero TCR2 is a legal, non-enabling write, independent of ASID/TTBR format.
  * CONTEXTIDR does not hold the ASID in long-descriptor formats; choose
  * the configuration register we must program anyway.
- * A zero readback is only a filter (RAZ/WI could pass); all configuration and
+ * A masked-zero readback is only a filter (RAZ/WI could pass); all configuration and
  * GR1 readbacks remain mandatory. Never retry a failure AFTER claiming a CB. */
 static int
 wl_smmu_claim_candidate(void)
@@ -765,11 +798,11 @@ wl_smmu_claim_candidate(void)
 		if (state < 0) { return 3; }
 		if (state) { continue; }
 		wl_cb = i;
-		printf("FUXI WLAN: M6c CB probe %u/%u CB %u SCTLR %#x M=0 unreferenced; TCR2 zero\n",
+		printf("FUXI WLAN: M6d CB probe %u/%u CB %u SCTLR %#x M=0 unreferenced; TCR2 zero\n",
 		    ++attempts, WL_CB_PROBE_MAX, i, ctl);
-		if (wl_smmu_wr("CB_TCR2 probe", wl_cb_addr(i) + 0x10, 0)) {
+		if (wl_smmu_wr("CB_TCR2 probe", wl_cb_addr(i) + 0x10, 0, wl_tcr2_mask())) {
 			wl_cb_unusable[i] = true;
-			printf("FUXI WLAN: M6c CB %u unusable; probe failed%s\n", i, fw_faults ? "; MMIO fault, abort" : "; next candidate");
+			printf("FUXI WLAN: M6d CB %u unusable; probe failed%s\n", i, fw_faults ? "; MMIO fault, abort" : "; next candidate");
 			if (fw_faults) { return 6; }
 			continue;
 		}
@@ -777,10 +810,10 @@ wl_smmu_claim_candidate(void)
 		if (wl_smmu_candidate(i, &now) || now != ctl) { return 3; }
 		wl_old_sctlr = ctl;
 		wl5_report[9] = i;
-		printf("FUXI WLAN: M6c CB %u probe accepted; claim pending full CB/GR1 readbacks\n", i);
+		printf("FUXI WLAN: M6d CB %u probe accepted; claim pending full CB/GR1 readbacks\n", i);
 		return 0;
 	}
-	printf("FUXI WLAN: M6c CB probe exhausted %u candidates (limit %u); no bank claimed\n", attempts, WL_CB_PROBE_MAX);
+	printf("FUXI WLAN: M6d CB probe exhausted %u candidates (limit %u); no bank claimed\n", attempts, WL_CB_PROBE_MAX);
 	return 6;
 }
 
@@ -855,23 +888,31 @@ wl_smmu_enable(void)
 	if (claim) { return claim; }
 	uint64_t cb = wl_cb_addr(wl_cb), ttbr = wl_pt_pa(0) | ((uint64_t)wl_cb << 48);
 	wl_owned = true; /* includes partial setup: abort must disable and sync */
-	if (wl_smmu_wr("CB_SCTLR disable", cb, 0) ||
-	    wl_smmu_wr("GR1_CBA2R", wl_gr1 + 0x800 + 4 * wl_cb, 1) || /* VA64 */
-	    wl_smmu_wr("GR1_CBAR", wl_gr1 + 4 * wl_cb, 0x1f300) || /* S1, S2 bypass */
-	    wl_smmu_wr("CB_TCR2", cb + 0x10, 0x38011) || /* SEP upstream, AS, 36-bit PA */
-	    wl_smmu_wr("CB_TCR", cb + 0x30, 0x803520) || /* EPD1, WB/ISH, 32-bit IOVA */
-	    wl_smmu_wr("CB_TTBR0_HI", cb + 0x24, (uint32_t)(ttbr >> 32)) ||
-	    wl_smmu_wr("CB_TTBR0_LO", cb + 0x20, (uint32_t)ttbr) ||
-	    wl_smmu_wr("CB_TTBR1_HI", cb + 0x2c, wl_cb << 16) || wl_smmu_wr("CB_TTBR1_LO", cb + 0x28, 0) ||
-	    wl_smmu_wr("CB_MAIR0", cb + 0x38, 0xff) || wl_smmu_wr("CB_MAIR1", cb + 0x3c, 0)) { return 4; }
+	/* IRPTNDX is not required storage in v2; VMID16 is RES0 when disabled. */
+	bool vmid16 = (wl5_report[4] & (1u << 31)) && (wl5_report[7] & (1u << 15));
+	uint32_t cbar_mask = vmid16 ? 0x00ffff00 : 0x00ffffff;
+	uint32_t cba2r_mask = vmid16 ? 0xffff0001 : 1; /* MONC ignored Non-secure */
+	uint32_t ttbr_hi_mask = wl_ttbr_hi_mask();
+	if (wl_smmu_wr("CB_SCTLR disable", cb, 0, WL_CB_SCTLR_MASK) ||
+	    wl_smmu_wr("GR1_CBA2R", wl_gr1 + 0x800 + 4 * wl_cb, 1, cba2r_mask) || /* VA64 */
+	    wl_smmu_wr("GR1_CBAR", wl_gr1 + 4 * wl_cb, 0x1f300, cbar_mask) || /* S1, S2 bypass */
+	    wl_smmu_wr("CB_TCR2", cb + 0x10, 0x38011, wl_tcr2_mask()) || /* SEP upstream, AS, 36-bit PA */
+	    /* EPD1, WB/ISH, 32-bit IOVA; legal TG1=4KiB/T1SZ=32 even while disabled. */
+	    wl_smmu_wr("CB_TCR", cb + 0x30, 0x80a03520, WL_CB_TCR_MASK) ||
+	    wl_smmu_wr("CB_TTBR0_HI", cb + 0x24, (uint32_t)(ttbr >> 32), ttbr_hi_mask) ||
+	    wl_smmu_wr("CB_TTBR0_LO", cb + 0x20, (uint32_t)ttbr, WL_CB_TTBR_LO_MASK) ||
+	    wl_smmu_wr("CB_TTBR1_HI", cb + 0x2c, wl_cb << 16, ttbr_hi_mask) ||
+	    wl_smmu_wr("CB_TTBR1_LO", cb + 0x28, 0, WL_CB_TTBR_LO_MASK) ||
+	    wl_smmu_wr("CB_MAIR0", cb + 0x38, 0xff, WL_CB_MAIR_MASK) ||
+	    wl_smmu_wr("CB_MAIR1", cb + 0x3c, 0, WL_CB_MAIR_MASK)) { return 4; }
 	/* FSR is W1C only for our newly owned bank; preserve later DMA faults. */
 	wl_pwr(cb + 0x58, 0xc00001fe);
 	if (wl_smmu_verify("CB_FSR W1C", cb + 0x58, 0xc00001fe,
 	    wl_prd(cb + 0x58), 0, 0xc00001fe)) { return 5; }
 	if (wl_smmu_fault(20) || wl_smmu_sync(false) ||
-	    wl_smmu_wr("CB_SCTLR enable", cb, 0x1027) || /* ASIDPNE, CFRE, AFE, TRE, M; IRQ/stall off */
-	    wl_smmu_wr("GR0_S2CR", WL_SMMU + 0xc00 + 4 * wl_slot, wl_cb) ||
-	    wl_smmu_wr("GR0_SMR", WL_SMMU + 0x800 + 4 * wl_slot, 0x80001401)) { return 5; }
+	    wl_smmu_wr("CB_SCTLR enable", cb, 0x1027, WL_CB_SCTLR_MASK) || /* ASIDPNE, CFRE, M; IRQ/stall off */
+	    wl_smmu_wr("GR0_S2CR", WL_SMMU + 0xc00 + 4 * wl_slot, wl_cb, ~0u) ||
+	    wl_smmu_wr("GR0_SMR", WL_SMMU + 0x800 + 4 * wl_slot, 0x80001401, ~0u)) { return 5; }
 	wl_enabled = true;
 	printf("FUXI WLAN: SMMU owned stage1 SMR %u CB %u TTBR %#llx IOVA %#llx-%#llx readback verified\n",
 	    wl_slot, wl_cb, wl_pt_pa(0), WL_IOVA, wl_contexts.iova + wl_contexts.size - 1);
@@ -906,7 +947,13 @@ wl_smmu_undo(void)
 		uint64_t s2cr = WL_SMMU + 0xc00 + 4 * wl_slot;
 		if (wl_contain_wr(smr, 0x1401) || (wl_prd(smr) & 0x80000000u)) { return 1; }
 		if (wl_contain_wr(s2cr, wl_old_s2cr) || wl_prd(s2cr) != wl_old_s2cr) { return 1; }
-		if (wl_contain_wr(wl_cb_addr(wl_cb), 0) || wl_prd(wl_cb_addr(wl_cb)) != 0) { return 1; }
+		uint64_t cb = wl_cb_addr(wl_cb);
+		if (wl_contain_wr(cb, 0)) { return 1; }
+		unsigned before = fw_faults;
+		uint32_t readback = wl_prd(cb);
+		printf("FUXI WLAN: M6d SMMU undo CB %u CB_SCTLR offset %#x wrote 0 read %#x mask %#x faults %u\n",
+		    wl_cb, (unsigned)(cb - WL_SMMU), readback, WL_CB_SCTLR_MASK, fw_faults);
+		if ((readback & WL_CB_SCTLR_MASK) || fw_faults != before) { return 1; }
 		if (wl_smmu_sync(true)) { return 1; }
 		if (wl_contain_wr(smr, wl_old_smr) || wl_prd(smr) != wl_old_smr) { return 1; }
 		wl_enabled = wl_owned = false;
@@ -1085,7 +1132,8 @@ wl5_step(unsigned s)
 		    wl_prd(WL_SMMU) != wl5_report[4] ||
 		    wl_prd(WL_SMMU + 0x800 + 4 * wl_slot) != 0x80001401 ||
 		    wl_prd(WL_SMMU + 0xc00 + 4 * wl_slot) != wl_cb ||
-		    wl_prd(wl_cb_addr(wl_cb)) != 0x1027 ||
+		    wl_smmu_verify("CB_SCTLR pre-DMA", wl_cb_addr(wl_cb), 0x1027,
+		    wl_prd(wl_cb_addr(wl_cb)), 0x1027, WL_CB_SCTLR_MASK) ||
 		    (wl_prd(WL_PARF + 0x2c00) & 1) || wl_prd(WL_PARF + 0x234)) { return 6; }
 		for (unsigned o = 0x60; o <= 0x70; o += 4) { wl_mwr(wl_bhie + o, 0); }
 		wl_mwr(wl_bhi + 0x20, 0); wl_mwr(wl_bhi + 0x2c, 0);

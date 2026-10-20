@@ -74,6 +74,10 @@ static unsigned nr, ne, sleeps, frees, allocations;
 static bool progress = true, fail_bm, fail_perst, no_root;
 static bool noncontig, high_memory, fail_alloc, tlb_busy, mismatch, inject_fault;
 static uint64_t mismatch_pa, read_fault_pa, corrupt_write_pa;
+static uint32_t corrupt_write_mask;
+struct read_mask { uint64_t pa; uint32_t rao, raz; };
+static struct read_mask read_masks[32];
+static unsigned nread_masks;
 static bool probe_block[128], probe_steal, probe_change_next;
 static int open_error, read_resid;
 static uint8_t fixture[0x80000 + 37];
@@ -86,8 +90,11 @@ static void record(char k, uint64_t pa, uint32_t v) {
 }
 static uint32_t wl_prd(uint64_t pa) {
     if (read_fault_pa && pa==read_fault_pa) {fw_faults++; return ~0u;}
-    for (unsigned i=0;i<nr;i++) if(regs[i].pa==pa) return (tlb_busy && (pa & 0xfff)==0x7f4) ? 1 : regs[i].v;
-    return 0;
+    uint32_t v=0;
+    for (unsigned i=0;i<nr;i++) if(regs[i].pa==pa) {v=regs[i].v; break;}
+    for (unsigned i=0;i<nread_masks;i++) if(read_masks[i].pa==pa)
+        v=(v | read_masks[i].rao) & ~read_masks[i].raz;
+    return (tlb_busy && (pa & 0xfff)==0x7f4) ? 1 : v;
 }
 static void setreg(uint64_t pa, uint32_t v) {
     for (unsigned i=0;i<nr;i++) if(regs[i].pa==pa) {regs[i].v=v; return;}
@@ -105,7 +112,7 @@ static void raw_pwr(uint64_t pa, uint32_t v) {
         }
         if (probe_block[cb]) return;
     }
-    if (pa==corrupt_write_pa) v^=1;
+    if (pa==corrupt_write_pa) v^=corrupt_write_mask;
     if (fail_bm && pa==WL_EPCFG+4) return;
     if (fail_perst && pa==TS_TLMM+0x1000*94+4) return;
     if (mismatch && pa==mismatch_pa) return;
@@ -183,7 +190,7 @@ static void init(void) {
     fw_faults=0; wl_mhi_valid=false; wl_smmu_mismatches=0; loglen=0; logbuf[0]=0;
     memset(wl_cb_unusable,0,sizeof(wl_cb_unusable));
     memset(probe_block,0,sizeof(probe_block));
-    probe_steal=probe_change_next=false; corrupt_write_pa=0;
+    probe_steal=probe_change_next=false; corrupt_write_pa=0; corrupt_write_mask=1; nread_masks=0;
     memset(&wl_image,0,sizeof(wl_image)); memset(&wl_vectors,0,sizeof(wl_vectors));
     memset(&wl_tables,0,sizeof(wl_tables)); wl_owned=wl_enabled=wl_route_owned=wl_route_installed=false; wl_iova_next=WL_IOVA;
     memset(&wl_contexts,0,sizeof(wl_contexts)); memset(wl5_report,0,sizeof(wl5_report));
@@ -216,7 +223,7 @@ static void check_mapping(void) {
     uint64_t expected=wl_pt_pa(0)|((uint64_t)wl_cb<<48);
     assert(wl_prd(wl_cb_addr(wl_cb)+0x20)==(uint32_t)expected);
     assert(wl_prd(wl_cb_addr(wl_cb)+0x24)==expected>>32);
-    assert(wl_prd(wl_cb_addr(wl_cb)+0x30)==0x803520);
+    assert(wl_prd(wl_cb_addr(wl_cb)+0x30)==0x80a03520);
     assert(wl_prd(wl_cb_addr(wl_cb)+0x10)==0x38011);
     assert(wl_prd(wl_gr1+0x800+4*wl_cb)==1);
     assert(wl_prd(wl_gr1+4*wl_cb)==0x1f300);
@@ -366,6 +373,102 @@ int main(void) {
     inject_fault=true; assert(wl5_step(21)==0); assert(wl_smmu_fault(21)==1 && wl_poll(0)==3);
     assert(wl5_report[100]==2); wl5_abort(21); assert(frees==4);
 
+    /* M6d: TBI reads one on every bank. The first candidate must pass both
+       the masked-zero probe and nonzero programming, preserving raw logs. */
+    init(); for(unsigned s=17;s<20;s++) assert(wl5_step(s)==0);
+    for(unsigned cb=1;cb<=8;cb++) read_masks[nread_masks++]=(struct read_mask){wl_cb_addr(cb)+0x10,0x60,0};
+    unsigned m6d_start=ne;
+    assert(wl5_step(20)==0 && wl_cb==1 && wl_owned && wl_enabled);
+    assert(!wl_cb_unusable[1] && !wl_smmu_mismatches);
+    assert(strstr(logbuf,"CB_TCR2 probe offset 0x81010 wrote 0 read 0x60 mask 0x38017 faults 0"));
+    assert(strstr(logbuf,"CB_TCR2 offset 0x81010 wrote 0x38011 read 0x38071 mask 0x38017 faults 0"));
+    assert(findwrite(wl_cb_addr(2)+0x10,0,m6d_start)<0);
+    assert(!(wl_prd(WL_EPCFG+4)&4));
+    wl5_abort(20); assert(frees==4);
+
+    /* Fixed architectural expectations, independent of the C mask constants:
+       ignore only non-writable/irrelevant bits; writable address, ASID, type,
+       cacheability and control bits must still reject, even for zero writes. */
+    const struct {uint64_t pa; uint32_t ignored, checked;} masks[]={
+        {0x15081000,0x80203806,0x7fdfc7f9}, /* reserved, ASIDPNE, AFE/TRE */
+        {0x15001804,0xfffffffe,1}, /* VA64 only with VMID16 disabled */
+        {0x15001004,0xff000000,0x00ffffff}, /* v2 IRPTNDX no storage */
+        {0x15081010,0xfffc7fe8,0x00038017}, /* TBI + reserved/Secure/absent extensions */
+        {0x15081030,0x40,0xffffffbf},
+        {0x15081024,0x0000ff00,0xffff00ff}, /* fixture: 40-bit PA + 16-bit ASID */
+        {0x15081020,0x1f,0xffffffe0}, /* root has 4 L1 entries: 32-byte alignment */
+        {0x1508102c,0x0000ff00,0xffff00ff},
+        {0x15081028,0x1f,0xffffffe0},
+        {0x15081038,0,0xffffffff}, {0x1508103c,0,0xffffffff},
+    };
+    for(unsigned i=0;i<sizeof(masks)/sizeof(*masks);i++) {
+        init(); read_masks[nread_masks++]=(struct read_mask){masks[i].pa,masks[i].ignored,0};
+        for(unsigned s=17;s<20;s++) assert(wl5_step(s)==0);
+        int masked_result=wl5_step(20);
+        if(masked_result || !wl_enabled || wl_smmu_mismatches) fprintf(stderr,"mask case %u result %d\n%s",i,masked_result,logbuf);
+        assert(masked_result==0 && wl_enabled && !wl_smmu_mismatches);
+        /* Neither ACTLR nor CONTEXTIDR is touched in this AArch64 lane. */
+        for(unsigned j=0;j<ne;j++) if(events[j].kind=='W')
+            assert(events[j].pa!=0x15081004 && events[j].pa!=0x15081034);
+        wl5_abort(20); assert(frees==4);
+        /* Exercise every meaningful bit through actual programming, including
+           the zero probe and zero-valued fields, rather than testing a model. */
+        for(unsigned bit=0;bit<32;bit++) if(masks[i].checked & (1u<<bit)) {
+            init(); for(unsigned s=17;s<20;s++) assert(wl5_step(s)==0);
+            corrupt_write_pa=masks[i].pa; corrupt_write_mask=1u<<bit;
+            int result=wl5_step(20);
+            if(masks[i].pa==0x15081010) {
+                assert(result==0 && wl_cb==2 && wl_cb_unusable[1]);
+            } else { assert(result==4 && wl_cb==1 && !wl_enabled); }
+            corrupt_write_pa=0; wl5_abort(20); assert(frees==4);
+        }
+    }
+    /* A writable probe mismatch alongside TBI ones still excludes that bank. */
+    init(); for(unsigned s=17;s<20;s++) assert(wl5_step(s)==0);
+    probe_block[1]=true; setreg(0x15081010,0x61);
+    assert(wl5_step(20)==0 && wl_cb==2 && wl_cb_unusable[1]);
+    assert(strstr(logbuf,"CB_TCR2 probe offset 0x81010 wrote 0 read 0x61 mask 0x38017"));
+    wl5_abort(20); assert(frees==4);
+    /* Full-programming RAZ/WI with TBI=1 passes the probe, fails after claim. */
+    init(); for(unsigned s=17;s<20;s++) assert(wl5_step(s)==0);
+    probe_block[1]=true; setreg(0x15081010,0x60);
+    assert(wl5_step(20)==4 && wl_owned && wl_cb==1 && !wl_enabled);
+    assert(strstr(logbuf,"CB_TCR2 offset 0x81010 wrote 0x38011 read 0x60 mask 0x38017"));
+    wl5_abort(20); assert(frees==4);
+
+    /* SCTLR non-writable bits also survive the pre-DMA gate and undo;
+       AFE/TRE may read zero despite Linux-style writes of one. */
+    init(); read_masks[nread_masks++]=(struct read_mask){0x15081000,0x80202800,0x1006};
+    for(unsigned step=17;step<=28;step++) assert(wl5_step(step)==0);
+    assert(strstr(logbuf,"CB_SCTLR pre-DMA") && !wl_smmu_mismatches);
+    wl5_abort(28); assert(frees==4);
+    const uint32_t enable_bits[]={1,0x20};
+    for(unsigned i=0;i<2;i++) {
+        init(); read_masks[nread_masks++]=(struct read_mask){0x15081000,0,enable_bits[i]};
+        for(unsigned step=17;step<20;step++) assert(wl5_step(step)==0);
+        assert(wl5_step(20)==5 && !wl_enabled && !(wl_prd(WL_EPCFG+4)&4));
+        wl5_abort(20); assert(frees==4);
+    }
+    init(); for(unsigned step=17;step<=20;step++) assert(wl5_step(step)==0);
+    read_masks[nread_masks++]=(struct read_mask){0x15081000,1,0}; /* M stuck on */
+    wl5_abort(20); assert(frees==0 && wl_owned);
+    nread_masks=0; wl5_abort(20); assert(frees==4);
+
+    /* Optional writable extensions/VMID16 are checked only when implemented. */
+    init(); wl5_report[6]=1u<<24; wl5_report[7]=(1u<<28)|0x11;
+    assert(wl_tcr2_mask()==0x38717);
+    wl5_report[6]=3u<<24; assert(wl_tcr2_mask()==0x38f17);
+    init(); setreg(WL_SMMU+0x24,0x62000046); /* reserved HAFDBS encoding */
+    assert(wl5_step(17)==1 && ne==0);
+    wl5_report[6]=0; wl5_report[7]=0x55; assert(wl_ttbr_hi_mask()==0xffffffff);
+    for(unsigned bit=16;bit<32;bit++) {
+        init(); setreg(WL_SMMU,0x80000400); setreg(WL_SMMU+0x28,0x9011);
+        for(unsigned s=17;s<20;s++) assert(wl5_step(s)==0);
+        corrupt_write_pa=0x15001804; corrupt_write_mask=1u<<bit;
+        assert(wl5_step(20)==4 && !wl_enabled);
+        corrupt_write_pa=0; wl5_abort(20); assert(frees==4);
+    }
+
     /* M6c: blocked zero probe skips a bank without claiming/programming it. */
     init(); for(unsigned s=17;s<20;s++) assert(wl5_step(s)==0);
     setreg(0x15081000,0x2468); /* unknown reset bits with M=0 are not ownership */
@@ -422,17 +525,17 @@ int main(void) {
     assert(wl5_step(20)==4 && wl_owned && wl_cb==1);
     assert(strstr(logbuf,"CB_TCR2 offset 0x81010 wrote 0x38011 read 0"));
     wl5_abort(20); assert(frees==4);
-    const struct {uint64_t pa; const char *name; unsigned error;} badregs[]={
+    const struct {uint64_t pa; const char *name; unsigned error; uint32_t bit;} badregs[]={
         {0x15081000,"CB_SCTLR disable",4}, {0x15001804,"GR1_CBA2R",4},
         {0x15001004,"GR1_CBAR",4}, {0x15081030,"CB_TCR",4},
-        {0x15081024,"CB_TTBR0_HI",4}, {0x15081020,"CB_TTBR0_LO",4},
-        {0x1508102c,"CB_TTBR1_HI",4}, {0x15081028,"CB_TTBR1_LO",4},
+        {0x15081024,"CB_TTBR0_HI",4}, {0x15081020,"CB_TTBR0_LO",4,0x20},
+        {0x1508102c,"CB_TTBR1_HI",4}, {0x15081028,"CB_TTBR1_LO",4,0x20},
         {0x15081038,"CB_MAIR0",4}, {0x1508103c,"CB_MAIR1",4},
         {WL_SMMU+0xc00,"GR0_S2CR",5}, {WL_SMMU+0x800,"GR0_SMR",5},
     };
     for(unsigned i=0;i<sizeof(badregs)/sizeof(*badregs);i++) {
         init(); for(unsigned s=17;s<20;s++) assert(wl5_step(s)==0);
-        corrupt_write_pa=badregs[i].pa;
+        corrupt_write_pa=badregs[i].pa; corrupt_write_mask=badregs[i].bit?badregs[i].bit:1;
         assert(wl5_step(20)==badregs[i].error && !wl_enabled && !(wl_prd(WL_EPCFG+4)&4));
         char expected[128]; snprintf(expected,sizeof(expected),"%s offset %#x wrote ",badregs[i].name,(unsigned)(badregs[i].pa-WL_SMMU));
         assert(strstr(logbuf,expected) && strstr(logbuf," read "));
