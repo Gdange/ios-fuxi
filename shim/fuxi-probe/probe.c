@@ -1231,11 +1231,15 @@ ud_setup(void)
             memcpy(data, gpu_report, sizeof(gpu_report)); n=sizeof(gpu_report);
         } else ok = false;
     } else if (type == 0xc0 && req == 0x5c && value == 0x574c && !monitor_report[MON_LAUNCH]) {
-        /* 'WL': index 1 = read-only snapshot, 0x100 = re-read last report. */
+        /* 'WL': 1 = read-only snapshot, 0x100 = re-read it; 0x301..0x30d run
+         * M3 steps 1..n (gated power-up/PCIe0/endpoint ID), 0x3ff = M3 report. */
         unsigned index = st[4] | (unsigned)st[5] << 8;
         if (index == 1) wlan_snapshot();
         if (index == 1 || index == 0x100) {
             memcpy(data, wlan_report, sizeof(wlan_report)); n=sizeof(wlan_report);
+        } else if ((index > 0x300 && index <= 0x300 + WL3_STEPS) || index == 0x3ff) {
+            if (index != 0x3ff) wlan_m3(index - 0x300);
+            memcpy(data, wl3_report, sizeof(wl3_report)); n=sizeof(wl3_report);
         } else ok = false;
     } else if (type == 0xc0 && req == 0x54 && value >= 1 && value <= 60) {
         /* Host-requested reset deadline: now + value minutes (bounded, never disabled). */

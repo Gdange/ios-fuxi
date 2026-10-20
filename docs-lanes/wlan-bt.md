@@ -1,6 +1,9 @@
 # Lane: Wi-Fi and Bluetooth (WCN7850 "kiwi")
 
-Status: milestone 1 (research + read-only probe). Nothing here powers the chip yet.
+Status:
+- Milestone 1 (read-only snapshot): built.
+- Milestone 3 (gated power-up, PCIe0 link, endpoint ID and BAR sizes): built, not yet run on the device.
+- Wi-Fi is the lane priority; Bluetooth (M2) waits.
 
 ## 1. Topology
 
@@ -124,16 +127,94 @@ Gating: an unclocked peripheral read hangs the NoC and resets the SoC; the touch
   - Wrap2/SE6 clock votes, pinmux 76-79, GENI FIFO UART at 115200.
   - Send HCI_Reset `01 03 0c 00`; expect `04 0e 04 01 03 0c 00`. Then the QCA version request `01 00 fc 01 19`.
   - Bounded timeouts throughout.
-- **M3 (PCIe)**
-  - Rails l1e/l3e, WLAN_EN.
-  - Bring up PCIe0 in the Linux order in section 2.
-  - iATU CFG0 read of bus 1; expect `0x110717cb`.
+- **M3 (PCIe)**: implemented; see section 7. Wi-Fi now has priority over M2.
 
-## 6. Firmware needed from the phone (coordinator pull; never committed)
+## 6. Firmware (pulled by the coordinator; gitignored, never committed)
 
-Please send `ls -lR` of `/vendor/firmware_mnt/image`, `/vendor/firmware`, `/vendor/bt_firmware`, `/vendor/etc/wifi` and `/odm/etc/wifi`. From those, pull the following.
+Observed in the phone's `firmware_mnt/image/kiwi` listing:
+- `amss.bin` and `amss20.bin` (WLAN firmware; the `20` names are presumably for chip v2)
+- `Data.msc`, `Data20.msc`
+- `phy_ucode.elf`, `phy_ucode20.elf`
+- `regdb.bin`, `regdb_xiaomi.bin`
+- board files `bdwlan.e*` and `bd_*.elf`
+- qdss configs
 
-- **Bluetooth** (bluetooth partition mounted at `/vendor/bt_firmware/image/`): `hmtbtfw*.tlv` (rampatch) and `hmtnv*.bin` / `hmtnv*.b*` (NVM/board).
-- **Wi-Fi**:
-  - kiwi `amss.bin` / `amss20.bin`, `m3.bin`, `regdb.bin`, `bdwlan*.elf` / `bdwlan*.e*`, `phy_ucode*.elf`. They are probably under `/vendor/firmware/` or `firmware_mnt/image/`.
-  - `/vendor/etc/wifi/kiwi*/WCNSS_qcom_cfg.ini`.
+There is **no `m3.bin`** on this phone. Linux ath12k's WCN7850 hw2.0 set does include a separate `m3.bin`. My guess is that the kiwi build here carries M3 inside `amss.bin`, or that CNSS does not need it; the QMI capability exchange will tell.
+
+Bluetooth: `hmtbtfw10/20.tlv` and `hmtnv*.b*`. Wi-Fi ini files: `etc-wifi/kiwi*/WCNSS_qcom_cfg.ini`.
+
+Which board file to use is picked from the board ID the firmware reports over QMI. That needs M4+; it cannot be read from config space.
+
+## 7. Milestone 3: gated power-up, PCIe0 link and endpoint ID
+
+- **Request**: 0x5c, value 0x574c. Index `0x300 + N` runs steps 1..N; index `0x3ff` re-reads the report. The request is refused after XNU launch.
+- **Re-runs**: steps that completed earlier in the same boot are skipped, so increasing limits can be run on one boot.
+- **Failure**: the first failure latches. Every later request just returns the report; reboot to retry.
+- **Attribution**: before each step touches hardware, the step number goes into report word 2. When the probe-03 scanout geometry is present, a band reading "WLAN M3 STEP nn" is also painted at y=1700. It may not show if the panel needs a START.
+- **Fault handling**: all PCIe register accesses go through the sync-abort-safe helpers. An asynchronous SError or a NoC hang still resets the SoC.
+
+### Writes, with their sources
+
+| Step | Writes | Source |
+|---|---|---|
+| 1 | none: snapshot; check cmd-db magic and the 8 rail addresses against the OrangeFox dump; check RSC DRV2 id/TCS count; check GPLL0 is locked | — |
+| 2 | RPMh VRM (voltage mV, then enable=1), in this order: s5g 1000, l15b 1800, s2g 980, s4e 952, s4g 1350, s6g 1900 | order: `pwrseq-qcom-wcn.c` `pwrseq_wcn7850_vregs`; values: live DT `chip_cfg@1` `qcom,vdd-wlan*-config`, each within that regulator's live-DT min/max (s4e uses the 952 mV init voltage, which covers the 950 mV request) |
+| 3 | gpio80 (WLAN_EN): function gpio, pull-up, 16 mA, output high; then 50 ms | live DT `cnss_wlan_en_active`; pwrseq wcn7850 `pwup_delay_ms` |
+| 4 | RPMh ldoe1 880 mV, then ldoe3 1200 mV | live DT `vreg-0p9` / `vreg-1p2`; order from `qmp_phy_vreg_l` |
+| 5 | gpio94 output low (PERST# asserted, pull-down 2 mA); gpio95 function 1 (CLKREQ#) pull-up; gpio96 input pull-up | live DT `pcie0_*_default`; `qcom_ep_reset_assert` |
+| 6 | clear GCC 0x52020 bit 0, poll `CFG_GDSCR` bit 16, set RETAIN_FF (GDSCR bit 11); same for the PHY GDSC with bit 3; 1.5 ms bound | `gcc-sm8550.c` `pcie_0_gdsc` / `pcie_0_phy_gdsc`; `gdsc.c` `gdsc_enable`; live DT `qcom,gds-timeout` |
+| 7 | aux RCG = XO; rchng RCG = GPLL0_EVEN/3 (100 MHz); votes 0x52008 bits 0,1,2,3,5; 0x52000 bits 12,19,22; TCSR 0x15100 bit 0 | `sm8550.dtsi` pcie0 + pcie0_phy clocks; `assigned-clock-rates`; gcc-kalama offsets |
+| 8 | PCIE_0_BCR pulse (1 ms / 1 ms); PARF DEVICE_TYPE=4, PHY_CTRL&=~1, DBI/ATU base, SLV_ADDR_SPACE, SYS_CTRL&=~bit29, MHI BYPASS, PM_CTRL&=~bit5, AXI halt EN | `pcie-qcom.c` `qcom_pcie_init_2_7_0` + `qcom_pcie_configure_dbi_atu_base` |
+| 9 | PHY BCR pulse; POWER_DOWN_CONTROL\|=3; 109-entry table; pipe mux=PHY; pipe vote; SW_RESET release; START; poll PHYSTATUS for up to 10 ms | `phy-qcom-qmp-pcie.c` `qmp_pcie_init` / `qmp_pcie_power_on`, `sm8550_qmp_gen3x2_*_tbl` |
+| 10 | 100 ms, then gpio94 high, then 1 ms | `qcom_ep_reset_deassert` |
+| 11 | PARF_LTSSM\|=LTSSM_EN; poll DLLLA up to 1 s; records LTSSM states seen | `qcom_pcie_2_3_2_ltssm_enable`, `dw_pcie_wait_for_link` |
+| 12 | 100 ms; RC bus numbers 0/1/0xff; iATU region 0 = CFG0 at 0x60100000 → bus 1; read the ID, retrying CRS / all-ones for up to 1 s | `dw_pcie_setup_rc`, `dw_pcie_prog_outbound_atu`, `dw_pcie_other_conf_map_bus` |
+| 13 | for each BAR: write all-ones, read back, restore (64-bit pairs aware); the command register is not touched | standard PCI sizing |
+
+The PHY table is the mainline `sm8550_qmp_gen3x2` table. It was compared programmatically with the live-DT `qcom,phy-sequence`:
+- All 108 shared register writes are identical.
+- The DT sequence also includes the power-down, SW_RESET and START writes; mainline issues those separately, and the probe does the same.
+- Mainline additionally writes `RXEQEVAL_TIME` (0x6f4 = 0x27).
+
+### Gaps (not done, with reasons)
+
+- **32 kHz sleep clock**: mainline QRD routes it through PMK8550 GPIO3 (`pmk8550_sleep_clk`). That is a PMIC/SPMI write, and this round does none. Most likely the bootloader or Android left it configured. If the link fails at step 11, check this next with a read-only check.
+- **Interconnect votes** (`pcie-mem`, `cpu-pcie`): not cast. CPU→PCIe config/DBI traffic uses the always-active config NoC, and the device does no DMA in M3.
+- **ASPM/L1SS, BDF→SID table, MSI**: not needed for config reads; left alone.
+- **BT_EN**: stays untouched.
+
+### Device test order (coordinator)
+
+1. Fresh `fastboot boot fuxi-wlan-m3-boot.img`. First run `python3 tools/fuxi-wlan-probe.py --save wl-m1.bin`; this is the M1 snapshot and is read-only.
+2. On the same boot, run `python3 tools/fuxi-wlan-probe.py --m3 N --save wl-m3-N.bin` for N = 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, in that order, one call per N.
+   - Stop at the first FAIL or reset, and send the outputs.
+   - If the SoC resets, note the last N and any "WLAN M3 STEP nn" band on screen. Then reboot and send `--m3-report` output if the device comes back to the probe; after a reset it will not have the state.
+3. Expected on success:
+   - steps 1–13 `OK`
+   - step 9: `pcs_status` bit 6 clear
+   - step 11: link up within about 100 ms, speed 1–3, width x1–x2
+   - step 12: `endpoint id=0x110717cb`, class 0x0280xx (network controller)
+   - step 13: BAR0 mem64, probably 2 MiB (Linux ath12k maps BAR0)
+4. Known risk points:
+   - step 2: RPMh vote errors are reported, not fatal to the SoC;
+   - step 7: a branch not running means a missing parent;
+   - step 9: PHYSTATUS stuck means a refclk/rail problem;
+   - step 11: link timeout points at the chip not booting, i.e. sleep clock, rails or WLAN_EN.
+
+Nothing here touches UFS, modem, persist or fuses.
+
+## 8. What XNU needs for Wi-Fi (sketch, estimates for one experienced person)
+
+| Piece | Content | Estimate |
+|---|---|---|
+| A. PCIe host (arm, qcom DWC) | Port the M3 sequence into a Fuxi XNU driver. bsd/dev style, like the buttons/keys drivers, or an IOService nub. It needs: config accessors through iATU, BAR assignment from the 0x60300000+0x3d00000 window, INTx (SPI 149) or the qcom SPI-MSI block (DT `qcom,pcie0_msi@0x17110040`), and apps-SMMU stream setup for SIDs 0x1400/0x1401 (reuse the GPU lane's SMMU code) | 1–2 weeks |
+| B. MHI host | Minimal MHI host: BHI/BHIe image download of `amss.bin`, the MHI state machine (RESET→READY→M0), event/command rings, the IPCR channels for QRTR. Linux `drivers/bus/mhi/host` is about 6k lines; a needed subset is about 1.5–2k | 2–4 weeks |
+| C. QRTR + QMI WLFW | Host-capability exchange, firmware memory request (host provides the `cnss_wlan_region`-style memory segments), BDF download (board file chosen by the reported board ID), regdb, cal data, wlan mode on. Linux `ath12k/qmi.c` is the reference | 2–3 weeks |
+| D. ath12k core + data path | CE pipes, HTT, WMI init; vdev create, scan, connect; TX/RX rings (TCL/REO/WBM). The host must build 802.11 auth/assoc (mac80211 work) and run EAPOL/WPA2 (wpa_supplicant-class code) | 2–4 months for a minimal open/WPA2 station |
+| E1. iOS interface, plain | An IOEthernetController subclass (`en1`) that bridges 802.3↔802.11 frames over D. configd/IPConfiguration should DHCP it like the USB `en` interface. Association driven by a small private tool, with no wifid | 1 week once D works |
+| E2. iOS interface, native | IO80211Controller + IO80211SkywalkInterface subclass answering the APPLE80211 ioctls wifid uses, plus a `wlan` DT node so launchd loads wifid. This gives the Settings UI | 1–3 months on top of D |
+
+Recommendation:
+- Use the USB CDC-ECM `en` interface for IP now.
+- For Wi-Fi, do A→B→C as the next milestones. Each is testable on its own: firmware boots, QMI ready, then a firmware version reply.
+- Then build D with E1 for a first wireless IP connection. Consider E2 only after E1 works.

@@ -87,8 +87,76 @@ def decode(r):
     return '\n'.join(o)
 
 
+M3_STEPS = {1: 'precheck (cmd-db, RSC, GPLL0)', 2: 'WCN rails s5g/l15b/s2g/s4e/s4g/s6g',
+            3: 'WLAN_EN gpio80 high + 50 ms', 4: 'PHY rails ldoe1/ldoe3',
+            5: 'PERST# low, CLKREQ#/WAKE# pins', 6: 'PCIe0 core + PHY GDSC',
+            7: 'PCIe0 clocks', 8: 'core BCR + PARF init', 9: 'QMP PHY init + PHYSTATUS',
+            10: 'PERST# high', 11: 'LTSSM + link (DLLLA)', 12: 'iATU CFG0 + endpoint ID',
+            13: 'BAR sizing'}
+M3_REASONS = {
+    1: {1: 'cmd-db magic', 2: 'cmd-db address mismatch', 3: 'RSC DRV id/TCS count', 4: 'GPLL0 not locked'},
+    2: {i + 1: f'vote {n} failed' for i, n in enumerate(['s5g', 'l15b', 's2g', 's4e', 's4g', 's6g'])},
+    3: {1: 'WLAN_EN readback low'}, 4: {1: 'ldoe1 vote', 2: 'ldoe3 vote'}, 5: {1: 'PERST# not low'},
+    6: {1: 'core GDSC timeout', 2: 'PHY GDSC timeout'},
+    7: {1: 'aux RCG update', 2: 'rchng RCG update', 3: 'branch(es) not running'},
+    8: {1: 'PARF abort or DEVICE_TYPE readback'}, 9: {1: 'PHY register abort', 2: 'PHYSTATUS stuck (not ready)'},
+    10: {1: 'PERST# readback low'}, 11: {1: 'no PCIe capability / DBI abort', 2: 'abort while polling', 3: 'link timeout'},
+    12: {1: 'iATU enable / abort', 2: 'config read abort', 3: 'unexpected ID'}, 13: {1: 'abort during sizing'}}
+
+
+def bar_sizes(r):
+    out, b = [], 0
+    while b < 6:
+        orig, rb = r[81 + b], r[87 + b]
+        if rb == 0:
+            b += 1
+            continue
+        if orig & 1:
+            out.append(f'BAR{b} io size={(~(rb & ~3) & 0xffffffff) + 1:#x}')
+            b += 1
+        elif (orig >> 1) & 3 == 2 and b < 5:
+            mask = (r[88 + b] << 32) | (rb & ~0xf)
+            out.append(f'BAR{b} mem64 base={(r[82 + b] << 32) | (orig & ~0xf):#x} size={((~mask) & (2**64 - 1)) + 1:#x}'
+                       f' prefetch={(orig >> 3) & 1}')
+            b += 2
+        else:
+            out.append(f'BAR{b} mem32 size={(~(rb & ~0xf) & 0xffffffff) + 1:#x} prefetch={(orig >> 3) & 1}')
+            b += 1
+    return out
+
+
+def decode_m3(r):
+    o = [f'magic={r[0]:#x} limit={r[1]} last_step_entered={r[2]} result={r[3]:#x} faults={r[124]} esr={r[125]:#x} far={r[126]:#x}']
+    for s in range(1, 14):
+        v = r[3 + s]
+        if not v:
+            continue
+        if v & 0x1000:
+            o.append(f'  step {s:2} OK   {M3_STEPS[s]} ({r[100 + s]} ms)')
+        else:
+            why = M3_REASONS.get(s, {}).get(v & 0xff, f'reason {v & 0xff}')
+            o.append(f'  step {s:2} FAIL {M3_STEPS[s]}: {why}')
+    o.append(f'  cmd-db rails: ' + ' '.join(f'{n}={r[20 + i]:#x}' for i, n in enumerate(CMDDB[:8])) + f'  GPLL0 mode={r[28]:#x}')
+    o.append(f'  rail votes (0 ok) s5g..s6g={r[29:35]} ldoe1={r[35]} ldoe3={r[42]}')
+    o.append(f'  SW_CTRL/WLAN_SW_CTRL io before={r[36]:#x}/{r[37]:#x} after={r[40]:#x}/{r[41]:#x}  WLAN_EN cfg/io={r[38]:#x}/{r[39]:#x}')
+    o.append(f'  PERST io={r[43]:#x} WAKE io={r[44]:#x}  GDSC polls core/phy={r[45]}/{r[46]} gdscr={r[47]:#x}/{r[48]:#x}')
+    o.append('  clocks cfg_ahb slv_axi mstr_axi aux slv_q2a aggre ddrss rchng: ' + ' '.join(f'{x:#x}' for x in r[49:57]) + f' bad={r[57]:#x}')
+    o.append(f'  PARF DEVICE_TYPE={r[58]:#x} PHY_CTRL={r[59]:#x} DBI_BASE={r[60]:#x} ATU_BASE={r[61]:#x}')
+    o.append(f'  PHY polls={r[62]}us pcs_status={r[63]:#x} pipe_cbcr={r[64]:#x} pipe_mux={r[65]:#x}  PERST after={r[66]:#x}')
+    o.append(f'  link: cap={r[67]:#x} {r[68]} ms LTSSM={r[69]:#x} (state {r[69] & 0x3f}) lnkctl/sta={r[70]:#010x} '
+             f'(speed {(r[70] >> 16) & 0xf} width x{(r[70] >> 20) & 0x3f} DLLLA {(r[70] >> 29) & 1}) '
+             f'states_seen={(r[72] << 32) | r[71]:#x} int_all={r[73]:#x}')
+    o.append(f'  iATU ctrl2={r[74]:#x}  endpoint id={r[75]:#010x} (expect 0x110717cb) tries={r[76]} '
+             f'class/rev={r[77]:#x} hdr={r[78]:#x} subsys={r[79]:#x} cmd/status={r[80]:#x}')
+    o += ['  ' + x for x in bar_sizes(r)]
+    return '\n'.join(o)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--m3', type=int, metavar='LIMIT', choices=range(1, 14),
+                    help='run gated M3 steps 1..LIMIT (writes hardware; see docs-lanes/wlan-bt.md)')
+    ap.add_argument('--m3-report', action='store_true', help='re-read the M3 report')
     ap.add_argument('--read-report', action='store_true', help='re-read the last snapshot')
     ap.add_argument('--timeout', type=int, default=5000)
     ap.add_argument('--save', type=Path)
@@ -103,16 +171,22 @@ def main():
                 if usb.util.get_string(d, d.iProduct) == 'Fuxi hardware probe']
         if len(devs) != 1:
             ap.error('expected exactly one Fuxi native probe (1209:0001)')
-        blob = bytes(devs[0].ctrl_transfer(0xc0, 0x5c, 0x574c, 0x100 if args.read_report else 1, 512,
-                                           timeout=args.timeout))
+        if args.m3:
+            index = 0x300 + args.m3
+        elif args.m3_report:
+            index = 0x3ff
+        else:
+            index = 0x100 if args.read_report else 1
+        blob = bytes(devs[0].ctrl_transfer(0xc0, 0x5c, 0x574c, index, 512,
+                                           timeout=max(args.timeout, 15000) if args.m3 else args.timeout))
     if len(blob) != 512:
         raise SystemExit(f'expected 512 bytes, got {len(blob)}')
     r = list(struct.unpack('<128I', blob))
-    if r[0] != 0x574c0001:
+    if r[0] not in (0x574c0001, 0x574c0003):
         raise SystemExit(f'bad magic {r[0]:#x} (probe lacks the 0x5c handler?)')
     if args.save:
         args.save.write_bytes(blob)
-    print(decode(r))
+    print(decode(r) if r[0] == 0x574c0001 else decode_m3(r))
     return 0
 
 
