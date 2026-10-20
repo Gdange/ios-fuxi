@@ -1774,3 +1774,19 @@ pointer changes. The hardware root cause remains unconfirmed.
   CPU; rptr 7 -> 11, no faults, CP_INT 0, TRUST still 0x1.** The GPU executes PM4 from our ring
   through our SMMU context.
 - Open: CB FSR bit 10 (0x400) on both banks from programming time; secure-mode exit; no draw yet.
+
+## Device results, milestones 4–5 (2026-10-20, coordinator)
+
+| Image | Run | Result |
+| --- | --- | --- |
+| m4 `00fc43eb` | fresh 7..14 | 7–13 PASS; 14 = `0xe06`: all 65536 dst pixels untouched (`0xdeadbeef`), ring consumed, post-blit fence landed, no faults |
+| m4b `d5807c0d` | fresh 7..14 | 14 = `0xe06`; the source-free solid clear (`0xe0b`) also writes nothing. `RBBM_SECVID_TRUST_CNTL` = 1 |
+| m5 `ec9f0953` | fresh 7..16 | 16 = `0xf06`: SCM reachable, but PAS `is_supported(13)` returns 0 and the stage stopped |
+| m5b `eaabc9a4` | fresh 7..16 | 16 PASS: `init_image`, `mem_setup` (0x9b09a000 + 0x1000), `auth_and_reset` all return 0; `CP_SET_SECURE_MODE 0`; TRUST 1 → 0; clear and 256×256 copy PASS per pixel. GPU 67.7 µs, uncached CPU byte copy 53.2 ms |
+| m5b `eaabc9a4` | 16 then 15, same boot | 15 PASS: 256×64 GPU blit into the live scanout at `0xb8000000` (pitch 4320), checksum match. GPU 217.9 µs, uncached CPU byte copy 13.5 ms |
+
+Facts: without the zap shader the A740 stays in secure mode and only the CP reaches
+normal memory; the 2D engine silently drops its writes. This firmware answers
+`is_supported(13)` with 0 even though the real PAS calls succeed, so the query is
+advisory only (Linux does not issue it either). The CB FSR bit 10 (0x400) on both
+banks remains unexplained and harmless so far.
