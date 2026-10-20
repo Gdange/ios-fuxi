@@ -132,6 +132,97 @@ uses with `launchd_unsecure_cache=1`). `--legacy-wallpaper` writes
 PosterBoard applies the job's environment, and that the `/Library/Preferences`
 override is honoured on a customer build.
 
+## 1b. Boot 0098i: Autobahn off, wallpaper still black
+
+Boot `research/device/ios-0098-igpu/boot.log` (local), root with `--legacy-wallpaper`
+and `--posterboard-oslog`; boot-args had `sweetsample=backboardd,Preferences,PosterBoard
+sweetscan=PosterBoard,Preferences` and no `sweetnull`; SpringBoard/backboardd stderr is teed
+anyway, PosterBoard's is not (0 `|PosterBoard|` lines), so `--posterboard-oslog` showed nothing.
+
+### Facts (observed)
+
+- No `CRASH PosterBoard` (one `exec PosterBoard`, pid 242, stays up). No `exec
+  SBRendererService`, no poster extension, no `CRASH SpringBoard`/`backboardd`.
+- All 14 PosterBoard samples (slide 0x35688000) are idle: t0 `mach_msg2_trap` <-
+  `__CFRunLoopServiceMachPort` <- `__CFRunLoopRun` <- `CFRunLoopRunSpecific` <-
+  `GSEventRunModal` <- `-[UIApplication _run]` <- `UIApplicationMain` <- `start`;
+  the other thread is the UIEventFetcher run loop (`-[UIEventFetcher threadMain]`) or a
+  parked workqueue thread (`__workq_kernreturn`).
+- The 413 `|SpringBoard|` lines are the same set as in ios-0097-* (poster mode): CATransformLayer
+  property warnings, 20x QuartzCore "trying to set state of nil layer." (also 20x in every
+  0097 log, so not wallpaper-mode related), UICollectionViewFlowLayout size warnings, the
+  `AppleM2ScalerCSCDriver` match failure. Nothing about wallpaper, image decode or
+  CARenderServer. backboardd stderr is only GameController class-duplicate warnings.
+- Root image (read-only): `/var/mobile/Library/SpringBoard` has IconState, RecentAppLayouts,
+  SBLastRestoreIdentifier, TodayViewArchive only - no `LockBackground*`/`HomeBackground*`.
+  `com.apple.springboard.plist` has `SBLockScreenWallpapers`/`SBHomeScreenWallpapers` =
+  `{none = {parallax 1, zoom 1, portrait, no video, no cropping, procedural not user set}}`:
+  geometry only, no color, gradient, procedural identifier or image hash.
+  `MappedImageCache/Wallpaper` is empty.
+- `/Library/Wallpaper/DefaultWallpapers~iphone.plist` default (no iPhone10,3 entry) is
+  collection iOS 16 / wallpaper 7400 "WWDC 2022", type `LayeredAnimation`: three CoreAnimation
+  packages whose assets are HEIC (HEVC) only. Every `.wallpaperCollection` asset in the
+  image is HEIC (48 files, no PNG/JPEG). Heritage stripes (`Stills/Any/3xx`) are procedural.
+- PaperBoardUI (20H392 disassembly):
+  - `-[PBUIWallpaperConfigurationManager init]`: data stores = `PBUIWallpaperDirectoryDataStore`
+    (`CPSharedResourcesDirectory()/Library/SpringBoard`) + `PBUIWallpaperUserDefaultsDataStore`
+    (single-user mode).
+  - `wallpaperConfigurationForVariant:includingValuesForTypes:wallpaperMode:` tries, per
+    store, procedural info -> color -> gradient -> static image (`hasWallpaperImageForVariant:`)
+    -> video; with none it returns `fallbackWallpaperConfigurationForVarient:`, which is a
+    color configuration with `+[UIColor blackColor]`.
+  - `restoreDefaultWallpaperForAllVariantsAndNotify:` only runs for `idiom & ~4 == 1` (iPad);
+    otherwise it logs "Hello NOT iPad, trying to restoreDefaultWallpaperForAllVariantsAndNotify?
+    not today." Even on iPad, `setWallpaperBundle:appearance:` only takes
+    `fileBasedWallpaperForLocation:andAppearance:` (still/live image URLs), not LayeredAnimation.
+  - Static image file = `LockBackground.cpbitmap` (variant 0) / `HomeBackground.cpbitmap`
+    (variant 1); for wallpaper mode 2 the name gets `PBUIStringForWallpaperMode(2)` appended and
+    a missing file falls back to the mode-none one ("Defaulting to PBUIWallpaperModeNone image"), read with `CPBitmapCreateImagesFromData` (raw pixels, no ImageIO decode).
+  - AppSupport `CPBitmapCreateImagesFromData` (disassembly, matches SpringBoard's own
+    `MappedImageCache/*.cpbitmap` in the image): rows of BGRA (format 0, `0x2006`) padded to
+    16 pixels, then an optional colorspace plist, an "extra" binary plist (SpringBoard
+    writes the scale `3.0`, 50 bytes), then a 28-byte trailer
+    `<cs len, extra len, width, height, format, count, 0xdcb543a2>` (u32 LE); total length
+    must equal `stride*height + cs + extra + 28`.
+
+### Hypotheses (ranked)
+
+1. **Most likely (inference from the disassembly + empty data stores):** the legacy path is
+   active and shows its black fallback. On iPhone nothing ever installs a default wallpaper
+   (restore refuses on non-iPad), the stores hold no image/color/gradient/procedural entry,
+   so `fallbackWallpaperConfigurationForVarient:` = black color. This matches "no crash,
+   everything else renders, wallpaper black". Not verified at runtime: that SpringBoard
+   really took the legacy branch (no os_log from SpringBoard in the console).
+2. Even with a default installed, the stock default would not render here: 7400 is a
+   LayeredAnimation (poster-only type, not handled by `setWallpaperBundle:`) with HEVC HEIC
+   assets, and there is no hardware HEVC decoder. Matters for the poster path later.
+3. Next possible failure once an image exists (guess): a treated/blurred variant requested
+   through SBRendererService (`+[SBFCARendererImpl _actuallyRenderImage:...]`, nil Metal queue,
+   see section 1), or CABackdrop-based treatment on the CPU renderer.
+
+### Fix: `--legacy-wallpaper-image [PNG]`
+
+Writes `/private/var/mobile/Library/SpringBoard/LockBackground.cpbitmap` and
+`HomeBackground.cpbitmap` (mobile 501:501, 0644; directory created 0755 if missing) in the
+format above. Without an argument it uses a built-in 1125x2436 blue-purple vertical
+gradient (screen size UIKit sees, patch 0061); with a PNG (8-bit RGB/RGBA, non-interlaced,
+1125x2436 recommended) it converts that. No preference changes are needed: the type comes
+from the file being reachable. Requires `--legacy-wallpaper` (Autobahn off). Undo with
+`--no-legacy-wallpaper-image`. Host test: `python3 tools/test-sweet-root-tweaks.py`
+(checks the trailer/extra plist byte-for-byte against SpringBoard's own 3x7 cpbitmap, the
+length rule, pixel order, PNG decode, file modes).
+
+```sh
+sudo python3 tools/sweet-root-tweaks.py --only-optional --legacy-wallpaper-image <root>
+```
+
+Next boot, expected: lock screen and home screen show the gradient (lock first: blue at the
+top, purple at the bottom). If it is still black, boot with
+`sweetnull=SpringBoard sweetsample=SpringBoard sweetscan=SpringBoard` and look for
+`exec SBRendererService` / `CRASH SBRendererService`, a `CRASH SpringBoard`, and the heap-scan
+strings "Cannot find image for variant", "Wallpaper file URL", "CPBitmapErrorDomain",
+"Invalid magic in trailer", "Length of file does not match expected length".
+
 ## 2. Settings > General > About
 
 ### Facts
