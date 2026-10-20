@@ -1100,7 +1100,9 @@ static int g3_cp_start(void)
  e[43] = 1; e[45] = g3_gr(0xf400);
  e[46] = g3_gr(0xfc00); e[47] = g3_gr(0xfc01);
  if (e[116]) return 0xc09;
- if (e[45]) return 0xc0a;
+ /* Device (m3c): TRUST stays 0x1 after the write (TZ-owned on retail fuxi).
+  * Report it (e[45]) but continue, so stage 13 shows whether the CP fence
+  * write still lands in this state. */
  if (g3_faulted()) return 0xc06;
  e[60] = 6;
  return 1;
