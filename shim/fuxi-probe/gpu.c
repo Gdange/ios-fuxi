@@ -521,7 +521,10 @@ static int g_hfi_send(unsigned id, uint32_t *msg, unsigned words, unsigned recor
   g_wr(G_HFI_PA, 112, (rd+((n+3)&~3u))&1023);
   gm_wr(0x5191, 1);
   if ((hdr&255) == 100) return 0x905;
-  if ((hdr&255) != 126 || ((hdr>>16)&15) != 1 || rec[2] != rec[0]) return 0x906;
+  /* gen70200 GMU echoes the command id in the ACK header (observed
+   * 0x00010304 for PERF_TABLE); older firmware uses id 126. Linux only
+   * matches ret_header, so accept either id with type ACK. */
+  if (((hdr&255) != 126 && (hdr&255) != id) || ((hdr>>16)&15) != 1 || rec[2] != rec[0]) return 0x906;
   if (rec[3]) return 0x907;
   return 0;
  } while (rsr("cntpct_el0") < until);
