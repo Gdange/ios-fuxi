@@ -18,9 +18,15 @@
 #define MACH_KERNEL_PRIVATE 1
 #include <kern/thread_call.h>
 #undef MACH_KERNEL_PRIVATE
+#include <kern/kern_types.h>
 #include "fuxi_adreno.h"
 #include "gpu-handoff.h"
 extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
+/* The BSD header export omits sched_prim's private dependencies. These match
+ * osfmk/kern/{processor,sched_prim}.h; processor_t remains opaque here. */
+extern processor_t cpu_to_processor(int);
+extern processor_t thread_bind(processor_t);
+extern wait_result_t thread_block(thread_continue_t);
 /* ARM64 pmap_paddr_t is uint64_t; the typedef is private to Mach headers. */
 extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t,
     uint64_t, vm_prot_t, vm_prot_t, unsigned, boolean_t, unsigned, void *);
@@ -134,7 +140,49 @@ static const uint8_t *fg_firmware(unsigned which, unsigned *size)
 #define FUXI_GPU_XNU 1
 #define G_PTR(pa) fg_pointer(pa)
 #define G_RING_INDEX(w) ((w) & 8191u)
+static void fg_scm_call(uint64_t ret[4], unsigned slot, unsigned step,
+    uint32_t fn, uint32_t info, uint64_t a, uint64_t b, uint64_t c);
 #include "gpu.c"
+
+/* Retain BOTH physical attempts, independently of the shared logical-call
+ * report slot. Static storage only; no allocation or firmware in diagnostics. */
+static volatile struct {
+ uint32_t fn, info, attempts, cpu[2];
+ uint64_t ret[2][4];
+} fg_scm_records[8];
+static void fg_scm_call(uint64_t ret[4], unsigned slot, unsigned step,
+    uint32_t fn, uint32_t info, uint64_t a, uint64_t b, uint64_t c)
+{
+ /* thread_bind changes eligibility; explicitly block to force migration.
+  * This is a sleepable thread-call worker, never an interrupt cross-call.
+  * Restore its previous binding on every returned path. */
+ processor_t previous = thread_bind(cpu_to_processor(0));
+ (void)thread_block(THREAD_CONTINUE_NULL);
+ fg_scm_records[slot].fn = fn;
+ fg_scm_records[slot].info = info;
+ for (unsigned attempt = 0; attempt < 2; attempt++) {
+  printf("FUXI GPU: PAS step %u fn %#x attempt %u (enter CPU0 bound)\n",
+      step, fn, attempt+1);
+  boolean_t interrupts = ml_set_interrupts_enabled(FALSE);
+  unsigned cpu = ml_get_cpu_number_local();
+  if (cpu == 0) g5_smc_raw(ret, fn, info, a, b, c);
+  else { ret[0] = UINT64_MAX; ret[1] = ret[2] = ret[3] = 0; }
+  /* Capture all results before interrupt restoration can reschedule us.
+   * Neither logging nor the retry delay executes with interrupts masked. */
+  fg_scm_records[slot].cpu[attempt] = cpu;
+  for (unsigned i = 0; i < 4; i++) fg_scm_records[slot].ret[attempt][i] = ret[i];
+  fg_scm_records[slot].attempts = attempt+1;
+  (void)ml_set_interrupts_enabled(interrupts);
+  printf("FUXI GPU: PAS fn %#x CPU%u attempt %u x0=%#llx x1=%#llx x2=%#llx x3=%#llx\n",
+      fn, cpu, attempt+1, ret[0], ret[1], ret[2], ret[3]);
+  if (cpu != 0) { printf("FUXI GPU: PAS CPU0 bind failed; SMC skipped\n"); break; }
+  if (ret[0] != fn) break;
+  printf("FUXI GPU: PAS fn %#x not serviced (x0 == fn); %s\n", fn,
+      attempt ? "bounded retry exhausted" : "retry 1/1 after 100 us");
+  if (!attempt) delay(100);
+ }
+ (void)thread_bind(previous);
+}
 
 #define FG_SOURCE_VA 0x50000000u
 #define FG_SOURCE_BYTES 0x01000000u

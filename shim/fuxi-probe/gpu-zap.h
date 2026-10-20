@@ -1,6 +1,7 @@
-/* M5b: one-shot Qualcomm PAS13, Linux6.12 mdt_loader + qcom_scm ARM64 ABI.
+/* Qualcomm PAS13, Linux6.12 mdt_loader + qcom_scm ARM64 ABI.
  * Included after gpu_m4. All input remains in the optional, external MBN.
- * No SCM retries, WAITQ, interrupted-call continuation or TRUST MMIO writes.
+ * No WAITQ, interrupted-call continuation or TRUST MMIO writes. XNU permits
+ * one bounded retry ONLY for the unserviced x0 == original function ID case.
  */
 #define G5_META_PA (G_MEM + 0x1600000)
 #define G5_META_BYTES 0x2000u
@@ -73,14 +74,16 @@ static int g5_plan_mbn(const uint8_t *fw, size_t bytes, struct g5_plan *p)
 /* SMCCC x0 transport status, x1 service result, x2/x3 extra results.
  * x6 starts at zero (QCOM_A6); nonzero x0 stops, including interrupted=1,
  * WAITQ_SLEEP=2 and EBUSY=-12. There is deliberately no call continuation. */
-static void g5_smc_raw(uint64_t ret[4], uint32_t fn, uint32_t info,
+static __attribute__((noinline)) void g5_smc_raw(uint64_t ret[4], uint32_t fn, uint32_t info,
                        uint64_t a, uint64_t b, uint64_t c)
 {
  register uint64_t x0 __asm__("x0") = fn, x1 __asm__("x1") = info;
  register uint64_t x2 __asm__("x2") = a, x3 __asm__("x3") = b;
  register uint64_t x4 __asm__("x4") = c, x5 __asm__("x5") = 0;
  register uint64_t x6 __asm__("x6") = 0, x7 __asm__("x7") = 0;
- __asm__ volatile("dsb sy; smc #0; dsb sy"
+ /* Darwin's AArch64 assembler treats ';' as a comment, unlike ELF GAS.
+  * Separate instructions with newlines or the entire SMC silently vanishes. */
+ __asm__ volatile("dsb sy\n\tsmc #0\n\tdsb sy"
   : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
   :: "x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","cc","memory");
  ret[0] = x0; ret[1] = x1; ret[2] = x2; ret[3] = x3;
@@ -101,12 +104,11 @@ static int g5_scm(uint32_t *d, uint32_t fn, unsigned info,
  s[0] = d[3]; s[1] = fn; s[2] = info;
  s[4] = a; s[5] = a>>32; s[6] = b; s[7] = b>>32;
  __asm__ volatile("dsb sy" ::: "memory");
+ uint64_t ret[4];
 #ifdef FUXI_GPU_XNU
- printf("FUXI GPU: PAS step %u fn %#x (enter)\n", d[3], fn);
-#endif
- uint64_t ret[4]; g5_smc_raw(ret, fn, info, a, b, c);
-#ifdef FUXI_GPU_XNU
- printf("FUXI GPU: PAS fn %#x x0=%#llx x1=%#llx\n", fn, ret[0], ret[1]);
+ fg_scm_call(ret, d[5]-1, d[3], fn, info, a, b, c);
+#else
+ g5_smc_raw(ret, fn, info, a, b, c);
 #endif
  for (unsigned i = 0; i < 4; i++) { s[8+i*2] = ret[i]; s[9+i*2] = ret[i]>>32; }
  s[3] = 1;

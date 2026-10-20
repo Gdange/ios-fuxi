@@ -237,6 +237,7 @@ int main(void)
 def main():
     subprocess.run(['python3', str(ROOT / 'tools/sync-fuxi-adreno-shared.py'), '--check'], check=True)
     subprocess.run(['python3', str(ROOT / 'tools/test-fuxi-adreno-mapping.py')], check=True)
+    subprocess.run(['python3', str(ROOT / 'tools/test-fuxi-scm.py')], check=True)
     probe = sync.added_file('gpu.c')
     adapter = sync.added_file('fuxi_adreno.c')
     windows = [(int(a, 16), int(b, 16)) for a, b in re.findall(r'\{(0x[0-9a-f]+),(0x[0-9a-f]+),0\}', adapter)]

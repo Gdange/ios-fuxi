@@ -1,3 +1,145 @@
+# Milestone 6c — emit the SCM instruction in XNU
+
+Branch `codex-gpu-m6c`, based on `e289e5f` (M6b).
+**0096d built and verified offline; device acceptance is pending.** This section
+supersedes the pending 0096c status and SCM behavior in the historical sections
+below. No phone access or push. Protected handoff files are unchanged.
+
+## 0096c device result and proven cause
+
+Coordinator evidence: `research-log/ios-0096c-01-gpu.txt` (private, untracked).
+With `fuxigpu=1`, 768 MiB, there was no panic. Inside XNU, clock=7 and
+GMU/HFI/GX/CB/CP/fence=1 all passed. The first PAS transport query,
+`is_call_available(0x02000207)`, returned x0=`0x42000601` (its function ID) and
+x1=1 (its arginfo). Stage16 ended with zap=`0xf05`, clear/copy=0; GPU permanently
+disabled itself and CPU presents continued through SpringBoard. The same loader
+query previously returned x0=0, x1=1. That register-preservation symptom initially
+suggested an unserviced TZ call; disassembly proves the instruction was absent.
+
+`llvm-objdump-18` on the SHA256-verified 0096c unstripped kernel shows
+`g5_smc_raw` inlined into `_g5_scm`. At `0xfffffe00074f8fe0..8ffc`, it correctly
+sets x0=fn, x1=info, x2=a, x3=b, x4=c and x5=x6=x7=0. At
+`0xfffffe00074f9000` it executes `dsb sy`, then immediately copies x0..x3 into
+saved registers at `0xfffffe00074f9004..9010`. There is **no SMC and no second
+DSB** between argument setup and result capture. The source was:
+
+```c
+__asm__ volatile("dsb sy; smc #0; dsb sy" /* register operands */);
+```
+
+Darwin's ARM64 assembler treats the semicolon as a comment. The same string
+compiled for ELF emits all three instructions; Mach-O emits only the first DSB.
+A minimal cross-compile reproduces this independently of XNU, optimization,
+scheduling and hardware. The repair uses `"dsb sy\n\tsmc #0\n\tdsb sy"` and keeps
+`g5_smc_raw` out of line for a stable audit symbol. In 0096d, `_g5_smc_raw`
+sets all eight argument registers, executes DSB / **SMC at
+`0xfffffe00074f92e0`, opcode `0xd4000003`** / DSB, and stores x0/x1 at `[x19]`
+and x2/x3 at `[x19+0x10]`. Both the cross-compiled objects and final native
+kernel pass a register-flow check with distinct 64-bit argument/result values.
+This fixes a demonstrated missing instruction; successful TZ/PAS execution
+in 0096d still requires a device run.
+
+## Linux comparison and execution context
+
+Linux v6.12's [`qcom_scm-smc.c`](https://github.com/torvalds/linux/blob/v6.12/drivers/firmware/qcom/qcom_scm-smc.c)
+uses `ARM_SMCCC_QUIRK_QCOM_A6` as host-side metadata, **not a magic x6 argument**.
+`__scm_smc_do_quirk` starts `quirk.state.a6=0`; its first SMC passes zero in x6.
+On `QCOM_SCM_INTERRUPTED=1`, it resumes with x0=1 and the saved returned x6
+while reloading the other arguments. Non-atomic calls serialize, handle
+`WAITQ_SLEEP=2` by waiting for completion and issuing WAITQ_RESUME with the
+returned call context, and retry EBUSY=-12 after 30 ms with a finite retry
+counter. XNU has no WAITQ completion/IRQ infrastructure: these returned statuses
+remain explicit failures, with no continuation or replay. Its sole retry is
+for x0 equal to the original function ID. The original x6=0 was already correct.
+
+The Linux ARM64 [`smccc-call.S`](https://github.com/torvalds/linux/blob/v6.12/arch/arm64/kernel/smccc-call.S)
+issues `smc #0`, saves x0..x3, and copies returned x6 into the quirk structure.
+The shared PAS ABI matches: standard SMC64/SIP fn, x1=arginfo, x2..x4=arguments,
+x5=0 for these calls, x6 initially zero, x7=0. No HVC conduit probe was added.
+
+Linux's [ARM64 boot contract](https://www.kernel.org/doc/html/latest/arch/arm64/booting.html)
+accepts nonsecure EL1 as well as EL2. Qualcomm's SM8550 stack runs Linux under
+the platform hypervisor; EL1 is not an XNU-only constraint. The
+[SM8550 device tree](https://github.com/torvalds/linux/blob/v6.12/arch/arm64/boot/dts/qcom/sm8550.dtsi)
+reserves hyp memory, defines the SM8550 SCM service and selects SMC for PSCI;
+the downstream [Kalama VM description](https://github.com/LineageOS/android_kernel_xiaomi_sm8550-devicetrees/blob/43b5ada5654ed84c25f74789bc8f6326b7bacd20/qcom/kalama-vm.dtsi)
+also exposes the Gunyah infrastructure. The local loader requires CurrentEL=EL1
+at its Linux Image entry and has already demonstrated SCM via SMC there.
+These facts provide no evidence for switching the SCM conduit to HVC.
+MMU/caches, SCTLR/PAN/TCR and exception routing were possible context differences,
+but cannot explain an instruction that never reached the binary. MMU/caches
+and translation state remain live; disabling them inside XNU would be unsafe.
+
+## XNU guard and diagnostics
+
+For each logical SCM call the sleepable worker binds to `cpu_to_processor(0)`,
+then calls `thread_block(THREAD_CONTINUE_NULL)` to force migration. Merely setting
+the binding is insufficient. It saves/restores the previous binding on every
+returned path. Around **each physical attempt** it saves the interrupt state,
+uses `ml_set_interrupts_enabled(FALSE)`, checks the actual logical CPU via
+MPIDR, calls SMC only on CPU0, captures all results, and restores the saved
+state. The audited XNU API masks IRQ/FIQ/SError and prevents preemption during
+this interval. An unexpected CPU skips SMC and fails closed with a clear log.
+Logging and the retry delay are outside the added interrupt-masked interval.
+
+Every attempt logs step/function/attempt before entry and actual CPU plus all
+four 64-bit return registers afterward. Eight static volatile records retain
+both attempts per logical call (fn, info, count, CPU and x0..x3); the existing
+probe report slot retains the final result without changing its wire layout.
+If x0==fn, it records/logs `not serviced`, delays 100 us, and retries once with
+the original arguments. A repeated match logs `bounded retry exhausted` and
+selects the existing permanent CPU fallback. Real returned errors are never
+retried. There are no new allocations, HVC calls or firmware changes.
+
+## Validation and artifacts
+
+Native build exit0 in the existing **`ci-lane-gpu6` only**. The complete updated
+0096 patch applies to the integration baseline and all ten resulting files
+match the native build inputs. Shared-source check passes. The new SCM test
+compiles the actual primitive for Mach-O and ELF, checks the actual final native
+kernel, and models CPU migration/binding restoration, interrupt restoration,
+both retained 64-bit result sets, retry-success/exhaustion, off-CPU refusal and
+non-retry of INTERRUPTED/WAITQ/EBUSY/errors. ASan/UBSan passes. These tests neither
+execute an SMC on the host nor emulate TZ or the native scheduler.
+
+Existing mapping/startup tests pass all ten VA failures and 2144 page failures;
+the submit model passes 1018 pixel copies, 1000 frames and 333 ring wraps.
+The probe model passes with the exact external GMU/SQE/zap inputs. Firmware-enabled
+loader builds without warnings. Offline checks pass boot-v4/Image/payload
+geometry, 768 MiB memory bounds, native abort recovery records and exact embedded
+firmware. ADT changes only dram-size and the GPU reservation property; integration
+identity, seven CPUs and pinned root extents are preserved. The payload command
+line is **exactly the integ1 command line plus ` fuxigpu=1`**.
+
+```sh
+python3 tools/test-fuxi-adreno.py
+python3 tools/test-fuxi-scm.py --kernel xnu/out-fuxi-0096d/kernel.development.fuxi.unstripped
+python3 tools/test-fuxi-gpu-probe.py --firmware "$FW/gmu_gen70200.bin" \
+  --sqe "$FW/a740_sqe.fw" --zap "$ZAP/a740_zap.mbn"
+llvm-objdump-18 --disassemble-symbols=_g5_smc_raw \
+  xnu/out-fuxi-0096d/kernel.development.fuxi.unstripped
+```
+
+| Artifact | SHA256 |
+| --- | --- |
+| `xnu/out-fuxi-0096d/kernel.development.fuxi` | `ecb2e3d1322098ff7d913a58890266c4023f707a5f9abfe1d9f915d29b7e80e7` |
+| `xnu/out-fuxi-0096d/kernel.development.fuxi.unstripped` | `d794daf2cf103dd7252f203d12702002f8c57c3f11ab3c94a98313110dd2a4cc` |
+| `shim/out/fuxi-0096d-payload.bin` | `8e8d4e0069cc55fd7209b74b234e8641223c31a6bf2890c683b6848864fac3b3` |
+| `shim/out/fuxi-0096d-boot.img` | `520e245e82ef87224e04edda72e095c72a9eb7a0eb9c861d9cf8dc4bd5b5d74f` |
+
+Binaries, firmware, disassemblies, build/test logs and SHA256 sidecars remain
+external/gitignored. Fresh-boot coordinator acceptance: expect first query
+CPU0 x0=0 x1=1 (support-query x1 may still be false as in M5b), real PAS calls
+x0=x1=0, then TRUST0, clear/copy PASS, `ready` and GPU present counters. If a call
+returns unserviced twice, capture both full return logs and confirm continuing
+CPU presents. No 0096d device success is claimed.
+
+Risks: an entered SMC can stall indefinitely with interrupts masked; EL1 cannot
+cancel it. Long returning calls can also trigger XNU interrupt-latency diagnostics.
+Interrupted/WAITQ calls still fail closed. Actual TZ behavior, cache/SMMU/display
+coherency and performance remain unverified in XNU beyond the 0096c CP fence.
+The earlier asynchronous-abort and failed-drain/late-DMA risks remain.
+
 # Milestone 6b — fallible XNU GPU mappings
 
 Branch `codex-gpu-m6b`, based on M6 `8b36bdc` plus monitor fix `33d5615`.

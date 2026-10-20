@@ -831,7 +831,8 @@ def main():
         audit_linux_pas(args.linux_msm)
     source = (ROOT / 'shim/fuxi-probe/gpu.c').read_text()
     source = source.replace('#include \"gpu-zap.h\"', (ROOT / 'shim/fuxi-probe/gpu-zap.h').read_text())
-    source = re.sub(r'static void g5_smc_raw\(.*?\n\}', 'static void g5_smc_raw(uint64_t ret[4], uint32_t fn, uint32_t info, uint64_t a, uint64_t b, uint64_t c) { mock_smc(ret, fn, info, a, b, c); }', source, flags=re.S)
+    source, raw_count = re.subn(r'static __attribute__\(\(noinline\)\) void g5_smc_raw\(.*?\n\}', 'static void g5_smc_raw(uint64_t ret[4], uint32_t fn, uint32_t info, uint64_t a, uint64_t b, uint64_t c) { mock_smc(ret, fn, info, a, b, c); }', source, flags=re.S)
+    assert raw_count == 1
     source = source.replace('extern const uint8_t _gpu_fw_start[], _gpu_fw_end[];',
                             'extern uint8_t _gpu_fw_start[], _gpu_fw_end[];')
     source = source.replace('extern const uint8_t _sqe_fw_start[], _sqe_fw_end[];',

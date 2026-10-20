@@ -10,7 +10,7 @@
  bsd/dev/sweet_spmi.c			standard
 --- a/bsd/dev/fuxi_adreno.c
 +++ b/bsd/dev/fuxi_adreno.c
-@@ -0,0 +1,367 @@
+@@ -0,0 +1,415 @@
 +/* M6 platform adapter. gpu.c/gpu-a740.h/gpu-zap.h are exact shared probe
 + * sources, copied into patch 0096 by tools/sync-fuxi-adreno-shared.py.
 + * Fixed memory is excluded from boot_args AND ADT RAM before VM bootstrap.
@@ -31,9 +31,15 @@
 +#define MACH_KERNEL_PRIVATE 1
 +#include <kern/thread_call.h>
 +#undef MACH_KERNEL_PRIVATE
++#include <kern/kern_types.h>
 +#include "fuxi_adreno.h"
 +#include "gpu-handoff.h"
 +extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
++/* The BSD header export omits sched_prim's private dependencies. These match
++ * osfmk/kern/{processor,sched_prim}.h; processor_t remains opaque here. */
++extern processor_t cpu_to_processor(int);
++extern processor_t thread_bind(processor_t);
++extern wait_result_t thread_block(thread_continue_t);
 +/* ARM64 pmap_paddr_t is uint64_t; the typedef is private to Mach headers. */
 +extern kern_return_t pmap_enter_options_addr(pmap_t, vm_map_offset_t,
 +    uint64_t, vm_prot_t, vm_prot_t, unsigned, boolean_t, unsigned, void *);
@@ -147,7 +153,49 @@
 +#define FUXI_GPU_XNU 1
 +#define G_PTR(pa) fg_pointer(pa)
 +#define G_RING_INDEX(w) ((w) & 8191u)
++static void fg_scm_call(uint64_t ret[4], unsigned slot, unsigned step,
++    uint32_t fn, uint32_t info, uint64_t a, uint64_t b, uint64_t c);
 +#include "gpu.c"
++
++/* Retain BOTH physical attempts, independently of the shared logical-call
++ * report slot. Static storage only; no allocation or firmware in diagnostics. */
++static volatile struct {
++ uint32_t fn, info, attempts, cpu[2];
++ uint64_t ret[2][4];
++} fg_scm_records[8];
++static void fg_scm_call(uint64_t ret[4], unsigned slot, unsigned step,
++    uint32_t fn, uint32_t info, uint64_t a, uint64_t b, uint64_t c)
++{
++ /* thread_bind changes eligibility; explicitly block to force migration.
++  * This is a sleepable thread-call worker, never an interrupt cross-call.
++  * Restore its previous binding on every returned path. */
++ processor_t previous = thread_bind(cpu_to_processor(0));
++ (void)thread_block(THREAD_CONTINUE_NULL);
++ fg_scm_records[slot].fn = fn;
++ fg_scm_records[slot].info = info;
++ for (unsigned attempt = 0; attempt < 2; attempt++) {
++  printf("FUXI GPU: PAS step %u fn %#x attempt %u (enter CPU0 bound)\n",
++      step, fn, attempt+1);
++  boolean_t interrupts = ml_set_interrupts_enabled(FALSE);
++  unsigned cpu = ml_get_cpu_number_local();
++  if (cpu == 0) g5_smc_raw(ret, fn, info, a, b, c);
++  else { ret[0] = UINT64_MAX; ret[1] = ret[2] = ret[3] = 0; }
++  /* Capture all results before interrupt restoration can reschedule us.
++   * Neither logging nor the retry delay executes with interrupts masked. */
++  fg_scm_records[slot].cpu[attempt] = cpu;
++  for (unsigned i = 0; i < 4; i++) fg_scm_records[slot].ret[attempt][i] = ret[i];
++  fg_scm_records[slot].attempts = attempt+1;
++  (void)ml_set_interrupts_enabled(interrupts);
++  printf("FUXI GPU: PAS fn %#x CPU%u attempt %u x0=%#llx x1=%#llx x2=%#llx x3=%#llx\n",
++      fn, cpu, attempt+1, ret[0], ret[1], ret[2], ret[3]);
++  if (cpu != 0) { printf("FUXI GPU: PAS CPU0 bind failed; SMC skipped\n"); break; }
++  if (ret[0] != fn) break;
++  printf("FUXI GPU: PAS fn %#x not serviced (x0 == fn); %s\n", fn,
++      attempt ? "bounded retry exhausted" : "retry 1/1 after 100 us");
++  if (!attempt) delay(100);
++ }
++ (void)thread_bind(previous);
++}
 +
 +#define FG_SOURCE_VA 0x50000000u
 +#define FG_SOURCE_BYTES 0x01000000u
@@ -581,10 +629,11 @@
 +#endif
 --- a/bsd/dev/gpu-zap.h
 +++ b/bsd/dev/gpu-zap.h
-@@ -0,0 +1,254 @@
-+/* M5b: one-shot Qualcomm PAS13, Linux6.12 mdt_loader + qcom_scm ARM64 ABI.
+@@ -0,0 +1,256 @@
++/* Qualcomm PAS13, Linux6.12 mdt_loader + qcom_scm ARM64 ABI.
 + * Included after gpu_m4. All input remains in the optional, external MBN.
-+ * No SCM retries, WAITQ, interrupted-call continuation or TRUST MMIO writes.
++ * No WAITQ, interrupted-call continuation or TRUST MMIO writes. XNU permits
++ * one bounded retry ONLY for the unserviced x0 == original function ID case.
 + */
 +#define G5_META_PA (G_MEM + 0x1600000)
 +#define G5_META_BYTES 0x2000u
@@ -657,14 +706,16 @@
 +/* SMCCC x0 transport status, x1 service result, x2/x3 extra results.
 + * x6 starts at zero (QCOM_A6); nonzero x0 stops, including interrupted=1,
 + * WAITQ_SLEEP=2 and EBUSY=-12. There is deliberately no call continuation. */
-+static void g5_smc_raw(uint64_t ret[4], uint32_t fn, uint32_t info,
++static __attribute__((noinline)) void g5_smc_raw(uint64_t ret[4], uint32_t fn, uint32_t info,
 +                       uint64_t a, uint64_t b, uint64_t c)
 +{
 + register uint64_t x0 __asm__("x0") = fn, x1 __asm__("x1") = info;
 + register uint64_t x2 __asm__("x2") = a, x3 __asm__("x3") = b;
 + register uint64_t x4 __asm__("x4") = c, x5 __asm__("x5") = 0;
 + register uint64_t x6 __asm__("x6") = 0, x7 __asm__("x7") = 0;
-+ __asm__ volatile("dsb sy; smc #0; dsb sy"
++ /* Darwin's AArch64 assembler treats ';' as a comment, unlike ELF GAS.
++  * Separate instructions with newlines or the entire SMC silently vanishes. */
++ __asm__ volatile("dsb sy\n\tsmc #0\n\tdsb sy"
 +  : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
 +  :: "x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","cc","memory");
 + ret[0] = x0; ret[1] = x1; ret[2] = x2; ret[3] = x3;
@@ -685,12 +736,11 @@
 + s[0] = d[3]; s[1] = fn; s[2] = info;
 + s[4] = a; s[5] = a>>32; s[6] = b; s[7] = b>>32;
 + __asm__ volatile("dsb sy" ::: "memory");
++ uint64_t ret[4];
 +#ifdef FUXI_GPU_XNU
-+ printf("FUXI GPU: PAS step %u fn %#x (enter)\n", d[3], fn);
-+#endif
-+ uint64_t ret[4]; g5_smc_raw(ret, fn, info, a, b, c);
-+#ifdef FUXI_GPU_XNU
-+ printf("FUXI GPU: PAS fn %#x x0=%#llx x1=%#llx\n", fn, ret[0], ret[1]);
++ fg_scm_call(ret, d[5]-1, d[3], fn, info, a, b, c);
++#else
++ g5_smc_raw(ret, fn, info, a, b, c);
 +#endif
 + for (unsigned i = 0; i < 4; i++) { s[8+i*2] = ret[i]; s[9+i*2] = ret[i]>>32; }
 + s[3] = 1;
