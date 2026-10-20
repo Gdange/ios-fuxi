@@ -204,8 +204,8 @@ anyway, PosterBoard's is not (0 `|PosterBoard|` lines), so `--posterboard-oslog`
 
 Writes `/private/var/mobile/Library/SpringBoard/LockBackground.cpbitmap` and
 `HomeBackground.cpbitmap` (mobile 501:501, 0644; directory created 0755 if missing) in the
-format above. Without an argument it uses a built-in 1125x2436 blue-purple vertical
-gradient (screen size UIKit sees, patch 0061); with a PNG (8-bit RGB/RGBA, non-interlaced,
+format above. Without an argument it uses a built-in 1125x2436 vertical
+gradient (first dark blue-purple; light since 1c) (screen size UIKit sees, patch 0061); with a PNG (8-bit RGB/RGBA, non-interlaced,
 1125x2436 recommended) it converts that. No preference changes are needed: the type comes
 from the file being reachable. Requires `--legacy-wallpaper` (Autobahn off). Undo with
 `--no-legacy-wallpaper-image`. Host test: `python3 tools/test-sweet-root-tweaks.py`
@@ -222,6 +222,81 @@ top, purple at the bottom). If it is still black, boot with
 `exec SBRendererService` / `CRASH SBRendererService`, a `CRASH SpringBoard`, and the heap-scan
 strings "Cannot find image for variant", "Wallpaper file URL", "CPBitmapErrorDomain",
 "Invalid magic in trailer", "Length of file does not match expected length".
+
+## 1c. Boot 0098-wlan5: cpbitmap found, wallpaper white
+
+Root with `--legacy-wallpaper --legacy-wallpaper-image` (dark built-in gradient #1d3b72 ->
+#6a3d9a). Evidence: `research/device/ios-0098-wlan5/{boot.log,framebuffer.png}` (local), the
+20H392 cache and `SBRendererService` from the staged root (static analysis only).
+
+### Facts (observed)
+
+- Framebuffer: lock screen background (255,255,255); clock, date, home indicator dark
+  purple (76,38,77); camera button a dark platter.
+- `exec SBRendererService` (boot.log line 2355), the first time in any 0097/0098 log
+  (0 in ios-0098-igpu and ios-0098-metal2a). No `CRASH SBRendererService`, and
+  SBRendererService creates no IOSurface (no `SWEET SURF: SBRendererService`).
+- AppSupport `CPBitmapCreateImagesFromData` (0x1914f0204) / `__CPBitmapGetImageInfoForFormat`
+  (0x1914f0bb0, jump table 0x1915082c0): format 0 = 8 bpc / 32 bpp DeviceRGB, bitmapInfo
+  0x2006 (32-bit little-endian, alpha skip-first, so the 4th byte is ignored); format 1 =
+  0x2006 with read flag 1 (PaperBoardUI passes 1) else 0x2002 (premultiplied); 2 = 16 bpp
+  0x1006; 3 = gray 8; 5 = mask (CGImageMaskCreate); 4/6/7 = KTX via ImageIO. Row stride =
+  width rounded up to 16 px (new magic 0xdcb543a2; 8 px with the old 0xcba43291) x 4.
+  Colorspace plist length 0 -> the DeviceRGB from the format table is used (no NULL
+  colorspace); length > 0 -> `CGColorSpaceCreateWithPropertyList`, failure = error, no image.
+  Length rule `stride*h + (count-1)*pageround(stride*h) + cs + extra + 28`. Our file parses.
+- `-[PBUIWallpaperDirectoryDataStore wallpaperImageForVariant:wallpaperMode:]` (0x1b0d103b8 area):
+  `CPBitmapCreateImagesFromData(data, &extra, 1, &err)`, scale from the extra NSNumber
+  (else `UIScreen.scale`), wrapped in `PBUIWallpaperImage`. No thumbnail, original image,
+  options plist or per-appearance file is required; mode-2 names fall back to the mode-none
+  file (section 1b).
+- `-[PBUIStaticWallpaperView _setupWallpaperImageFromConfiguration:options:]` (0x1b0cfba44)
+  stores the untreated image as sample/displayed image but only *displays* (`_displayImage:`)
+  what `_generateImageForImage:...` hands back (completion blocks 0x1b0cfc064 / 0x1b0cfc1dc
+  skip a nil image). The display call uses downsample 1.0, the sample call 16.
+- The generator block (0x1b0cfc680) treats the image when `imageRequiresLuminanceTreatment`
+  (0x1b0cfcf3c: `legibilitySettings.style != 2`), downsample > 1, dimming or the inactive
+  appearance. The treatment is `PBUITreatImageRequest` -> `+[PBUICARemoteRenderer
+  remoteRendererIfPossible]` (SpringBoard is FrontBoard -> XPC) -> SBRendererService
+  `-[PBUIRenderService init]` = `-[PBUICALocalRenderer initWithColorSpace:]`, which returns nil
+  when `MTLCreateSystemDefaultDevice` is nil; `renderRequest:reply:` sends `[nil renderRequest:]`
+  = nil. Back in SpringBoard `UIImage _initWithIOSurface:nil` is an empty image and
+  `pbui_CGImageBackedImageUsingDataProvider` returns nil.
+- The wallpaper view's legibility style comes from the mean color of its PBUIColorBoxes
+  (`_UILegibilitySettingsProvider accumulateChangesToContentColor:contrast:`, 0x18927d6ec):
+  style 2 if Rec.709 luma (0.2126/0.7152/0.0722 on sRGB components) > 0.86, or brightness
+  > 0.8 with contrast < 0.09, or saturation < 0.1 with brightness + 2(0.1 - sat) > 0.92;
+  else 1. The dark gradient: luma ~0.26 -> style 1.
+- SpringBoard's own writers: `setWallpaperImage:forVariant:wallpaperMode:` uses UIKit
+  `-[UIImage writeToCPBitmapFile:flags:]`; `CPBitmapWriterAddImage` redraws the CGImage into
+  the format's layout and writes `CGColorSpaceCopyPropertyList` of the image colorspace when
+  it differs from the format's DeviceRGB. So real wallpapers usually carry an sRGB plist;
+  leaving it out is valid (DeviceRGB).
+
+### Conclusion
+
+Most likely (inference, high confidence for the mechanism, not runtime-verified): the
+cpbitmap was read correctly, but because the image is dark PaperBoardUI requests a luminance
+treatment, the only renderer for it is Metal-backed, the reply is nil and the static wallpaper
+view never gets an image. SBRendererService's first-ever launch in exactly this boot fits.
+Not explained: why the undrawn area is white rather than black (whatever is behind the
+static wallpaper view; no white placeholder was found in PaperBoardUI's static path) and why
+the lock-screen text is dark (style 2). Neither changes the fix.
+
+### Fix
+
+`--legacy-wallpaper-image` now writes a light built-in gradient (#dfe9fb -> #f1e4fb, mean
+luma ~0.91, style 2), so no treatment is requested and the CPBitmap is displayed as is. A PNG
+is still accepted; the tool prints its predicted legibility style and warns for style 1
+(`legibility_style()` mirrors the UIKit rule without the contrast branch). Host test covers the
+style rule.
+
+Expected next boot: light blue -> lavender lock and home wallpaper, dark lock-screen text, and
+no `exec SBRendererService` before the lock screen appears (the downsampled sample request may
+still start it; a nil sample is harmless). If it is still white: SBRendererService-free and
+white means the image layer itself does not render (look at CA image upload in SpringBoard
+with `sweetsample=SpringBoard`). A dark wallpaper needs a working MTLDevice or a non-image
+(color) configuration.
 
 ## 2. Settings > General > About
 

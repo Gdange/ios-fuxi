@@ -32,7 +32,19 @@ pw, ph, stride, extra = parse_cpbitmap(blob)
 assert (pw, ph, stride) == (1125, 2436, 1136 * 4)
 first = blob[:4]
 last = blob[stride * (h - 1):stride * (h - 1) + 4]
-assert first == bytes((0x72, 0x3b, 0x1d, 255)) and last == bytes((0x9a, 0x3d, 0x6a, 255))
+(tr, tg, tb), (br, bg, bb) = m.GRADIENT
+assert first == bytes((tb, tg, tr, 255)) and last == bytes((bb, bg, br, 255))
+
+# Legibility: the built-in gradient must be "light" (style 2) with margin, so
+# PaperBoardUI displays it without the Metal-only luminance treatment; the
+# first, dark gradient (device: white, undrawn wallpaper) is style 1.
+style, luma, _, _ = m.legibility_style(m.gradient(w, h))
+assert style == 2 and luma > 0.89, (style, luma)
+dark = m.gradient(64, 64, (0x1d, 0x3b, 0x72), (0x6a, 0x3d, 0x9a))
+assert m.legibility_style(dark)[0] == 1
+assert m.legibility_style(bytes((255, 255, 255, 255)) * 16)[0] == 2
+assert m.legibility_style(bytes((0xd8, 0xd8, 0xd8, 255)) * 16)[0] == 2     # gray rule
+assert m.legibility_style(bytes((0xa0, 0xa0, 0xa0, 255)) * 16)[0] == 1     # gray < 0.72
 
 
 def png(w, h, rgb_rows, filters):
@@ -75,4 +87,4 @@ with tempfile.TemporaryDirectory() as tmp:
     m.remove_legacy_wallpaper_image(root)
     assert not any(os.path.exists(os.path.join(root, m.WALLPAPER_DIR, n)) for n in m.WALLPAPER_FILES)
 
-print('PASS: cpbitmap trailer/length/pixels, PNG decode, wallpaper files')
+print('PASS: cpbitmap trailer/length/pixels, legibility style, PNG decode, wallpaper files')

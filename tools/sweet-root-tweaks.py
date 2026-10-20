@@ -42,9 +42,13 @@ Opt-in steps (off unless named; docs-lanes/wallpaper.md has the evidence):
                         static wallpaper for that legacy path: writes
                         /var/mobile/Library/SpringBoard/{Lock,Home}Background.cpbitmap
                         (raw BGRA CPBitmap, no image decoder needed) from an
-                        8-bit RGB/RGBA PNG, or a built-in 1125x2436 gradient.
-                        On iPhone the legacy path never installs a default
-                        wallpaper and falls back to black
+                        8-bit RGB/RGBA PNG, or a built-in light 1125x2436
+                        gradient. On iPhone the legacy path never installs a
+                        default wallpaper and falls back to black. The image
+                        must be light (UIKit legibility style 2): a dark one
+                        gets a luminance treatment rendered by SBRendererService
+                        with Metal, which fails here and leaves the wallpaper
+                        undrawn (white). A dark PNG is written with a warning
   --no-legacy-wallpaper-image  remove those two files again
   --only-optional       apply just the named opt-in steps, not the base set
 """
@@ -212,7 +216,14 @@ def cpbitmap(width, height, bgra, scale=3.0):
     return rows + extra + struct.pack('<7I', 0, len(extra), width, height, 0, 1, CPBITMAP_MAGIC)
 
 
-def gradient(width, height, top=(0x1d, 0x3b, 0x72), bottom=(0x6a, 0x3d, 0x9a)):
+# Light blue -> light lavender: mean Rec.709 luma ~0.91, above UIKit's 0.86
+# "light background" threshold, so PaperBoardUI shows it untreated (see
+# legibility_style). The first gradient, #1d3b72 -> #6a3d9a (luma ~0.26),
+# was style 1 and stayed undrawn on device (boot ios-0098-wlan5: white).
+GRADIENT = ((0xdf, 0xe9, 0xfb), (0xf1, 0xe4, 0xfb))
+
+
+def gradient(width, height, top=GRADIENT[0], bottom=GRADIENT[1]):
     """Plain vertical gradient, tight BGRA rows."""
     out = bytearray()
     for y in range(height):
@@ -220,6 +231,27 @@ def gradient(width, height, top=(0x1d, 0x3b, 0x72), bottom=(0x6a, 0x3d, 0x9a)):
         r, g, b = (round(a + (c - a) * t) for a, c in zip(top, bottom))
         out += bytes((b, g, r, 255)) * width
     return bytes(out)
+
+
+def legibility_style(bgra):
+    """UIKit -[_UILegibilitySettingsProvider accumulateChangesToContentColor:contrast:]
+    (20H392) on the mean color, which is what -[PBUIWallpaperView legibilitySettings]
+    feeds it (average of PBUIColorBoxes). 2 = dark content on a light image,
+    1 = white content. The contrast branch (brightness > 0.8 and contrast <
+    0.09) is left out: it needs PBUI's box contrast, and the other two rules
+    are enough for a light image. Returns (style, luma, brightness, saturation).
+
+    -[PBUIStaticWallpaperView imageRequiresLuminanceTreatment] is style != 2.
+    A treated image goes to PBUICARemoteRenderer -> SBRendererService ->
+    PBUICALocalRenderer, which is nil without an MTLDevice, so the reply
+    has no IOSurface and the display image is never set."""
+    n = len(bgra) // 4
+    b, g, r = (sum(bgra[i::4]) / n / 255 for i in range(3))
+    luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    bright = max(r, g, b)
+    sat = (bright - min(r, g, b)) / bright if bright else 0.0
+    light = luma > 0.86 or (sat < 0.1 and bright + 2 * (0.1 - sat) > 0.92)
+    return (2 if light else 1), luma, bright, sat
 
 
 def read_png(path):
@@ -273,13 +305,20 @@ def legacy_wallpaper_image(root, png, owner=(MOBILE, MOBILE)):
     /var/mobile/Library/SpringBoard/{Lock,Home}Background.cpbitmap. Without
     one (and no color/gradient/procedural defaults) it uses
     fallbackWallpaperConfigurationForVarient: = black; restoreDefaultWallpaper
-    refuses on iPhone ("Hello NOT iPad ...")."""
+    refuses on iPhone ("Hello NOT iPad ..."). The image has to be light, see
+    legibility_style."""
     if png in (None, 'gradient'):
         w, h, pixels = SCREEN[0], SCREEN[1], gradient(*SCREEN)
         src = 'built-in gradient'
     else:
         w, h, pixels = read_png(png)
         src = os.path.basename(png)
+    style, luma, bright, sat = legibility_style(pixels)
+    if style != 2:
+        print(f'warning: {src} is dark (mean luma {luma:.2f}, brightness {bright:.2f}, '
+              f'saturation {sat:.2f}): PaperBoardUI requests a luminance treatment from '
+              'SBRendererService, which needs Metal; expect an undrawn (white) wallpaper. '
+              'Use an image with mean luma > 0.86.', file=sys.stderr)
     blob = cpbitmap(w, h, pixels)
     d = os.path.join(root, WALLPAPER_DIR)
     if not os.path.isdir(d):
@@ -292,7 +331,8 @@ def legacy_wallpaper_image(root, png, owner=(MOBILE, MOBILE)):
             f.write(blob)
         os.chown(path, *owner)
         os.chmod(path, 0o644)
-    print(f'legacy wallpaper: {src} {w}x{h} -> {", ".join(WALLPAPER_FILES)} ({len(blob)} bytes each)')
+    print(f'legacy wallpaper: {src} {w}x{h} (legibility style {style}, luma {luma:.2f}) -> '
+          f'{", ".join(WALLPAPER_FILES)} ({len(blob)} bytes each)')
 
 
 def remove_legacy_wallpaper_image(root):
