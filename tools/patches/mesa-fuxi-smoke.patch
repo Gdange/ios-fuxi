@@ -1,0 +1,40 @@
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -162,4 +162,4 @@
+       uint64_t slice = 1000000; /* 1 ms */
+-      if (abs_timeout_ns != UINT64_MAX && abs_timeout_ns <= now)
+-         slice = 0;
++      if (abs_timeout_ns != UINT64_MAX)
++         slice = abs_timeout_ns <= now ? 0 : MIN2(slice, abs_timeout_ns - now);
+       NativeAdrenoAbiWaitFence req = {.fence = fence, .timeout_ns = slice};
+@@ -180,3 +180,4 @@
+ {
+-   uint64_t abs = timeout_ns == UINT64_MAX ? UINT64_MAX : os_time_get_nano() + timeout_ns;
++   uint64_t now = os_time_get_nano();
++   uint64_t abs = timeout_ns >= UINT64_MAX - now ? UINT64_MAX : now + timeout_ns;
+    return dw_wait_fence_locked_free(queue->device, fence, abs);
+@@ -651,6 +652,5 @@
+             struct vk_darwin_sync *s = container_of(waits[i].sync, struct vk_darwin_sync, vk);
+-            if (darwin_sync_wait(device, s, 0) == VK_SUCCESS ||
+-                (s->state == DARWIN_SYNC_FENCE &&
+-                 dw_wait_fence_locked_free(device, s->fence, 0) == VK_SUCCESS))
+-               return VK_SUCCESS;
++            VkResult result = darwin_sync_wait(device, s, 0);
++            if (result != VK_TIMEOUT)
++               return result;
+          }
+@@ -717,2 +717,4 @@
+       if (kr == KERN_SUCCESS) {
++         mesa_logi("FUXI KMD: submit IBs %u fence %llu", count,
++                   (unsigned long long)reply.fence);
+          *fence = (uint32_t)reply.fence;
+@@ -753,2 +755,9 @@
+    const unsigned total = util_dynarray_num_elements(&submit->commands, NativeAdrenoAbiSubmitBuffer);
++   /* Fuxi resets CP context at every kernel submit. Splitting one Turnip
++    * command list would discard state between chunks, after partial execution.
++    * Reject before the first doorbell; a future ABI needs an atomic IB chain. */
++   if (total > NativeAdrenoAbiMaxBuffers)
++      return vk_device_set_lost(&dev->vk,
++                               "Fuxi IB list %u exceeds atomic submit limit %u",
++                               total, (unsigned)NativeAdrenoAbiMaxBuffers);
+    if (total) {

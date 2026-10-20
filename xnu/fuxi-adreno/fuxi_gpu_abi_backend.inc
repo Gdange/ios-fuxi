@@ -32,8 +32,36 @@ static int fg_abi_switch(uint64_t root)
  return !g4_tlb(tlb) && !fg_access_failed &&
      g3_sr(cb+0x20)==(uint32_t)ttbr && g3_sr(cb+0x24)==(uint32_t)(ttbr>>32);
 }
+/* One bounded, read-only snapshot before isolation destroys CP/SMMU evidence.
+ * GPU offsets are A6XX/A7XX dwords from Mesa a6xx.xml; SMMU offsets are
+ * bytes (same context-bank registers as g3_diagnostics). No indexed-port
+ * walks, retry loops, status clears or fault-resume writes on this path. */
+static unsigned fg_abi_hang_dumped;
+static void fg_abi_hang_dump(const char *why)
+{
+ if (fg_abi_hang_dumped) return;
+ fg_abi_hang_dumped=1;
+ printf("FUXI GPU HANG: %s seq %u completed %u busy %u expected-wptr 0x%x\n",
+     why,fg_abi_seq,fg_abi_completed,fg_client_busy,g3_wptr);
+ static const struct { const char *name; unsigned reg; } regs[] = {
+  {"CP_RB_RPTR",0x806},{"CP_RB_WPTR",0x807},
+  {"CP_IB1_BASE_LO",0x928},{"CP_IB1_BASE_HI",0x929},
+  {"CP_IB1_REM_SIZE",0x92a},{"CP_IB1_INIT_SIZE",0x943},
+  {"CP_STATUS_1",0x825},{"CP_HW_FAULT",0x821},
+  {"CP_INTERRUPT_STATUS",0x823},{"CP_PROTECT_STATUS",0x824},
+  {"RBBM_STATUS",0x210},{"RBBM_STATUS3",0x213},{"RBBM_INT_0_STATUS",0x201},
+ };
+ for (unsigned i=0;i<sizeof(regs)/sizeof(regs[0]);i++)
+  printf("FUXI GPU HANG: %s [0x%x]=0x%x\n",regs[i].name,regs[i].reg,g3_gr(regs[i].reg));
+ unsigned cb=g_cb(g3_bank);
+ printf("FUXI GPU HANG: SMMU GPU CB %u TTBR 0x%x:%08x FSR 0x%x FAR 0x%x:%08x FSYNR0 0x%x FSYNR1 0x%x GFSR 0x%x\n",
+     g3_bank,g3_sr(cb+0x24),g3_sr(cb+0x20),g3_sr(cb+0x58),
+     g3_sr(cb+0x64),g3_sr(cb+0x60),g3_sr(cb+0x68),g3_sr(cb+0x6c),g3_sr(0x48));
+ printf("FUXI GPU HANG: MMIO-access-failed %u; isolating\n",fg_access_failed);
+}
 static int fg_abi_fault(const char *why)
 {
+ fg_abi_hang_dump(why);
  fg_abi_poisoned = 1;
  fg_fail(why,0x701);
  fg_abi_drained = fg_isolate();

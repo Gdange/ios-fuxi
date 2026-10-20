@@ -1,3 +1,210 @@
+# Metal lane M3: staged Turnip submission smoke
+
+2026-10-20. **M2 observed on metal2h**, reported by the coordinator: direct ICD
+load, instance creation, one Qualcomm physical device (`0x5143` / `0x43050a01`,
+Turnip Adreno 740, pinned Mesa 26.2.0-devel), 1.5 GiB device-local heap,
+logical device/queue creation and destruction all passed. Three internal BOs
+were allocated, GPU-mapped, CPU-mapped/unmapped and freed before close. No panic
+and no managed-page physical-descriptor warning occurred. This confirms the
+metal2h mapping fix and the M2 lifetime gate; no GPU work was submitted.
+
+**M3 built and host-tested; not run on device.** No phone access, root-image
+edit or push was performed. The new kernel changes only add a read-only,
+once-per-loss register snapshot before existing isolation. The native tree
+also includes the inherited WLAN RC SID initialization fix at this branch tip;
+`fuxiwlan` remains absent/off. No speculative CP initialization change is made.
+
+`tools/fuxi-vk-smoke.cpp` ignores every argv value, including the executable
+name, because exec-swap supplies the host daemon's argv. It reads a maximum
+stage **1..4** from `/usr/local/share/fuxi/vk-smoke.conf`; absent config defaults
+to **4**, malformed/unreadable config fails before loading the ICD. The staged
+config contains `4` and a newline. Stages run as a prefix, stop at the first
+failure and print unbuffered stdout:
+
+| Stage | Work and acceptance |
+| --- | --- |
+| 1 `fill` | Recreated 64 KiB host-visible buffer; `vkCmdFillBuffer`, transfer-to-host barrier, submit/fence, invalidate mapped range, compare all 16384 words against `0xa740cafe`. |
+| 2 `compute` | 256 workgroups of 64 invocations; storage buffer receives `(i * 1664525 + 1013904223) ^ 0xa740cafe` with uint32 arithmetic. Compare all 16384 words. |
+| 3 `triangle` | Offscreen 256x256 RGBA8 UNORM render pass, opaque red triangle on opaque black, transfer to host buffer. Validate all pixels are red/black, six known inside/outside samples, and red count 8192 +/-128. |
+| 4 `reuse-reopen` | Repeat fill 16 times with destruction/recreation and varying patterns; destroy device **and instance**, create both again in the same process (closing/reopening the global Darwin connection), then repeat fill and compute. |
+
+The three GLSL files live in `tools/shaders/`. `glslangValidator -V
+--target-env vulkan1.1` generates `tools/out/vk-smoke-spv.h` at build time; C
+arrays are embedded in the signed executable. No runtime shader compiler or
+shader sidecar is staged. Each submit prints BEGIN and fence rc/elapsed-ms.
+The smoke forces `TU_DEBUG=nocb`, direct service/open type 0, and
+`MESA_LOG_LEVEL=debug` **before dlopen**. No sysmem/gmem/flushall/syncdraw override
+changes the submission path. The ICD overlay logs accepted IB count and seqno.
+
+Fence waits request **2 s**. On timeout the tool prints FAIL and elapsed time,
+then attempts `vkDeviceWaitIdle` once under a **1 s SIGALRM wall bound**; either
+return or alarm exits nonzero without driver teardown. Setup/stages/teardown
+also have 30/30/10 s wall bounds (60 s for stage 4), covering a stuck submit or
+cleanup. Other failures exit immediately and leave connection cleanup to
+process death and the independent kernel watchdog. These software bounds do
+not make wedged MMIO/interconnect access recoverable.
+
+Rebuild with the existing M2 external pins/cache and the same
+`tools/build-fuxi-turnip.py` command below. It now builds/signs both diagnostics,
+applies `tools/patches/mesa-fuxi-smoke.patch` **after** the iOS16 overlay, and
+checks the exact patched tree, including an already patched M3 cache. The M3
+overlay SHA256 is
+`6a2f66e50170887d26fb30a3ed67c1aabe3a5a49d4fdfbc6de0f17b1c77f2c13`.
+The historical M2 artifact hashes below describe the observed no-submit build.
+
+Native XNU was rebuilt in the assigned `ci-lane-metal2` tree with all 32 native
+inputs checked against the branch/canonical sources and unchanged base inputs.
+Use the standard native build/IIG setup, copy stripped/unstripped kernels to
+`xnu/out-fuxi-metal3/`, then pack/check:
+
+```sh
+export FUXI_GMU_FIRMWARE FUXI_SQE_FIRMWARE FUXI_GPU_ZAP_MBN MKBOOTIMG
+# Every variable above must name an existing absolute external file.
+bash tools/build-fuxi-metal3-images.sh "$METAL2H_ARTIFACTS"
+python3 tools/test-fuxi-metal-artifacts.py --lane metal3 \
+  --base "$METAL2H_ARTIFACTS" --out xnu/out-fuxi-metal3 \
+  --firmware "$FUXI_GMU_FIRMWARE" --sqe "$FUXI_SQE_FIRMWARE" --zap "$FUXI_GPU_ZAP_MBN"
+```
+
+The ADT is byte-identical to metal2h. The command line changes only the
+exec-swap target to
+`sweetexecswap=peakpowermanagerd:/usr/local/bin/fuxi-vk-smoke` and adds
+`sweetnull=backboardd,SpringBoard,fuxi-vk-smoke,peakpowermanagerd`.
+Firmware remains external, hash-pinned and present in the boot Image.
+
+For a later root edit, as the mounted-root editor:
+
+```sh
+python3 tools/stage-fuxi-vulkan.py "$IOS_ROOT" \
+  tools/out/libvulkan_freedreno.dylib tools/out/fuxi-vk-probe \
+  --smoke tools/out/fuxi-vk-smoke --conf tools/out/vk-smoke.conf
+```
+
+This retains the probe and stages the ICD and both binaries as **0:0 0755**,
+and the config at `/usr/local/share/fuxi/vk-smoke.conf` as **0:0 0644**. No job
+is installed. Boot `shim/out/fuxi-metal3-boot.img` through the coordinator's
+usual temporary-boot workflow only after those files are staged.
+
+Expected acceptance lines (not device observations):
+
+```text
+FUXI VK: stage 0 setup PASS instance/device/graphics+compute queue
+FUXI VK: stage 1 fill PASS verified readback
+FUXI VK: stage 2 compute PASS verified readback
+FUXI VK: stage 3 triangle PASS verified readback
+FUXI VK: stage 4 reuse-reopen PASS verified 16 recreations + device/instance reopen + fill/compute
+FUXI VK: done PASS
+```
+
+## M3 submit/fence review and failure triage
+
+Reviewed the pinned `tu_knl_darwin.cc`, Turnip's `tu_queue.cc`,
+`tu_cmd_buffer.cc`, A6XX/A7XX XML registers, and this tree's ABI client,
+`fuxi_abi_wire.h`, backend and ring bring-up. Findings:
+
+- **Timeouts:** relative ABI nanoseconds, zero polls once, kernel client slices
+  at 1 ms and caps any call at 1 s. Independent hardware ownership deadline is
+  100 ms. Darwin waits use monotonic absolute deadlines and 1 ms ABI slices.
+  The overlay caps the final slice to remaining time, saturates relative-to-
+  absolute addition, and propagates device loss in wait-any instead of looping.
+  A watchdog loss is reported as ABI Timeout, so an infinite Vulkan wait could
+  keep polling it; this tool always uses finite waits and a process alarm.
+- **Seqnos:** global uint32 monotonic fence with per-connection first/last
+  bounds; kernel refuses wrap. KMD's uint32 fence storage matches this limit;
+  a fresh connection resets KMD tracking but kernel seqnos continue. Queue 0
+  exists at open; hardware accepts one outstanding job. Darwin's eight-entry
+  inflight history is bookkeeping, not eight supported Fuxi hardware slots.
+- **IBs/BOs:** 1..16 top-level IBs; each handle must be live and GPU-mapped,
+  4-byte address/length alignment, nonempty, wholly inside that BO, at most
+  `0xfffff` dwords (4194300 bytes). Queue/reserved/wait-fence fields and exact
+  struct sizes are checked before submission. There is no separate residency
+  list: all live mapped BOs are already in the client's root, including shader,
+  descriptor and nested IB BOs. No PM4 opcode/nested-IB validation or security
+  boundary is claimed. Freed mappings are invalidated before release; busy
+  work prevents unmap. The KMD previously split >16 entries into separate
+  submits, but this kernel resets context on each submit: the overlay rejects
+  such lists **before any partial submission** with `Fuxi IB list N exceeds
+  atomic submit limit 16`. It does not truncate or insert extra doorbells.
+- **Caches:** KMD BoMap requests Normal NC (`writeback=0`, outer-shareable 2),
+  matching CPU write-combine BO views. The kernel publishes CPU stores with
+  `dsb sy`, flushes/invalidates GPU caches in the frame and switches TTBR only
+  while idle with ASID invalidation/TLBSYNC. Completion uses BR/BV timestamps,
+  idle/ring checks and restored root. The tool flushes initialized mappings,
+  emits shader/transfer-to-host barriers, and invalidates before verification,
+  including noncoherent memory. No cached-coherent or HostImport promise was
+  added; actual shader/UCHE/CCU coherence remains a device gate.
+- **Ring contract:** cold init programs SQE/ring/RPTR/BV RPTR bases, privileged
+  access/protection, HBB/UBWC NC and UCHE GMEM/trap ranges. CP_ME_INIT omits the
+  unavailable IFPC restore-list ordinal; GX stays held, IFPC/preemption are
+  disabled, no preemption records or separate BV/LPAC ring are invented. The
+  per-submit frame synchronizes BR, resets BOTH threads/context, waits for
+  PERFCTR SRAM initialization, invalidates caches, runs IBs and retires BV then
+  BR with idle. Turnip marks `has_preemption=false`; its command buffers emit
+  static register initialization, CP_SET_DRAW_STATE, CP_SET_MARKER render modes,
+  BR/BV offsets/ambles/thread controls and CCU/GMEM configuration themselves.
+  Thus missing marker/draw state or preemption records cannot be asserted as
+  the cause of UniXNU's reported CP hang. Compatibility of this subset with
+  real Turnip packets is still unqualified; raw CP_MEM_WRITE/BLIT is weaker
+  evidence. No speculative framing change was justified by the code review.
+
+Ranked hypotheses for the first device run:
+
+1. **CP/thread/context initialization mismatch.** Stage-1 accepted submit then
+   no retirement; `CP_RB_RPTR/WPTR`, `CP_IB1_BASE_*`, `CP_IB1_REM_SIZE`,
+   `CP_STATUS_1`, `CP_HW_FAULT`, `CP_INTERRUPT_STATUS`, `CP_PROTECT_STATUS` and
+   `RBBM_STATUS/STATUS3` distinguish fetch/protection/error evidence from a
+   busy BR/BV wait. An unchanged IB remainder with no faults suggests a stalled
+   packet/wait, not proof of which packet. Preserve all snapshot lines.
+2. **Client SMMU/nested resource mapping.** `SMMU GPU CB` logs TTBR, FSR, FAR,
+   FSYNR0/1 and GFSR. Nonzero fault plus FAR into an IB/shader/descriptor range
+   points to translation/access or lifetime; clean FSR alone does not prove
+   all mappings or cache attributes correct.
+3. **Cache visibility/flush ordering.** Fence rc 0 followed by `fill ... word`
+   or `compute word ... got ... want ...` fails data rather than retirement.
+   Failures first appearing in stage 4 implicate reuse/alias/lifetime/TLBI.
+4. **Shader or graphics state/GMEM/UBWC setup.** Fill PASS then compute FAIL
+   narrows to shader/SP/descriptor execution; compute PASS then triangle FAIL
+   narrows to graphics/CCU/image copy. `triangle pixel`, `triangle sample` or
+   `triangle count` distinguishes invalid bytes, geometry and coverage. Kernel
+   GMEM range initialization is not a complete render-pipeline setup.
+5. **ABI/quota/IB limits before CP.** Tool API `rc`, KMD `submit failed: 0x...`
+   or explicit atomic IB-limit error, with no accepted `FUXI KMD: submit IBs N
+   fence F`, distinguishes rejected work. BO limit is 64 and live wired quota
+   256 MiB despite the advertised 1.5 GiB heap. On reopen failure, check close,
+   open and `stage 4 reuse-reopen` setup failure before blaming the shader.
+
+On a pending fault/deadline the kernel prints **16 bounded `FUXI GPU HANG:`
+lines once per boot-wide loss, before reset**, including all registers above
+and MMIO-access-failed state. The independent 2 ms watchdog observes the 100 ms
+job deadline even without WaitFence calls. It permanently disables submission,
+drains GBIF (bounded polling), holds reset and faults SID0/1; `GBIF drain ACK`
+permits release, `GBIF drain FAILED ... source quarantined until reset` retains
+DMA backing. CPU presentation remains the existing fallback; no CP restart or
+recovery is attempted. Timing depends on scheduler/MMIO progress.
+
+Validation: real smoke commands/readbacks on the software ICD under ASan/UBSan
+passed all four stages, exact 8192/57344 pixel counts and complete reopen.
+Injected final-word corruption, device loss, timeout, hung idle, malformed
+config and host argv passed stop/bound checks. Extracted actual Darwin KMD
+functions passed finite/poll/overflow waits, wait-any loss propagation, 17-IB
+rejection before submit, 16-IB and empty-submit fence tests. Existing no-submit
+probe, ABI/backend/framing/patch-chain, exec-swap, NC/cache/mapping/lifetime,
+present quarantine, memory and native SCM checks passed. Mach-O audit/signature
+verification passed (plain arm64, iOS 16 minimum, system dependencies, no
+CTR_EL0 reads); the eight additional strong imports were found in the supplied
+iOS 16 cache. These checks do not qualify Turnip GPU execution or Metal.
+
+| M3 artifact | SHA256 |
+| --- | --- |
+| `xnu/out-fuxi-metal3/kernel.development.fuxi` | `194e4222564b1b27152ca43b992d39ca7e38bc8f7bfc118748cadf300375a9e0` |
+| `xnu/out-fuxi-metal3/kernel.development.fuxi.unstripped` | `6efaf3446b989820b056cb96ca1214bde44165d2975d399d94e548359db45482` |
+| `shim/out/fuxi-metal3-boot.img` | `61240f263a112d6f5d2bcd51aa959ccfafaa0c8dae59a8b8374d2b5c778fe2b5` |
+| `tools/out/libvulkan_freedreno.dylib` | `5661a054b5e4be57fe54bc38f3cccf6d264ae20562473caf72e50d2adc158a8c` |
+| `tools/out/fuxi-vk-smoke` | `1d7fda3c9cd94827a18b77a4111a058eb75644535c66623cc1498c1dab0edc34` |
+| `tools/out/vk-smoke.conf` | `7de1555df0c2700329e815b93b32c571c3ea54dc967b89e81ab73b9972b72d1d` |
+
+---
+
 # Metal lane M2 / metal2h: managed BO CPU mapping cleanup
 
 2026-10-20. **M1 qualified on device**, as reported by the coordinator for
@@ -23,8 +230,8 @@ missing/expired tokens, failed bind and failed drain. ABI/backend, patch-chain,
 execswap/quota, cache-sync/NC range tests pass. Native build succeeded in the
 assigned `ci-lane-metal2` tree. Packaging checks verify metal2g's byte-identical
 ADT and command line, external pinned GMU/SQE/zap bytes, recovery entries,
-service symbols and artifact hashes. No phone was accessed. Warning removal
-still needs an observed metal2h boot.
+service symbols and artifact hashes. No phone was accessed. Warning removal and the M2 device lifetime gate were subsequently observed on
+metal2h; see the M3 report above.
 
 Build with the same native XNU/IIG setup as metal2g, copy stripped/unstripped
 outputs into `xnu/out-fuxi-metal2h/`, then:
@@ -51,14 +258,15 @@ page`. The M2 Vulkan probe needs a separate coordinator-selected invocation.
 
 ## M2: iOS 16 Turnip cross-build (offline complete)
 
-**Built, not run on device.** `tools/build-fuxi-turnip.py` builds/signs the real
+**M2 lifetime gate subsequently observed on metal2h** (coordinator report; see
+M3 above). `tools/build-fuxi-turnip.py` builds/signs the real
 Turnip ICD against this tree's `xnu/fuxi-adreno/NativeAdrenoABI.h`, then builds
 `tools/fuxi-vk-probe.cpp` using Mesa's Vulkan headers. The probe directly dlopens
 the ICD, creates an instance, enumerates physical properties/heaps, creates one
 logical device/queue, and destroys them. It never resolves or calls a submit
 entrypoint, allocates application GPU resources, creates a surface, or presents.
 Source review of the pinned CreateDevice/queue-init path found BO/command-stream
-initialization but no hardware submission. No Vulkan success on Fuxi is claimed.
+initialization but no hardware submission. The M2 report above qualifies enumeration/device lifetime only.
 
 ### Exact inputs and patch order
 
@@ -185,7 +393,8 @@ in the discovery section below). No required import is a dynamic lookup. The
 ICD has **5571 weak dynamic references** from generated optional Turnip/WSI
 entrypoint tables. The upstream `-undefined dynamic_lookup` is retained; ld
 warns that it is deprecated on iOS, plus a duplicate `-lz` warning. These weak
-references and actual dyld/signing policy still require the root load gate.
+references outside the exercised M2 path remain unqualified; the root
+load/device-lifetime gate subsequently passed on metal2h.
 
 Reproduce audit on the Mac, then use the supplied cache offline:
 
@@ -223,7 +432,8 @@ path; an exec-swap host basename causes all host arguments to be ignored.
 metal2h's unchanged command line still selects the raw test; a coordinator must
 choose a separate root invocation or a later probe-specific exec-swap image.
 
-Expected, **not observed**, output includes:
+M2 acceptance output (the coordinator subsequently reported this lifetime gate
+passing on metal2h; no submission was part of that run) includes:
 
 ```text
 FUXI VK: create-instance rc 0
@@ -246,11 +456,11 @@ Expected kernel calls include open/query/device-info/close for enumeration,
 reopen/query/device-info, internal BO alloc/map/cpu-map/free and close for device
 lifetime. **No Submit/WaitFence calls or GPU results are expected.**
 
-Remaining risks: warning removal and iOS dyld/device creation are untested;
-weak optional entrypoints, signing/runtime library policy, advertised heap vs
+Remaining risks after the observed M2 gate: weak optional entrypoints outside
+the exercised path, advertised heap vs
 kernel quota, single-client/global backend state, and existing A7xx
-cache/TTBR/submit assumptions. First require this no-submit gate and no panic;
-then M3 separately qualifies fill/compute/triangle/readback. No shader submission,
+cache/TTBR/submit assumptions. The no-submit gate passed without panic; M3 separately requires observed
+fill/compute/triangle/readback. No shader submission,
 Metal discovery/frontend, IOSurface import or CoreAnimation integration is
 qualified by this build.
 
@@ -898,7 +1108,7 @@ not establish Turnip or Metal success. Its documented Turnip IBs still hang CP.
    and watchdog containment above. Current status: raw IB/readback/reopen qualified on metal2g as recorded above;
    no new watchdog-containment or presentation qualification is claimed here.
 2. **M2 Turnip cross-build for iOS 16:** offline build/audits complete;
-   root load/enumeration/device lifetime remains untested (see M2 above). Follow UniXNU
+   root load/enumeration/device lifetime passed on metal2h (see M3 report above). Follow UniXNU
    `scripts/build-turnip-darwin.py` and `scripts/data/adreno-compiler-inputs.json`.
    The actual build pin is Mesa **85fda3b36405bcaea8bffc64aa4f2651dc90770d**;
    `gpu-metal-vulkan-inputs.json` also records **c823a83e...** as a reference
@@ -914,8 +1124,8 @@ not establish Turnip or Metal success. Its documented Turnip IBs still hang CP.
    and absence of EL0 CTR_EL0 instructions; the supplied patch now substitutes
    Darwin's 64-byte cache-line value. Require exported vk_icdGetInstanceProcAddr
    and a root-daemon load/enumeration before submitting shaders.
-3. **M3 Turnip smoke:** adapt NativeTurnipSmoke's direct-library tests, without
-   a Metal frontend. With TU_DEBUG=nocb, run Vulkan buffer fill, a small compute
+3. **M3 Turnip smoke:** staged tool/build/host tests complete (see M3 above);
+   device submission/readback acceptance remains pending, without a Metal frontend. With TU_DEBUG=nocb, run Vulkan buffer fill, a small compute
    shader, then an offscreen triangle; map and compare every result, repeat
    BO/IOVA reuse and process reopen, capture the failing fence/CP/SMMU state.
    Stop and use CPU UI after any loss. Real cache/TTBR/coherency and A7xx reset

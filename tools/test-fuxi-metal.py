@@ -147,11 +147,11 @@ static uint64_t counter(const char *name) {return strcmp(name,"cntfrq_el0")?tick
 static unsigned fg_access_failed,fg_busy,fg_client_busy,g3_wptr,g3_bank=2,g3_asid=3;
 static unsigned state=1,drains,drainGood=1,fault,tlbs,failTlb,doorbells,enqueued;
 static uint32_t regs[0x10000],sregs[0x1000],ring[8192];
-static unsigned readFault,sreadFault,writeFail,writeCount,logLines,dumpLines;
-static char lastLog[256];
+static unsigned readFault,sreadFault,writeFail,writeCount,logLines,dumpLines,hangLines;
+static char lastLog[256],hangLog[16][256];
 static int trace(const char *fmt,...) {
  va_list ap;va_start(ap,fmt);vsnprintf(lastLog,sizeof(lastLog),fmt,ap);va_end(ap);
- logLines++;if(strstr(lastLog,"init regs"))dumpLines++;return 0;
+ logLines++;if(strstr(lastLog,"init regs"))dumpLines++;if(strstr(lastLog,"FUXI GPU HANG:")){assert(hangLines<16);strcpy(hangLog[hangLines++],lastLog);}return 0;
 }
 #define printf trace
 static unsigned g_cb(unsigned bank) {return bank*0x100;}
@@ -164,7 +164,7 @@ static uint32_t g3_read(uint64_t pa) {return *(uint32_t *)G_PTR(pa);}
 static void g_wr(uint64_t pa,unsigned off,uint32_t value) {*(uint32_t *)G_PTR(pa+off)=value;}
 static int g3_faulted(void) {return fault;}
 static int g4_tlb(uint32_t *d) {(void)d;tlbs++;return failTlb;}
-static int fg_isolate(void) {drains++;return drainGood;}
+static int fg_isolate(void) {assert(hangLines==16);drains++;return drainGood;}
 static void fg_fail(const char *why,unsigned code) {(void)why;(void)code;state=2;}
 static int fuxi_gpu_ready(void) {return state==1;}
 static void g3_emit(uint32_t v) {ring[g3_wptr++&8191]=v;}
@@ -179,9 +179,9 @@ static void seed(void) {
  regs[0xe07]=regs[0xe09]=0xfffff000;regs[0xe08]=regs[0xe0a]=0x1ffff;regs[0x534]=1;regs[0xe0b]=0x1000000;regs[0xe0d]=0x12ff000;regs[0xe01]=3u<<21;
  sregs[SMMU_ID2/4]=0x5511;
  state=drainGood=1;fg_busy=fg_client_busy=fg_access_failed=0;g3_wptr=0;
- fg_abi_live=fg_abi_seq=fg_abi_completed=fg_abi_poisoned=fg_abi_timed_out=0;
+ fg_abi_live=fg_abi_seq=fg_abi_completed=fg_abi_poisoned=fg_abi_timed_out=0;fg_abi_hang_dumped=0;
  ticks=tlbs=failTlb=doorbells=enqueued=drains=fault=0;
- readFault=sreadFault=writeFail=writeCount=logLines=0;
+ readFault=sreadFault=writeFail=writeCount=logLines=hangLines=0;
 }
 static void reset(void) {
  seed();
@@ -278,9 +278,16 @@ int main(void) {
  for(unsigned good=0;good<2;good++) {
   reset();drainGood=good;
   assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence));
+  regs[0x928]=0x23450000;regs[0x92a]=0x90;sregs[(g_cb(g3_bank)+0x58)/4]=0xc0000002;
+  unsigned beforeWrites=writeCount;
   ticks=100001;fg_abi_watch(NULL,NULL);
   assert(state==2 && drains==1 && !fg_client_busy && !fuxi_gpu_abi_available());
   assert(fuxi_gpu_abi_poll(fence)==(good?-3:-4));
+  assert(hangLines==16 && writeCount==beforeWrites);
+  assert(strstr(hangLog[3],"CP_IB1_BASE_LO [0x928]=0x23450000"));
+  assert(strstr(hangLog[5],"CP_IB1_REM_SIZE [0x92a]=0x90"));
+  assert(strstr(hangLog[14],"FSR 0xc0000002"));
+  fg_abi_watch(NULL,NULL);assert(hangLines==16 && drains==1);
   assert(fuxi_gpu_abi_unmap(va,bytes)==(good?0:-2));
  }
  reset();assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence));fault=1;

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build/sign the pinned Turnip ICD and no-submit probe on an Apple Silicon Mac.
+"""Build/sign the pinned Turnip ICD, no-submit probe and staged smoke tool on an Apple Silicon Mac.
 
 Supply external Mesa and UniXNU checkouts; source/build caches must stay out of
 this repository. See docs-lanes/metal.md for pins, setup and audit limitations.
@@ -54,17 +54,26 @@ def main():
     ordered=[]
     for name, digest in PATCHES.items():
         patch = (args.patches/name).resolve()
-        ordered.append(patch)
         if hashlib.sha256(patch.read_bytes()).hexdigest() != digest:
             ap.error('patch hash mismatch: '+name)
-        if subprocess.run(['git','-C',str(source),'apply','--reverse','--check',str(patch)], capture_output=True).returncode:
-            run(['git', '-C', source, 'apply', '--check', patch])
-            run(['git', '-C', source, 'apply', patch])
-    patch = ROOT/'tools/patches/mesa-fuxi-ios16.patch'
-    if subprocess.run(['git','-C',str(source),'apply','--reverse','--check',str(patch)], capture_output=True).returncode:
+        ordered.append(patch)
+    ordered += [ROOT/'tools/patches/mesa-fuxi-ios16.patch', ROOT/'tools/patches/mesa-fuxi-smoke.patch']
+    # Accept only an exact known prefix, including a previously completed M3
+    # cache. Reverse-checking an upstream added file fails after a local overlay.
+    with tempfile.TemporaryDirectory() as tmp:
+        git_env=dict(os.environ,GIT_INDEX_FILE=str(Path(tmp)/'prefix.index'))
+        run(['git','-C',source,'read-tree',MESA],env=git_env)
+        prefix = None
+        for i in range(len(ordered)+1):
+            if not subprocess.run(['git','-C',str(source),'diff','--quiet'],env=git_env).returncode:
+                prefix = i
+            if i<len(ordered):
+                run(['git','-C',source,'apply','--cached',ordered[i]],env=git_env)
+        if prefix is None:
+            ap.error('Mesa worktree is not an exact known patch prefix')
+    for patch in ordered[prefix:]:
         run(['git','-C',source,'apply','--check',patch])
         run(['git','-C',source,'apply',patch])
-    ordered.append(patch)
     # Reconstruct the exact expected patched tree in a temporary index. Reject
     # cache edits beyond the pinned patches, including edits in patched files.
     with tempfile.TemporaryDirectory() as tmp:
@@ -112,12 +121,19 @@ def main():
     probe = out/'fuxi-vk-probe'
     run([find('clang++'),*flags,'-std=c++17','-O2','-Wall','-Wextra','-Werror',
          '-I'+str(source/'include'),ROOT/'tools/fuxi-vk-probe.cpp','-o',probe])
-    for binary in (library,probe):
+    run(['python3',ROOT/'tools/build-fuxi-vk-shaders.py',out/'vk-smoke-spv.h'])
+    smoke = out/'fuxi-vk-smoke'
+    run([find('clang++'),*flags,'-std=c++17','-O2','-Wall','-Wextra','-Werror',
+         '-I'+str(source/'include'),'-I'+str(out),ROOT/'tools/fuxi-vk-smoke.cpp','-o',smoke])
+    shutil.copyfile(ROOT/'tools/vk-smoke.conf',out/'vk-smoke.conf')
+    for binary in (library,probe,smoke):
         run(['codesign','-f','-s','-',binary])
         run(['codesign','--verify','--strict',binary])
     run(['python3',ROOT/'tools/audit-fuxi-vulkan.py',library,probe])
     (out/'M2-SHA256SUMS').write_text(''.join(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n' for p in (library,probe)))
-    print((out/'M2-SHA256SUMS').read_text())
+    (out/'M3-SHA256SUMS').write_text(''.join(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n' for p in (library,smoke,out/'vk-smoke.conf')))
+    run(['python3',ROOT/'tools/audit-fuxi-vulkan.py',library,smoke])
+    print((out/'M3-SHA256SUMS').read_text())
 
 
 if __name__ == '__main__':
