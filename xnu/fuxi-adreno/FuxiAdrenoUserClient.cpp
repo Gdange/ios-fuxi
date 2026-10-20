@@ -8,6 +8,7 @@
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IOSubMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
 #include <kern/clock.h>
@@ -16,28 +17,25 @@
 #include "fuxi_gpu_abi.h"
 #include "fuxi_abi_wire.h"
 
-/* A physical-range view must OWN its wired backing until its last mapping is
- * destroyed. IOConnectUnmapMemory64 looks up this same descriptor again.
- * Releasing a BO with a forgotten CPU mapping can then never free live PTEs.
- * Kernel and client mappings both use Normal NC/write-combine, avoiding a
- * cached alias of memory the GPU accesses noncoherently. */
-class FuxiAdrenoBoView : public IOGeneralMemoryDescriptor {
+/* A subrange keeps the BO's managed-page descriptor/pager identity. Never
+ * reconstruct a physical descriptor over wired managed RAM. The extra backing
+ * reference owns the matched prepare until the final CPU mapping disappears.
+ * Both mappings keep the buffer's Normal NC/write-combine cache policy. */
+class FuxiAdrenoBoView : public IOSubMemoryDescriptor {
  OSDeclareDefaultStructors(FuxiAdrenoBoView)
  IOBufferMemoryDescriptor *backing_ = nullptr;
 public:
- bool bind(IOBufferMemoryDescriptor *backing, IOAddressRange *ranges, unsigned count) {
-  if (!initWithOptions(ranges,count,0,nullptr,
-      kIODirectionInOut|kIOMemoryTypePhysical64|kIOMemoryMapperNone,nullptr)) return false;
+ bool bind(IOBufferMemoryDescriptor *backing) {
+  if (!initSubRange(backing,0,backing->getLength(),kIODirectionInOut)) return false;
   backing_=backing; backing_->retain(); return true;
  }
  void free() override {
   IOBufferMemoryDescriptor *backing=backing_;
-  /* Tear down physical views/pager before releasing the backing. */
-  IOGeneralMemoryDescriptor::free();
+  IOSubMemoryDescriptor::free();
   if (backing) { backing->complete(); backing->release(); }
  }
 };
-OSDefineMetaClassAndStructors(FuxiAdrenoBoView,IOGeneralMemoryDescriptor)
+OSDefineMetaClassAndStructors(FuxiAdrenoBoView,IOSubMemoryDescriptor)
 
 static IOLock *openLock;
 static bool connected;
@@ -151,10 +149,8 @@ class FuxiAdrenoUserClient : public IOUserClient {
   if (!memory && !r.contiguous) memory=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,options,allocated,mask);
   if (!memory) return kIOReturnNoMemory;
   if (memory->prepare()!=kIOReturnSuccess) { memory->release(); return kIOReturnNoMemory; }
-  unsigned capacity=(unsigned)(allocated/16384), count=0;
-  IOAddressRange *ranges=IONewData(IOAddressRange,capacity);
   FuxiAdrenoBoView *view=new FuxiAdrenoBoView;
-  bool valid=ranges && view && memory->getBytesNoCopy() && memory->getLength()==allocated;
+  bool valid=view && memory->getBytesNoCopy() && memory->getLength()==allocated;
   uint64_t first=0;
   for (uint64_t off=0;valid && off<allocated;off+=16384) {
    IOByteCount length=0;
@@ -163,14 +159,11 @@ class FuxiAdrenoUserClient : public IOUserClient {
        (!off ? !(pa&((UINT64_C(1)<<r.align_log2)-1)) : !r.contiguous || pa==first+off);
    if (!valid) break;
    if (!off) first=pa;
-   if (count && ranges[count-1].address+ranges[count-1].length==pa) ranges[count-1].length+=16384;
-   else ranges[count++]={pa,16384};
   }
   if (valid) {
    bzero(memory->getBytesNoCopy(),allocated); /* includes 16K mapping tail */
-   valid=view->bind(memory,ranges,count);
+   valid=view->bind(memory);
   }
-  if (ranges) IODeleteData(ranges,IOAddressRange,capacity);
   if (!valid) {
    if (view) view->release();
    memory->complete(); memory->release(); return kIOReturnNoMemory;

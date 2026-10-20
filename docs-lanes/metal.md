@@ -1,3 +1,56 @@
+# Metal lane M2 / metal2h: managed BO CPU mapping cleanup
+
+2026-10-20. **M1 qualified on device**, as reported by the coordinator for
+metal2g (`5c0b2da`): root pid 78, hosted by peakpowermanagerd, completed
+open/query/device-info/alloc/map/cpu-token/cpu-map/submit/wait with rc 0,
+`mem 0xa740cafe bad-pixels 0 rounds 1/2`, close/reopen, the same result for
+`rounds 2/2`, then free/close with no panic. This is observed raw PM4 success,
+not Turnip/shader/Metal qualification. One nonfatal managed-page physical
+IOMemoryDescriptor warning occurred in cpu-map.
+
+**metal2h change:** `FuxiAdrenoBoView` now derives from
+`IOSubMemoryDescriptor`, using the original IOBufferMemoryDescriptor as its
+parent for the entire allocated BO. It no longer builds physical-address
+ranges over managed RAM. `clientMemoryForType` still returns the same retained
+view for map/unmap, with Normal NC/write-combine flags. The view keeps the
+matched prepare and buffer reference until its final mapping is destroyed;
+failed DMA drain still quarantines all references. Reserved carve-out NC
+mappings and pmap cache synchronization are unchanged.
+
+**Validation:** the real view/bind/cpu-map/drop methods run under ASan/UBSan,
+covering retained CPU maps after BO close, same-descriptor unmap identity,
+missing/expired tokens, failed bind and failed drain. ABI/backend, patch-chain,
+execswap/quota, cache-sync/NC range tests pass. Native build succeeded in the
+assigned `ci-lane-metal2` tree. Packaging checks verify metal2g's byte-identical
+ADT and command line, external pinned GMU/SQE/zap bytes, recovery entries,
+service symbols and artifact hashes. No phone was accessed. Warning removal
+still needs an observed metal2h boot.
+
+Build with the same native XNU/IIG setup as metal2g, copy stripped/unstripped
+outputs into `xnu/out-fuxi-metal2h/`, then:
+
+```sh
+# All firmware/tool variables must name existing absolute external files.
+export FUXI_GMU_FIRMWARE FUXI_SQE_FIRMWARE FUXI_GPU_ZAP_MBN MKBOOTIMG
+bash tools/build-fuxi-metal2-images.sh "$METAL2G_ARTIFACTS" metal2h
+python3 tools/test-fuxi-metal2h.py
+python3 tools/test-fuxi-metal-artifacts.py --lane metal2h \
+  --base "$METAL2G_ARTIFACTS" --out xnu/out-fuxi-metal2h \
+  --firmware "$FUXI_GMU_FIRMWARE" --sqe "$FUXI_SQE_FIRMWARE" --zap "$FUXI_GPU_ZAP_MBN"
+```
+
+| Artifact | SHA256 |
+| --- | --- |
+| `xnu/out-fuxi-metal2h/kernel.development.fuxi` | `e375ac6962acd8856f5d00219ca2e999b43734867ebc6786f8197e753fd5c848` |
+| `xnu/out-fuxi-metal2h/kernel.development.fuxi.unstripped` | `75d52a0c6f876f2f957bfb0b67d4098aba7fa486d2a76b3a9f86ced4e4f0e785` |
+| `shim/out/fuxi-metal2h-boot.img` | `3212f853c3787b2c128162d7d9cbb5ab3ee88c73f9a9e950b06c3184567510b0` |
+
+metal2h intentionally still exec-swaps the raw ABI test. Expect the same two
+successful rounds as metal2g, without `IOMemoryDescriptor physical with managed
+page`. The M2 Vulkan probe needs a separate coordinator-selected invocation.
+
+---
+
 # Metal lane, milestone 2g: full-width cache sync and bounded NC access
 
 2026-10-20, based on metal2e and Wi-Fi M6. No device execution in this lane.
@@ -637,8 +690,8 @@ not establish Turnip or Metal success. Its documented Turnip IBs still hang CP.
 ## Remaining milestones and acceptance gates
 
 1. **M1 device qualification:** normal raw IB/readback/reopen, present coexistence
-   and watchdog containment above. Current status: built and offline-tested,
-   awaiting coordinator execution.
+   and watchdog containment above. Current status: raw IB/readback/reopen qualified on metal2g as recorded above;
+   no new watchdog-containment or presentation qualification is claimed here.
 2. **M2 Turnip cross-build for iOS 16:** follow UniXNU
    `scripts/build-turnip-darwin.py` and `scripts/data/adreno-compiler-inputs.json`.
    The actual build pin is Mesa **85fda3b36405bcaea8bffc64aa4f2651dc90770d**;

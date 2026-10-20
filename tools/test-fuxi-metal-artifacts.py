@@ -20,7 +20,7 @@ def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--base', type=Path, required=True)
     ap.add_argument('--out', type=Path, default=Path('xnu/out-fuxi-metal1'))
-    ap.add_argument('--lane', choices=('metal1','metal2a','metal2b','metal2c','metal2e','metal2g'), default='metal1')
+    ap.add_argument('--lane', choices=('metal1','metal2a','metal2b','metal2c','metal2e','metal2g','metal2h'), default='metal1')
     ap.add_argument('--base-boot', type=Path, default=Path('shim/out/fuxi-metal2c-boot.img'))
     ap.add_argument('--nm', default='llvm-nm-18')
     ap.add_argument('--firmware', type=Path)
@@ -34,7 +34,7 @@ def main():
              if len(line.split())==3}
     for name in ('map','unmap','submit','poll','available','publish'):
         assert '_fuxi_gpu_abi_'+name in symbols,name
-    if args.lane=='metal2g':
+    if args.lane in ('metal2g','metal2h'):
         assert '_fuxi_gpu_nc_pointer' in symbols and '_pmap_sync_page_attributes_phys' in symbols
         assert b'FUXI GPU: cache sync outside RAM/NC windows:' in raw
     assert any('NativeAdrenoGpuPublished10gMetaClass' in name for name in symbols)
@@ -52,8 +52,8 @@ def main():
     assert payload[:8]==b'SWEETXNU'
     cmdline=payload[72:680].split(b'\0')[0]
     basecmd=args.base.joinpath('cmdline.txt').read_bytes().strip()
-    if args.lane in ('metal2b','metal2c','metal2e','metal2g'):
-        if args.lane=='metal2g':
+    if args.lane in ('metal2b','metal2c','metal2e','metal2g','metal2h'):
+        if args.lane in ('metal2g','metal2h'):
             expected=basecmd
             assert (args.out/'cmdline.txt').read_bytes()==(args.base/'cmdline.txt').read_bytes()
             assert expected.split().count(b'sweetexecswap=peakpowermanagerd:/usr/local/bin/fuxi-gpu-abi-test')==1
@@ -106,7 +106,7 @@ def main():
     assert platform==2 and signature
     print('PASS: signed arm64 Mach-O, LC_BUILD_VERSION iOS 16.0')
     firmware=[args.firmware,args.sqe,args.zap]
-    if args.lane in ('metal2e','metal2g'): assert all(firmware),'lane requires all three firmware inputs'
+    if args.lane in ('metal2e','metal2g','metal2h'): assert all(firmware),'lane requires all three firmware inputs'
     if any(firmware):
         assert all(firmware),'provide all three firmware inputs'
         loader=Path(f'shim/out/fuxi-{args.lane}-loader.elf').read_bytes()
