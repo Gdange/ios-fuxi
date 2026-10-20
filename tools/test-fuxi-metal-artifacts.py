@@ -20,7 +20,7 @@ def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--base', type=Path, required=True)
     ap.add_argument('--out', type=Path, default=Path('xnu/out-fuxi-metal1'))
-    ap.add_argument('--lane', choices=('metal1','metal2a'), default='metal1')
+    ap.add_argument('--lane', choices=('metal1','metal2a','metal2b'), default='metal1')
     ap.add_argument('--nm', default='llvm-nm-18')
     ap.add_argument('--firmware', type=Path)
     ap.add_argument('--sqe', type=Path)
@@ -48,7 +48,14 @@ def main():
     assert payload[:8]==b'SWEETXNU'
     cmdline=payload[72:680].split(b'\0')[0]
     basecmd=args.base.joinpath('cmdline.txt').read_bytes().strip()
-    if args.lane=='metal2a':
+    if args.lane=='metal2b':
+        expected=basecmd
+        assert (args.out/'cmdline.txt').read_bytes()==(args.base/'cmdline.txt').read_bytes()
+        assert b'fuxigpuabi=1' in expected.split() and not any(a.startswith(b'fuxiwlan=') for a in expected.split())
+        assert b'sweetexecswap=bluetoothd:/usr/local/bin/fuxi-gpu-abi-test' in expected.split()
+        assert '_fuxi_wlan_init' in symbols and b'SWEET EXECSWAP:' in raw and b'FUXI ABI: result' in raw
+        assert b'FUXI GPU ABI: init check' in raw and b'FUXI GPU ABI: init write' in raw
+    elif args.lane=='metal2a':
         expected=basecmd.replace(b'sweetnoexec=bluetoothd,',b'sweetnoexec=')+b' sweetexecswap=bluetoothd:/usr/local/bin/fuxi-gpu-abi-test'
         assert b'fuxigpuabi=1' in expected.split() and not any(a.startswith(b'fuxiwlan=') for a in expected.split())
         assert '_fuxi_wlan_init' in symbols and b'SWEET EXECSWAP:' in raw and b'FUXI ABI: result' in raw

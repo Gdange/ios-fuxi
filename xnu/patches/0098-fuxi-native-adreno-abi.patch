@@ -463,7 +463,7 @@
 +#endif
 --- a/bsd/dev/fuxi_gpu_abi_backend.inc
 +++ b/bsd/dev/fuxi_gpu_abi_backend.inc
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,238 @@
 +/* Built into fuxi_adreno.c, with access to its proven SMMU/ring helpers.
 + * Single privileged diagnostic client, not a security boundary for PM4.
 + * Its root has no scanout or surface-cache mappings. The kernel-only runtime
@@ -541,18 +541,67 @@
 + /* 772 4K pages: root, two L2s, kernel runtime L3, 768 client L3s.
 +  * Allocate all table storage from unused reserved NC scratch, never VM.
 +  * No existing GMU or present PTE is reused as mutable client storage. */
-+ /* Verify programmed UCHE/GMEM/HBB facts before advertising DeviceInfo. */
-+ if (g3_gr(0xe07)!=0xfffff000u || g3_gr(0xe08)!=0x1ffff ||
-+     g3_gr(0xe0b)!=0x1000000 || g3_gr(0xe0c) ||
-+     g3_gr(0xe0d)!=0x12fffff || g3_gr(0xe0e) ||
-+     ((g3_gr(0xe01)>>21)&3)!=3 ||
-+     ((g3_sr(SMMU_ID2)>>4)&15)<1 || fg_access_failed) return 0;
-+ /* SM8550 UBWC4 configuration, same NC values as the proven present path;
-+  * initialize both BR and BV banks before exposing a context to Turnip. */
-+ if (!g3_gw(G4_RB_NC,0x816) || !g3_gw(G4_TPL1_NC,6) || !g3_gw(G4_SP_NC,0x26)) return 0;
-+ for (unsigned pipe=1;pipe<=2;pipe++)
-+  if (!g3_gw(G3_APERTURE_HOST,pipe<<12) || !g3_gw(G4_GRAS_NC,0x60)) return 0;
-+ if (!g3_gw(G3_APERTURE_HOST,0)) return 0;
++ /* Snapshot once before checking: do not short-circuit away the evidence.
++  * GPU offsets are dwords; SMMU_ID2 is a byte offset. The UCHE address
++  * registers are adjacent 32-bit low/high pairs, including on A740.
++  * Keep exact checks until hardware readback establishes any RAZ bits. */
++ static const struct { const char *name; unsigned reg; uint32_t want; } checks[] = {
++  {"UCHE_WRITE_THRU_BASE_LO",0xe07,0xfffff000u},
++  {"UCHE_WRITE_THRU_BASE_HI",0xe08,0x1ffff},
++  {"UCHE_TRAP_BASE_LO",0xe09,0xfffff000u},
++  {"UCHE_TRAP_BASE_HI",0xe0a,0x1ffff},
++  {"UCHE_GMEM_RANGE_MIN_LO",0xe0b,0x1000000},
++  {"UCHE_GMEM_RANGE_MIN_HI",0xe0c,0},
++  {"UCHE_GMEM_RANGE_MAX_LO",0xe0d,0x12fffff},
++  {"UCHE_GMEM_RANGE_MAX_HI",0xe0e,0},
++  {"UCHE_MODE_CNTL_HBB",0xe01,3},
++  {"RBBM_NC_MODE_CNTL",0x534,1},
++ };
++ uint32_t values[sizeof(checks)/sizeof(checks[0])];
++ for (unsigned i=0;i<sizeof(checks)/sizeof(checks[0]);i++) values[i]=g3_gr(checks[i].reg);
++ uint32_t id2=g3_sr(SMMU_ID2);
++ static unsigned dumped;
++ if (!dumped) {
++  dumped=1;
++  for (unsigned i=0;i<sizeof(checks)/sizeof(checks[0]);i++)
++   printf("FUXI GPU ABI: init regs %s [0x%x]=0x%x\n",checks[i].name,checks[i].reg,values[i]);
++  printf("FUXI GPU ABI: init regs SMMU_ID2 [0x%x]=0x%x\n",SMMU_ID2,id2);
++ }
++ if (fg_access_failed) {
++  printf("FUXI GPU ABI: init check register_access got 0x%x want 0x0\n",fg_access_failed);
++  return 0;
++ }
++ for (unsigned i=0;i<sizeof(checks)/sizeof(checks[0]);i++) {
++  uint32_t got=checks[i].reg==0xe01 ? (values[i]>>21)&3 : values[i];
++  if (got!=checks[i].want) {
++   printf("FUXI GPU ABI: init check %s got 0x%x want 0x%x\n",checks[i].name,got,checks[i].want);
++   return 0;
++  }
++ }
++ if (((id2>>4)&15)<1) {
++  printf("FUXI GPU ABI: init check SMMU_ID2_OAS_min got 0x%x want 0x1\n",(id2>>4)&15);
++  return 0;
++ }
++ /* SM8550 UBWC4 configuration, same NC values as stage14 (also run by
++  * stage16). GX OOB stays held; fg_state is not ready, so no present can
++  * race these CPU MMIO writes. CP protection applies to packets, not AHB.
++  * Host PIPE bits 13:12 select BR=1/BV=2; restore default aperture last. */
++ static const struct { const char *name; unsigned reg; uint32_t value; } writes[] = {
++  {"G4_RB_NC",G4_RB_NC,0x816},
++  {"G4_TPL1_NC",G4_TPL1_NC,6},
++  {"G4_SP_NC",G4_SP_NC,0x26},
++  {"G3_APERTURE_HOST_BR",G3_APERTURE_HOST,1u<<12},
++  {"G4_GRAS_NC_BR",G4_GRAS_NC,0x60},
++  {"G3_APERTURE_HOST_BV",G3_APERTURE_HOST,2u<<12},
++  {"G4_GRAS_NC_BV",G4_GRAS_NC,0x60},
++  {"G3_APERTURE_HOST_DEFAULT",G3_APERTURE_HOST,0},
++ };
++ for (unsigned i=0;i<sizeof(writes)/sizeof(writes[0]);i++) {
++  if (!g3_gw(writes[i].reg,writes[i].value)) {
++   printf("FUXI GPU ABI: init write %s [0x%x]=0x%x failed\n",writes[i].name,writes[i].reg,writes[i].value);
++   return 0;
++  }
++ }
 + g_zero(FG_ABI_PT,FG_ABI_PT_BYTES);
 + volatile uint64_t *root = (volatile uint64_t *)G_PTR(FG_ABI_PT);
 + volatile uint64_t *l20 = (volatile uint64_t *)G_PTR(FG_ABI_PT+4096);

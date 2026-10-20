@@ -96,6 +96,7 @@ BACKEND_PREFIX = r'''
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdarg.h>
 #include "fuxi_abi_wire.h"
 #define FG_GUARD
 #define G_MEM 0x9fe000000ULL
@@ -135,10 +136,17 @@ static uint64_t counter(const char *name) {return strcmp(name,"cntfrq_el0")?tick
 static unsigned fg_access_failed,fg_busy,fg_client_busy,g3_wptr,g3_bank=2,g3_asid=3;
 static unsigned state=1,drains,drainGood=1,fault,tlbs,failTlb,doorbells,enqueued;
 static uint32_t regs[0x10000],sregs[0x1000],ring[8192];
+static unsigned readFault,sreadFault,writeFail,writeCount,logLines,dumpLines;
+static char lastLog[256];
+static int trace(const char *fmt,...) {
+ va_list ap;va_start(ap,fmt);vsnprintf(lastLog,sizeof(lastLog),fmt,ap);va_end(ap);
+ logLines++;if(strstr(lastLog,"init regs"))dumpLines++;return 0;
+}
+#define printf trace
 static unsigned g_cb(unsigned bank) {return bank*0x100;}
-static uint32_t g3_gr(unsigned reg) {assert(reg<0x10000);return regs[reg];}
-static int g3_gw(unsigned reg,uint32_t value) {regs[reg]=value; if(reg==0x807) doorbells++; return 1;}
-static uint32_t g3_sr(unsigned reg) {return sregs[reg/4];}
+static uint32_t g3_gr(unsigned reg) {assert(reg<0x10000);if(reg==readFault)fg_access_failed=1;return regs[reg];}
+static int g3_gw(unsigned reg,uint32_t value) {if(++writeCount==writeFail) {fg_access_failed=1;return 0;} regs[reg]=value; if(reg==0x807) doorbells++; return 1;}
+static uint32_t g3_sr(unsigned reg) {if(sreadFault)fg_access_failed=1;return sregs[reg/4];}
 static int g3_sw(unsigned reg,uint32_t value) {assert(!fg_busy);sregs[reg/4]=value;return 1;}
 static void g_zero(uint64_t pa,unsigned bytes) {assert(pa>=G_MEM && pa+bytes<=G_MEM+G_MEM_SIZE);memset((void *)G_PTR(pa),0,bytes);}
 static uint32_t g3_read(uint64_t pa) {return *(uint32_t *)G_PTR(pa);}
@@ -155,13 +163,17 @@ static void thread_call_setup_with_options(thread_call_data_t *c,void (*fn)(void
 static int thread_call_enter_delayed(thread_call_data_t *c,uint64_t d) {(void)c;(void)d;enqueued++;return 0;}
 '''
 BACKEND_TEST = r'''
-static void reset(void) {
+static void seed(void) {
  memset(scratch,0x5a,sizeof(scratch)); memset(regs,0,sizeof(regs));memset(sregs,0,sizeof(sregs));
- regs[0xe07]=0xfffff000;regs[0xe08]=0x1ffff;regs[0xe0b]=0x1000000;regs[0xe0d]=0x12fffff;regs[0xe01]=3u<<21;
+ regs[0xe07]=regs[0xe09]=0xfffff000;regs[0xe08]=regs[0xe0a]=0x1ffff;regs[0x534]=1;regs[0xe0b]=0x1000000;regs[0xe0d]=0x12fffff;regs[0xe01]=3u<<21;
  sregs[SMMU_ID2/4]=0x5511;
  state=drainGood=1;fg_busy=fg_client_busy=fg_access_failed=0;g3_wptr=0;
  fg_abi_live=fg_abi_seq=fg_abi_completed=fg_abi_poisoned=fg_abi_timed_out=0;
  ticks=tlbs=failTlb=doorbells=enqueued=drains=fault=0;
+ readFault=sreadFault=writeFail=writeCount=logLines=0;
+}
+static void reset(void) {
+ seed();
  assert(fg_abi_init()); assert(fuxi_gpu_abi_available());
 }
 static void complete(void) {
@@ -169,7 +181,43 @@ static void complete(void) {
  regs[0x806]=regs[0x807]=g3_wptr;regs[0x210]=0;
 }
 int main(void) {
+ /* Every mismatch, read failure and MMIO write failure uses the actual init.
+  * The first failure still captures all registers; later attempts never dump.
+  * Refusal must precede table construction and ABI publication. */
+ const unsigned verified[]={0xe07,0xe08,0xe09,0xe0a,0xe0b,0xe0c,0xe0d,0xe0e,0xe01,0x534};
+ const char *names[]={"UCHE_WRITE_THRU_BASE_LO","UCHE_WRITE_THRU_BASE_HI",
+  "UCHE_TRAP_BASE_LO","UCHE_TRAP_BASE_HI","UCHE_GMEM_RANGE_MIN_LO",
+  "UCHE_GMEM_RANGE_MIN_HI","UCHE_GMEM_RANGE_MAX_LO","UCHE_GMEM_RANGE_MAX_HI",
+  "UCHE_MODE_CNTL_HBB","RBBM_NC_MODE_CNTL"};
+ for(unsigned i=0;i<10;i++) {
+  seed();regs[verified[i]]^=i==8 ? 1u<<21 : 1;
+  assert(!fg_abi_init() && !fg_abi_live && !writeCount);
+  assert(strstr(lastLog,"init check") && strstr(lastLog,names[i]) && strstr(lastLog,"got 0x") && strstr(lastLog,"want 0x"));
+  assert(dumpLines==11 && logLines==(i ? 1u : 12u));
+  assert(*(uint64_t *)G_PTR(FG_ABI_PT)==0x5a5a5a5a5a5a5a5aULL);
+ }
+ seed();sregs[SMMU_ID2/4]=0x5501;
+ assert(!fg_abi_init() && strstr(lastLog,"SMMU_ID2_OAS_min got 0x0 want 0x1"));
+ for(unsigned i=0;i<10;i++) {
+  seed();readFault=verified[i];
+  assert(!fg_abi_init() && !writeCount && !fg_abi_live);
+  assert(strstr(lastLog,"register_access got 0x1 want 0x0"));
+ }
+ seed();sreadFault=1;
+ assert(!fg_abi_init() && !writeCount && !fg_abi_live);
+ assert(strstr(lastLog,"register_access got 0x1 want 0x0") && logLines==1);
+ const char *writes[]={"G4_RB_NC","G4_TPL1_NC","G4_SP_NC","G3_APERTURE_HOST_BR",
+  "G4_GRAS_NC_BR","G3_APERTURE_HOST_BV","G4_GRAS_NC_BV","G3_APERTURE_HOST_DEFAULT"};
+ for(unsigned i=0;i<8;i++) {
+  seed();writeFail=i+1;
+  assert(!fg_abi_init() && !fg_abi_live && writeCount==i+1);
+  assert(strstr(lastLog,"init write") && strstr(lastLog,writes[i]) && strstr(lastLog,"failed"));
+  assert(logLines==1 && dumpLines==11);
+  assert(*(uint64_t *)G_PTR(FG_ABI_PT)==0x5a5a5a5a5a5a5a5aULL);
+ }
+ puts("PASS: actual init all register mismatches/read faults/eight write failures, no publication or tables, one-time bounded dump");
  reset();
+ assert(writeCount==8 && !regs[G3_APERTURE_HOST] && !logLines);
  assert(*(uint64_t *)G_PTR(G3_PT)==0x5a5a5a5a5a5a5a5aULL);
  for(uint64_t pa=G5_META_PA;pa<FG_FW_BASE+3*FG_FW_SLOT;pa+=8)
   assert(*(uint64_t *)G_PTR(pa)==0x5a5a5a5a5a5a5a5aULL);

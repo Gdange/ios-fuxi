@@ -1,3 +1,101 @@
+# Metal lane, milestone 2b: identify ABI init failures
+
+2026-10-20, branch `codex-metal2b`. Built in the existing `ci-lane-metal2`
+native tree. All ten host test scripts, the shim host renderer and artifact
+checks pass. This lane did not access a phone or boot this image.
+
+**Observed:** the supplied `ios-0098-metal2a/boot.log` reaches GPU stage 16
+PASS (including zap and clear/copy), then prints ready and
+`FUXI GPU ABI: initialization failed, service withheld`. Execswap runs the
+raw test as pid 84 and again as pid 241. There are no ABI open/query lines.
+The old compound check does not record its failing operand. The root cause
+of that refusal remains unresolved; no register-value correction is claimed.
+
+**Source audit:** `g3_hw_init()` runs before CP startup in both ABI and normal
+boots. It writes the following values using dword-indexed GPU offsets and
+separate 32-bit low/high stores. `g3_sr()` instead takes a byte offset.
+
+| Register | Offset(s) | Programmed / required value |
+| --- | --- | --- |
+| UCHE_WRITE_THRU_BASE | `0xe07/0xe08` | `0xfffff000 / 0x1ffff` |
+| UCHE_TRAP_BASE | `0xe09/0xe0a` | `0xfffff000 / 0x1ffff` |
+| UCHE_GMEM_RANGE_MIN | `0xe0b/0xe0c` | `0x1000000 / 0` |
+| UCHE_GMEM_RANGE_MAX | `0xe0d/0xe0e` | `0x12fffff / 0` (3 MiB, inclusive end) |
+| UCHE_MODE_CNTL | `0xe01` | `0x600000`; bits 22:21 = 3, HBB = 13+3 = 16 |
+| RBBM_NC_MODE_CNTL | `0x534` | `1` (macrotile mode; HBB is in UCHE) |
+| SMMU_ID2 | byte `0x28` | earlier observed `0x5511`, OAS code 1 = 36 bits |
+
+The supplied Linux `a6xx_gpu.c` and `a6xx.xml` agree. Qualcomm's
+[adreno_gen7.c](https://github.com/qualcomm-linux/kgsl/blob/2b2d762c0b843c560d2ae2203f6b3cfe1474fb3f/adreno_gen7.c),
+[register header](https://github.com/qualcomm-linux/kgsl/blob/2b2d762c0b843c560d2ae2203f6b3cfe1474fb3f/gen7_reg.h)
+and [Gen7.2 catalog](https://github.com/qualcomm-linux/kgsl/blob/2b2d762c0b843c560d2ae2203f6b3cfe1474fb3f/adreno-gpulist.h)
+also agree on the offsets, trap/write-through address, 16 MiB GMEM alignment,
+3 MiB size and HBB16. Reference copies remain in ignored `out-fuxi-metal2b/refs`.
+The old ABI verified WRITE_THRU, despite the DeviceInfo text discussing TRAP;
+both are programmed identically. The new snapshot/checks include both pairs.
+No source evidence establishes a read-as-zero mask for these registers, so
+2b retains exact comparisons rather than guessing a mask or rewriting state.
+
+`gpu_probe(16)` reaches `g5_run()`, which exits secure mode and explicitly
+runs `gpu_m4(14)`. That clear/copy path already writes RB/TPL1/SP/GRAS NC
+values `0x816/6/0x26/0x60`, even with the ABI enabled. No later software reset
+or write to the checked UCHE registers was found between `g3_hw_init()` and
+`fg_abi_init()`. `g3_hold_gx()` retains GMU OOB until reset, with no idle
+collapse. Thus missing stage14 setup or a deliberate GX power release is
+not supported by the code/observed stage results. This does not establish
+what each UCHE register actually read back on the failing boot.
+
+The ABI-only writes use the same GPU MMIO window and fault-contained helper
+as stage14. The helper executes `dsb sy` after each access. Host aperture
+`0xa00` uses PIPE bits 13:12, BR=1/BV=2, then restores zero, matching Qualcomm's
+`gen7_host_aperture_set()` / GRAS setup. CP packet protection does not prohibit
+these CPU AHB writes. Init finishes before ready is released to display
+callers. RB/TPL1/SP were already writable during the observed clear/copy;
+the explicit BR/BV GRAS selections still need device qualification.
+
+The diagnostic change is in the canonical backend and regenerated patch
+0098; patch 0100 stays unchanged. On the first init attempt, it takes one
+snapshot of all ten GPU registers plus SMMU_ID2 before any comparison. It
+prints eleven `FUXI GPU ABI: init regs ...` lines, then at most one named
+`init check <name> got 0x... want 0x...` or
+`init write <reg> [0x...]=0x... failed` line. The existing service-withheld
+line follows failure. There is no retry or periodic dump. Access failures
+have a separate `register_access` check; raw snapshot values following a
+fault must not be treated as valid hardware facts. The first mismatch still
+stops setup, and publication/table construction stay behind all checks.
+
+Host coverage injects every register mismatch, GPU and SMMU read failures,
+and each of the eight write failures into the actual C init function. It
+checks the named reason, one-time dump cap, and untouched tables/unpublished
+service after refusal. Existing PM4, mapping, async present, watchdog,
+quarantine, execswap, governor, root-tool and SCM regressions pass. Artifact
+checks verify the linked native recovery/SCM code, exact metal2a ADT and
+cmdline, boot geometry, existing signed raw tool and all pinned firmware.
+All 32 recorded native inputs match metal2a except the intended backend edit.
+These are host tests; raw IB/readback and service publication are unproven.
+
+Repack using the normal private loader/toolchain environment, after copying
+the native kernels into `xnu/out-fuxi-metal2b`:
+
+```sh
+bash tools/build-fuxi-metal2-images.sh "$METAL2A_ARTIFACTS" metal2b
+python3 tools/test-fuxi-metal-artifacts.py --lane metal2b \
+  --base "$METAL2A_ARTIFACTS" --out xnu/out-fuxi-metal2b
+```
+
+Outputs and build/test logs: `xnu/out-fuxi-metal2b/`. Image:
+`shim/out/fuxi-metal2b-boot.img`, SHA256
+`0d0cb22d70c78380baab5fef91efb7a84f31eb5c2971a0943ad915b9be32f172`.
+`SHA256SUMS` records the kernel, ADT, payload, image, loader and raw tool.
+
+Expected next device output: eleven named raw-register lines, followed by
+the precise failing check/write and service withheld if the failure repeats.
+If all checks/writes pass, expect `FUXI GPU ABI: NativeAdrenoGpuPublished v1`
+and then the existing bounded `FUXI ABI:` open/query/submit/wait/result trace.
+Do not treat that success path as an observed 2b result.
+
+---
+
 # Metal lane, milestone 2a: route the existing raw test and observe it
 
 2026-10-20, branch `codex-metal2`, base `b978770` (0098i integration plus
