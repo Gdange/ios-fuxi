@@ -246,6 +246,11 @@ def decode_m6(r):
         code = r[32 + step]
         if code:
             state = 'OK' if code == (0x1000 | step) else f'FAIL reason {code & 255}'
+            if code != (0x1000 | step) and step == 17 and (code & 255) == 5:
+                reason = {0: 'detail unavailable (M6)', 1: 'config/offset unproven',
+                          2: 'table in use (bypass clear)', 3: 'MSI/other user unproven',
+                          4: 'table zero readback', 5: 'mapping/bypass readback'}.get(r[25], 'unknown')
+                state += f' RC route: {reason}'
             lines.append(f'  step {step} {state} {name}; CB FSR={r[96 + step - 17]:#x}')
     lines.append(f'  SMMU IDR0={r[5]:#x} IDR1={r[6]:#x} IDR2={r[7]:#x} '
                  f'SMR={r[8]} CB={r[9]} (selection valid only after successful step 17)')

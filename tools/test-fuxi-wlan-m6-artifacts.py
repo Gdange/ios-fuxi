@@ -26,20 +26,41 @@ def sections(elf):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument('--milestone', choices=('m6', 'm6b'), default='m6')
     args = parser.parse_args()
     root = args.root
-    out, old = root / 'xnu/out-fuxi-wlan6', root / 'xnu/out-fuxi-wlan5'
+    lane = 'wlan6b' if args.milestone == 'm6b' else 'wlan6'
+    out, old = root / f'xnu/out-fuxi-{lane}', root / 'xnu/out-fuxi-wlan5'
     shim = root / 'shim/out'
     adt, cmdline = (out / 'fuxi.adt').read_bytes(), (out / 'cmdline.txt').read_text().strip()
     assert adt == (old / 'fuxi.adt').read_bytes(), 'M5 ADT must remain byte-identical'
     assert cmdline == (old / 'cmdline.txt').read_text().strip(), 'M5 boot arguments changed'
     assert cmdline.split().count('fuxiwlan=1') == 1 and len(cmdline.encode()) < 608
-    payload = (shim / 'fuxi-wlan-m6-payload.bin').read_bytes()
+    verify_variant(root, out, old, args.milestone, '', 1)
+    if args.milestone == 'm6b':
+        verify_variant(root, out, old, args.milestone, '-s20', 20)
+    for line in (out / 'SHA256SUMS').read_text().splitlines():
+        digest, filename = line.split(maxsplit=1)
+        assert hashlib.sha256((root / filename).read_bytes()).hexdigest() == digest
+    print(args.milestone, 'all manifest hashes verified')
+
+
+def verify_variant(root, out, old, milestone, suffix, limit):
+    shim = root / 'shim/out'
+    adt = (out / 'fuxi.adt').read_bytes()
+    cmdline = (out / f'cmdline{suffix}.txt').read_text().strip()
+    expected = (old / 'cmdline.txt').read_text().strip().split()
+    expected[expected.index('fuxiwlan=1')] = f'fuxiwlan={limit}'
+    assert cmdline.split() == expected and len(cmdline.encode()) < 608
+    stem = f'fuxi-wlan-{milestone}{suffix}'
+    payload = (shim / f'{stem}-payload.bin').read_bytes()
     rebuilt, _ = mkpayload.build(out / 'kernel.development.fuxi', out / 'fuxi.adt', cmdline)
     assert payload == rebuilt, 'payload differs from packed kernel/ADT/cmdline'
     assert struct.unpack_from('<QQ', payload, 56) == (0x8c0000000, 0x13e000000)
     assert b'M6 apps_smmu' in payload and b'SMMU owned stage1' in payload
-    elf = (shim / 'fuxi-wlan-m6-loader.elf').read_bytes()
+    if milestone == 'm6b':
+        assert b'M6b RC bypassed table zeroed' in payload and b'RC table in use' in payload
+    elf = (shim / f'{stem}-loader.elf').read_bytes()
     sec = sections(elf)
     assert sec['.payload'][1] == payload
     gpu = sec['.gpu_fw'][1]
@@ -53,7 +74,7 @@ def main():
     for size, digest in sizes_hashes:
         assert hashlib.sha256(gpu[offset:offset + size]).hexdigest() == digest
         offset += size
-    boot = (shim / 'fuxi-wlan-m6-boot.img').read_bytes()
+    boot = (shim / f'{stem}-boot.img').read_bytes()
     old_boot = (shim / 'fuxi-wlan-m5-boot.img').read_bytes()
     assert boot[:8] == b'ANDROID!' and struct.unpack_from('<I', boot, 40)[0] == 4
     kernel_size, ramdisk_size, os_version, header_size = struct.unpack_from('<IIII', boot, 8)
@@ -68,10 +89,7 @@ def main():
         address, data = sec[name]
         assert image[address:address + len(data)] == data
     assert not any(boot[4096 + kernel_size:])
-    for line in (out / 'SHA256SUMS').read_text().splitlines():
-        digest, filename = line.split(maxsplit=1)
-        assert hashlib.sha256((root / filename).read_bytes()).hexdigest() == digest
-    print('M6 artifacts: kernel/payload/ELF/boot match; M5 ADT/cmdline/header preserved; .gpu_fw 0x25ac8 and all hashes verified')
+    print(stem, 'artifacts: kernel/payload/ELF/boot match; M5 ADT/cmdline/header preserved; .gpu_fw 0x25ac8 and all hashes verified')
     print('boot SHA256', hashlib.sha256(boot).hexdigest())
 
 

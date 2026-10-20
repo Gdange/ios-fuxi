@@ -631,7 +631,8 @@ referenced banks are never written. Vacancy and ASID checks repeat after VFS
 and allocation sleeps, immediately before programming. There is no general
 apps-SMMU allocator in XNU; this is a single boot-thread ownership protocol.
 
-The RC table is checked independently: CRC8 polynomial `0x07` over RID bytes
+The original M6 RC policy below is superseded by **M6b**. It checked the table
+independently: CRC8 polynomial `0x07` over RID bytes
 `01 00` yields slot `0x15`, and the bounded chain must resolve uniquely to
 relative SID 1. SID_OFFSET must be zero. An existing enabled correct route
 is retained. If the **entire 256-entry table is empty**, the driver owns only
@@ -814,3 +815,115 @@ are byte-identical (apart from the boot header kernel-size field).
 The complete seven-file manifest is in the ignored M6 output directory.
 No firmware, captured device console, private input path or host address is
 part of this change. These build/host results do not establish device DMA.
+
+## Milestone 6b — initialize the bypassed RC SID table
+
+The coordinator's M6 run reached step 17 after steps 1–16 passed, then refused
+a populated RC table with bypass still enabled. The SMMU scan selected an
+unreferenced stream/context; no SMMU programming or endpoint DMA occurred.
+The failure was the RC table guard, followed by clean containment and buffer
+cleanup. M6's requirement for an already-zero reset table was too strict:
+contents are undefined while the table is bypassed.
+
+### Encoding and ownership
+
+Linux v6.12's
+[qcom_pcie_config_sid_1_9_0](https://github.com/torvalds/linux/blob/v6.12/drivers/pci/controller/dwc/pcie-qcom.c)
+zeros all 256 words, hashes the big-endian BDF with MSB CRC8 polynomial `0x07`,
+and encodes `BDF << 16 | (SID - iommu-map base) << 8 | next`.
+The [SM8550 PCIe0 DT](https://github.com/torvalds/linux/blob/v6.12/arch/arm64/boot/dts/qcom/sm8550.dtsi)
+maps root BDF 0 to SID `0x1400` and endpoint BDF `0x100` to `0x1401`, both
+length 1. This agrees with the saved live/vendor DT's base `0x1400`.
+The [downstream PCIe driver](https://android.googlesource.com/kernel/msm/+/41d4470112f489d6824ada4cf0a04587c6f4555d/drivers/pci/controller/pci-msm.c)
+also computes its table SID by subtracting `qcom,smmu-sid-base` from the SMMU
+SID. Thus the table contains **relative SID 1**, not absolute SID `0x1401`.
+The expected SMMU-visible endpoint SID is base `0x1400` plus offset 1.
+This follows the source/DT contract; successful endpoint DMA remains the
+hardware proof and has not been measured for M6b.
+
+| RID | CRC8 slot | SID offset | Table word | Expected SMMU SID |
+|---|---|---|---|---|
+| `0` | `0` | `0` | `0` | `0x1400` |
+| `0x100` | `0x15` | `1` | `0x01000100` | `0x1401` |
+
+The zero root entry is Linux's encoding, including NEXT=0. It is retained
+explicitly by the full-table zero/readback and checked again before SMMU
+programming and BME. These two BDFs do not collide, so no chain is needed.
+The root SID gets no new SMMU stream or context; only endpoint SID `0x1401`
+is translated by this driver. SID_OFFSET must remain zero and is never written.
+
+Step 17 now requires CFG bit 0 **set**, endpoint BME off, disabled MSI/MSI-X
+capabilities on root and endpoint, and zero DWC MSI vector enables in all
+eight blocks (`DBI+0x828+12*n`). Invalid, cyclic or inaccessible capability
+chains also refuse ownership. CFG bit 0 clear refuses **every** table,
+including an empty table or an apparently correct existing endpoint route.
+The old M6 route-adoption behavior is removed.
+
+With these prerequisites, claim the entire bypassed table, zero all 256
+entries, and verify every word. Install and verify the endpoint word at
+PARF `+0x2054`, keep root slot 0 zero, then clear CFG bit 0 **last**, preserving
+all other CFG bits. Power-on garbage is discarded rather than restored.
+Only a successfully installed route permits step 20's SMMU programming.
+The entire table, CFG and SID_OFFSET are checked before allocation of SMMU
+tables, immediately before SMMU writes after any sleeps, and before step 21 BME.
+
+After endpoint containment and the existing SMMU undo, RC undo restores and
+verifies saved CFG with bypass set **before** clearing any owned table word.
+It then zeros/verifies all 256 words, including partial scrub/install failures.
+A failed bypass restore leaves the table untouched; failed undo quarantines
+allocations. Successful step-20 bisection also performs this complete undo.
+
+Step 17 still maps any RC failure to reason 5 (`0x1105`); this is unrelated
+to step 20 reason 5's SMMU sync/enable path. A named `RC route refused` line
+and report word 25 now preserve the RC subreason; the offline decoder labels it:
+
+| RC subreason | Meaning |
+|---|---|
+| 1 | Config/offset inaccessible, unsupported or changed |
+| 2 | Table in use: bypass clear |
+| 3 | MSI/other user active or capability chain unproven |
+| 4 | Full-table zero readback failed |
+| 5 | Entry or bypass-clear readback failed |
+
+### Build, host verification and expected lines
+
+Linux and native-Mac ASan/UBSan suites passed. They cover bypassed garbage
+(including duplicate RID bits), refusal of active/nonempty and active/empty
+tables, MSI/MSI-X and DWC vector users, all-word zero verification, install and
+CFG readback failures, route changes before SMMU writes, bypass-first undo,
+and failed-undo retry. Both C files embedded in patch 0099 match their source.
+The native kernel build passed in the dedicated `ci-lane-wlan` tree.
+
+`tools/build-fuxi-wlan6b-images.sh BASE_METAL2A_ARTIFACT_DIR` consumes kernels
+in `xnu/out-fuxi-wlan6b/` and the same required absolute-path firmware/toolchain
+environment as M6. It packs two images from the same kernel and ADT: full
+`fuxiwlan=1` and pre-DMA `fuxiwlan=20` (474/475-byte command lines).
+`python3 tools/test-fuxi-wlan-m6-artifacts.py --milestone m6b` passed for both:
+payload reconstruction, embedded ELF/boot bytes, base ADT/header, command-line
+limits, pinned firmware hashes and `.gpu_fw` size `0x25ac8`.
+The eleven-file manifest is `xnu/out-fuxi-wlan6b/SHA256SUMS`.
+
+| Artifact | SHA256 |
+|---|---|
+| `shim/out/fuxi-wlan-m6b-boot.img` | `4fac2e4687731c4cd2c1a336cb42146da333134034bd7685a9d3f05844cf78de` |
+| `shim/out/fuxi-wlan-m6b-s20-boot.img` | `78897e6a63e20121f58c622a6feb436e7985ba528e0cbed4505b1b298a5b9c79` |
+| `xnu/out-fuxi-wlan6b/kernel.development.fuxi` | `9be8866b2a115959993ff3d9d1e6de4286ba60832644ddaf254363d07331cc85` |
+
+Coordinator: use the **s20 image first** on a fresh boot. Expected templates:
+
+```text
+FUXI WLAN: M6b RC bypassed table zeroed 256 entries, readback verified; MSI idle
+FUXI WLAN: M6b RC route installed: RID 0 -> DT SID 0x1400 offset 0 slot 0; RID 0x100 -> DT SID 0x1401 offset 1 slot 0x15 entry 0x1000100; bypass clear last
+FUXI WLAN: step 17 ok code 0x1011 (... ms, faults 0)
+FUXI WLAN: SMMU owned stage1 SMR ... CB ... TTBR ... IOVA ... readback verified
+FUXI WLAN: step 20 ok code 0x1014 (... ms, faults 0)
+FUXI WLAN: SMMU undo SMR invalid, S2CR restored, CB disabled, TLBI synced
+FUXI WLAN: M6b RC undo bypass restored first, 256 owned entries zeroed
+FUXI WLAN: abort buffers freed
+```
+
+The s20 image must show no BHI doorbell or bus-master-on line. Check all CB
+fault snapshots and cleanup before continuing with fresh-boot limits 21–28
+and finally the full image. On a pre-existing active table expect
+`RC route refused: RC table in use (bypass clear)` and step 17 `0x1105`,
+with no table/SMMU programming. No M6b phone run was performed by this lane.

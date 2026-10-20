@@ -54,6 +54,7 @@ typedef void *event_t;
 #define UIO_SYSSPACE 0
 #define WL_BAR0 0x60400000ull
 #define WL_EPCFG 0x60100000ull
+#define WL_DBI 0x60000000ull
 #define WL_PARF 0x1c00000ull
 #define TS_TLMM 0xf100000ull
 static uint32_t wl4_report[64], fw_faults;
@@ -161,7 +162,7 @@ static void init(void) {
     high_memory=noncontig=fail_alloc=tlb_busy=mismatch=inject_fault=false; open_error=read_resid=0;
     fw_faults=0; wl_mhi_valid=false;
     memset(&wl_image,0,sizeof(wl_image)); memset(&wl_vectors,0,sizeof(wl_vectors));
-    memset(&wl_tables,0,sizeof(wl_tables)); wl_owned=wl_enabled=wl_route_owned=false; wl_iova_next=WL_IOVA;
+    memset(&wl_tables,0,sizeof(wl_tables)); wl_owned=wl_enabled=wl_route_owned=wl_route_installed=false; wl_iova_next=WL_IOVA;
     memset(&wl_contexts,0,sizeof(wl_contexts)); memset(wl5_report,0,sizeof(wl5_report));
     memset(fixture,0,sizeof(fixture)); file_size=sizeof(fixture);
     memcpy(fixture,"\177ELF\1\1\1",7);
@@ -174,6 +175,7 @@ static void init(void) {
     setreg(WL_BAR0+0x268,0xcab04cf5); /* undefined before first BHIe DB */
     setreg(WL_BAR0+0x20,0x700); setreg(WL_EPCFG+4,0x100002);
     setreg(TS_TLMM+0x1000*94+4,2);
+    setreg(WL_PARF+0x2c00,1); /* bypass: table may contain undefined reset data */
 }
 static void release(void) { wl_dma_free(&wl_tables); wl_dma_free(&wl_contexts); wl_dma_free(&wl_vectors); wl_dma_free(&wl_image); }
 static uint64_t walk(uint64_t addr) {
@@ -220,6 +222,7 @@ int main(void) {
     int bme=findwrite(WL_EPCFG+4,0x406,0);
     int bhi=findwrite(WL_BAR0+0x118,0x12345,0);
     assert(bme>0 && bhi>bme);
+    assert(findwrite(0x15081000,0,0)>findwrite(WL_PARF+0x2c00,0,0));
     bool cleaned=false; for(int i=0;i<bme;i++) if(events[i].kind=='C') cleaned=true; assert(cleaned);
     assert(findwrite(WL_BAR0+0x10c,0,0)<findwrite(WL_BAR0+0x108,wl_image.iova,0));
     assert(findwrite(WL_BAR0+0x64,0,0)<findwrite(WL_BAR0+0x60,wl_contexts.iova+WL_ECTX,0));
@@ -258,9 +261,70 @@ int main(void) {
     init(); setreg(WL_SMMU,1); assert(wl5_step(17)==1 && ne==0);
     init(); setreg(WL_SMMU,8); assert(wl5_step(17)==1 && ne==0);
     init(); setreg(WL_SMMU+0x28,0); assert(wl5_step(17)==1 && ne==0);
-    init(); setreg(WL_PARF+0x234,1); assert(wl5_step(17)==5 && ne==0);
-    init(); setreg(WL_PARF+0x2054,0x01000200); assert(wl5_step(17)==5 && ne==0);
-    init(); setreg(WL_PARF+0x2054,0x01000100); assert(wl5_step(17)==0 && ne==0);
+    init(); setreg(WL_PARF+0x234,1); assert(wl5_step(17)==5 && wl5_report[25]==1 && ne==0);
+    /* M6b: bypassed garbage is not an active table, even duplicate RID bits. */
+    init(); setreg(WL_PARF+0x2c00,0xa5);
+    for(unsigned i=0;i<256;i++) setreg(WL_PARF+0x2000+4*i,0x0100ffff);
+    assert(wl_rc_hash(0)==0 && wl_rc_hash(0x100)==0x15);
+    assert(wl5_step(17)==0 && wl_route_installed && wl_prd(WL_PARF+0x2c00)==0xa4);
+    assert(ne==258); /* 256 zero writes, endpoint mapping, then bypass clear */
+    for(unsigned i=0;i<256;i++) {
+        assert(events[i].pa==WL_PARF+0x2000+4*i && events[i].v==0);
+        assert(wl_prd(WL_PARF+0x2000+4*i)==(i==0x15?0x01000100:0));
+    }
+    assert(events[256].pa==WL_PARF+0x2054 && events[256].v==0x01000100);
+    assert(events[257].pa==WL_PARF+0x2c00 && events[257].v==0xa4);
+    unsigned undo_start=ne; wl5_abort(17);
+    int bypass=findwrite(WL_PARF+0x2c00,0xa5,undo_start);
+    assert(bypass>findwrite(TS_TLMM+0x1000*94+4,0,undo_start));
+    for(unsigned i=0;i<256;i++) {
+        assert(findwrite(WL_PARF+0x2000+4*i,0,undo_start)>bypass);
+        assert(wl_prd(WL_PARF+0x2000+4*i)==0);
+    }
+    assert(!wl_route_owned && !wl_route_installed);
+    /* Never adopt or modify a table already in use, even a correct/empty one. */
+    const uint32_t active_entries[]={0xddb37e73,0x01000200,0x01000100,0};
+    for(unsigned i=0;i<4;i++) {
+        init(); setreg(WL_PARF+0x2c00,0); setreg(WL_PARF+0x2054,active_entries[i]);
+        assert(wl5_step(17)==5 && wl5_report[25]==2 && ne==0 && !wl_route_owned);
+    }
+    /* Existing MSI users or malformed capability chains forbid the scrub. */
+    for(unsigned c=0;c<2;c++) for(unsigned msix=0;msix<2;msix++) {
+        init(); uint64_t cfg=c?WL_EPCFG:WL_DBI;
+        setreg(cfg+0x34,0x40); setreg(cfg+0x40,msix?0x80000011:0x10005);
+        assert(wl5_step(17)==5 && wl5_report[25]==3 && ne==0);
+    }
+    for(unsigned i=0;i<8;i++) {
+        init(); setreg(WL_DBI+0x828+12*i,1);
+        assert(wl5_step(17)==5 && wl5_report[25]==3 && ne==0);
+    }
+    init(); setreg(WL_EPCFG+0x34,0x40); setreg(WL_EPCFG+0x40,0x4001);
+    assert(wl5_step(17)==5 && wl5_report[25]==3 && ne==0);
+    init(); setreg(WL_EPCFG+4,6); assert(wl5_step(17)==4 && ne==0);
+    /* Scrub must verify every entry before installing or enabling lookup. */
+    init(); mismatch=true; mismatch_pa=WL_PARF+0x23fc; setreg(mismatch_pa,0xdeadbeef);
+    assert(wl5_step(17)==5 && wl5_report[25]==4 && !wl_route_installed);
+    assert(findwrite(WL_PARF+0x2054,0x01000100,0)<0 && wl_prd(WL_PARF+0x2c00)==1);
+    mismatch=false; wl5_abort(17); assert(!wl_route_owned && !wl_prd(mismatch_pa));
+    const uint64_t route_mismatch[]={WL_PARF+0x2054,WL_PARF+0x2c00};
+    for(unsigned i=0;i<2;i++) {
+        init(); mismatch=true; mismatch_pa=route_mismatch[i];
+        assert(wl5_step(17)==5 && wl5_report[25]==5 && !wl_route_installed && !wl_owned);
+        mismatch=false; wl5_abort(17); assert(wl_prd(WL_PARF+0x2c00)==1 && !wl_prd(WL_PARF+0x2054));
+    }
+    /* Failed bypass restore must leave entries intact; retry completes cleanup. */
+    init(); assert(wl5_step(17)==0); mismatch=true; mismatch_pa=WL_PARF+0x2c00;
+    undo_start=ne; wl5_abort(17);
+    assert(wl_route_owned && wl_prd(WL_PARF+0x2054)==0x01000100);
+    assert(findwrite(WL_PARF+0x2000,0,undo_start)<0);
+    mismatch=false; wl5_abort(17); assert(!wl_route_owned);
+    /* No SMMU writes until a verified route exists, including late changes. */
+    init(); assert(wl_smmu_enable()==3 && ne==0 && allocations==0);
+    init(); for(unsigned s=17;s<20;s++) assert(wl5_step(s)==0);
+    setreg(WL_PARF+0x2000,1); undo_start=ne;
+    assert(wl5_step(20)==3 && !wl_owned && !wl_enabled);
+    for(unsigned i=undo_start;i<ne;i++) assert(events[i].pa<WL_SMMU || events[i].pa>=WL_SMMU+0x100000);
+    wl5_abort(20); assert(frees==3);
     /* Changed ownership, readback mismatch, timeout and latched DMA fault. */
     init(); for(unsigned s=17;s<20;s++) assert(wl5_step(s)==0);
     setreg(WL_SMMU+0x800,0x80001111); assert(wl5_step(20)==3); wl5_abort(20);
@@ -351,6 +415,9 @@ def main():
     added = patch.split('+++ b/bsd/dev/fuxi_wlan.c\n', 1)[1].split('\n--- a/', 1)[0]
     reconstructed = '\n'.join(line[1:] for line in added.splitlines() if line.startswith('+')) + '\n'
     assert reconstructed == driver, 'integration patch and standalone WLAN C differ'
+    included = patch.split('+++ b/bsd/dev/wlan.c\n', 1)[1]
+    reconstructed = '\n'.join(line[1:] for line in included.splitlines() if line.startswith('+')) + '\n'
+    assert reconstructed == (ROOT / 'shim/fuxi-probe/wlan.c').read_text(), 'included M3 source differs'
     block = driver.split('/* ---- milestone 5:', 1)[1].split('static void\nfw_dump(', 1)[0]
     block = '/* ---- milestone 5:' + block
     block = re.sub(r'__asm__ volatile\([^;]+;', '/* host memory barrier */;', block)
@@ -398,6 +465,10 @@ def main():
         failed = [0] * 128
         failed[2], failed[49] = 17, (17 << 8) | 1
         assert 'FAIL reason 1' in probe.decode_m6(failed)
+        failed[49], failed[25] = 0x1105, 2
+        assert 'RC route: table in use (bypass clear)' in probe.decode_m6(failed)
+        failed[25] = 4
+        assert 'RC route: table zero readback' in probe.decode_m6(failed)
         r[0], r[2], r[3], r[49] = 0x574c0005, 17, 0x1103, 0x1103
         r[11] = r[15] = 2
         assert 'SID 0x1401 type=FAULT' in probe.decode_m5(r)

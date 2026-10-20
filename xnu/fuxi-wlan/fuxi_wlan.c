@@ -430,9 +430,9 @@ static struct wl_dma wl_image, wl_vectors, wl_contexts, wl_tables;
 static uint64_t wl_iova_next = WL_IOVA, wl_cb_base, wl_gr1;
 static unsigned wl_slot, wl_cb, wl_smr_count, wl_cb_count, wl_pgshift;
 static uint32_t wl_old_smr, wl_old_s2cr, wl_old_sctlr;
-static uint32_t wl_route_cfg, wl_route_entry;
+static uint32_t wl_route_cfg;
 static unsigned wl_route_hash;
-static bool wl_owned, wl_enabled, wl_route_owned;
+static bool wl_owned, wl_enabled, wl_route_owned, wl_route_installed;
 static int wl_contain_wr(uint64_t, uint32_t);
 static int wl_smmu_fault(unsigned);
 /* Packed MHI contexts are 44 bytes; the old research note's 40 was wrong. */
@@ -532,51 +532,94 @@ wl5_status(unsigned step)
 	    r[65] & 1, r[66], r[67], r[68], r[69], r[70], r[71], r[72], r[73]);
 }
 
-/* DT: PCIe0 qcom,smmu-sid-base=0x1400; RID 0x100 -> SID 0x1401,
- * length 1; no iommu-map-mask override, no wildcard SMMU mask (mask=0).
- * Own only a vacant endpoint lookup entry. Never rewrite a collision chain,
- * SID_OFFSET, a populated entry, or an enabled route belonging to another RID. */
+/* Linux qcom_pcie_config_sid_1_9_0: CRC8/MSB over big-endian BDF,
+ * BDF[31:16] | (SID - first iommu-map SID)[15:8] | NEXT[7:0].
+ * PCIe0's DT base is 0x1400, so offsets 0/1 mean SIDs 0x1400/0x1401.
+ * RID 0 hashes to 0 and encodes as zero; RID 0x100 hashes to 0x15.
+ * Own the whole table only while bypassed and with no other user evident. */
+#define WL_RC_ENTRY 0x01000100u
+static unsigned
+wl_rc_hash(uint16_t rid)
+{
+	unsigned hash = 0;
+	for (unsigned byte = 0; byte < 2; byte++) {
+		hash ^= (rid >> (byte ? 0 : 8)) & 255;
+		for (unsigned bit = 0; bit < 8; bit++) {
+			hash = ((hash << 1) ^ ((hash & 0x80) ? 7 : 0)) & 255;
+		}
+	}
+	return hash;
+}
+
+/* Read-only capability walk: never disable an existing user to claim a table. */
+static int
+wl_rc_irqs_busy(uint64_t cfg)
+{
+	unsigned p = wl_prd(cfg + 0x34) & 255;
+	for (unsigned i = 0; p && i < 48; i++) {
+		if (p < 0x40 || p > 0xfc || (p & 3)) { return 1; }
+		uint32_t cap = wl_prd(cfg + p);
+		if (((cap & 255) == 5 && (cap & (1u << 16))) ||
+		    ((cap & 255) == 0x11 && (cap & (1u << 31)))) { return 1; }
+		p = (cap >> 8) & 255;
+	}
+	return p || fw_faults;
+}
+
+static int
+wl_rc_fail(unsigned reason, const char *name)
+{
+	wl5_report[25] = reason;
+	printf("FUXI WLAN: RC route refused: %s (route reason %u; step 17 reason 5)\n", name, reason);
+	return (int)reason;
+}
+
+static int
+wl_rc_check(void)
+{
+	if (!wl_route_installed || !wl_route_owned ||
+	    wl_prd(WL_PARF + 0x2c00) != (wl_route_cfg & ~1u) || wl_prd(WL_PARF + 0x234)) { return 1; }
+	for (unsigned i = 0; i < 256; i++) {
+		if (wl_prd(WL_PARF + 0x2000 + 4 * i) != (i == wl_route_hash ? WL_RC_ENTRY : 0)) { return 1; }
+	}
+	return !!fw_faults;
+}
+
 static int
 wl_rc_route(void)
 {
 	wl_route_cfg = wl_prd(WL_PARF + 0x2c00);
 	uint32_t offset = wl_prd(WL_PARF + 0x234);
-	unsigned hash = 0;
-	for (unsigned byte = 0; byte < 2; byte++) {
-		hash ^= byte ? 0 : 1;
-		for (unsigned bit = 0; bit < 8; bit++) {
-			hash = ((hash << 1) ^ ((hash & 0x80) ? 7 : 0)) & 255;
-		}
+	wl_route_hash = wl_rc_hash(0x100);
+	uint32_t entry = wl_prd(WL_PARF + 0x2000 + 4 * wl_route_hash);
+	wl5_report[22] = wl_route_cfg; wl5_report[23] = offset; wl5_report[24] = entry;
+	printf("FUXI WLAN: RC RID 0x100 SID cfg %#x offset %#x hash %#x entry %#x\n",
+	    wl_route_cfg, offset, wl_route_hash, entry);
+	if (fw_faults || offset || wl_route_cfg == ~0u) { return wl_rc_fail(1, "RC config/offset inaccessible or unsupported"); }
+	if (!(wl_route_cfg & 1)) { return wl_rc_fail(2, "RC table in use (bypass clear)"); }
+	if (wl_rc_irqs_busy(WL_DBI) || wl_rc_irqs_busy(WL_EPCFG) || (wl_prd(WL_EPCFG + 4) & 4)) {
+		return wl_rc_fail(3, "MSI/MSI-X or endpoint bus master active, or capability chain unproven");
 	}
-	wl_route_hash = hash;
-	bool route = false, empty = true;
-	unsigned matches = 0;
+	/* DWC supports up to eight blocks of 32 MSI vectors. All must be idle. */
+	for (unsigned i = 0; i < 8; i++) {
+		if (wl_prd(WL_DBI + 0x828 + 12 * i)) { return wl_rc_fail(3, "RC MSI vectors enabled"); }
+	}
+	if (fw_faults || wl_prd(WL_PARF + 0x2c00) != wl_route_cfg) { return wl_rc_fail(1, "RC config changed before claim"); }
+	wl_route_owned = true; /* includes partial scrub/install; never restore garbage */
+	for (unsigned i = 0; i < 256; i++) { wl_pwr(WL_PARF + 0x2000 + 4 * i, 0); }
 	for (unsigned i = 0; i < 256; i++) {
-		uint32_t v = wl_prd(WL_PARF + 0x2000 + 4 * i);
-		if (v) { empty = false; }
-		if ((v >> 16) == 0x100) { matches++; }
+		if (wl_prd(WL_PARF + 0x2000 + 4 * i) || fw_faults) { return wl_rc_fail(4, "RC table zero readback"); }
 	}
-	unsigned next = hash;
-	for (unsigned i = 0; i < 256; i++) {
-		uint32_t v = wl_prd(WL_PARF + 0x2000 + 4 * next);
-		if ((v >> 16) == 0x100) { route = ((v >> 8) & 255) == 1; wl_route_hash = next; break; }
-		if (!(v & 255)) { break; }
-		next = v & 255;
-	}
-	wl_route_entry = wl_prd(WL_PARF + 0x2000 + 4 * hash);
-	wl5_report[22] = wl_route_cfg; wl5_report[23] = offset; wl5_report[24] = wl_route_entry;
-	printf("FUXI WLAN: RC RID 0x100 SID cfg %#x offset %#x hash %#x entry %#x matches %u\n",
-	    wl_route_cfg, offset, hash, wl_route_entry, matches);
-	if (fw_faults || offset || wl_route_cfg == ~0u || matches > 1) { return 1; }
-	if (route && !(wl_route_cfg & 1) && matches == 1) { return 0; }
-	/* Reset RC: only install when the entire table is empty. */
-	if (!empty) { return 2; }
-	wl_route_owned = true;
-	wl_pwr(WL_PARF + 0x2000 + 4 * hash, 0x01000100);
-	if (wl_prd(WL_PARF + 0x2000 + 4 * hash) != 0x01000100 || fw_faults) { return 3; }
+	printf("FUXI WLAN: M6b RC bypassed table zeroed 256 entries, readback verified; MSI idle\n");
+	/* Root RID 0 -> offset 0 is already installed by the verified zero at slot 0. */
+	wl_pwr(WL_PARF + 0x2000 + 4 * wl_route_hash, WL_RC_ENTRY);
+	if (wl_prd(WL_PARF + 0x2000 + 4 * wl_route_hash) != WL_RC_ENTRY ||
+	    wl_prd(WL_PARF + 0x2000) || fw_faults) { return wl_rc_fail(5, "RC mapping readback"); }
+	/* Enable lookup last, preserving every other CFG bit. */
 	wl_pwr(WL_PARF + 0x2c00, wl_route_cfg & ~1u);
-	if (wl_prd(WL_PARF + 0x2c00) != (wl_route_cfg & ~1u) || fw_faults) { return 3; }
-	printf("FUXI WLAN: RC owned empty RID slot %#x -> DT SID 0x1401 (mask 0)\n", hash);
+	if (wl_prd(WL_PARF + 0x2c00) != (wl_route_cfg & ~1u) || fw_faults) { return wl_rc_fail(5, "RC bypass clear readback"); }
+	wl_route_installed = true;
+	printf("FUXI WLAN: M6b RC route installed: RID 0 -> DT SID 0x1400 offset 0 slot 0; RID 0x100 -> DT SID 0x1401 offset 1 slot %#x entry %#x; bypass clear last\n", wl_route_hash, WL_RC_ENTRY);
 	return 0;
 }
 
@@ -686,6 +729,7 @@ wl_pt_pa(unsigned table)
 static int
 wl_smmu_enable(void)
 {
+	if (wl_rc_check()) { return 3; }
 	if (wl_dma_alloc(&wl_tables, 10 * 4096)) { return 1; }
 	uint64_t *root = (uint64_t *)wl_tables.va;
 	uint64_t *l2 = (uint64_t *)(wl_tables.va + 4096);
@@ -720,7 +764,7 @@ wl_smmu_enable(void)
 			    (wl_prd(wl_cb_addr(i) + 0x2c) >> 16) == wl_cb) { return 3; }
 		}
 	}
-	if (fw_faults || wl_prd(WL_SMMU) != wl5_report[4]) { return 3; }
+	if (fw_faults || wl_prd(WL_SMMU) != wl5_report[4] || wl_rc_check()) { return 3; }
 	uint64_t cb = wl_cb_addr(wl_cb), ttbr = wl_pt_pa(0) | ((uint64_t)wl_cb << 48);
 	wl_owned = true; /* includes partial setup: abort must disable and sync */
 	if (wl_smmu_wr(cb, 0) ||
@@ -779,9 +823,15 @@ wl_smmu_undo(void)
 		printf("FUXI WLAN: SMMU undo SMR invalid, S2CR restored, CB disabled, TLBI synced\n");
 	}
 	if (wl_route_owned) {
-		if (wl_contain_wr(WL_PARF + 0x2c00, wl_route_cfg) || wl_prd(WL_PARF + 0x2c00) != wl_route_cfg ||
-		    wl_contain_wr(WL_PARF + 0x2000 + 4 * wl_route_hash, wl_route_entry) || wl_prd(WL_PARF + 0x2000 + 4 * wl_route_hash) != wl_route_entry) { return 1; }
+		/* Restore bypass before touching any owned entry, including partial setup. */
+		if (wl_contain_wr(WL_PARF + 0x2c00, wl_route_cfg) || wl_prd(WL_PARF + 0x2c00) != wl_route_cfg) { return 1; }
+		wl_route_installed = false;
+		for (unsigned i = 0; i < 256; i++) {
+			uint64_t pa = WL_PARF + 0x2000 + 4 * i;
+			if (wl_contain_wr(pa, 0) || wl_prd(pa)) { return 1; }
+		}
 		wl_route_owned = false;
+		printf("FUXI WLAN: M6b RC undo bypass restored first, 256 owned entries zeroed\n");
 	}
 	return 0;
 }
@@ -941,8 +991,7 @@ wl5_step(unsigned s)
 		return fw_faults ? 3 : wl_smmu_enable();
 	}
 	case 21:
-		if (!wl_enabled || wl_smmu_fault(21) ||
-		    (wl_prd(WL_PARF + 0x2000 + 4 * wl_route_hash) & 0xffffff00) != 0x01000100 ||
+		if (!wl_enabled || wl_smmu_fault(21) || wl_rc_check() ||
 		    wl_prd(WL_SMMU) != wl5_report[4] ||
 		    wl_prd(WL_SMMU + 0x800 + 4 * wl_slot) != 0x80001401 ||
 		    wl_prd(WL_SMMU + 0xc00 + 4 * wl_slot) != wl_cb ||
