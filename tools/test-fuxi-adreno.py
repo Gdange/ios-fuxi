@@ -60,7 +60,8 @@ static volatile uint64_t *fg_l2(void) { return model_l2; }
 #define G_PTR(pa) ((uintptr_t)((uint8_t *)model_leaves+(pa)-FG_SOURCE_TABLE))
 static unsigned fg_state=1, fg_force, fg_seq, fg_access_failed, g3_wptr;
 static unsigned g3_slot[2]={1,2};
-static uint64_t fg_deadline, ticks;
+static uint64_t fg_deadline, fg_submit_time, ticks;
+static unsigned fg_busy, fg_magic;
 static uint64_t model_counter(const char *r) { return strcmp(r,"cntfrq_el0") ? ++ticks : 1000000; }
 #define rsr(r) model_counter(r)
 static int fg_expired(void) { return model_counter("ticks") >= fg_deadline; }
@@ -111,17 +112,26 @@ static void g3_emit(uint32_t value)
 }
 static int g3_gw(unsigned reg, unsigned value);
 static uint64_t mach_absolute_time(void) { return ++ticks; }
-typedef uintptr_t event_t;
-#define NSEC_PER_USEC 1000
-#define THREAD_UNINT 0
-#define THREAD_CONTINUE_NULL 0
-static void clock_interval_to_deadline(unsigned n,unsigned scale,uint64_t *d) { assert(scale==1000); *d=ticks+n; }
-static uint64_t sleep_deadline;
-static int assert_wait_deadline(event_t ev,int interruptible,uint64_t d) { assert(ev==(uintptr_t)&fg_seq && !interruptible); sleep_deadline=d; return 0; }
-static int thread_block(int continuation) { assert(!continuation && sleep_deadline>ticks); ticks=sleep_deadline; return 0; }
 static int fuxi_gpu_ready(void) { return fg_state==1; }
 '''
 MODEL = r'''
+/* Legacy pixel cases also test the split actual submit/poll boundary. */
+static int model_copy(unsigned slot,uint64_t gen,uintptr_t src,uint64_t len,
+ unsigned p,unsigned sx,unsigned sy,unsigned dx,unsigned dy,unsigned w,unsigned h,struct fg_times *t)
+{
+ int r=fuxi_gpu_copy(slot,gen,src,len,p,sx,sy,dx,dy,w,h,t);
+ if(r!=2) return r;
+ assert(fg_busy);
+ unsigned before=doorbells;
+ assert(!fuxi_gpu_copy(slot,gen,src,len,p,sx,sy,dx,dy,w,h,t));
+ assert(doorbells==before && !fuxi_gpu_unmap(slot,t));
+ for(unsigned i=0;i<200;i++) {
+  r=fuxi_gpu_poll(t);
+  if(r) { assert(!fg_busy);return r==1 ? 1 : r==-2 ? -1 : 0; }
+  ticks+=1000; /* time passes OUTSIDE the display callback */
+ }
+ assert(0);return 0;
+}
 static uint32_t translated_pixel(unsigned va)
 {
  assert(va>=FG_SOURCE_VA && va<FG_SOURCE_VA+FG_SOURCE_BYTES);
@@ -197,7 +207,7 @@ static void reset(void)
 {
  fg_state=1; fg_force=fg_seq=fg_access_failed=mode=fail_tlb=tlbs=isolated=doorbells=0;
  g3_wptr=rptr=wptr=8190; fence=cache_clean=pending=gbif=reset_held=faulted_sids=paddr_missing=0;
- ticks=lookups=contiguous_pa=0; clean_bytes=0; memset(&times,0,sizeof(times)); memset(fg_generation,0,sizeof(fg_generation)); memset(model_l2,0,sizeof(model_l2)); memset(model_leaves,0,sizeof model_leaves); memset(panel,0x6b,4320*2400+64);
+ fg_busy=fg_magic=0; ticks=lookups=contiguous_pa=0; clean_bytes=0; memset(&times,0,sizeof(times)); memset(fg_generation,0,sizeof(fg_generation)); memset(model_l2,0,sizeof(model_l2)); memset(model_leaves,0,sizeof model_leaves); memset(panel,0x6b,4320*2400+64);
 }
 static void page_fixture(unsigned off,unsigned pitch,unsigned sx,unsigned sy,unsigned w,unsigned h)
 {
@@ -213,7 +223,7 @@ static void copy_case(unsigned off,unsigned pitch,unsigned sx,unsigned sy,unsign
  page_fixture(off,pitch,sx,sy,w,h);
  assert(fuxi_gpu_map(0,1,(uintptr_t)source_buf+off,len,&times)==1);
  unsigned before=doorbells;
- assert(fuxi_gpu_copy(0,1,(uintptr_t)source_buf+off,len,pitch,sx,sy,dx,dy,w,h,&times)==1);
+ assert(model_copy(0,1,(uintptr_t)source_buf+off,len,pitch,sx,sy,dx,dy,w,h,&times)==1);
  assert(doorbells==before+1);
  assert(fuxi_gpu_unmap(0,&times));
  for(unsigned y=0;y<2400;y++) for(unsigned x=0;x<1080;x++) {
@@ -256,11 +266,11 @@ int main(void)
  reset(); assert(fuxi_gpu_map(0,42,(uintptr_t)source_buf,4352*2400,&times));
  unsigned hot_lookups=lookups, hot_tlbs=tlbs;
  for(unsigned i=0;i<1000;i++)
-  assert(fuxi_gpu_copy(0,42,(uintptr_t)source_buf,4352*2400,4352,3,2,7,6,65,70,&times)==1);
+  assert(model_copy(0,42,(uintptr_t)source_buf,4352*2400,4352,3,2,7,6,65,70,&times)==1);
  assert(lookups==hot_lookups && tlbs==hot_tlbs && doorbells==1000);
- assert(!fuxi_gpu_copy(0,41,(uintptr_t)source_buf,4352*2400,4352,0,0,0,0,1,1,&times));
- assert(!fuxi_gpu_copy(0,42,(uintptr_t)source_buf,4096,4320,0,0,0,0,1080,2400,&times));
- assert(!fuxi_gpu_copy(0,42,(uintptr_t)source_buf,FG_SOURCE_BYTES+1ULL,4320,0,0,0,0,1,1,&times));
+ assert(!model_copy(0,41,(uintptr_t)source_buf,4352*2400,4352,0,0,0,0,1,1,&times));
+ assert(!model_copy(0,42,(uintptr_t)source_buf,4096,4320,0,0,0,0,1080,2400,&times));
+ assert(!model_copy(0,42,(uintptr_t)source_buf,FG_SOURCE_BYTES+1ULL,4320,0,0,0,0,1,1,&times));
  assert(fuxi_gpu_unmap(0,&times));
  reset(); paddr_missing=1;
  assert(!fuxi_gpu_map(0,1,(uintptr_t)source_buf,4320*10,&times) && fg_state==2 && !doorbells);
@@ -269,18 +279,24 @@ int main(void)
   if(m==1) { fail_tlb=2; assert(fuxi_gpu_unmap(0,&times)); assert(fg_state==2); continue; }
   if(m==3) continue;
   mode=m;
-  int result=fuxi_gpu_copy(0,1,(uintptr_t)source_buf,4320*10,4320,0,0,0,0,10,10,&times);
+  int result=model_copy(0,1,(uintptr_t)source_buf,4320*10,4320,0,0,0,0,10,10,&times);
   assert(result==(m==7 ? -1 : 0) && fg_state==2);
-  assert(ticks<22000); /* one frame deadline + bounded isolation */
+  assert(ticks<120000); /* six tick deadline + bounded isolation */
   if(doorbells) assert(isolated && gbif==2 && reset_held==1 && faulted_sids==2);
   unsigned before=doorbells;
-  assert(fuxi_gpu_copy(0,1,(uintptr_t)source_buf,4320*10,4320,0,0,0,0,10,10,&times)==0 && doorbells==before);
+  assert(model_copy(0,1,(uintptr_t)source_buf,4320*10,4320,0,0,0,0,10,10,&times)==0 && doorbells==before);
  }
  reset(); assert(fuxi_gpu_map(0,1,(uintptr_t)source_buf,4320*10,&times)); fg_force=2;
- assert(!fuxi_gpu_copy(0,1,(uintptr_t)source_buf,4320*10,4320,0,0,0,0,10,10,&times) && isolated);
+ assert(!model_copy(0,1,(uintptr_t)source_buf,4320*10,4320,0,0,0,0,10,10,&times) && isolated);
  reset(); assert(fuxi_gpu_map(0,1,(uintptr_t)source_buf,4352*10,&times)); mode=8;
- assert(fuxi_gpu_copy(0,1,(uintptr_t)source_buf,4352*10,4352,0,0,0,0,10,10,&times)==1);
- assert(times.sleeps==3 && times.wait>=750 && !isolated);
+ assert(model_copy(0,1,(uintptr_t)source_buf,4352*10,4352,0,0,0,0,10,10,&times)==1);
+ assert(times.sleeps==0 && times.wait>=700 && !isolated);
+ /* Real split API: later tick completes even past deadline; no sleep/poll loop. */
+ reset(); assert(fuxi_gpu_map(0,1,(uintptr_t)source_buf,4352*10,&times)); mode=8;
+ assert(fuxi_gpu_copy(0,1,(uintptr_t)source_buf,4352*10,4352,0,0,0,0,10,10,&times)==2);
+ assert(!fuxi_gpu_poll(&times) && !times.sleeps && fg_busy);
+ ticks+=200000;
+ assert(fuxi_gpu_poll(&times)==1 && !fg_busy && !isolated);
  /* Independent windows and generations; unmapping one preserves the others. */
  reset();
  for(unsigned slot=0;slot<4;slot++) {
@@ -296,7 +312,7 @@ int main(void)
  assert(clean_bytes==4352ULL*2400);
  clean_bytes=0; fg_clean((uintptr_t)source_buf,4352,17,3,10,10);
  assert(clean_bytes==640);
- printf("PASS: %u pixel-exact copies, cropped phases, noncontiguous 16K/4K mappings, full panel, hot cache, blocks/hints, exact clean ranges, one submit/frame, %u wraps, sleeping timeout/quarantine\n",checks,wrap_count);
+ printf("PASS: %u pixel-exact copies, cropped phases, noncontiguous 16K/4K mappings, full panel, hot cache, blocks/hints, exact clean ranges, one submit/frame, %u wraps, async busy/deadline/quarantine\n",checks,wrap_count);
  free(source_buf);free(panel);return 0;
 }
 '''
@@ -309,6 +325,8 @@ def main():
     subprocess.run(['python3', str(ROOT / 'tools/test-fuxi-adreno-cache.py')], check=True)
     probe = sync.added_file('gpu.c')
     adapter = sync.added_file('fuxi_adreno.c')
+    for n in ('fuxi_gpu_copy', 'fuxi_gpu_poll'):
+        assert not any(x in function(adapter, n) for x in ('thread_block', 'assert_wait', 'fg_sleep', 'delay('))
     windows = [(int(a, 16), int(b, 16)) for a, b in re.findall(r'\{(0x[0-9a-f]+),(0x[0-9a-f]+),0\}', adapter)]
     for pa, size in ((0x100000, 0x80000), (0x3d00000, 0x40000), (0x3d50000, 0x40000),
                      (0x3d90000, 0x10000), (0x3da0000, 0x40000), (0xb280000, 0x8000),
@@ -319,7 +337,7 @@ def main():
         for b, m in windows[i+1:]:
             assert a + n <= b or b + m <= a, 'overlapping platform mappings'
     functions = ''.join(function(probe, n) for n in ('g3_parity', 'g3_pkt7', 'g4_pkt4', 'g4_reg', 'g4_event', 'g4_wfi', 'g4_setup', 'g4_end'))
-    functions += ''.join(function(adapter, n) for n in ('fg_isolate', 'fuxi_gpu_unmap', 'fuxi_gpu_map', 'fg_rect', 'fg_clean', 'fg_sleep', 'fuxi_gpu_copy'))
+    functions += ''.join(function(adapter, n) for n in ('fg_isolate', 'fuxi_gpu_unmap', 'fuxi_gpu_map', 'fg_rect', 'fg_clean', 'fuxi_gpu_poll', 'fuxi_gpu_copy'))
     functions = re.sub(r'__asm__ volatile\([^;]*\);', ';', functions)
     constants = '\n'.join(line for line in sync.added_file('gpu-a740.h').splitlines() if line.startswith('#define G4_'))
     with tempfile.TemporaryDirectory() as d:

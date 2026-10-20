@@ -206,7 +206,8 @@ static volatile uint64_t *fg_l2(void)
 static volatile unsigned fg_state; /* 0 disabled/starting, 1 ready, 2 permanently failed */
 static unsigned fg_started, fg_limit, fg_force, fg_seq;
 int fuxi_gpu_ready(void) { return __atomic_load_n(&fg_state, __ATOMIC_ACQUIRE) == 1; }
-static uint64_t fg_deadline;
+static uint64_t fg_deadline, fg_submit_time;
+static unsigned fg_busy, fg_magic;
 static int fg_expired(void) { return rsr("cntpct_el0") >= fg_deadline; }
 static void fg_fail(const char *reason, unsigned code)
 {
@@ -264,7 +265,7 @@ static int fg_source_tables(void)
  * new generation. No PFN scan or TLB invalidation on a cache hit. */
 int fuxi_gpu_unmap(unsigned slot, struct fg_times *t)
 {
- if (slot >= FG_CACHE_SLOTS) return 0;
+ if (slot >= FG_CACHE_SLOTS || fg_busy) return 0;
  uint64_t start = mach_absolute_time();
  volatile uint64_t *l2 = fg_l2();
  unsigned first = ((FG_SOURCE_VA >> 21) & 511) + slot*FG_SOURCE_L3;
@@ -391,7 +392,7 @@ static void fg_thread(thread_call_param_t arg, thread_call_param_t result)
      !fg_source_tables()) { fg_fail("scanout geometry/mapping", 4); goto out; }
  uint32_t tlb[128] = {0};
  if (g4_tlb(tlb) || fg_access_failed) { fg_fail("initial TLB sync", 5); goto out; }
- printf("FUXI GPU: ready, BGRA strided rects + one fence, 4 cached backings, 220 MHz, sleep/poll\n");
+ printf("FUXI GPU: ready, BGRA strided rects + one fence, 4 cached backings, 220 MHz, async one-in-flight, no timer sleep\n");
  __atomic_store_n(&fg_state, 1, __ATOMIC_RELEASE);
  out: return;
 }
@@ -450,18 +451,31 @@ static void fg_clean(uintptr_t source, unsigned pitch, unsigned sx, unsigned sy,
  }
  if (end) CleanPoC_DcacheRegion_Force(begin, end-begin);
 }
-static void fg_sleep(void)
+/* Called once per display tick; never sleeps, spins for completion or submits.
+ * A completed fence wins over a late timer/deadline. */
+int fuxi_gpu_poll(struct fg_times *t)
 {
- uint64_t deadline;
- clock_interval_to_deadline(250, NSEC_PER_USEC, &deadline);
- (void)assert_wait_deadline((event_t)&fg_seq, THREAD_UNINT, deadline);
- (void)thread_block(THREAD_CONTINUE_NULL);
+ if (!fg_busy) return 1;
+ int err = fg_access_failed || g3_faulted();
+ if (!err && g3_read(G3_FENCE_PA+64) == fg_magic && g3_gr(0x806) == g3_wptr &&
+     g3_gr(0x807) == g3_wptr && !(g3_gr(0x210) & ~1u)) {
+  fg_busy = 0;
+  t->wait += mach_absolute_time()-fg_submit_time;
+  return 1;
+ }
+ if (!err && !fg_expired()) return 0;
+ fg_fail("async present fence/fault/deadline", 0x603);
+ /* Only fault containment has bounded register polling; no scheduler wait. */
+ int drained = fg_isolate();
+ fg_busy = 0;
+ t->wait += mach_absolute_time()-fg_submit_time;
+ return drained ? -1 : -2;
 }
 int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t length,
     unsigned pitch, unsigned sx, unsigned sy, unsigned dx, unsigned dy,
     unsigned width, unsigned height, struct fg_times *t)
 {
- if (!fuxi_gpu_ready() || slot >= FG_CACHE_SLOTS || fg_generation[slot] != generation) return 0;
+ if (!fuxi_gpu_ready() || fg_busy || slot >= FG_CACHE_SLOTS || fg_generation[slot] != generation) return 0;
  if (!width || !height || width > 1080 || height > 2400 || dx > 1080-width || dy > 2400-height ||
      (source & 3) || (pitch & 3) || pitch > 131008 || ((uint64_t)sx+width)*4 > pitch ||
      length+(source&4095) > FG_SOURCE_BYTES ||
@@ -485,27 +499,17 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
  g4_end(G3_FENCE_VA+64, magic);
  g3_wptr &= 8191;
  __asm__ volatile("dsb sy" ::: "memory");
- fg_deadline = rsr("cntpct_el0") + rsr("cntfrq_el0")/60;
+ fg_deadline = rsr("cntpct_el0") + rsr("cntfrq_el0")/10; /* six ticks */
  if (!g3_gw(0x807, g3_wptr)) err = 0x602;
  if (fg_force == 2) err = 0x6ff;
  t->submit += mach_absolute_time()-start;
- start = mach_absolute_time();
- unsigned polls;
- /* Check once immediately (small jobs), then yield the CPU every check.
-  * The original synchronous surface/swap ownership is preserved through the
-  * fence, rptr AND idle gates; no completion is signalled early to producers. */
- for (polls = 0; !err && polls < 80; polls++) {
-  if (g3_read(G3_FENCE_PA+64) == magic && g3_gr(0x806) == g3_wptr &&
-      g3_gr(0x807) == g3_wptr && !(g3_gr(0x210) & ~1u)) break;
-  if (fg_expired() || g3_faulted()) { err = 0x603; break; }
-  fg_sleep(); t->sleeps++;
- }
- t->wait += mach_absolute_time()-start;
- if (!err && (polls == 80 || fg_access_failed || g3_faulted())) err = 0x604;
- if (err) {
-  fg_fail("present fence/fault/deadline", err);
+ if (err || fg_access_failed) {
+  fg_fail("present submit", err);
   return !fg_isolate() ? -1 : 0;
  }
- return 1;
+ fg_magic = magic;
+ fg_submit_time = mach_absolute_time();
+ fg_busy = 1;
+ return 2; /* submitted; source is owned until poll retires this fence */
 }
 #endif

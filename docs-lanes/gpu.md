@@ -1,9 +1,43 @@
-# Milestone 7 — memory
+# Milestone 7 — full RAM and asynchronous present
 
 XNU now gets **5088 MiB**, with the last 32 MiB of the observed 5 GiB bank
 reserved for GPU scratch and the cold handoff. See [memory layout](memory.md)
 for addresses, XNU limit audit, USB offset extension and the `--ram-layout 1g`
 compatibility option. No device access or boot is claimed.
+
+## Async ownership and completion
+
+The display timer submits once and returns. At the start of every subsequent
+60 Hz tick it checks the fence, read/write pointers, idle and fault gates once.
+It never calls `thread_block`, `assert_wait` or a completion sleep. A finished
+fence retires even if the timer woke beyond its 100 ms timeout; a still-pending
+job at that deadline disables the GPU permanently. There is at most one frame
+in flight. Every busy tick preserves the latest pending swap, sends VSYNC as
+usual and defers all framebuffer writes, including power-off clearing. A
+successful retirement kicks the display; submission alone does not.
+
+The source `SweetSurface` has a strong reference until completion/drain and its
+cached IOBuffer remains retained and prepared. Cache unmap/eviction refuses the
+in-flight slot. IOSurface writer lock traps wait on the **producer thread**
+until retirement, and submission refuses an existing writer. Writer unlock
+releases that exclusion. The timer does not wait for a producer. This contract
+requires producers to obey IOSurface lock/unlock; arbitrary writes through raw
+mappings cannot be fenced by retaining an OSObject. Failed drain quarantines
+the surface as well as the prepared descriptor, rejects later writer traps,
+and holds isolation/reset/SID faulting as before. CPU fallback is retained;
+on async failure the newest pending swap is replayed through it.
+
+`FUXI GPU: ready, ... async one-in-flight, no timer sleep` identifies the path.
+Stats add `busy ticks N failed N`; `GPU retire avg` and split `wait` measure
+submission-to-observed-retirement wall time, normally about one tick even when
+the GPU finishes much earlier. They are **not** GPU execution latency. `sleeps`
+is zero. CPU-time still excludes descheduled time and counts submit/poll/cache
+work. ASan/UBSan tests compile the actual split submit/poll and cache functions:
+pixel copies, duplicate-submit/unmap refusal, busy ticks, writer exclusion,
+retained-source lifetime, late fence, timeout/fault/isolation and quarantine.
+Offline tests do not establish producer compliance, real DMA coherency, tearing
+or smoothness. Failure containment can spend bounded time polling GBIF; normal
+completion has no poll loop. No device run is claimed.
 
 # Milestone 6d — present CPU cost
 

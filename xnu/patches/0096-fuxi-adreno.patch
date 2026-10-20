@@ -10,7 +10,7 @@
  bsd/dev/sweet_spmi.c			standard
 --- a/bsd/dev/fuxi_adreno.c
 +++ b/bsd/dev/fuxi_adreno.c
-@@ -0,0 +1,511 @@
+@@ -0,0 +1,515 @@
 +/* M6 platform adapter. gpu.c/gpu-a740.h/gpu-zap.h are exact shared probe
 + * sources, copied into patch 0096 by tools/sync-fuxi-adreno-shared.py.
 + * Fixed memory is excluded from boot_args AND ADT RAM before VM bootstrap.
@@ -219,7 +219,8 @@
 +static volatile unsigned fg_state; /* 0 disabled/starting, 1 ready, 2 permanently failed */
 +static unsigned fg_started, fg_limit, fg_force, fg_seq;
 +int fuxi_gpu_ready(void) { return __atomic_load_n(&fg_state, __ATOMIC_ACQUIRE) == 1; }
-+static uint64_t fg_deadline;
++static uint64_t fg_deadline, fg_submit_time;
++static unsigned fg_busy, fg_magic;
 +static int fg_expired(void) { return rsr("cntpct_el0") >= fg_deadline; }
 +static void fg_fail(const char *reason, unsigned code)
 +{
@@ -277,7 +278,7 @@
 + * new generation. No PFN scan or TLB invalidation on a cache hit. */
 +int fuxi_gpu_unmap(unsigned slot, struct fg_times *t)
 +{
-+ if (slot >= FG_CACHE_SLOTS) return 0;
++ if (slot >= FG_CACHE_SLOTS || fg_busy) return 0;
 + uint64_t start = mach_absolute_time();
 + volatile uint64_t *l2 = fg_l2();
 + unsigned first = ((FG_SOURCE_VA >> 21) & 511) + slot*FG_SOURCE_L3;
@@ -404,7 +405,7 @@
 +     !fg_source_tables()) { fg_fail("scanout geometry/mapping", 4); goto out; }
 + uint32_t tlb[128] = {0};
 + if (g4_tlb(tlb) || fg_access_failed) { fg_fail("initial TLB sync", 5); goto out; }
-+ printf("FUXI GPU: ready, BGRA strided rects + one fence, 4 cached backings, 220 MHz, sleep/poll\n");
++ printf("FUXI GPU: ready, BGRA strided rects + one fence, 4 cached backings, 220 MHz, async one-in-flight, no timer sleep\n");
 + __atomic_store_n(&fg_state, 1, __ATOMIC_RELEASE);
 + out: return;
 +}
@@ -463,18 +464,31 @@
 + }
 + if (end) CleanPoC_DcacheRegion_Force(begin, end-begin);
 +}
-+static void fg_sleep(void)
++/* Called once per display tick; never sleeps, spins for completion or submits.
++ * A completed fence wins over a late timer/deadline. */
++int fuxi_gpu_poll(struct fg_times *t)
 +{
-+ uint64_t deadline;
-+ clock_interval_to_deadline(250, NSEC_PER_USEC, &deadline);
-+ (void)assert_wait_deadline((event_t)&fg_seq, THREAD_UNINT, deadline);
-+ (void)thread_block(THREAD_CONTINUE_NULL);
++ if (!fg_busy) return 1;
++ int err = fg_access_failed || g3_faulted();
++ if (!err && g3_read(G3_FENCE_PA+64) == fg_magic && g3_gr(0x806) == g3_wptr &&
++     g3_gr(0x807) == g3_wptr && !(g3_gr(0x210) & ~1u)) {
++  fg_busy = 0;
++  t->wait += mach_absolute_time()-fg_submit_time;
++  return 1;
++ }
++ if (!err && !fg_expired()) return 0;
++ fg_fail("async present fence/fault/deadline", 0x603);
++ /* Only fault containment has bounded register polling; no scheduler wait. */
++ int drained = fg_isolate();
++ fg_busy = 0;
++ t->wait += mach_absolute_time()-fg_submit_time;
++ return drained ? -1 : -2;
 +}
 +int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t length,
 +    unsigned pitch, unsigned sx, unsigned sy, unsigned dx, unsigned dy,
 +    unsigned width, unsigned height, struct fg_times *t)
 +{
-+ if (!fuxi_gpu_ready() || slot >= FG_CACHE_SLOTS || fg_generation[slot] != generation) return 0;
++ if (!fuxi_gpu_ready() || fg_busy || slot >= FG_CACHE_SLOTS || fg_generation[slot] != generation) return 0;
 + if (!width || !height || width > 1080 || height > 2400 || dx > 1080-width || dy > 2400-height ||
 +     (source & 3) || (pitch & 3) || pitch > 131008 || ((uint64_t)sx+width)*4 > pitch ||
 +     length+(source&4095) > FG_SOURCE_BYTES ||
@@ -498,33 +512,23 @@
 + g4_end(G3_FENCE_VA+64, magic);
 + g3_wptr &= 8191;
 + __asm__ volatile("dsb sy" ::: "memory");
-+ fg_deadline = rsr("cntpct_el0") + rsr("cntfrq_el0")/60;
++ fg_deadline = rsr("cntpct_el0") + rsr("cntfrq_el0")/10; /* six ticks */
 + if (!g3_gw(0x807, g3_wptr)) err = 0x602;
 + if (fg_force == 2) err = 0x6ff;
 + t->submit += mach_absolute_time()-start;
-+ start = mach_absolute_time();
-+ unsigned polls;
-+ /* Check once immediately (small jobs), then yield the CPU every check.
-+  * The original synchronous surface/swap ownership is preserved through the
-+  * fence, rptr AND idle gates; no completion is signalled early to producers. */
-+ for (polls = 0; !err && polls < 80; polls++) {
-+  if (g3_read(G3_FENCE_PA+64) == magic && g3_gr(0x806) == g3_wptr &&
-+      g3_gr(0x807) == g3_wptr && !(g3_gr(0x210) & ~1u)) break;
-+  if (fg_expired() || g3_faulted()) { err = 0x603; break; }
-+  fg_sleep(); t->sleeps++;
-+ }
-+ t->wait += mach_absolute_time()-start;
-+ if (!err && (polls == 80 || fg_access_failed || g3_faulted())) err = 0x604;
-+ if (err) {
-+  fg_fail("present fence/fault/deadline", err);
++ if (err || fg_access_failed) {
++  fg_fail("present submit", err);
 +  return !fg_isolate() ? -1 : 0;
 + }
-+ return 1;
++ fg_magic = magic;
++ fg_submit_time = mach_absolute_time();
++ fg_busy = 1;
++ return 2; /* submitted; source is owned until poll retires this fence */
 +}
 +#endif
 --- a/bsd/dev/fuxi_adreno.h
 +++ b/bsd/dev/fuxi_adreno.h
-@@ -0,0 +1,19 @@
+@@ -0,0 +1,22 @@
 +#ifndef FUXI_ADRENO_H
 +#define FUXI_ADRENO_H
 +#define FG_CACHE_SLOTS 4u
@@ -540,6 +544,9 @@
 +    uint64_t length, struct fg_times *t);
 +/* False means failed DMA drain: keep backing prepared/retained until reset. */
 +int fuxi_gpu_unmap(unsigned slot, struct fg_times *t);
++/* copy: 2 submitted, 0 fallback, -1 quarantine. poll: 0 busy, 1 done,
++ * -1 failed/drained, -2 failed/quarantined. Serialized by the surface lock. */
++int fuxi_gpu_poll(struct fg_times *t);
 +int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t length,
 +    unsigned pitch, unsigned sx, unsigned sy, unsigned dx, unsigned dy,
 +    unsigned width, unsigned height, struct fg_times *t);
@@ -2827,16 +2834,18 @@
  
  extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
  extern "C" { int sweet_fb_display_off; }        /* read by bsd/dev/fuxi_touch.c */
-@@ -129,6 +134,8 @@
+@@ -129,6 +134,10 @@
  	uint64_t      fNextTick;      /* next vsync deadline */
  	uint64_t      fStatCopy, fStatCopyMax, fStatStart;
  	uint32_t      fStatFrames, fStatSwaps, fStatDropped;
 +	uint32_t      fGpuFrames, fCpuFrames;
 +	uint64_t      fGpuTime, fCpuTime;
++	bool          fGpuPending;
++	uint32_t      fGpuBusyTicks, fGpuFailed;
  
  	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
  	void addClient(IOMobileFramebufferUserClient *client);
-@@ -231,6 +238,10 @@
+@@ -231,6 +240,10 @@
  	registerService();
  	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
  	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
@@ -2847,7 +2856,45 @@
  	return true;
  }
  
-@@ -375,6 +386,7 @@
+@@ -263,12 +276,37 @@
+ 		0, 0,
+ 	};
+ 
++#if defined(FUXI)
++ uint64_t elapsed = 0;
++ int completed = sweet_surface_gpu_poll(&elapsed);
++ bool gpuBusy = completed == 0;
++ if (gpuBusy) fb->fGpuBusyTicks++;
++ if (fb->fGpuPending && completed) {
++  fb->fGpuPending = false;
++  if (completed == 1) {
++   fb->fGpuFrames++;
++   fb->fGpuTime += elapsed;
++   fuxi_display_kick();
++  } else {
++   fb->fGpuFailed++;
++   /* Replay the newest swap through the CPU on this tick. */
++   IOLockLock(fb->fLock); fb->fDirty = true; IOLockUnlock(fb->fLock);
++  }
++ }
++#endif
+ 	IOLockLock(fb->fLock);
+ 	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
+ 		IOMobileFramebufferUserClient *client =
+ 		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
++#if defined(FUXI)
++ if (gpuBusy) { /* retain latest pending swap; no copy or black clear yet */
++  IOLockUnlock(fb->fLock);
++  sweet_fb_rearm(fb, sender);
++  return;
++ }
++#endif
+ 	if (fb->fPowerOff) {
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+ 		uint32_t step = fb->fFadeStep;
+@@ -375,6 +413,7 @@
  {
  	uint32_t mask = get32(rec, 0x104);
  	uint64_t t0 = mach_absolute_time();
@@ -2855,7 +2902,7 @@
  
  	if (!fConsolePaused) {
  		int quiet = 0;
-@@ -453,16 +465,37 @@
+@@ -453,16 +492,36 @@
  			src = 0;
  		}
  		if (src != 0 && bpe == 4) {
@@ -2867,19 +2914,19 @@
 +			 * multi-layer records rather than submit multiple fences per frame. */
 +			if ((mask & (mask-1)) == 0)
 +				copied = sweet_surface_gpu_copy(s, src, sx, sy, dx, dy, w, h);
-+			if (copied == 1) {
++			if (copied == 2) {
 +				gpuFrame = true;
-+				fGpuTime += mach_absolute_time() - copyStart;
++				fGpuPending = true;
 +			}
 +			copyStart = mach_absolute_time();
 +#endif
-+			if (copied != 1) for (int32_t y = 0; y < h; y++) {
++			if (copied != 2) for (int32_t y = 0; y < h; y++) {
  				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
  				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
  				    (size_t)w * 4);
  			}
 +#if defined(FUXI)
-+			if (copied != 1) {
++			if (copied != 2) {
 +				cpuFrame = true;
 +				fCpuTime += mach_absolute_time() - copyStart;
 +			}
@@ -2888,13 +2935,13 @@
  		s->release();
  	}
  #if defined(FUXI)
- 	fuxi_display_kick();
-+	fGpuFrames += gpuFrame;
+-	fuxi_display_kick();
++	if (!gpuFrame) fuxi_display_kick();
 +	fCpuFrames += cpuFrame;
  	uint64_t t1 = mach_absolute_time(), took = t1 - t0;
  	fStatCopy += took;
  	fStatCopyMax = took > fStatCopyMax ? took : fStatCopyMax;
-@@ -478,6 +511,29 @@
+@@ -478,6 +537,30 @@
  		IOLog("SWEET FB: stats %u frames in %llu ms, copy avg %llu us max %llu us, "
  		    "%u swaps, %u not shown\n", fStatFrames, span_ns / 1000000, avg_ns / 1000,
  		    max_ns / 1000, swaps, dropped);
@@ -2912,13 +2959,14 @@
 +			absolutetime_to_nanoseconds(ticks[i], &ns);
 +			us[i] = attempts ? ns / 1000 / attempts : 0;
 +		}
-+		IOLog("FUXI GPU: presents GPU %u CPU %u, GPU avg %llu us CPU avg %llu us, "
++		IOLog("FUXI GPU: presents GPU %u CPU %u, GPU retire avg %llu us CPU avg %llu us, "
 +		    "split pin %llu lookup %llu map+TLB %llu clean %llu submit %llu wait %llu unmap %llu us, "
-+		    "GPU CPU-time %llu us, cache hit %u miss %u, sleeps %u, 2M %u 64K %u\n",
++		    "GPU CPU-time %llu us, cache hit %u miss %u, sleeps %u, 2M %u 64K %u, busy ticks %u failed %u\n",
 +		    fGpuFrames, fCpuFrames, fGpuFrames ? gpu_ns / 1000 / fGpuFrames : 0ULL,
 +		    fCpuFrames ? cpu_ns / 1000 / fCpuFrames : 0ULL,
 +		    us[0], us[1], us[2], us[3], us[4], us[5], us[6], us[7],
-+		    split.hits, split.misses, split.sleeps, split.blocks, split.groups);
++		    split.hits, split.misses, split.sleeps, split.blocks, split.groups, fGpuBusyTicks, fGpuFailed);
++		fGpuBusyTicks = fGpuFailed = 0;
 +		fGpuFrames = fCpuFrames = 0;
 +		fGpuTime = fCpuTime = 0;
  		fStatFrames = 0;
@@ -2998,7 +3046,10 @@
  		vm_map_t      map;
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -79,0 +80,108 @@
+@@ -77,9 +77,180 @@
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
 +#if defined(FUXI)
 +extern "C" uint64_t thread_get_runtime_self(void);
 +struct sweet_gpu_backing {
@@ -3012,6 +3063,9 @@
 +static sweet_gpu_backing sweet_gpu_cache[FG_CACHE_SLOTS];
 +static uint64_t sweet_gpu_generation, sweet_gpu_age;
 +static struct fg_times sweet_gpu_times;
++static SweetSurface *sweet_gpu_inflight; /* strong until fence/drain */
++static unsigned sweet_gpu_slot;
++static uint64_t sweet_gpu_begin;
 +static bool sweet_gpu_init(void)
 +{
 + if (!sweet_gpu_lock) {
@@ -3025,6 +3079,7 @@
 +{
 + sweet_gpu_backing &c = sweet_gpu_cache[slot];
 + if (!c.memory) return true;
++ if (sweet_gpu_inflight && slot == sweet_gpu_slot) return false;
 + if (c.quarantine || !fuxi_gpu_unmap(slot, &sweet_gpu_times)) {
 +  c.surface = NULL; c.quarantine = true;
 +  return false; /* preserve descriptor AND preparation until reset */
@@ -3051,6 +3106,8 @@
 +     OSDynamicCast(IOBufferMemoryDescriptor, s->memory) == NULL || !sweet_gpu_init()) return 0;
 + uint64_t cpu = thread_get_runtime_self(), start = mach_absolute_time();
 + IOLockLock(sweet_gpu_lock);
++ if (sweet_gpu_inflight) { IOLockUnlock(sweet_gpu_lock); return 2; }
++ if (s->gpuWriters || s->gpuQuarantined) { IOLockUnlock(sweet_gpu_lock); return 0; }
 + unsigned slot = FG_CACHE_SLOTS, victim = 0, replacement = FG_CACHE_SLOTS;
 + uint64_t length = s->memory->getLength()-s->offset;
 + uintptr_t source = src+s->offset;
@@ -3090,11 +3147,65 @@
 + sweet_gpu_cache[slot].age = ++sweet_gpu_age;
 + result = fuxi_gpu_copy(slot, sweet_gpu_cache[slot].generation, source, length,
 +     s->bytesPerRow, sx, sy, dx, dy, width, height, &sweet_gpu_times);
-+ if (result < 0) sweet_gpu_cache[slot].quarantine = true;
++ if (result == 2) {
++  s->retain();
++  sweet_gpu_inflight = s;
++  sweet_gpu_slot = slot;
++  sweet_gpu_begin = mach_absolute_time();
++ }
++ if (result < 0) {
++  sweet_gpu_cache[slot].quarantine = true;
++  s->gpuQuarantined = true;
++  s->retain(); /* failed submit/drain: reject writers, preserve until reset */
++ }
 + out:
 + sweet_gpu_times.cpu += thread_get_runtime_self()-cpu;
 + IOLockUnlock(sweet_gpu_lock);
 + return result;
++}
++/* The display calls this before touching any framebuffer pixels, including
++ * power-off clearing. Keep the strong surface ref across every busy tick. */
++int sweet_surface_gpu_poll(uint64_t *elapsed)
++{
++ if (!sweet_gpu_lock) return 1;
++ uint64_t cpu = thread_get_runtime_self();
++ IOLockLock(sweet_gpu_lock);
++ SweetSurface *release = NULL;
++ int result = 1;
++ if (sweet_gpu_inflight) {
++  result = fuxi_gpu_poll(&sweet_gpu_times);
++  if (result) {
++   *elapsed = mach_absolute_time()-sweet_gpu_begin;
++   if (result == -2) {
++    sweet_gpu_cache[sweet_gpu_slot].quarantine = true;
++    sweet_gpu_inflight->gpuQuarantined = true;
++   }
++   else release = sweet_gpu_inflight;
++   /* Failed-drain surface AND descriptor stay retained until reset. */
++   sweet_gpu_inflight = NULL;
++   IOLockWakeup(sweet_gpu_lock, &sweet_gpu_inflight, false);
++  }
++ }
++ sweet_gpu_times.cpu += thread_get_runtime_self()-cpu;
++ IOLockUnlock(sweet_gpu_lock);
++ if (release) release->release(); /* free() takes the cache lock */
++ return result;
++}
++/* IOSurface writer traps wait on the producer thread, never the display
++ * timer. A writer already holding the surface makes GPU submission ineligible.
++ * Userspace must obey IOSurface lock/unlock when writing a mapped surface. */
++static bool sweet_gpu_writer(SweetSurface *s, bool lock)
++{
++ if (!sweet_gpu_init()) return false;
++ IOLockLock(sweet_gpu_lock);
++ if (lock) {
++  while (sweet_gpu_inflight == s)
++   IOLockSleep(sweet_gpu_lock, &sweet_gpu_inflight, THREAD_UNINT);
++  if (!s->gpuQuarantined) s->gpuWriters++;
++ } else if (s->gpuWriters) s->gpuWriters--;
++ bool ok = !s->gpuQuarantined;
++ IOLockUnlock(sweet_gpu_lock);
++ return ok;
 +}
 +void sweet_surface_gpu_stats(struct fg_times *t)
 +{
@@ -3107,19 +3218,72 @@
 +}
 +#endif
 +
-@@ -82,0 +191,3 @@
+ void
+ SweetSurface::free()
+ {
 +#if defined(FUXI)
 + sweet_gpu_release(this);
 +#endif
+ 	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
+@@ -822,13 +993,18 @@
+ }
+ 
+ IOReturn
+-IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOut,
++IOSurfaceRootUserClient::trapLock(void *id, void *options, void *seedOut,
+     void *, void *, void *)
+ {
+ 	SweetSurface *s = sweet_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
++#if defined(FUXI)
++ if (!((uintptr_t)options & kIOSurfaceLockReadOnly) && !sweet_gpu_writer(s, true)) {
++  s->release(); return kIOReturnNotReady;
++ }
++#endif
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
+ 	s->release();
+ 	return ret;
+@@ -842,6 +1018,9 @@
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
++#if defined(FUXI)
++ if (!((uintptr_t)options & kIOSurfaceLockReadOnly)) (void)sweet_gpu_writer(s, false);
++#endif
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut,
+ 	    !((uintptr_t)options & kIOSurfaceLockReadOnly));
+ 	s->release();
 --- a/iokit/Kernel/arm/SweetSurface.h
 +++ b/iokit/Kernel/arm/SweetSurface.h
-@@ -49,0 +50,9 @@
+@@ -29,6 +29,10 @@
+ 
+ public:
+ 	uint32_t id;
++#if defined(FUXI)
++ unsigned gpuWriters;
++ bool gpuQuarantined;
++#endif
+ 	uint32_t width, height, bytesPerRow, offset, pixelFormat, allocSize;
+ 	uint16_t bytesPerElement;
+ 	uint8_t  elementWidth, elementHeight;
+@@ -47,6 +51,16 @@
+ 	uintptr_t kernelAddress();
+ };
+ 
 +#if defined(FUXI)
 +extern "C" {
 +#include "../../../bsd/dev/fuxi_adreno.h"
 +}
 +int sweet_surface_gpu_copy(SweetSurface *, uintptr_t, unsigned, unsigned,
 +    unsigned, unsigned, unsigned, unsigned);
++int sweet_surface_gpu_poll(uint64_t *);
 +void sweet_surface_gpu_stats(struct fg_times *);
 +#endif
 +
+ /* Retained surface for an id, or NULL. */
+ SweetSurface *sweet_surface_copy(uint32_t id);
+ 

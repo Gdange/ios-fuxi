@@ -30,9 +30,12 @@ static uint64_t ticks;
 static uint64_t mach_absolute_time() { return ++ticks; }
 extern "C" uint64_t thread_get_runtime_self() { return ++ticks; }
 struct IOLock { bool held; };
+#define THREAD_UNINT 0
+static void IOLockSleep(IOLock *,void *,int);
 static IOLock *IOLockAlloc() { return new IOLock{false}; }
 static void IOLockFree(IOLock *p) { delete p; }
 static void IOLockLock(IOLock *p) { assert(!p->held); p->held=true; }
+static void IOLockWakeup(IOLock *p,void *,bool) { assert(p->held); }
 static void IOLockUnlock(IOLock *p) { assert(p->held); p->held=false; }
 static bool OSCompareAndSwapPtr(IOLock *old,IOLock *p,IOLock **dst) {
  if(*dst!=old) return false;
@@ -49,10 +52,15 @@ struct IOMemoryDescriptor {
  int prepare(int d) { assert(d==1);if(fail_prepare) return 1;prepared++;return 0; }
  void complete(int d) { assert(d==1 && prepared);prepared--; }
 };
-struct SweetSurface { IOMemoryDescriptor *memory; unsigned offset=0,pixelFormat=0x42475241,bytesPerRow=4352; };
+struct SweetSurface {
+ unsigned refs=1, gpuWriters=0; bool gpuQuarantined=false;
+ void retain() { refs++; }
+ void release() { assert(refs>1);refs--; }
+ IOMemoryDescriptor *memory; unsigned offset=0,pixelFormat=0x42475241,bytesPerRow=4352; };
 static unsigned maps,unmaps,copies;
 static bool ready=true, fail_map=false, fail_unmap=false;
-static int copy_result=1;
+static int copy_result=2, poll_result=1;
+static int fuxi_gpu_poll(fg_times *) { return poll_result; }
 static uint64_t generations[4];
 static int fuxi_gpu_ready() { return ready; }
 static int fuxi_gpu_map(unsigned slot,uint64_t generation,uintptr_t,uint64_t,fg_times *t) {
@@ -68,13 +76,21 @@ static int fuxi_gpu_unmap(unsigned slot,fg_times *t) {
 static int fuxi_gpu_copy(unsigned slot,uint64_t generation,uintptr_t,uint64_t,
  unsigned,unsigned,unsigned,unsigned,unsigned,unsigned,unsigned,fg_times *) {
  assert(generations[slot]==generation);copies++;
- if(copy_result!=1) ready=false;
+ if(copy_result!=2) ready=false;
  return copy_result;
 }
 '''
 MODEL = r'''
+static void IOLockSleep(IOLock *p,void *,int mode) {
+ assert(!mode); IOLockUnlock(p);uint64_t elapsed=0;
+ assert(sweet_surface_gpu_poll(&elapsed)==1);IOLockLock(p);
+}
+
 static int copy(SweetSurface &s) {
- return sweet_surface_gpu_copy(&s,0x10000,0,0,0,0,1080,10);
+ int r=sweet_surface_gpu_copy(&s,0x10000,0,0,0,0,1080,10);
+ if(r!=2) return r;
+ uint64_t elapsed=0; assert(sweet_surface_gpu_poll(&elapsed)==1 && elapsed);
+ return 1;
 }
 static void balanced(IOMemoryDescriptor &m) { assert(m.refs==1 && !m.prepared); }
 int main() {
@@ -104,16 +120,41 @@ int main() {
  assert(copy(s[5])==0 && maps==9 && unmaps==9);balanced(mem[5]);
  ready=true;fail_map=false;
  assert(copy(s[6])==1);copy_result=-1;
- assert(copy(s[6])==-1);sweet_gpu_release(&s[6]);
+ assert(copy(s[6])==-1);
+ assert(s[6].refs==2 && s[6].gpuQuarantined && !sweet_gpu_writer(&s[6],true));
+ sweet_gpu_release(&s[6]);
  assert(mem[6].refs==2 && mem[6].prepared==1); /* late DMA quarantine */
  unsigned before=maps;
  assert(copy(s[7])==0 && maps==before);balanced(mem[7]);
- ready=true;copy_result=1;assert(copy(s[7])==1);
+ ready=true;copy_result=2;assert(copy(s[7])==1);
  fail_unmap=true;sweet_gpu_release(&s[7]);
  assert(mem[7].refs==2 && mem[7].prepared==1); /* unmap sync + drain failure */
  fg_times t;sweet_surface_gpu_stats(&t);
  assert(t.attempts && t.hits==1001 && t.cpu && !sweet_gpu_times.attempts);
  puts("PASS: actual C++ cache, 1000 hits, bounded LRU, replacement/generation, release, prepare/map failures and DMA quarantine");
+ /* Async retains the exact source through delayed ticks; no new map/copy. */
+ ready=true;fail_unmap=false;copy_result=2;
+ IOMemoryDescriptor extra; SweetSurface frame; frame.memory=&extra;
+ assert(sweet_surface_gpu_copy(&frame,0x10000,0,0,0,0,1080,10)==2);
+ assert(frame.refs==2 && extra.refs==2 && extra.prepared==1);
+ unsigned submits=copies, mapped=maps; uint64_t elapsed=0;
+ poll_result=0;
+ for(unsigned i=0;i<4;i++) {
+  assert(!sweet_surface_gpu_poll(&elapsed) && frame.refs==2);
+  assert(sweet_surface_gpu_copy(&frame,0x10000,0,0,0,0,1080,10)==2);
+  assert(copies==submits && maps==mapped);
+ }
+ assert(!sweet_gpu_drop(sweet_gpu_slot));
+ poll_result=1;assert(sweet_surface_gpu_poll(&elapsed)==1 && frame.refs==1 && elapsed);
+ assert(sweet_gpu_writer(&frame,true) && frame.gpuWriters==1);
+ assert(!sweet_surface_gpu_copy(&frame,0x10000,0,0,0,0,1080,10));
+ assert(sweet_gpu_writer(&frame,false) && !frame.gpuWriters);
+ assert(sweet_surface_gpu_copy(&frame,0x10000,0,0,0,0,1080,10)==2);
+ assert(sweet_gpu_writer(&frame,true)); /* only producer waits; retires fence */
+ assert(frame.refs==1 && frame.gpuWriters==1);
+ assert(sweet_gpu_writer(&frame,false));
+ sweet_gpu_release(&frame);balanced(extra);
+ puts("PASS: async retained source, four busy ticks, no resubmit/unmap, fence release");
  IOLockFree(sweet_gpu_lock);
 }
 '''
@@ -125,7 +166,7 @@ def main():
     added = ''.join(line[1:] for line in block.splitlines(True) if line.startswith('+') and not line.startswith('+++'))
     declarations = added[added.index('struct sweet_gpu_backing'):added.index('static bool sweet_gpu_init')]
     functions = ''.join(submit.function(added, n) for n in (
-        'sweet_gpu_init', 'sweet_gpu_drop', 'sweet_gpu_release', 'sweet_surface_gpu_copy', 'sweet_surface_gpu_stats'))
+        'sweet_gpu_init', 'sweet_gpu_drop', 'sweet_gpu_release', 'sweet_surface_gpu_copy', 'sweet_surface_gpu_poll', 'sweet_gpu_writer', 'sweet_surface_gpu_stats'))
     with tempfile.TemporaryDirectory() as tmp:
         src = Path(tmp) / 'cache.cc'
         src.write_text(PREFIX + declarations + functions + MODEL)
