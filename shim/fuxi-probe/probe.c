@@ -413,6 +413,9 @@ static void ts_gpio(unsigned n, unsigned func, unsigned pull, unsigned ma, int o
 /* Lane-gpu (milestone 1): staged A740 power/clock/cmd-db probe on request 0x56.
  * Kept in its own single-TU file so other lanes' probe.c edits stay separate. */
 #include "gpu.c"
+/* Lane-audio (milestone 1): snapshot, firmware staging and ADSP PAS boot on
+ * requests 0x5a/0x5b; see audio.c and docs-lanes/audio.md. */
+#include "audio.c"
 
 /* SE4 and wrapper registers hang the bus (SoC reset) while wrapper1's AHB
  * clocks are gated: touch them only with m_ahb running (s_ahb is under
@@ -870,6 +873,8 @@ static struct {
 	uint32_t    evt_pos;
 	enum { EP0_SETUP, EP0_DATA, EP0_WAIT_STATUS2, EP0_WAIT_STATUS3, EP0_STATUS } state;
 	bool        data_in;        /* data stage direction */
+	bool        audio_out;      /* OUT data stage carries an audio staging chunk */
+	uint16_t    out_index, out_length;
 	uint32_t    events;
 } ud;
 
@@ -1125,8 +1130,10 @@ ud_setup(void)
 	uint32_t n = 0;
 	bool ok = true;
 
-	printf("SWEET USB: setup %02x %02x %04x len %u\n", type, req, value, length);
+	if (req != 0x5b || value == 0)  /* audio staging sends ~10^5 chunks: log the first only */
+		printf("SWEET USB: setup %02x %02x %04x len %u\n", type, req, value, length);
 	ud.data_in = (type & 0x80) != 0;
+	ud.audio_out = false;
 	if (type == 0xc0 && (req == 0x40 || req == 0x41)) {
         uint32_t offset = (uint32_t)value | ((uint32_t)st[4] << 16) | ((uint32_t)st[5] << 24);
         const uint8_t *src = req == 0x40 ? (const uint8_t *)&probe_info : (const uint8_t *)probe_fdt;
@@ -1237,6 +1244,10 @@ ud_setup(void)
     } else if (type == 0xc0 && req == 0x57 && (n = thermal_request(value, (uint16_t)(st[4] | st[5] << 8))) != 0) {
         /* thermal lane: TSENS / EPSS / monitor idle (see thermal_request) */
         memcpy(data, th_report, n);
+    } else if (type == 0xc0 && req == 0x5a && (n = audio_request(value, (uint16_t)(st[4] | st[5] << 8), data)) != 0) {
+        /* audio lane: 'AS' snapshot, 'AU' staging status, 'AB' ADSP boot, 'AR' report */
+    } else if (type == 0x40 && req == 0x5b && au_out_ok(value, (uint16_t)(st[4] | st[5] << 8), length)) {
+        ud.audio_out = true; ud.out_index = (uint16_t)(st[4] | st[5] << 8); ud.out_length = length;
     } else if (type == 0xc0 && req == 0x48) {
         memcpy(data, monitor_error, sizeof(monitor_error)); n=sizeof(monitor_error);
 #if defined(FUXI_XNU_LOADER)
@@ -1282,7 +1293,8 @@ ud_setup(void)
 		}
 		ud_start(1, UD_DATA, n, TRBCTL_DATA);
 	} else {
-		ud_start(0, UD_DATA, 64, TRBCTL_DATA);  /* OUT data is not used here */
+		/* OUT TRB length is a max-packet multiple; only audio chunks are used. */
+		ud_start(0, UD_DATA, ud.audio_out ? ((uint32_t)length + 63u) & ~63u : 64u, TRBCTL_DATA);
 	}
 }
 
@@ -1327,6 +1339,15 @@ ud_event(uint32_t ev)
 			ud_setup();
 			break;
 		case EP0_DATA:
+			if (ud.audio_out) {
+				/* TRB size field holds the untransferred remainder. */
+				uint32_t want = ((uint32_t)ud.out_length + 63u) & ~63u;
+				uint32_t left = *(volatile uint32_t *)(ud.dma + UD_TRB_OUT + 8) & 0xffffff;
+				ud_sync(UD_DATA, want);
+				if (want - left == ud.out_length)
+					au_out_data(ud.out_index, (const volatile uint8_t *)(ud.dma + UD_DATA), ud.out_length);
+				ud.audio_out = false;
+			}
 			ud.state = EP0_WAIT_STATUS3;
 			break;
 		case EP0_STATUS:
