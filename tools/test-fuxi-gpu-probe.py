@@ -35,6 +35,8 @@ static int firmware_success = 1, ack_mode, corrupt_readback, tlb_busy;
 static unsigned firmware_releases, mmio_writes;
 static int cp_mode; /* 1 stalled, 2 fault, 3 missing fence, 4 corrupt fence guard */
 static uint64_t abort_read, abort_write;
+static unsigned blit_mode;
+static void model_blit_stream(unsigned end);
 static unsigned drop_sqe_base, start_fault, doorbells, sqe_controls;
 uint32_t probe_fault_esr;
 uint64_t probe_fault_far;
@@ -59,6 +61,7 @@ static void mock_write(uint64_t at, uint32_t val)
  mmio_writes++;
  if (drop_sqe_base && at == GPU_REG_BASE+G3_SQE_BASE*4) *ptr(at)=0;
  if (at == GPU_REG_BASE+G3_SQE_CNTL*4) sqe_controls++;
+ assert(at != GPU_REG_BASE+0xf400*4); /* TRUST is strictly read-only */
  /* Model the suspected premature fetch explicitly, not SQE instructions.
   * Both 3 and 1 contain enable bit0. A zero-base fetch is latched even if
   * software later repairs INSTR_BASE; this models the observed signature. */
@@ -78,6 +81,7 @@ static void mock_write(uint64_t at, uint32_t val)
   assert(*ptr(G3_RING_PA+8)==0x70c80004 && *ptr(G3_RING_PA+12)==0x4b);
   if (cp_mode == 1) return;
   if (cp_mode == 2) { *ptr(GPU_REG_BASE+0x823*4)=4; return; }
+  if (val > G3_FENCE_DWORDS) { model_blit_stream(val); if (blit_mode == 1 || blit_mode == 4) return; }
   *ptr(GPU_REG_BASE+0x806*4)=val; *ptr(G3_PTR_PA)=val;
   if (val==G3_FENCE_DWORDS) {
    assert(*ptr(G3_RING_PA+G3_INIT_DWORDS*4)==0x703d8003);
@@ -124,15 +128,16 @@ static void reset_model(void)
  gpu_snapshot_valid = gpu_gmu_started = gpu_m2_attempted = gpu_s8_ok = 0;
  gpu_s9_attempted = gpu_s9_ok = gpu_s10_attempted = 0;
  ticks = firmware_releases = mmio_writes = 0;
- cp_mode=0; abort_read=abort_write=0;
+ cp_mode=0; blit_mode=0; abort_read=abort_write=0;
  ack_mode = corrupt_readback = tlb_busy = 0; firmware_success = 1;
+ *ptr(GPU_REG_BASE+0xf400*4) = 1;
  *ptr(GPU_SMMU_BASE+0x20) = 0x4c017e18;
  *ptr(GPU_SMMU_BASE+0x24) = 0x40000016;
  *ptr(GPU_SMMU_BASE+0x28) = 0x5511;
  *ptr(GPU_SMMU_BASE) = 0x2f0406;
  *ptr(GPU_GMU_CORE+0x5000*4) = 1;
  *ptr(GPU_GMU_CORE+(0x1c00+0xff8)*4) = 0x20010005;
- gpu_extra[0][0] = 0xa7400005;
+ gpu_extra[0][0] = 0xa7400006;
  assert(g_snapshot());
 }
 static void aux_fixture(void)
@@ -161,6 +166,87 @@ static uint64_t walk(unsigned va)
  uint64_t *l3=(uint64_t *)(uintptr_t)(l2[(va>>21)&511]&~0xfffull);
  return l3[(va>>12)&511];
 }
+/* Small PM4 interpreter for the documented subset. This does not model GPU
+ * execution/cache ordering. Decode literal HW registers and translate every
+ * memory access through the emitted PTEs (including write permissions). */
+static uint64_t model_gpu_pa(unsigned va, unsigned write)
+{
+ uint64_t *l1=(uint64_t *)(uintptr_t)G3_PT;
+ assert(l1[va>>30]);
+ uint64_t *l2=(uint64_t *)(uintptr_t)(l1[va>>30]&~0xfffull);
+ assert(l2[(va>>21)&511]);
+ uint64_t *l3=(uint64_t *)(uintptr_t)(l2[(va>>21)&511]&~0xfffull);
+ uint64_t pte=l3[(va>>12)&511];
+ assert((pte&3)==3 && (!write || !(pte&128)));
+ return (pte & 0xfffffffff000ull) | (va&4095);
+}
+static void model_blit_stream(unsigned end)
+{
+ unsigned pos=*ptr(GPU_REG_BASE+0x806*4);
+ assert(end<=8192 && end>pos);
+ if (blit_mode==1) return;
+ if (blit_mode==4) { *ptr(GPU_REG_BASE+0x823*4)=4; return; }
+ uint32_t regs[0xc000]={0}; unsigned copies=0, fences=0;
+ while (pos<end) {
+  uint32_t hdr=*ptr(G3_RING_PA+pos++*4);
+  if ((hdr>>28)==4) {
+   unsigned count=hdr&0x7f, reg=(hdr>>8)&0x3ffff;
+   assert(reg+count<0xc000 && pos+count<=end);
+   for(unsigned i=reg;i<reg+count;i++) for(unsigned slot=0;slot<48;slot++) {
+    uint32_t pr=g3_protect[slot];
+    if(pr&0x80000000u) assert(i<(pr&0x3ffffu) || i>(pr&0x3ffffu)+((pr>>18)&0x1fff));
+   }
+   assert(hdr==g4_pkt4(reg,count));
+   while(count--) regs[reg++]=*ptr(G3_RING_PA+pos++*4);
+  } else {
+   assert((hdr>>28)==7);
+   unsigned count=hdr&0x3fff, op=(hdr>>16)&0x7f;
+   assert(hdr==g3_pkt7(op,count) && pos+count<=end);
+   uint32_t *args=ptr(G3_RING_PA+pos*4);
+   if (op==0x2c) {
+    assert(count==1 && args[0]==3);
+    assert(regs[0x8c00]==0x10f03000 && regs[0x8400]==regs[0x8c00]);
+    assert(regs[0xa9bf]==0xf180 && regs[0xb2d2]==1u<<29);
+    assert(regs[0xb2c0]==0x500430 && regs[0x8c17]==0x430);
+    assert(regs[0x88e5]==0xc0000000);
+    assert(!regs[0xb2c3] && !regs[0x8c19]);
+    unsigned sx=regs[0x8401]>>8, ex=regs[0x8402]>>8;
+    unsigned sy=regs[0x8403]>>8, ey=regs[0x8404]>>8;
+    unsigned dx=regs[0x8405]&0xffff, dy=regs[0x8405]>>16;
+    unsigned bx=regs[0x8406]&0xffff, by=regs[0x8406]>>16;
+    assert(ex-sx==bx-dx && ey-sy==by-dy);
+    unsigned sp=(regs[0xb2c4]>>9)*64, dp=regs[0x8c1a]*64;
+    assert(sp==1024 && dp>=(bx+1)*4);
+    assert((regs[0x8c18]&63)==0 && (regs[0xb2c2]&63)==0);
+    for(unsigned y=0;y<=ey-sy;y++) for(unsigned x=0;x<=ex-sx;x++) {
+     unsigned src=regs[0xb2c2]+(sy+y)*sp+(sx+x)*4;
+     unsigned dst=regs[0x8c18]+(dy+y)*dp+(dx+x)*4;
+     *ptr(model_gpu_pa(dst,1))=*ptr(model_gpu_pa(src,0));
+    }
+    copies++;
+   } else if(op==0x46 && count==4) {
+    assert(args[0]==(49u|1u<<27) && !args[2]);
+    if(blit_mode!=3) *ptr(model_gpu_pa(args[1],1))=args[3];
+    fences++;
+   } else assert((op==0x26 && count==0) || (op==0x65 && count==1 && args[0]==12) || (op==0x46 && count==1));
+   pos+=count;
+  }
+ }
+ assert(copies && fences==1);
+ if (blit_mode==2) *ptr(G4_DST_PA+259*4)^=1;
+ if (blit_mode==5) *ptr(G4_DST_PA-4)=0;
+ if (blit_mode==6) *ptr(G4_SRC_PA)^=1;
+ if (blit_mode==7) *ptr(G4_FB_PA+((G4_FB_Y)*1080+G4_FB_X-1)*4)^=1;
+}
+static void panel_fixture(void)
+{
+ *ptr(0x0ae05014)=0xb8000000;
+ *ptr(0x0ae05024)=4320;
+ *ptr(0x0ae05000)=(2400u<<16)|1080;
+ *ptr(0x0ae05030)=0x237ff;
+ memset((void *)(uintptr_t)G4_FB_PA,0x6b,G4_FB_MAP);
+}
+
 int main(int argc, char **argv)
 {
  (void)argc; (void)argv;
@@ -169,6 +255,10 @@ int main(int argc, char **argv)
  assert(mmap((void *)(uintptr_t)0x0b280000, 0x10000, PROT_READ|PROT_WRITE,
   MAP_ANONYMOUS|MAP_PRIVATE|MAP_FIXED_NOREPLACE,-1,0) != MAP_FAILED);
  assert(mmap((void *)(uintptr_t)G_MEM, G_MEM_SIZE, PROT_READ|PROT_WRITE,
+  MAP_ANONYMOUS|MAP_PRIVATE|MAP_FIXED_NOREPLACE,-1,0) != MAP_FAILED);
+ assert(mmap((void *)(uintptr_t)0x0ae05000, 0x1000, PROT_READ|PROT_WRITE,
+  MAP_ANONYMOUS|MAP_PRIVATE|MAP_FIXED_NOREPLACE,-1,0) != MAP_FAILED);
+ assert(mmap((void *)(uintptr_t)G4_FB_PA, G4_FB_MAP, PROT_READ|PROT_WRITE,
   MAP_ANONYMOUS|MAP_PRIVATE|MAP_FIXED_NOREPLACE,-1,0) != MAP_FAILED);
  reset_model(); unsigned before=mmio_writes;
  assert(g_snapshot() && before == mmio_writes && g_ncb == 22 && g_nsmr == 24 && g_cbbase == 0x20000);
@@ -225,7 +315,7 @@ int main(int argc, char **argv)
  uint64_t *mid=(void *)(uintptr_t)(root[1]&~0xfffull);
  uint64_t *leaf=(void *)(uintptr_t)(mid[0]&~0xfffull);
  assert(!root[0] && !root[2] && !leaf[tail+1] && !mid[1]);
- gpu_m2(12); assert(gpu_extra[5][3]==1 && gpu_extra[5][49]==G3_INIT_DWORDS && gpu_extra[5][43]);
+ gpu_m2(12); assert(gpu_extra[5][3]==1 && gpu_extra[5][49]==G3_INIT_DWORDS && !gpu_extra[5][43] && gpu_extra[5][45]==1);
  assert(gpu_extra[5][17]==_sqe_fw_end-_sqe_fw_start && gpu_extra[5][18]==_sqe_fw_end-_sqe_fw_start-4);
  assert(!memcmp((void *)(uintptr_t)G3_SQE_PA,_sqe_fw_start+4,gpu_extra[5][18]));
  assert(sqe_controls==1 && gpu_extra[5][119]==7);
@@ -298,7 +388,7 @@ int main(int argc, char **argv)
   else assert(gpu_extra[5][4]==(mode==3?0xd03:0xd05));
   before=mmio_writes; gpu_m2(13); assert(before==mmio_writes && gpu_gmu_started);
  }
- reset_model(); aux_fixture(); gpu_m2(11); abort_write=GPU_REG_BASE+0xf400*4;
+ reset_model(); aux_fixture(); gpu_m2(11); abort_read=GPU_REG_BASE+0xf400*4;
  gpu_m2(13); assert(gpu_extra[5][3]==0xc09 && gpu_extra[5][116] && !gpu_extra[5][6]);
  reset_model(); aux_fixture(); gpu_m2(10); abort_read=GPU_SMMU_BASE+SMMU_SMR(1);
  gpu_m2(13); assert(gpu_extra[5][2]==0xb01 && !gpu_extra[5][5]);
@@ -337,7 +427,52 @@ int main(int argc, char **argv)
  reset_model(); aux_fixture(); gpu_m2(11); abort_read=GPU_REG_BASE+G3_BV_STAT_DATA*4;
  gpu_m2(13); assert(gpu_extra[5][3]==0xc05 && !gpu_extra[5][6]);
  assert(gpu_extra[9][2]==0 && gpu_extra[9][3]==51 && gpu_extra[9][4]);
- puts("PASS: SMMU snapshot/ownership/readback, all icache PTEs, firmware load, HFI order/ACK/wrap/errors/timeouts, m3 mappings/CP packets/fence/abort/timeouts, one-shot GMU/handoff latch");
+ /* Pixel work is modeled separately from CP_MEM_WRITE. */
+ reset_model(); aux_fixture(); panel_fixture(); gpu_m2(14);
+ assert(gpu_extra[11][2]==1 && gpu_extra[11][21]==0 && gpu_extra[11][20]==gpu_extra[11][19]);
+ assert(!gpu_extra[12][1] && gpu_extra[5][4]==1);
+ assert(gpu_extra[11][28]==5 && gpu_extra[11][31]==11 && gpu_extra[11][32]==74);
+ assert(gpu_extra[11][38] && gpu_extra[11][37]==0xa740b014);
+ uint32_t frozen14[128]; memcpy(frozen14,gpu_extra[11],sizeof(frozen14));
+ before=doorbells; gpu_m2(15);
+ assert(gpu_extra[12][2]==1 && gpu_extra[12][21]==0 && gpu_extra[12][47]==0);
+ assert(!gpu_extra[12][26] && !gpu_extra[12][49] && !gpu_extra[12][45]);
+ assert(gpu_extra[12][28]==10 && doorbells==before+1 && gpu_extra[12][32]==1586);
+ assert(memcmp(frozen14,gpu_extra[11],sizeof(frozen14))==0);
+ before=doorbells; gpu_m2(15); gpu_m2(14); assert(doorbells==before && gpu_gmu_started);
+ FILE *m4=fopen("report-m4.bin","wb");
+ assert(m4); gpu_report[0]=0xa740; fwrite(gpu_report,sizeof(gpu_report),1,m4);
+ fwrite(gpu_extra,sizeof(gpu_extra),1,m4); fclose(m4);
+ for(unsigned mode=1;mode<=6;mode++) {
+  reset_model(); aux_fixture(); gpu_m2(13); blit_mode=mode; unsigned begun=ticks;
+  gpu_m2(15);
+  unsigned errors[]={0,0xe05,0xe06,0xe05,0xe02,0xe07,0xe06};
+  assert(gpu_extra[11][2]==errors[mode] && !gpu_extra[12][1] && ticks-begun<100000);
+  if(mode==2) assert(gpu_extra[11][21]==1 && gpu_extra[11][22]==3 && gpu_extra[11][23]==1);
+  before=doorbells; gpu_m2(15); assert(doorbells==before && gpu_gmu_started);
+ }
+ reset_model(); aux_fixture(); gpu_m2(14); panel_fixture(); *ptr(0x0ae05024)=4352;
+ before=doorbells; gpu_m2(15); assert(gpu_extra[12][2]==0xe08 && doorbells==before);
+ reset_model(); aux_fixture(); gpu_m2(14); panel_fixture(); blit_mode=7;
+ gpu_m2(15); assert(gpu_extra[12][2]==0xe07 && !gpu_extra[12][40]);
+ reset_model(); aux_fixture(); gpu_m2(13); tlb_busy=1;
+ gpu_m2(15); assert(gpu_extra[11][2]==0xe03 && !gpu_extra[12][1]);
+ reset_model(); aux_fixture(); gpu_m2(13); abort_read=GPU_REG_BASE+0x806*4;
+ gpu_m2(15); assert(gpu_extra[11][2]==0xe01 && !gpu_extra[12][1]);
+ reset_model(); aux_fixture(); gpu_m2(13); abort_read=G4_DST_PA;
+ gpu_m2(15); assert(gpu_extra[11][2]==0xe01 && gpu_extra[11][92] && !gpu_extra[12][1]);
+ for(unsigned mode=1;mode<=4;mode+=2) {
+  reset_model(); aux_fixture(); gpu_m2(14); panel_fixture(); blit_mode=mode;
+  gpu_m2(15); assert(gpu_extra[12][2]==0xe05 && !gpu_extra[12][40]);
+  before=doorbells; gpu_m2(15); assert(before==doorbells && gpu_gmu_started);
+ }
+ reset_model(); aux_fixture(); gpu_m2(13); abort_write=GPU_REG_BASE+G4_RB_NC*4;
+ before=doorbells; gpu_m2(15); assert(gpu_extra[11][2]==0xe01 && before==doorbells);
+ reset_model(); aux_fixture(); gpu_m2(14); panel_fixture(); abort_read=0x0ae05014;
+ gpu_m2(15); assert(gpu_extra[12][2]==0xe01);
+ reset_model(); aux_fixture(); gpu_m2(13); g3_wptr=8190;
+ before=doorbells; gpu_m2(15); assert(gpu_extra[11][2]==0xe04 && before==doorbells);
+ puts("PASS: M4 pixels/row pitches/fences/guards/faults/no-retry; SMMU snapshot/ownership/readback, all icache PTEs, firmware load, HFI order/ACK/wrap/errors/timeouts, m3 mappings/CP packets/fence/abort/timeouts, one-shot GMU/handoff latch");
  return 0;
 }
 '''
@@ -382,6 +517,14 @@ def audit_linux(msm):
              'G3_MISC': 'CP_MISC_CNTL', 'G3_CHICKEN': 'CP_CHICKEN_DBG',
              'G3_BV_UCODE_ADDR': 'CP_BV_SQE_UCODE_DBG_ADDR', 'G3_BV_UCODE_DATA': 'CP_BV_SQE_UCODE_DBG_DATA',
              'G3_AC_UCODE_ADDR': 'CP_SQE_AC_UCODE_DBG_ADDR', 'G3_AC_UCODE_DATA': 'CP_SQE_AC_UCODE_DBG_DATA'}
+    names.update({'G4_GRAS_BLIT': 'GRAS_2D_BLIT_CNTL', 'G4_GRAS_SRC_X': 'GRAS_2D_SRC_TL_X',
+                  'G4_GRAS_NC': 'GRAS_NC_MODE_CNTL', 'G4_CCU_CNTL2': 'RB_CCU_CNTL2',
+                  'G4_RB_BLIT': 'RB_2D_BLIT_CNTL', 'G4_RB_PIXEL': 'RB_2D_UNKNOWN_8C01',
+                  'G4_RB_DST_INFO': 'RB_2D_DST_INFO', 'G4_CCU_CNTL': 'RB_CCU_CNTL',
+                  'G4_RB_NC': 'RB_NC_MODE_CNTL', 'G4_SP_FORMAT': 'SP_2D_DST_FORMAT',
+                  'G4_SP_NC': 'SP_NC_MODE_CNTL', 'G4_SP_SRC_INFO': 'SP_PS_2D_SRC_INFO',
+                  'G4_SP_WINDOW': 'SP_PS_2D_WINDOW_OFFSET', 'G4_TPL1_BLIT': 'SP_PS_UNKNOWN_B2D2',
+                  'G4_TPL1_NC': 'TPL1_NC_MODE_CNTL'})
     for macro, name in names.items():
         value = int(re.search(r'^#define ' + macro + r'\s+(0x[0-9a-f]+)', header, re.M)[1], 16)
         assert value == offsets[name], f'{macro}: Linux {name} offset drift'
@@ -393,7 +536,7 @@ def audit_linux(msm):
     firmware = (msm / 'adreno/adreno_gpu.c').read_text().split('struct drm_gem_object *adreno_fw_create_bo', 1)[1].split('int adreno_hw_init', 1)[0]
     assert 'memcpy(ptr, &fw->data[4], fw->size - 4)' in firmware
     assert 'MSM_BO_WC | MSM_BO_GPU_READONLY' in firmware
-    print('PASS: Linux source audit: 54 HWCG pairs, 48 protection slots, 21 CP offsets; cold SQE order and firmware copy')
+    print('PASS: Linux source audit: 54 HWCG pairs, 48 protection slots, 36 CP/2D offsets; cold SQE order and firmware copy')
 
 
 def main():
@@ -451,7 +594,17 @@ def main():
         client = decoder['fault_client']
         assert client(0, 0) == 'CP' and client(3, 9) == 'BV_SP' and client(8, 7) == 'LPAC_TP'
         assert decoder['bit_names'](0x80, decoder['CP_BITS']) == 'BR_ILLEGAL_INSTR'
-        print('PASS: twelve-page offline Python decoder')
+        m4report = subprocess.run(['python3', str(ROOT / 'tools/fuxi-gpu-probe.py'), '--decode', str(tmp / 'report-m4.bin')],
+                                  check=True, capture_output=True, text=True).stdout
+        assert 'stage 14 A7xx 2D blit' in m4report and 'stage 15 A7xx 2D blit' in m4report
+        assert 'mismatch=0' in m4report and 'CPU_mismatch=0' in m4report
+        # v5's unchanged prefix must still decode as a 12-page saved report.
+        legacy = bytearray((tmp / 'report.bin').read_bytes()[:6144])
+        import struct
+        struct.pack_into('<I', legacy, 512, 0xa7400005)
+        old = tmp / 'v5.bin'; old.write_bytes(legacy)
+        subprocess.run(['python3', str(ROOT / 'tools/fuxi-gpu-probe.py'), '--decode', str(old)], check=True, stdout=subprocess.DEVNULL)
+        print('PASS: fourteen-page M4 and legacy v5 offline Python decoder')
 
 
 if __name__ == '__main__':

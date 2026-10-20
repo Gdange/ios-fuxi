@@ -1,3 +1,233 @@
+# Lane: GPU A740 — milestone 4, 2026-10-20
+
+Branch `codex-gpu-m4`, based on main `b6996c1`. This section supersedes earlier
+handoffs below; retain their history and **Device results, milestone3**.
+No phone/USB/adb/fastboot access, no push, no handoff. The GMU-start lock stays.
+
+## Verified baseline and new device hypotheses
+
+Coordinator M3d verified stages1..13, including SQE/CP consuming PM4 through
+CB2 and CP_MEM_WRITE landing at the CPU-visible fence. TRUST remained1, and
+reserved CB FSR bit10 remained report-only. M4 adds **unverified on hardware**
+pixel work. The offline model executes a small interpreted PM4 subset, not
+SQE firmware, real SMMU translation, cache behavior or the rendering pipeline.
+
+Stage12 now reads SECVID/TSB only: its legacy ignored TRUST=0 fallback write is
+removed to leave secure mode alone. Page6[43]=0 means no write was attempted;
+[44]/[45] are two raw read samples. No secure mode packet, zap/PAS/SCM call or
+SID2 mapping is added. Init/fence command sizes remain7/11 and stage11 still
+uses3 page-table pages. New mappings are installed only when their stage runs.
+
+Local Mesa was found before using external references: revision
+`875160ed32cc5bc32777fa04870a0a57ed38c987`, `src/gallium/drivers/freedreno/a6xx/`
+`fd6_blitter.cc`, `fd6_emit.{cc,h}`, `src/freedreno/vulkan/tu_clear_blit.cc`,
+`common/fd6_gmem_cache.h`, `freedreno_devices.py`, `fdl/fd6_format_table.c`,
+and `registers/adreno/{a6xx.xml,a6xx_enums.xml}`. Linux reference remains the
+supplied kernel-guest msm tree. `$MESA`, `$MSM`, `$FW`, `$LLVM`, `$PAYLOAD` below
+are local input placeholders, never tracked machine paths.
+
+## Stage14: 256x256 scratch BGRA copy
+
+Stage14 requires13 PASS, retained GPU_SET, idle CP with expected rptr/wptr,
+no defined faults and intact old fence guards. It adds two NC mappings to the
+existing GPU table pool, with AF/shareability and permissions matching M3,
+then publishes a barrier, invalidates the owned ASID and polls TLBSYNC at most
+1000x1us. Neither context control nor stream ownership is reprogrammed; faults
+are not cleared. Mapping/setup failure is one-shot, with no rollback or retry.
+
+| Surface | GPU VA | Physical address | Mapped bytes / AP |
+|---|---:|---:|---|
+| Source | `0x40201000` | `0x8f1401000` | `0x40000`, read-only AP3 |
+| Destination | `0x40401000` | `0x8f1501000` | `0x40000`, RW AP1 |
+| Panel, stage15 only | `0x41000000` | `0xb8000000` | `0x9e4000`, RW AP1 |
+
+Both scratch surfaces have a CPU-written 4KiB guard page immediately before
+and after them, outside their GPU mappings. All guards and all source/dest
+pixels are checked after completion. Pattern `(x^y)<<24 | x<<16 | y<<8 |
+((13*x+7*y)&255)` varies every channel, including alpha; destination starts
+as `deadbeef`. Expected and actual checksums are FNV-style **u32-word** folds:
+start2166136261, `(hash ^ pixel)*16777619 mod2^32` in row-major order. Counts
+and first bad x/y/expected/actual are primary evidence, not checksum alone.
+
+Submission follows fd6/Turnip's linear 2D path: WFI, RM6_BLIT2DSCALE, A7xx CCU
+clean/invalidate and UCHE invalidate events, sysmem CCU configuration, matching
+RB/GRAS_2D_BLIT_CNTL (format30 UNORM8, maskf), A7xx SP_2D_DST_FORMAT at `a9bf`,
+SP_PS_2D_SRC_* at `b2c0` (not A6xx `b4c0`), TPL1_A2D_BLT_CNTL at `b2d2`
+(TEX_2D), BGRA WXYZ swap1, nearest, linear, single sample, no UBWC/sRGB.
+Mesa's corrected SP output field has float type0 and half_precision0; do not
+set the older Linux XML's misleading NORM bit0. Source pitch is encoded in
+64-byte units at bit9, destination pitch in64-byte units at bit0. GRAS source
+coordinates are shifted8; source/dest BR coordinates are inclusive.
+
+A740's six CCUs x256KiB depth cache put the sysmem color cache at GMEM offset
+`0x180000`: RB_CCU_CNTL2=`c0000000`, full caches; RB_CCU_CNTL=0 disables
+concurrent resolve. Protected RB/TPL1/SP/GRAS NC registers use safe **CPU MMIO**
+with Linux's A740 HBB16 configuration, after the idle gate. They never appear
+as protected PKT4 writes. The PM4 model audits every PKT4 against the existing
+NORDWR protection ranges. No 3D shaders, draw state, preemption or GMEM resolve
+is enabled, and no bulk unrelated Mesa 3D magic is copied. Whether this minimal
+cold 2D setup suffices on retail A740 remains a device question.
+
+Each copy emits LABEL then `CP_BLIT / BLIT_OP_SCALE`, followed by WFI. The job
+ends with CCU_CLEAN_COLOR/DEPTH and A7xx `CP_EVENT_WRITE7` CACHE_CLEAN49,
+WRITE_ENABLED bit27, user32 payload to its own fence. This is Linux
+`a7xx_submit`'s A7xx event encoding, not A6xx timestamp bit31 or a bare
+CP_MEM_WRITE. A final WFI follows. CPU completion requires expected fence,
+rptr=wptr and idle RBBM, with CP/RBBM/global/both-bank faults checked every16
+polls and at completion. Wait is at most5000x10us plus MMIO cost. All new MMIO
+and verification reads use abort-recovering wrappers; CPU-owned scratch fills
+use the existing uncached stores. Failure retains power, mappings and ring.
+
+Expected stage14 ring: starts11, appends63 words, ends74; tables3→5;
+fence `0x40029010`=`a740b014`, all65536 pixels match, no guard/source damage.
+
+## Stage15: visible bars and CPU comparison, gated on14 PASS
+
+Before mapping or touching scanout, safe reads check the same source pipe as
+request4e: PA=`b8000000`, stride4320, size=`09600438` (1080x2400),
+format=`237ff`. A mismatch/abort stops with no panel submission. Never read
+MDSS/MDP top, program display registers, or issue manual START.
+
+The region is x64..319, y256..319: 256x64 BGRA pixels /65536 bytes. Eight
+32-pixel bars are red, green, blue, white, yellow, cyan, magenta, dark grey.
+Source is rebuilt in the same scratch surface. The destination's4320-byte
+stride is **not** a multiple of64 and cannot be encoded directly. Submit64
+one-row blits: base=`align_down(panelVA+row*4320+x*4,64)`, destination x phase
+=`(byteOffset&63)/4`, padded single-row pitch1088; source y selects the row
+from the256-wide scratch image. Pitch is never used to advance to another
+panel row. WFI serializes coordinate/base changes. The 32KiB ring is never
+wrapped or reused, and worst-case capacity is checked before writing new words.
+
+Expected stage15 ring: starts74, appends1512 words, ends1586; tables5→10;
+fence `0x40029020`=`a740b015`. Compare all16384 output/source pixels before any
+CPU benchmark. Compare saved pixels immediately left/right of every row and
+above/below the region, plus all scratch guards and old fence guards. This is
+a perimeter check, not a proof that every other framebuffer pixel is unchanged.
+
+Only after GPU verification succeeds, time a CPU `memcpy` of the exact same
+64 rows/source/target and verify the region and perimeter again. The comparator
+is probe.c's **volatile byte memcpy with MMU/caches off**, not an optimized XNU
+memcpy. `cntpct_el0` GPU time includes doorbell, polling, fence and idle, excludes
+mapping, pattern creation, packet construction and pixel verification. CPU time
+includes64 memcpy calls plus final `dsb sy`. Both are u64 ticks with CNTFRQ in
+Hz; polling granularity/MMIO overhead can dominate this small job. No speedup
+or physical-panel visibility is claimed offline. CPU readback cannot establish
+panel scanout/tearing; coordinator checks the actual bars.
+
+## Report v6: fourteen512-byte pages
+
+Selectors100..10d (7168 bytes); page1/page6/extended signatures=`a7400006`.
+Updated host accepts `--stage 14/15`, fetches all14 pages, and still decodes
+legacy v2/v3/v4/v5 sizes. `--read-reports` copies frozen RAM only. Stage12/13's
+frozen records are preserved. Pages12/13 hold one128-u32 record for14/15:
+
+| Words (local indices) | Meaning |
+|---|---|
+| 0/1/2/3 | signature / attempted stage (0 absent) / result / step |
+| 4..8 | width,height,source pitch,logical destination pitch,bytes copied |
+| 9/10 | source/destination GPU base VA |
+| 11..14 | source PA low/high, destination PA low/high |
+| 15/16 | destination x/y within logical surface |
+| 17/18 | event fence VA / expected magic |
+| 19/20/21 | expected checksum / actual checksum / mismatch count |
+| 22..25 | first bad x,y,expected,actual; x/y=`ffffffff` when none |
+| 26/27 | scratch guard or panel perimeter mismatch count / old fence low guard |
+| 28..30 | table pages / last TLBSTATUS / TLB polls |
+| 31..37 | ring start,end,count / completion polls / rptr,wptr / fence value |
+| 38..42 | GPU ticks low/high, CPU ticks low/high, CNTFRQ Hz |
+| 43/44 | reserved0 |
+| 45..49 | scratch guard mismatches / source pixel mismatches / CPU pixel mismatches / old fence high guard / CPU perimeter mismatches |
+| 50..53 | stage15 raw display PA,stride,size,format |
+| 54..63 | reserved0 |
+| 64..71 | frozen rptr,wptr,RBBM_STATUS,CP_INT,CP_HW_FAULT,CP_PROTECT_STATUS,RBBM_INT,GFSR |
+| 72..79 | GPU CB,FSR,FAR low/high,FSYNR0/1,CBFRSYNRA,SCTLR |
+| 80..87 | GMU bank, same fields |
+| 88..91 | TRUST read-only / RBBM_STATUS1/2/3 |
+| 92..95 | cumulative safe access faults / last PA low/high / ESR; page6 retains FAR/op/first fault |
+| 96..127 | first32 command words of this stage |
+
+Steps:1 prerequisites,2 map/TLB,3 pattern/guards,4 render setup/encode,
+5 submit/wait,6 GPU verification,7 CPU benchmark/verification,8 complete.
+Unreached fields are0; checksum, counts and timing are valid only once the
+corresponding step ran. Snapshot reads are sequential, not atomic. Guard/source
+failures stop before CPU overwrites. Diagnostic abort converts a tentative PASS
+to failure. Result1=PASS,0=not run. Shared M4 failure codes:
+
+| Code | Meaning |
+|---|---|
+| e01 | safe register/memory access abort (see page6 and record92..95) |
+| e02 | defined CP/RBBM/global or either-bank fault |
+| e03 | live mapping TLB sync timeout |
+| e04 | OOB/previous stage/ring/idle/capacity precondition lost |
+| e05 | event fence/rptr/wptr/idle timeout |
+| e06 | destination or source pixel mismatch |
+| e07 | scratch guard, old fence guard or panel perimeter damage |
+| e08 | live scanout geometry mismatch |
+| e09 | page-table mapping failure |
+| e0a | CPU benchmark readback/perimeter mismatch |
+
+## Validation and coordinator order
+
+Offline synthetic and exact sheng GMU/SQE native UBSan models pass with
+`-Wall -Wextra -Werror`. The model interprets PKT4/PKT7, walks real emitted PTEs
+and enforces write permissions; it copies every pixel using decoded pitches,
+base alignment and inclusive coordinates. It verifies full surface copies,
+panel row phases, event fences, frozen records, one-shot failure/no next stage,
+corrupt destination/source/guards/perimeter, missing fence, stall, CP error,
+safe-access failures, TLB timeout, geometry refusal and ring capacity refusal.
+It does not emulate SQE, caches, physical addresses or real rendering. Source
+audit checks54 HWCG pairs,48 protection entries and36 CP/2D offsets against
+Linux, plus cold RUN order and firmware copy. v6/legacy v5 decoders pass offline.
+
+Reproduce without a device:
+```
+python3 tools/test-fuxi-gpu-probe.py
+python3 tools/test-fuxi-gpu-probe.py --linux-msm "$MSM" \
+  --firmware "$FW/gmu_gen70200.bin" --sqe "$FW/a740_sqe.fw"
+```
+
+1. Fresh boots: regression7,8a ownership review,10; then11,12,13. On12 expect
+   TRUST1 with **write_ok0**, CP init rptr7; on13 fence/rptr11, no defined faults.
+2. Fresh stage14 (`--raw --save <private-report>`). Require14 result1/step8,
+   ring74, event magic, checksum equality, mismatch/source/guard counts0,
+   no defined CP/RBBM/SMMU faults or safe aborts. Keep both bank FSR bit10 raw.
+3. Only after14 passes, fresh stage15. Require region/geometry/fence/ring1586,
+   all GPU/CPU mismatch and perimeter counts0; retain raw timings and visually
+   check bars. Do not infer visibility solely from CPU memory.
+4. Same boot11→12→13→14→15, report fetches and delays between stages. Repeated
+   stages must preserve records/no new submission. Fetch all14 pages with the
+   lane decoder; an old12-page runner loses M4 evidence. Keep request49 refusal.
+5. Any failure/reset: stop climbing; retain all available reports, stage/step,
+   exact boot outcome and image hash. No retries/recovery/handoff in that boot.
+
+Risk by stage:1..13 retain proven hardware sequence apart from12's removal of
+the ineffective TRUST write and report format;14 first exercises the cold2D
+pipeline and can hang/fault despite bounded CPU polling;15 additionally permits
+GPU writes to the active framebuffer and can damage output if address/stride
+hardware semantics differ. None of M4 has been tested on the phone here.
+
+Firmware-enabled loader (`-Werror`), explicitly empty-firmware loader, and
+standalone probe build with clang-r547379: PASS, **zero warnings**. C relocation,
+link, Image header/size guards pass. Independent inspection verifies boot v4,
+zero ramdisk/padding, exact embedded sheng GMU/SQE and unchanged integ1 payload,
+and no relocations in the saved firmware ELF. Firmware hashes match prior
+milestones. Payload SHA256:
+`800b9ea17ce18f1872c0533d5ef13f916c490eb7b1524e677fc2555378f00d66`.
+
+Final ignored artifact: `shim/out/lane-gpu/fuxi-gpu-m4-boot.img`, **20,881,408 B**.
+SHA256:
+`00fc43ebbba2d0b3b01fa2e3d42a4c0a5aae9b46e9cbf1ba2a39272807041782`.
+Kernel Image:20,873,296 B. Saved firmware ELF: GMU `[0x138c8,0x23de4)` (66844 B),
+SQE `[0x23de4,0x36458)` (75380 B), BSS `[0x38000,0x68000)`,
+payload start`0x78000`, Image end`0x13e8050`. The lane image/ELF/Image were
+saved before the empty-firmware build; the lane artifact contains both blobs.
+A `.sha256` file sits beside it. No firmware, dump, ELF, boot image or local
+absolute input path is committed. Commit: the commit containing this handoff.
+
+For the post-handoff driver, see [gpu-xnu-plan.md](gpu-xnu-plan.md).
+
+---
+
 # Lane: GPU A740 — milestone 3c, 2026-10-20
 
 Current branch remains `codex-gpu-m3b`, continuing merged commit `86753f3`.

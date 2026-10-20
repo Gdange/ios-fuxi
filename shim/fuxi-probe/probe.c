@@ -1209,12 +1209,12 @@ ud_setup(void)
             memcpy(data, touch_report, sizeof(touch_report)); n=sizeof(touch_report);
         }
     } else if (type == 0xc0 && req == 0x56 && value == 0x4753 && !monitor_report[MON_LAUNCH]) {
-        /* 'GS': stages1..13 / 0x8a snapshot; 0x100..107 read frozen pages. */
+        /* 'GS': stages1..15 / 0x8a snapshot; 0x100..10d read frozen pages. */
         unsigned index = st[4] | (unsigned)st[5] << 8;
         if (index >= 0x100 && index < 0x100 + G_PAGES) {
             const uint32_t *page = index == 0x100 ? gpu_report : gpu_extra[index - 0x101];
             memcpy(data, page, sizeof(gpu_report)); n=sizeof(gpu_report);
-        } else if ((index >= 1 && index <= 13) || index == G_STAGE_8A) {
+        } else if ((index >= 1 && index <= 15) || index == G_STAGE_8A) {
             gpu_probe(index);
             memcpy(data, gpu_report, sizeof(gpu_report)); n=sizeof(gpu_report);
         } else ok = false;

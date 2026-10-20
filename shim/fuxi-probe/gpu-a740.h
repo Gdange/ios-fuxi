@@ -131,3 +131,24 @@ static const uint32_t g3_protect[48] = {
  0,
  0x8001f8c0, /* NORDWR 0x1f8c0, 0x00000 */
 };
+
+/* M4 linear 2D state: supplied Linux XML, A7XX variants (dword offsets).
+ * SP_PS_UNKNOWN_B2D2 is named TPL1_A2D_BLT_CNTL by Mesa 875160ed32cc.
+ * SP_2D_DST_FORMAT is now SP_A2D_OUTPUT_INFO; float accumulator is bits1:2=0,
+ * bit0 is HALF_PRECISION (do not set Linux XML's older misleading NORM bit).
+ */
+#define G4_GRAS_BLIT  0x8400
+#define G4_GRAS_SRC_X 0x8401
+#define G4_GRAS_NC    0x8602
+#define G4_CCU_CNTL2  0x88e5
+#define G4_RB_BLIT    0x8c00
+#define G4_RB_PIXEL   0x8c01
+#define G4_RB_DST_INFO 0x8c17
+#define G4_CCU_CNTL   0x8e07
+#define G4_RB_NC      0x8e08
+#define G4_SP_FORMAT  0xa9bf
+#define G4_SP_NC      0xae02
+#define G4_SP_SRC_INFO 0xb2c0
+#define G4_SP_WINDOW  0xb2d1
+#define G4_TPL1_BLIT  0xb2d2
+#define G4_TPL1_NC    0xb604
