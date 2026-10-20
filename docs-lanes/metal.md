@@ -1,3 +1,209 @@
+# Metal lane M4: native discovery and transfer-only frontend
+
+2026-10-20. **Built, signed and host-tested; device acceptance pending.** M3
+passed the coordinator's metal3 device run (report below). M4 adds a native
+`IOAcceleratorES` discovery metaclass, the `FuxiMetal.bundle` Objective-C++
+frontend and the root `fuxi-metal-smoke` executable. The executable calls the
+system **MTLCreateSystemDefaultDevice()**: no interposition, direct constructor,
+Apple family/user-client ABI, shader compiler or MSL translation is used.
+No phone access, mounted-root edit or push was performed.
+
+## M4 route decision and evidence
+
+**Route (a)** is small enough in this kernel. An original empty
+`IOAcceleratorES : IOService` class is defined in the existing native client
+translation unit; `NativeAdrenoGpuPublished` now derives from it. The published
+service keeps its name, root-only open types and NativeAdrenoABI contract, and
+adds string properties `MetalPluginName=FuxiMetal` and
+`MetalPluginClassName=FuxiMTLDevice`. It checks `metaCast("IOAcceleratorES")`
+before publication and logs PASS/FAIL. No IOGPUFamily implementation is added.
+The canonical source and regenerated 0100 delta remain byte-checked together.
+
+Re-derived from the same iOS 16.7 cache identified below:
+
+| Check | Evidence and implication |
+| --- | --- |
+| Metal lookup | `_MTLRegisterDevices`, `0x181b14514..0x181b1452c`, passes `IOAcceleratorES` to IOServiceMatching/GetMatchingServices. It allocates the returned plugin class and calls `initWithAcceleratorPort:` at `0x181b14578..0x181b14580`. |
+| Exact dictionary semantics | `_IOServiceMatching`, `0x18e556804..0x18e556810`, constructs the **IOProviderClass** string property. In the cached XNU 8796 sources, `IOService::copyExistingServices` calls `OSMetaClass::applyToInstancesOfClassName`; the instance set recursively includes subclass sets. `matchInternal` uses `metaCast` when the class test was not already completed. This matches the **service's metaclass ancestry**, not its provider object's class, registry name, or an IOClass property. Defining the missing base metaclass is sufficient for this lookup. |
+| Bundle loading | `_getMetalPluginClassForService`, `0x181a3c7c8..0x181a3c8f4`, constructs `/System/Library/Extensions/FuxiMetal.bundle`, tries `classNamed:`, falls back to `principalClass`, checks the result is an `_MTLDevice` subclass, then returns it. |
+| Runtime class ownership | `-[NSBundle classNamed:]`, `0x1811e2b5c`, loads the bundle but requires `bundleForClass:` to equal that bundle. A runtime-created class has no image ownership. Therefore the plugin deliberately relies on the documented **principalClass fallback**, with `NSPrincipalClass=FuxiMTLDevice`. `__NSBundleGetPrincipalClassFromInfoDict`, `0x1811f17c0`, resolves that value with NSClassFromString without the ownership test. |
+| Registration hooks | `_MTLAddDevice`, `0x181a1b3b0..0x181a1b3f0`, checks MTLDevice and MTLDeviceSPI conformance, then calls `initLimits` and `initFeatureQueries`. The frontend implements those registration hooks; capability queries use its own conservative overrides rather than Apple's family tables. The default-device block at `0x181a37050` returns the sole registered device. |
+
+Reproduce these checks with external Apple inputs; keep the output ignored:
+
+```sh
+"$IPSW" dyld disass "$DSC" --symbol _MTLRegisterDevices --symbol-image Metal
+"$IPSW" dyld disass "$DSC" --symbol _getMetalPluginClassForService --symbol-image Metal
+"$IPSW" dyld disass "$DSC" --symbol _IOServiceMatching \
+  --symbol-image /System/Library/Frameworks/IOKit.framework/Versions/A/IOKit
+"$IPSW" dyld disass "$DSC" --symbol '-[NSBundle classNamed:]' --symbol-image Foundation
+"$IPSW" dyld disass "$DSC" --symbol __NSBundleGetPrincipalClassFromInfoDict --symbol-image Foundation
+"$IPSW" dyld disass "$DSC" --symbol _MTLAddDevice --symbol-image Metal
+"$IPSW" dyld disass "$DSC" --symbol ___MTLCreateSystemDefaultDevice_block_invoke --symbol-image Metal
+```
+
+This establishes the lookup contract by disassembly/source review and native
+linking. The boot-time metaclass check and actual bundle/Metal registration
+still require the coordinator's device run; they are not host observations.
+M4a direct construction was unnecessary once this small route was established.
+
+## M4 frontend contract
+
+`tools/fuxi-metal/Frontend.mm` registers `FuxiMTLDevice` with
+objc_allocateClassPair only if **class_getInstanceSize(_MTLDevice)==528**.
+It adds no private-layout ivars: its instance size is also 528. State lives in
+an associated owner object. The private superclass initializer/deallocator
+is bypassed; inherited private operations are replaced with forwarding, and
+NSObject lifetime/introspection behavior is supplied explicitly. Runtime
+protocol signatures govern unsupported calls: object results log and return
+nil; unsupported scalar/struct/void calls log and raise, never report success.
+The native ABI remains root-only, and plugin initialization also requires root.
+The registryID comes from IORegistryEntryGetRegistryEntryID on the actual
+accelerator port; the cache defines that dynamically resolved IOKit symbol.
+
+Supported: name/registryID, a command queue, retained command buffers, shared
+buffers (with or without initial bytes), contents/length, blit fill/copy,
+endEncoding, commit/wait/status/error and completion handlers before or after
+completion. Creation accepts default shared options **0** and lengths
+**1..16 MiB**. Transfer offsets/lengths must be in bounds and **4-byte aligned**;
+overlapping copies and unsupported options fail loudly. The frontend advertises
+no Metal GPU family/feature set, shader/texture sampling, ray tracing, dynamic
+libraries or render/compute thread capacity. This diagnostic subset is not a
+complete Metal family. Inherited ABI limits (64 BOs, 256 MiB live wired budget,
+one client and one hardware job) still apply; allocation failure returns nil.
+
+`Backend.hpp` directly dlopens `/usr/local/lib/libvulkan_freedreno.dylib` after
+setting the same service/open/debug environment as M3: NativeAdrenoGpuPublished,
+open type 0, TU_DEBUG=nocb and MESA_LOG_LEVEL=debug. It requires the observed
+Qualcomm device identity. Operations use vkCmdFillBuffer/vkCmdCopyBuffer, explicit
+host/transfer and transfer/transfer barriers, mapped-memory flush/invalidate,
+and a finite **2 s fence wait**. Commit is synchronous; the owner mutex
+serializes Vulkan work/allocation/destruction. Encoded resources stay retained
+through completion. Unknown ownership after submit/fence failure poisons the
+backend and skips ordinary driver/resource teardown; process death and the
+existing kernel containment path own cleanup. There is no recovery claim.
+
+The smoke ignores every argv value and reads a prefix stage **0..3** from
+`/usr/local/share/fuxi/metal-smoke.conf` (absent defaults to 3). Malformed or
+unreadable config fails at stage 0. Stdout/stderr are unbuffered. Discovery and
+fill/copy have 30 s process alarms, reuse 60 s, cleanup 10 s. Failure exits
+without driver teardown. The tool enforces the FuxiMTLDevice class and size,
+not merely any non-nil device. Expected output, **not device observations**:
+
+```text
+FUXI MTL: stage 0 discovery PASS name Fuxi Turnip Adreno 740 (M4 transfers only) class FuxiMTLDevice base-size 528 instance-size 528 registryID <actual ID>
+FUXI MTL: stage 1 fill PASS verified 65536 bytes + completion handlers
+FUXI MTL: stage 2 copy PASS verified CPU-write/GPU-copy/readback + sentinel edges
+FUXI MTL: stage 3 reuse PASS verified 16 fill/copy rounds
+FUXI MTL: done PASS
+```
+
+The kernel should additionally report `FUXI MTL: IOAcceleratorES metaclass match
+PASS plugin FuxiMetal/FuxiMTLDevice`; plugin stderr reports runtime class sizes.
+Require all selected stages, no GPU loss/SMMU fault/panic, and CPU-present
+fallback continuity. Bundle trust/loading, sandboxed clients and competition
+for the single native connection remain unqualified.
+
+## M4 rebuild, staging and verification
+
+On the assigned native Mac tree, using the external pinned M3 Vulkan headers:
+
+```sh
+bash tools/build-fuxi-metal.sh "$VULKAN_HEADERS"
+python3 tools/test-fuxi-metal-frontend.py
+# Linux: actual backend on the external software Vulkan ICD, with ASan/UBSan
+python3 tools/test-fuxi-metal-backend.py --headers "$VULKAN_HEADERS"
+```
+
+The build targets plain arm64-apple-ios16.0 with the iPhoneOS 27.1 SDK and
+ad-hoc signs/verifies the bundle and executable. Load-command audits passed:
+iOS 16.0 minimum, system dependencies only, no RPATH/strong dynamic lookup and
+no CTR_EL0 reads. All **126** combined strong imports were checked against the
+supplied iOS 16.7 cache. No Mesa, metal2vulkan, firmware or Apple binary/source
+is vendored. M5's external licensing/relinking work remains separate.
+
+Host validation: actual Vulkan fill/copy/barriers/readback with sentinel edges,
+32 submissions, buffer reuse and full backend reopen under ASan/UBSan; injected
+fence timeout, loss and corruption stop execution. Native Mac Objective-C tests
+use a synthetic 528-byte superclass and CPU backend, exercising size rejection,
+protocols, inherited unsupported calls, ownership, handlers, errors, bounds,
+alignment and overlap. The actual smoke source also passed all stage prefixes,
+default/invalid configs, host argv, nil/nonroot/failure/corruption and alarm
+checks with that explicit host adapter. Those tests do not qualify the private
+iOS base class or real discovery. Existing ABI/backend/watchdog/quarantine,
+managed-BO lifetime, NC mapping, exec-swap and patch-chain tests passed.
+
+Native XNU was rebuilt with the standard native/IIG setup. All 32 native input
+hashes match the M3 manifest except the intended canonical client change.
+Outputs are in `xnu/out-fuxi-metal4/`. Its ADT is byte-identical to metal3.
+The command line changes the exec-swap target to
+`sweetexecswap=peakpowermanagerd:/usr/local/bin/fuxi-metal-smoke` and appends
+fuxi-metal-smoke to metal3's sweetnull list; all other arguments are preserved.
+Pack with all firmware/tool variables naming existing **absolute external files**:
+
+```sh
+export FUXI_GMU_FIRMWARE FUXI_SQE_FIRMWARE FUXI_GPU_ZAP_MBN MKBOOTIMG
+bash tools/build-fuxi-metal4-images.sh "$METAL3_ARTIFACTS"
+python3 tools/test-fuxi-metal-artifacts.py --lane metal4 \
+  --base "$METAL3_ARTIFACTS" --out xnu/out-fuxi-metal4 \
+  --firmware "$FUXI_GMU_FIRMWARE" --sqe "$FUXI_SQE_FIRMWARE" --zap "$FUXI_GPU_ZAP_MBN"
+python3 tools/test-fuxi-metal-stage.py
+```
+
+Packaging tests passed native service/metaclass and recovery symbols, exact
+command line/ADT, boot-v4/Image/payload geometry and RAM bounds, allocated exact
+pinned GMU/SQE/zap bytes in the final boot Image, signatures/minimum OS and
+SHA256SUMS. Firmware stays external and ignored.
+
+For the coordinator's later offline root edit, as root on an already mounted
+writable iOS root:
+
+```sh
+python3 tools/stage-fuxi-metal.py "$IOS_ROOT" \
+  tools/out/libvulkan_freedreno.dylib tools/out/FuxiMetal.bundle \
+  tools/out/fuxi-metal-smoke --conf tools/out/metal-smoke.conf
+```
+
+The helper validates every source/destination before copying, refuses unsigned
+or wrong-target artifacts and escaping symlinks, installs no launchd job, and
+sets newly created directories to root:wheel 0755. Temporary-root tests passed
+idempotence, file/directory modes/ownership and malformed input/symlink rejection.
+Stage these files; all owners are **root:wheel (0:0)**:
+
+| Local artifact | iOS destination | Mode |
+| --- | --- | --- |
+| `tools/out/libvulkan_freedreno.dylib` | `/usr/local/lib/libvulkan_freedreno.dylib` | 0755 |
+| `tools/out/fuxi-metal-smoke` | `/usr/local/bin/fuxi-metal-smoke` | 0755 |
+| `tools/out/metal-smoke.conf` | `/usr/local/share/fuxi/metal-smoke.conf` | 0644 |
+| `tools/out/FuxiMetal.bundle/FuxiMetal` | `/System/Library/Extensions/FuxiMetal.bundle/FuxiMetal` | 0755 |
+| `tools/out/FuxiMetal.bundle/Info.plist` | `/System/Library/Extensions/FuxiMetal.bundle/Info.plist` | 0644 |
+| `tools/out/FuxiMetal.bundle/_CodeSignature/CodeResources` | `/System/Library/Extensions/FuxiMetal.bundle/_CodeSignature/CodeResources` | 0644 |
+
+Boot artifact: `shim/out/fuxi-metal4-boot.img`. The following hashes describe
+this build; complete manifests also live in the ignored output directories.
+
+| M4 artifact | SHA256 |
+| --- | --- |
+| `xnu/out-fuxi-metal4/kernel.development.fuxi` | `8bfeae158e8250e906e3b3ffbcbddb8f5d63404eedd9807cf8e2838cf7a1b5d9` |
+| `xnu/out-fuxi-metal4/kernel.development.fuxi.unstripped` | `858e6cfe0b636530f7f8d097f23ca84a5f7efd0516093b74c5aba90431d353a8` |
+| `shim/out/fuxi-metal4-boot.img` | `e10f981a0bae32ad5c892d978a786eabe4cc21acda6e35ed064f1ad68a53c4b6` |
+| `tools/out/libvulkan_freedreno.dylib` | `5661a054b5e4be57fe54bc38f3cccf6d264ae20562473caf72e50d2adc158a8c` |
+| `tools/out/FuxiMetal.bundle/FuxiMetal` | `9535102237abd309c94978b3ab52a1435f124b4f022ab6bdfeab0b39f60dc603` |
+| `tools/out/FuxiMetal.bundle/Info.plist` | `2578f53d73942a55e0163fa5c80c29beb00839bfb8db477a4060e0a81ab5fd06` |
+| `tools/out/FuxiMetal.bundle/_CodeSignature/CodeResources` | `26aaa98e843bdbffb42ecaefb507ff685bdf749a45ceb1d0c68a0c15d58e903c` |
+| `tools/out/fuxi-metal-smoke` | `64e747d6a7079fee0a675b2f757752c1569b20c19484259d5122fcc63467aec7` |
+| `tools/out/metal-smoke.conf` | `1121cfccd5913f0a63fec40a6ffd44ea64f9dc135c66634ba001d10bcf4302a2` |
+
+
+M6 still needs IOSurface/texture import, CAMetalLayer drawables, producer/consumer
+fences and lifetime/coherency, pixel format/stride/orientation, and the render
+and compute paths actually used by CoreAnimation. M4's discovery and buffer
+transfers do not supply any of those. The existing kernel CPU-present fallback
+is unchanged; accelerated app/CA correctness, latency, thermal and memory
+measurements remain acceptance gates after M5 translation/licensing.
+
+---
+
 # Metal lane M3: staged Turnip submission smoke
 
 2026-10-20. **M2 observed on metal2h**, reported by the coordinator: direct ICD
@@ -8,7 +214,14 @@ were allocated, GPU-mapped, CPU-mapped/unmapped and freed before close. No panic
 and no managed-page physical-descriptor warning occurred. This confirms the
 metal2h mapping fix and the M2 lifetime gate; no GPU work was submitted.
 
-**M3 built and host-tested; not run on device.** No phone access, root-image
+**M3 observed PASS on metal3 (`5fd2350`), coordinator report 2026-10-20:**
+root smoke exec-swapped into peakpowermanagerd completed setup, fill (16384
+words, fence 1.2 ms), compute (16384 words), triangle (six probes, red 8192 /
+black 57344), 16 fill reuse rounds, device/instance destruction and reopen,
+then fill/compute again, ending `done PASS`. No hang, SMMU fault or panic was
+reported. This qualifies the M3 Turnip workload, not Metal or CoreAnimation.
+
+**M3 build work:** No phone access, root-image
 edit or push was performed. The new kernel changes only add a read-only,
 once-per-loss register snapshot before existing isolation. The native tree
 also includes the inherited WLAN RC SID initialization fix at this branch tip;
@@ -143,11 +356,11 @@ Reviewed the pinned `tu_knl_darwin.cc`, Turnip's `tu_queue.cc`,
   static register initialization, CP_SET_DRAW_STATE, CP_SET_MARKER render modes,
   BR/BV offsets/ambles/thread controls and CCU/GMEM configuration themselves.
   Thus missing marker/draw state or preemption records cannot be asserted as
-  the cause of UniXNU's reported CP hang. Compatibility of this subset with
-  real Turnip packets is still unqualified; raw CP_MEM_WRITE/BLIT is weaker
+  the cause of UniXNU's reported CP hang. The later M3 run above qualified this
+  subset for its tested Turnip workload; raw CP_MEM_WRITE/BLIT alone was weaker
   evidence. No speculative framing change was justified by the code review.
 
-Ranked hypotheses for the first device run:
+Historical pre-run hypotheses (the reported M3 run subsequently passed):
 
 1. **CP/thread/context initialization mismatch.** Stage-1 accepted submit then
    no retirement; `CP_RB_RPTR/WPTR`, `CP_IB1_BASE_*`, `CP_IB1_REM_SIZE`,
@@ -1124,22 +1337,18 @@ not establish Turnip or Metal success. Its documented Turnip IBs still hang CP.
    and absence of EL0 CTR_EL0 instructions; the supplied patch now substitutes
    Darwin's 64-byte cache-line value. Require exported vk_icdGetInstanceProcAddr
    and a root-daemon load/enumeration before submitting shaders.
-3. **M3 Turnip smoke:** staged tool/build/host tests complete (see M3 above);
-   device submission/readback acceptance remains pending, without a Metal frontend. With TU_DEBUG=nocb, run Vulkan buffer fill, a small compute
-   shader, then an offscreen triangle; map and compare every result, repeat
-   BO/IOVA reuse and process reopen, capture the failing fence/CP/SMMU state.
-   Stop and use CPU UI after any loss. Real cache/TTBR/coherency and A7xx reset
-   sequencing remain hypotheses until these pass; do not infer success from
-   a successful cross-build or CP_MEM_WRITE alone.
-4. **M4 Metal discovery/frontend:** use the iOS 16 findings above and a runtime
-   size guard. Decide between a small native IOAcceleratorES compatibility
-   service and bringing in an appropriate family after auditing real kernel
-   dependencies; the current kernel cannot inherit an absent metaclass.
-   Verify bundle loading, signing and unsandboxed MTLCreateSystemDefaultDevice
-   returning a real device first. Then derive iOS 16 sandbox access and actual
-   selectors. Do not add a catch-all selector tunnel as a substitute for that
-   audit. Implement device capabilities, resources, queues and encoders against
-   the tested Vulkan path; enumerate unsupported features truthfully.
+3. **M3 Turnip smoke:** observed PASS on metal3 (see report above), including
+   fill, compute, triangle, reuse and reopen with TU_DEBUG=nocb. This qualifies
+   that tested workload; no Metal frontend was involved. Preserve finite waits
+   and CPU UI fallback after any future loss. Broader coherence, reset/recovery
+   and workloads beyond the tested subset remain separate gates.
+4. **M4 Metal discovery/frontend:** native discovery class + signed transfer-only
+   bundle and smoke built/host-tested (M4 section above). **Device acceptance
+   pending:** require real unsandboxed-root MTLCreateSystemDefaultDevice,
+   shared-buffer blit fill, copy and 16 reuse rounds. A runtime size guard
+   requires 528. No iOS sandbox access, Apple user-client ABI or selector tunnel
+   is implemented. Stop on failure; derive any additional requirements from
+   the supplied iOS 16 cache before expanding the interface.
 5. **M5 Translation and licensing:** keep **metal2vulkan external** at pinned
    `720ef1ce9ae2a2068999a8675717418b9416283e`; its declared choice is
    GPL-2.0+ OR LGPL-3.0+. Do not vendor it or statically fold it into this repo's
@@ -1157,9 +1366,11 @@ not establish Turnip or Metal success. Its documented Turnip IBs still hang CP.
 
 ## Risks and delivery
 
-metal2g qualified the raw IB, readback and reopen path. Broader TTBR/coherence,
-CP recovery and shader/fence behavior still require M3 execution. The raw solid
-fill is deliberately small; it does not prove shader or Turnip execution. Raw PM4 is privileged and not validated as a security
+metal2g qualified raw IB/readback/reopen; metal3 subsequently qualified the
+reported Turnip fill/compute/triangle/reuse/reopen workload. These do not
+qualify general coherency, CP recovery, shaders beyond that workload, or M4
+Metal discovery. The M4 build adds the diagnostic frontend; device acceptance
+and all presentation integration remain pending. Raw PM4 is privileged and not validated as a security
 boundary; only an unsandboxed root diagnostic client is supported. Arbitrary
 root IBs can access privileged GPU state. Failed bus drain leaks/quarantines
 memory until reboot; wedged interconnect/MMIO can exceed software containment.

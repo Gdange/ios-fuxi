@@ -12,7 +12,7 @@ import struct
 import subprocess
 
 
-def audit(path):
+def audit(path, required_export="_vk_icdGetInstanceProcAddr"):
     raw=path.read_bytes()
     magic,cpu,subtype,kind,ncmds,size,flags,reserved=struct.unpack_from('<8I',raw)
     assert (magic,cpu,subtype)==(0xfeedfacf,0x100000c,0), 'plain arm64 Mach-O required'
@@ -50,9 +50,9 @@ def audit(path):
           (minimum[0][2]>>16,(minimum[0][2]>>8)&255))
     for s in ids: print('  ID '+s)
     for s in loads: print('  LOAD '+s)
-    if kind==6:
+    if kind==6 and required_export:
         symbols=subprocess.check_output(['nm','-gU',str(path)],text=True)
-        assert ' T _vk_icdGetInstanceProcAddr' in symbols
+        assert ' T '+required_export in symbols
     imports=subprocess.check_output(['nm','-um',str(path)],text=True)
     strong={};weak_dynamic=0
     for line in imports.splitlines():

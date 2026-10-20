@@ -1,4 +1,4 @@
-/* NativeAdrenoABI v1 userspace lane. No Apple accelerator/Metal impersonation.
+/* NativeAdrenoABI v1 userspace lane. Minimal Metal discovery metaclass only.
  * ABI and framing credit: UniXNU NativeAdreno contributors (MIT).
  * See NativeAdrenoABI.h and LICENSE.NativeAdreno for copied material.
  */
@@ -336,10 +336,17 @@ public:
  }
 };
 OSDefineMetaClassAndStructors(FuxiAdrenoUserClient,IOUserClient)
-
 /* Name matches Turnip's direct unsandboxed backend. Type 0 is its default;
  * 0x4147 is the NativeAdreno plugin/raw-test open type. */
-class NativeAdrenoGpuPublished : public IOService {
+/* IOServiceMatching("IOAcceleratorES") matches metaclass ancestry, not the
+ * provider object or a mutable IOClass property. This owns only a discovery
+ * name; it implements no Apple family/user-client ABI. The native root-only
+ * ABI below remains the sole GPU connection contract. */
+class IOAcceleratorES : public IOService {
+ OSDeclareDefaultStructors(IOAcceleratorES)
+};
+OSDefineMetaClassAndStructors(IOAcceleratorES,IOService)
+class NativeAdrenoGpuPublished : public IOAcceleratorES {
  OSDeclareDefaultStructors(NativeAdrenoGpuPublished)
 public:
  IOReturn newUserClient(task_t task, void *securityID, UInt32 type,
@@ -361,7 +368,7 @@ public:
   *handler=uc; return kIOReturnSuccess;
  }
 };
-OSDefineMetaClassAndStructors(NativeAdrenoGpuPublished,IOService)
+OSDefineMetaClassAndStructors(NativeAdrenoGpuPublished,IOAcceleratorES)
 extern "C" void fuxi_gpu_abi_publish(void)
 {
  char swap[192]={};
@@ -375,6 +382,16 @@ extern "C" void fuxi_gpu_abi_publish(void)
  }
  service->setName("NativeAdrenoGpu");
  service->setProperty("NativeAdrenoABI",1ULL,32);
+ service->setProperty("MetalPluginName","FuxiMetal");
+ service->setProperty("MetalPluginClassName","FuxiMTLDevice");
+ // Verify the exact ancestry test used by IOService's matching path before
+ // publishing a service which Metal will attempt to open.
+ if (!service->metaCast("IOAcceleratorES")) {
+  IOLog("FUXI MTL: IOAcceleratorES metaclass match FAIL\n");
+  service->stop(IOService::getPlatform());service->detach(IOService::getPlatform());
+  service->release();return;
+ }
+ IOLog("FUXI MTL: IOAcceleratorES metaclass match PASS plugin FuxiMetal/FuxiMTLDevice\n");
  service->registerService(); /* retained for boot lifetime */
  IOLog("FUXI GPU ABI: NativeAdrenoGpuPublished v1, open 0x4147, root only, watchdog 100 ms\n");
 }
