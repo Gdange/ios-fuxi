@@ -22,10 +22,23 @@ for i in range(n):
  va,vs,off,sz=struct.unpack_from('<4Q',b,680+32*i)
  assert off<=len(b) and sz<=len(b)-off and sz<=vs
 PY
+# Optional local firmware input; only the ignored build directory receives bytes.
+# An empty section gives non-GPU builds the same symbols with size zero.
+python3 - "${FUXI_GMU_FIRMWARE:-}" "$out/gpu-fw.S" <<'FWPY'
+import json, pathlib, sys
+src, dst = sys.argv[1:]
+lines = ['.section .gpu_fw,"a"', '.balign 4', '.global _gpu_fw_start', '_gpu_fw_start:']
+if src:
+    path = pathlib.Path(src).resolve(strict=True)
+    assert path.is_file() and 0 < path.stat().st_size <= 0x100000, 'invalid GMU firmware size'
+    lines.append('.incbin ' + json.dumps(str(path)))
+lines += ['.global _gpu_fw_end', '_gpu_fw_end:']
+pathlib.Path(dst).write_text('\n'.join(lines) + '\n')
+FWPY
 # incbin avoids C absolute pointers in an Image loaded at an arbitrary PA.
 printf '.section .payload,"a"\n.incbin "%s"\n' "$payload" > "$out/payload.S"
 flags=(--target=aarch64-none-elf -O2 -ffreestanding -fno-builtin -nostdlib
-       -fno-pic -fno-stack-protector -mgeneral-regs-only -mstrict-align -Wall -Wextra -DFUXI=1 -DFUXI_XNU_LOADER=1 -I..)
+       -fno-pic -fno-stack-protector -mgeneral-regs-only -mstrict-align -Wall -Wextra -Werror -DFUXI=1 -DFUXI_XNU_LOADER=1 -I..)
 for source in start.S loader.c ../console.c ../fuxi-probe/probe.c; do
  name=$(basename "${source%.*}")
  "$CLANG" "${flags[@]}" -c "$source" -o "$out/$name.o"
@@ -34,7 +47,8 @@ for source in start.S loader.c ../console.c ../fuxi-probe/probe.c; do
  fi
 done
 "$CLANG" "${flags[@]}" -c "$out/payload.S" -o "$out/payload.o"
-"$LLD" -T loader.ld --build-id=none "$out/start.o" "$out/loader.o" "$out/console.o" "$out/probe.o" "$out/payload.o" -o "$out/loader.elf"
+"$CLANG" "${flags[@]}" -c "$out/gpu-fw.S" -o "$out/gpu-fw.o"
+"$LLD" -T loader.ld --build-id=none "$out/start.o" "$out/loader.o" "$out/console.o" "$out/probe.o" "$out/gpu-fw.o" "$out/payload.o" -o "$out/loader.elf"
 "$OBJCOPY" -O binary "$out/loader.elf" "$out/Image"
 python3 - "$out/Image" <<'PY'
 import struct,sys

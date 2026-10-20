@@ -3,6 +3,7 @@ SECTIONS {
  . = 0;
  .text : { *(.text.head) *(.text*) }
  .rodata : { *(.rodata*) }
+ .gpu_fw : { *(.gpu_fw) }
  .data : { *(.data*) }
  . = ALIGN(16384);
  _bss_start = .;

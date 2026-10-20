@@ -1,4 +1,4 @@
-/* Fuxi A740 GPU power / clock staged probe (lane-gpu, milestone 1).
+/* Fuxi A740 staged GPU/GMU probe (lane-gpu, milestones 1 and 2).
  *
  * Single translation unit #included by probe.c before ud_setup(), so these
  * statics share probe.c's helpers (delay(), the volatile memcpy) and the USB
@@ -88,15 +88,16 @@
 #define GMU_DWORD(d) (GPU_GMU_CORE + ((uint64_t)(d) * 4 - 0x6a000))
 #define GMUD_CM3_SYSRESET   0x1f800
 #define GMUD_HFI_CTRL_STATUS 0x1f980
-#define GMUD_SPTPRAC_STATUS 0x1f8d0   /* GMU_SPTPRAC_PWR_CLK_STATUS (A7XX): GX off = bits0,1 clear */
+#define GMUD_SPTPRAC_STATUS 0x1f8d0   /* GMU_SPTPRAC_PWR_CLK_STATUS; see stage10 mask below */
 #define RSCC_SEQ_BUSY_DRV0  0x101     /* rscc dword */
 #define CXMISC_TCM_RET_CNTL 0x39      /* cx_misc dword */
 #define GPU_RBBM_STATUS     0x210     /* gpu reg dword */
 
-/* ---- report layout (128 u32 = 512 bytes, the control-IN cap) ---- */
+/* ---- report pages (each 128 u32 = the 512-byte control-IN cap) ---- */
 #define GPU_REPORT_WORDS 128
 static uint32_t gpu_report[GPU_REPORT_WORDS];
 static unsigned gpu_stage;   /* furthest stage entered, for a post-mortem photo */
+static void g_enter(unsigned stage) { gpu_stage = stage; gpu_report[2] = stage; }
 
 static uint32_t g_rd(uint64_t base, uint32_t off)
 {
@@ -155,21 +156,490 @@ static void g_set_bit0(uint64_t base, uint32_t off)
 static uint16_t cdb16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 static uint32_t cdb32(const uint8_t *p) { return cdb16(p) | (uint32_t)cdb16(p + 2) << 16; }
 
-/* The staged sequence. `limit` (host st[4], 1..7) is the last stage allowed;
+/* The staged sequence. `limit` (USB wIndex) is the last stage allowed;
  * the report records the actual outcome of each stage it reached. */
+/* Milestone 2: Linux 6.12 a6xx_gmu.c/a6xx_hfi.c, ARM SMMUv2.
+ * Fixed scratch in the loader-only XNU RAM window. Never part of .bss.
+ * Firmware and tables must survive until reset once CM3 has been released.
+ */
+#define G_MEM       0x8f0000000ULL
+#define G_MEM_SIZE  0x02000000u
+#define G_IC_PA     (G_MEM + 0x100000)
+#define G_DATA_PA   (G_MEM + 0x1100000)
+#define G_DUMMY_VA  0x60000000u
+#define G_LOG_VA    0x60002000u
+#define G_HFI_VA    0x60006000u
+#define G_DEBUG_VA  0x60400000u
+#define G_LOG_PA    (G_DATA_PA + 0x2000)
+#define G_HFI_PA    (G_DATA_PA + 0x6000)
+#define G_DEBUG_PA  (G_DATA_PA + 0xa000)
+#define G_IC_SIZE   0xffc000u
+#define G_PAGES     6
+#define G_STAGE_8A  0x8au
+static uint32_t gpu_extra[G_PAGES - 1][GPU_REPORT_WORDS];
+static unsigned gpu_gmu_started; /* monotonic: also covers failed init/ACK */
+static unsigned gpu_m2_attempted, gpu_s8_ok, gpu_s9_attempted, gpu_s9_ok, gpu_s10_attempted;
+static unsigned g_bank, g_slot, g_asid, g_stride, g_cbbase, g_ncb, g_nsmr, g_pt_next;
+static unsigned gpu_snapshot_valid;
 static uint8_t gpu_cmddb[GPU_CMDDB_BYTES] __attribute__((aligned(8)));
+
+/* All new GMU offsets are relative to the upstream GMU core resource,
+ * unlike the GPU-relative dword offsets in milestone 1. */
+static uint32_t gm_rd(unsigned reg) { return g_rd(GPU_GMU_CORE, reg * 4); }
+static void gm_wr(unsigned reg, uint32_t val) { g_wr(GPU_GMU_CORE, reg * 4, val); }
+static void g_wr64(uint64_t at, uint64_t val)
+{
+ __asm__ volatile("dmb oshst" ::: "memory");
+ *(volatile uint64_t *)(uintptr_t)at = val;
+ __asm__ volatile("dsb sy" ::: "memory");
+}
+static void g_zero(uint64_t at, unsigned bytes)
+{
+ for (unsigned i = 0; i < bytes; i += 8) *(volatile uint64_t *)(uintptr_t)(at + i) = 0;
+ __asm__ volatile("dsb sy" ::: "memory");
+}
+static unsigned g_cb(unsigned b) { return g_cbbase + b * g_stride; }
+static void g_live(void)
+{
+ uint32_t *e = gpu_extra[0];
+ e[4] = gpu_gmu_started;
+ e[84] = gm_rd(0x5192); e[85] = gm_rd(0x9305); e[86] = gm_rd(0x9313);
+ e[87] = g_rd(GPU_SMMU_BASE, SMMU_GFSR);
+ if (gpu_m2_attempted && e[15]) {
+  unsigned cb = g_cb(g_bank);
+  e[88] = g_rd(GPU_SMMU_BASE, cb + 0x58);
+  e[89] = g_rd(GPU_SMMU_BASE, cb + 0x60);
+  e[90] = g_rd(GPU_SMMU_BASE, cb + 0x64);
+  e[91] = g_rd(GPU_SMMU_BASE, cb + 0x68);
+  e[92] = g_rd(GPU_SMMU_BASE, cb + 0x6c);
+ }
+ if (gpu_s8_ok) {
+  e[93] = g_rd(G_HFI_PA, 24 + 40); e[94] = g_rd(G_HFI_PA, 24 + 44);
+  e[95] = g_rd(G_HFI_PA, 72 + 40); e[96] = g_rd(G_HFI_PA, 72 + 44);
+ }
+}
+static int g_snapshot(void)
+{
+ uint32_t *e = gpu_extra[0];
+ uint32_t id0 = g_rd(GPU_SMMU_BASE, SMMU_ID0), id1 = g_rd(GPU_SMMU_BASE, SMMU_ID1);
+ uint32_t id2 = g_rd(GPU_SMMU_BASE, SMMU_ID2);
+ g_stride = (id1 >> 31) ? 65536 : 4096;
+ g_cbbase = (2u << ((id1 >> 28) & 7)) * g_stride;
+ g_ncb = id1 & 255; g_nsmr = id0 & 255;
+ e[5] = g_nsmr; e[6] = g_ncb; e[7] = g_stride; e[8] = g_cbbase;
+ /* Bound every access to Fuxi's 256K resource and report capacity. */
+ if (!g_ncb || g_ncb > 24 || !g_nsmr || g_nsmr > 32 ||
+     g_cbbase >= 0x40000 || g_ncb * g_stride > 0x40000 - g_cbbase ||
+     !(id0 & (1u << 30)) || !(id0 & (1u << 27)) ||
+     !(id2 & (1u << 12)) || ((id2 >> 4) & 15) < 1 ||
+     (g_rd(GPU_SMMU_BASE, SMMU_SCR0) & 1)) { e[2] = 0x801; return 0; }
+ for (unsigned i = 0; i < g_nsmr; i++) {
+  gpu_extra[1][i * 2] = g_rd(GPU_SMMU_BASE, SMMU_SMR(i));
+  gpu_extra[1][i * 2 + 1] = g_rd(GPU_SMMU_BASE, SMMU_S2CR(i));
+ }
+ for (unsigned b = 0; b < g_ncb; b++) {
+  uint32_t *d = &gpu_extra[2 + b / 8][(b % 8) * 16];
+  unsigned cb = g_cb(b);
+  /* Spare words in the stream page retain implementation context controls. */
+  gpu_extra[1][64 + b] = g_rd(GPU_SMMU_BASE, cb + 4); /* ACTLR */
+  gpu_extra[1][88 + b] = g_rd(GPU_SMMU_BASE, cb + 0x34); /* CONTEXTIDR */
+  d[0] = g_rd(GPU_SMMU_BASE, g_stride + b * 4);
+  d[1] = g_rd(GPU_SMMU_BASE, g_stride + 0x800 + b * 4);
+  static const unsigned offs[14] = {0,0x10,0x20,0x24,0x28,0x2c,0x30,0x38,0x3c,0x58,0x60,0x64,0x68,0x6c};
+  for (unsigned i = 0; i < 14; i++) d[2 + i] = g_rd(GPU_SMMU_BASE, cb + offs[i]);
+ }
+ e[9] = g_rd(GPU_SMMU_BASE, SMMU_GFSR);
+ gpu_snapshot_valid = 1; e[1] = 1;
+ return 1;
+}
+static uint64_t g_new_table(void)
+{
+ if (g_pt_next >= 256) return 0;
+ return G_MEM + 4096 * g_pt_next++;
+}
+/* 32-bit IOVA, 4K granules: L1 root -> L2 -> L3 pages. All leafs NC,
+ * inner-shareable (MAIR index 0 = 0x44), AF=1. Privileged fixed regions
+ * match MSM_BO_MAP_PRIV; log/HFI permit unprivileged GMU accesses. */
+static int g_map(unsigned va, uint64_t pa, unsigned size, unsigned unpriv)
+{
+ for (unsigned off = 0; off < size; off += 4096) {
+  unsigned v = va + off;
+  volatile uint64_t *l1 = (volatile uint64_t *)(uintptr_t)G_MEM;
+  unsigned a = v >> 30;
+  if (!l1[a]) { uint64_t t = g_new_table(); if (!t) return 0; l1[a] = t | 3; }
+  volatile uint64_t *l2 = (volatile uint64_t *)(uintptr_t)(l1[a] & ~0xfffull);
+  unsigned b = (v >> 21) & 511;
+  if (!l2[b]) { uint64_t t = g_new_table(); if (!t) return 0; l2[b] = t | 3; }
+  volatile uint64_t *l3 = (volatile uint64_t *)(uintptr_t)(l2[b] & ~0xfffull);
+  unsigned c = (v >> 12) & 511;
+  if (l3[c]) return 0;
+  l3[c] = (pa + off) | 3 | (3u << 8) | (1u << 10) | (unpriv ? (1u << 6) : 0);
+ }
+ __asm__ volatile("dsb sy" ::: "memory");
+ return 1;
+}
+static int g_range(unsigned addr, unsigned size, unsigned base, unsigned bytes)
+{ return addr >= base && addr - base < bytes && size <= bytes - (addr - base); }
+/* Return a physical destination, or zero for an unmapped address. */
+static uint64_t g_fw_dest(unsigned addr, unsigned size)
+{
+ if (g_range(addr, size, 0, 0x4000)) return GPU_GMU_CORE + 0xc00 * 4 + addr;
+ if (g_range(addr, size, 0x10004000, 0x4000)) return GPU_GMU_CORE + 0x1c00 * 4 + addr - 0x10004000;
+ if (g_range(addr, size, 0x4000, G_IC_SIZE)) return G_IC_PA + addr - 0x4000;
+ if (g_range(addr, size, G_DUMMY_VA, 0x2000)) return G_DATA_PA + addr - G_DUMMY_VA;
+ return 0;
+}
+static int g_firmware(unsigned load)
+{
+#if defined(FUXI_XNU_LOADER)
+ extern const uint8_t _gpu_fw_start[], _gpu_fw_end[];
+ const uint8_t *fw = _gpu_fw_start;
+ size_t bytes = (uintptr_t)_gpu_fw_end - (uintptr_t)_gpu_fw_start;
+#else
+ const uint8_t *fw = 0; size_t bytes = 0;
+#endif
+ uint32_t *e = gpu_extra[0]; e[17] = bytes;
+ if (!bytes) { e[2] = 0x802; return 0; }
+ size_t at = 0; unsigned blocks = 0, prealloc = 0, total = 0;
+ while (at < bytes) {
+  if (bytes - at < 16) { e[2] = 0x803; return 0; }
+  unsigned addr = cdb32(fw + at), size = cdb32(fw + at + 4);
+  unsigned extent = size ? size : cdb32(fw + at + 12);
+  uint64_t dst = g_fw_dest(addr, extent);
+  if ((addr & 3) || (size & 3) || size > bytes - at - 16 || !dst || !extent) {
+   e[2] = 0x803; e[21] = addr; e[22] = size; return 0;
+  }
+  if (size) {
+   blocks++; total += size;
+   if (load) for (unsigned i = 0; i < size; i += 4) {
+    uint32_t word = cdb32(fw + at + 16 + i);
+    g_wr(dst, i, word);
+    if (g_rd(dst, i) != word) { e[2] = 0x80a; e[21] = addr + i; return 0; }
+   }
+  } else prealloc++;
+  at += 16 + size;
+ }
+ e[18] = blocks; e[19] = prealloc; e[20] = total;
+ if (!blocks) { e[2] = 0x803; return 0; }
+ return 1;
+}
+static int g_select_context(void)
+{
+ uint32_t *e = gpu_extra[0]; unsigned used = 0;
+ g_slot = g_nsmr;
+ for (unsigned i = 0; i < g_nsmr; i++) {
+  unsigned smr = gpu_extra[1][2*i], s2cr = gpu_extra[1][2*i+1];
+  if (!(smr & (1u << 31))) { if (g_slot == g_nsmr) g_slot = i; continue; }
+  unsigned mask = (smr >> 16) & 0x7fff;
+  if (((smr ^ 5) & ~mask & 0x7fff) == 0) { e[2] = 0x804; return 0; }
+  if (((s2cr >> 16) & 3) == 0) {
+   unsigned bank = s2cr & 255;
+   if (bank < g_ncb) used |= 1u << bank;
+  }
+ }
+ g_bank = g_ncb;
+ unsigned s2banks = (g_rd(GPU_SMMU_BASE, SMMU_ID1) >> 16) & 255;
+ for (unsigned b = s2banks ? s2banks : 1; b < g_ncb; b++)
+  if (!(used & (1u << b)) && !(gpu_extra[2+b/8][b%8*16+2] & 1)) { g_bank = b; break; }
+ if (g_slot == g_nsmr || g_bank == g_ncb) { e[2] = 0x805; return 0; }
+ /* ASIDs are shared across banks; avoid every enabled bank's two TTBR ASIDs. */
+ for (g_asid = 1; g_asid < 256; g_asid++) {
+  int used_asid = 0;
+  for (unsigned b = 0; b < g_ncb; b++) {
+   uint32_t *d = &gpu_extra[2+b/8][b%8*16];
+   if ((d[2] & 1) && ((d[5] >> 16) == g_asid || (d[7] >> 16) == g_asid)) used_asid = 1;
+  }
+  if (!used_asid) break;
+ }
+ if (g_asid == 256) { e[2] = 0x805; return 0; }
+ e[10] = g_slot; e[11] = g_bank; e[12] = g_asid;
+ return 1;
+}
+static int g_program_context(void)
+{
+ uint32_t *e = gpu_extra[0]; unsigned cb = g_cb(g_bank);
+ /* An unused, disabled bank only; never alter GR0 or unrelated streams. */
+ if (g_rd(GPU_SMMU_BASE, cb) & 1) { e[2] = 0x805; return 0; }
+ uint64_t ttbr = G_MEM | ((uint64_t)g_asid << 48);
+ g_wr(GPU_SMMU_BASE, g_stride + 0x800 + g_bank * 4, 1);
+ g_wr(GPU_SMMU_BASE, g_stride + g_bank * 4, 0x1f300);
+ /* 36-bit PA, AArch64 ASID, TTBR0=32-bit IOVA, TTBR1 disabled.
+  * Table walks are NC/outer-shareable, coherent with uncached CPU writes. */
+ g_wr(GPU_SMMU_BASE, cb + 0x10, 0x38011);
+ g_wr(GPU_SMMU_BASE, cb + 0x30, 0x80802020);
+ g_wr64(GPU_SMMU_BASE + cb + 0x20, ttbr);
+ g_wr64(GPU_SMMU_BASE + cb + 0x28, (uint64_t)g_asid << 48);
+ g_wr(GPU_SMMU_BASE, cb + 0x38, 0xff44);
+ g_wr(GPU_SMMU_BASE, cb + 0x3c, 0);
+ g_wr(GPU_SMMU_BASE, cb + 0x58, 0xffffffff);
+ e[15] = 1;
+ g_wr(GPU_SMMU_BASE, cb + 0x610, g_asid);
+ g_wr(GPU_SMMU_BASE, cb + 0x7f0, 0);
+ unsigned i;
+ for (i = 0; i < 1000; i++) {
+  e[16] = g_rd(GPU_SMMU_BASE, cb + 0x7f4);
+  if (!(e[16] & 1)) break;
+  delay(1);
+ }
+ if (i == 1000) { e[2] = 0x808; return 0; }
+ e[23] = g_rd(GPU_SMMU_BASE, g_stride + g_bank * 4);
+ e[24] = g_rd(GPU_SMMU_BASE, g_stride + 0x800 + g_bank * 4);
+ e[25] = g_rd(GPU_SMMU_BASE, cb + 0x10); e[26] = g_rd(GPU_SMMU_BASE, cb + 0x30);
+ e[27] = g_rd(GPU_SMMU_BASE, cb + 0x20); e[28] = g_rd(GPU_SMMU_BASE, cb + 0x24);
+ e[29] = g_rd(GPU_SMMU_BASE, cb + 0x38);
+ if (e[23] != 0x1f300 || e[24] != 1 || (e[25] & ~0x60u) != 0x38011 ||
+     e[26] != 0x80802020 || e[27] != (uint32_t)ttbr || e[28] != (uint32_t)(ttbr >> 32) ||
+     e[29] != 0xff44 || g_rd(GPU_SMMU_BASE, cb + 0x28) ||
+     g_rd(GPU_SMMU_BASE, cb + 0x2c) != (g_asid << 16) || g_rd(GPU_SMMU_BASE, cb + 0x3c)) {
+  e[2] = 0x809; return 0;
+ }
+ g_wr(GPU_SMMU_BASE, cb, 0x1067); /* faults reported, no interrupt controller needed */
+ e[30] = g_rd(GPU_SMMU_BASE, cb);
+ if ((e[30] & ~0x1000u) != 0x67) { e[2] = 0x809; return 0; }
+ g_wr(GPU_SMMU_BASE, SMMU_S2CR(g_slot), g_bank); /* translate, PRIVCFG=default */
+ g_wr(GPU_SMMU_BASE, SMMU_SMR(g_slot), 0x80000005);
+ e[31] = g_rd(GPU_SMMU_BASE, SMMU_SMR(g_slot));
+ e[32] = g_rd(GPU_SMMU_BASE, SMMU_S2CR(g_slot));
+ if (e[31] != 0x80000005 || e[32] != g_bank) { e[2] = 0x809; return 0; }
+ return 1;
+}
+static int g_memory_load(void)
+{
+ uint32_t *e = gpu_extra[0];
+ if (gm_rd(0x5000) != 1 || g_rd(GPU_CXMISC_BASE, 0x39*4) ||
+     g_rd(GPU_RSCC_BASE, 0x101*4) || (gm_rd(0x5180) & 1)) { e[2] = 0x806; return 0; }
+ if (!g_firmware(0) || !g_select_context()) return 0;
+ extern char _head[], _end[];
+ uint64_t image = (uintptr_t)_head, end = (uintptr_t)_end;
+ uint64_t fdt = probe_fdt;
+ if ((image < G_MEM + G_MEM_SIZE && G_MEM < end) ||
+     (fdt < G_MEM + G_MEM_SIZE && G_MEM < fdt + probe_fdt_size)) { e[2] = 0x807; return 0; }
+ g_zero(G_MEM, 0x100000); g_zero(G_IC_PA, G_IC_SIZE); g_zero(G_DATA_PA, 0x11000);
+ g_pt_next = 1;
+ if (!g_map(0x4000, G_IC_PA, G_IC_SIZE, 0) || !g_map(G_DUMMY_VA, G_DATA_PA, 0x2000, 0) ||
+     !g_map(G_LOG_VA, G_LOG_PA, 0x4000, 1) || !g_map(G_HFI_VA, G_HFI_PA, 0x4000, 1) ||
+     !g_map(G_DEBUG_VA, G_DEBUG_PA, 0x7000, 0)) { e[2] = 0x80b; return 0; }
+ e[13] = (uint32_t)G_MEM; e[14] = G_MEM >> 32; e[33] = g_pt_next;
+ /* Linux fw_start's FAL veto + retention precede the TCM firmware writes. */
+ gm_wr(0x50f1, 1); gm_wr(0x50f0, 1); g_wr(GPU_CXMISC_BASE, 0x39*4, 1);
+ if (!g_program_context() || !g_firmware(1)) return 0;
+ if (g_rd(GPU_SMMU_BASE, g_cb(g_bank) + 0x58) & 0xc00001feu) { e[2] = 0x80c; return 0; }
+ e[2] = 1; gpu_s8_ok = 1;
+ return 1;
+}
+/* Linux has two queues, not three: command id0 and response id1. */
+static void g_hfi_init(void)
+{
+ g_zero(G_HFI_PA, 0x4000);
+ static const uint32_t table[6] = {0,120,6,12,2,2}; /* size is bytes in Linux implementation */
+ for (unsigned i = 0; i < 6; i++) g_wr(G_HFI_PA, i*4, table[i]);
+ for (unsigned q = 0; q < 2; q++) {
+  unsigned h = 24 + q*48;
+  g_wr(G_HFI_PA, h, 1); g_wr(G_HFI_PA, h+4, G_HFI_VA + (q+1)*4096);
+  g_wr(G_HFI_PA, h+8, (10u<<8)|q); g_wr(G_HFI_PA, h+12, 1024);
+  g_wr(G_HFI_PA, h+24, 1); g_wr(G_HFI_PA, h+28, 1); g_wr(G_HFI_PA, h+32, 1);
+ }
+}
+/* Return cmd-db aux data only after checking both the header and data extents. */
+static const uint8_t *g_aux(const char *name, unsigned *count)
+{
+ for (unsigned s = 0; s < 8; s++) {
+  const uint8_t *h = gpu_cmddb + 8 + s*16;
+  unsigned n = cdb16(h+6), at = 144 + cdb16(h+2), data = 144 + cdb16(h+4);
+  if (!cdb16(h)) continue;
+  if (at > GPU_CMDDB_BYTES || n > (GPU_CMDDB_BYTES-at)/24) return 0;
+  for (unsigned i = 0; i < n; i++) {
+   const uint8_t *p = gpu_cmddb + at + i*24;
+   unsigned j; for (j = 0; j < 8; j++) if (p[j] != (uint8_t)name[j]) break;
+   if (j != 8) continue;
+   unsigned len = cdb16(p+20), off = data + cdb16(p+22);
+   if (!len || (len & 1) || off > GPU_CMDDB_BYTES || len > GPU_CMDDB_BYTES-off || len > 512) return 0;
+   *count = len/2; return gpu_cmddb + off;
+  }
+ }
+ return 0;
+}
+static int g_arc_vote(const char *primary, const char *secondary, unsigned level, uint32_t *vote)
+{
+ unsigned np = 0, ns = 0;
+ const uint8_t *p = g_aux(primary, &np), *s = g_aux(secondary, &ns);
+ if (!p || !s) return 0;
+ unsigned pi, si = 0;
+ for (pi = 0; pi < np; pi++) if (cdb16(p+pi*2) >= level) break;
+ if (pi == np) return 0;
+ for (unsigned j = 0; j < ns; j++) {
+  if (cdb16(s+j*2) >= level) { si = j; break; }
+  if (cdb16(s+j*2)) si = j;
+ }
+ *vote = (uint32_t)cdb16(p+pi*2)<<16 | si<<8 | pi;
+ return 1;
+}
+/* e[40..59]: five command/ACK records {sent, response, returned, error}.
+ * Poll shared queue indices as well as interrupt status; reject malformed or
+ * unsolicited packets within one bounded deadline (no unbounded drain loop). */
+static int g_hfi_send(unsigned id, uint32_t *msg, unsigned words, unsigned record)
+{
+ uint32_t *e = gpu_extra[0], *rec = e + 40 + record*4;
+ unsigned seq = record + 1, count = (words+3)&~3u;
+ unsigned rd = g_rd(G_HFI_PA, 64), wr = g_rd(G_HFI_PA, 68);
+ rec[0] = msg[0] = seq<<20 | words<<8 | id;
+ if (words > 255 || rd >= 1024 || wr >= 1024 || (wr & 3) || ((rd-wr-1)&1023) < count) return 0x904;
+ for (unsigned i = 0; i < count; i++) g_wr(G_HFI_PA+4096, ((wr+i)&1023)*4, i < words ? msg[i] : 0xfafafafa);
+ g_wr(G_HFI_PA, 68, (wr+count)&1023);
+ gm_wr(0x5194, 1);
+ uint64_t until = rsr("cntpct_el0") + rsr("cntfrq_el0") / 20; /* 50ms total */
+ do {
+  unsigned intr = gm_rd(0x5192);
+  if (intr & (1u<<23)) return 0x905;
+  rd = g_rd(G_HFI_PA, 112); wr = g_rd(G_HFI_PA, 116);
+  if (rd >= 1024 || wr >= 1024 || (rd & 3) || (wr & 3)) return 0x904;
+  if (rd == wr) { delay(10); continue; }
+  __asm__ volatile("dmb oshld" ::: "memory");
+  unsigned hdr = g_rd(G_HFI_PA+8192, rd*4), n = (hdr>>8)&255;
+  rec[1] = hdr;
+  if (n < 3 || n > 19 || ((n+3)&~3u) > ((wr-rd)&1023)) return 0x904;
+  rec[2] = g_rd(G_HFI_PA+8192, ((rd+1)&1023)*4);
+  rec[3] = g_rd(G_HFI_PA+8192, ((rd+2)&1023)*4);
+  g_wr(G_HFI_PA, 112, (rd+((n+3)&~3u))&1023);
+  gm_wr(0x5191, 1);
+  if ((hdr&255) == 100) return 0x905;
+  if ((hdr&255) != 126 || ((hdr>>16)&15) != 1 || rec[2] != rec[0]) return 0x906;
+  if (rec[3]) return 0x907;
+  return 0;
+ } while (rsr("cntpct_el0") < until);
+ return 0x903;
+}
+static void g_rpmh_init(void)
+{
+ static const unsigned regs[] = {4,0xb,0xe,0xd,0x10,0xf,0x12,0x11,0x100,8,9,0xa,0x154,0x155,0x156,0x157,0x158};
+ static const uint32_t vals[] = {1u<<24,1,0,0,0,0,0x80000021,0,0,0x4520,0x4510,0x4514,
+  0xeaaae5a0,0xe1a1ebab,0xa2e0a581,0xecac82e2,0x0020edad};
+ for (unsigned i = 0; i < sizeof(regs)/sizeof(regs[0]); i++) g_wr(GPU_RSCC_BASE, regs[i]*4, vals[i]);
+ /* A7xx PDC uCode is AOP-owned: only enable/configure, never replace it. */
+ g_wr(0x0b280000, 0x1148*4, 0); g_wr(0x0b280000, 0x1140*4, 0x80000001);
+}
+static int g_poll(unsigned reg, uint32_t mask, uint32_t value, unsigned word)
+{
+ uint32_t *e = gpu_extra[0];
+ for (unsigned i = 0; i < 1000; i++) {
+  e[word] = gm_rd(reg);
+  if ((e[word]&mask) == value) return 1;
+  if (gm_rd(0x5192) & (1u<<23)) return 0;
+  delay(10);
+ }
+ return 0;
+}
+static int g_start(void)
+{
+ uint32_t *e = gpu_extra[0], perf[59], bw[160];
+ /* Volatile stores avoid compiler-emitted libc memset in a freestanding TU. */
+ for (unsigned i = 0; i < 59; i++) ((volatile uint32_t *)perf)[i] = 0;
+ for (unsigned i = 0; i < 160; i++) ((volatile uint32_t *)bw)[i] = 0;
+ /* Ascending Linux frequency indices, including OFF at index 0. kHz. */
+ static const uint32_t freq[10] = {0,220000,295000,348000,401000,475000,550000,615000,680000,719000};
+ static const unsigned level[10] = {0,0x34,0x38,0x3c,0x40,0x50,0x80,0x90,0xc0,0xe0};
+ static const uint32_t cfreq[3] = {0,200000,500000};
+ static const unsigned clevel[3] = {0,0x40,0x80};
+ static const char gfx[8] = "gfx.lvl", mx[8] = "mx.lvl", cx[8] = "cx.lvl", gmxc[8] = "gmxc.lvl";
+ unsigned unused;
+ const char *secondary = g_aux(gmxc, &unused) ? gmxc : mx;
+ perf[1] = 10; perf[2] = 3;
+ for (unsigned i = 0; i < 10; i++) {
+  if (!g_arc_vote(gfx, secondary, level[i], &perf[3+i*3])) { e[3] = 0x908; return 0; }
+  perf[4+i*3] = 0xffffffff; perf[5+i*3] = freq[i]; e[100+i] = perf[3+i*3];
+ }
+ for (unsigned i = 0; i < 3; i++) {
+  if (!g_arc_vote(cx, mx, clevel[i], &perf[51+i*2])) { e[3] = 0x908; return 0; }
+  perf[52+i*2] = cfreq[i]; e[110+i] = perf[51+i*2];
+ }
+ /* Full Linux bw struct is 160 words: 6 scalar + 6 + 12 + 8 + 128. */
+ bw[1] = 1; bw[2] = 1; bw[3] = 3; bw[4] = 1; bw[5] = 7;
+ bw[6] = gpu_report[90]; bw[12] = 0x40000000; bw[18] = 0x60000001;
+ for (unsigned i = 0; i < 3; i++) {
+  bw[24+i] = gpu_report[87+i]; bw[32+i] = 0x40000000;
+  if (!bw[24+i]) { e[3] = 0x908; return 0; }
+ }
+ if (!bw[6]) { e[3] = 0x908; return 0; }
+ if (gm_rd(0x5000) != 1 || g_rd(GPU_RSCC_BASE, 0x101*4) || (gm_rd(0x5180)&1)) { e[3] = 0x909; return 0; }
+ g_hfi_init(); g_rpmh_init();
+ gm_wr(0x9304, 0xffffffff); gm_wr(0x9306, 0xffffffff);
+ gm_wr(0x5191, 0xffffffff); gm_wr(0x5193, 0xffffffff); /* polled, no GIC IRQ */
+ gm_wr(0x501c, 0); gm_wr(0x5001, 2);
+ gm_wr(0x5185, G_HFI_VA); gm_wr(0x5184, 1);
+ gm_wr(0x9311, 0x80000000u | (0x32u<<18) | 0x8a0);
+ gm_wr(0x502d, 0x4052); gm_wr(0x51cf, 0x7020100); gm_wr(0x51cd, G_LOG_VA | 3);
+ gm_wr(0x4c0f, 1); gm_wr(0x4c00, 1); gm_wr(0x4c01, 1);
+ e[34] = gm_rd(0x1c00+0xff8);
+ uint32_t mask = e[34] <= 0x20010004 ? 0xffffffff : 0x1ff;
+ e[35] = e[34] <= 0x20010004 ? 0xbabeface : 0x100;
+ gm_wr(0x5000, 1); gm_wr(0x51ce, 0);
+ gpu_gmu_started = 1; e[4] = 1; /* latch BEFORE releasing reset, including timeout */
+ __asm__ volatile("dsb sy" ::: "memory");
+ gm_wr(0x5000, 0);
+ if (!g_poll(0x501c, mask, e[35], 36)) { e[3] = 0x901; return 0; }
+ gm_wr(0x5186, 1);
+ if (!g_poll(0x5180, 1, 1, 37)) { e[3] = 0x902; return 0; }
+ e[38] = gm_rd(0x5181);
+ int err = g_hfi_send(4, perf, 59, 0);
+ if (!err) err = g_hfi_send(3, bw, 160, 1);
+ uint32_t core[2] = {0}, start[1] = {0};
+ if (!err) err = g_hfi_send(14, core, 2, 2);
+ if (!err) err = g_hfi_send(10, start, 1, 3);
+ if (err) { e[3] = err; return 0; }
+ e[3] = 1; gpu_s9_ok = 1;
+ return 1;
+}
+static void g_gx(void)
+{
+ uint32_t *e = gpu_extra[0];
+ if (g_rd(GPU_SMMU_BASE, g_cb(g_bank) + 0x58) & 0xc00001feu) { e[60] = 0xa04; return; }
+ uint32_t vote[4] = {0,1,1,0}; /* blocking, index1=220MHz, BW0 (only entry) */
+ int err = g_hfi_send(30, vote, 4, 4);
+ if (err) { e[60] = err; return; }
+ gm_wr(0x5191, 1u<<31); gm_wr(0x5194, 1u<<30);
+ int ack = g_poll(0x5192, 1u<<31, 1u<<31, 61);
+ gm_wr(0x5191, 1u<<31);
+ if (!ack) { gm_wr(0x5194, 1u<<31); e[60] = 0xa01; return; }
+ /* Hold GPU_SET while checking GX and reading RBBM, just as Linux hw_init.
+  * Linux XML GX_HM_OFF bits6/7 must be clear; also wait transition bits0/1. */
+ if (!g_poll(0x50d0, 0xc3, 0, 62)) { gm_wr(0x5194, 1u<<31); e[60] = 0xa02; return; }
+ e[63] = g_rd(GPU_GPUCC_BASE, CC_GX_GDSCR);
+ if (!g_gdsc_on(e[63])) { gm_wr(0x5194, 1u<<31); e[60] = 0xa03; return; }
+ e[64] = g_rd(GPU_REG_BASE, GPU_RBBM_STATUS*4); e[65] = 1;
+ gm_wr(0x5194, 1u<<31); e[60] = 1;
+}
+static void gpu_m2(unsigned limit)
+{
+ if (!gpu_snapshot_valid && !g_snapshot()) return;
+ if (limit == G_STAGE_8A) { g_live(); return; }
+ if (!gpu_m2_attempted) { g_enter(8); gpu_m2_attempted = 1; g_memory_load(); }
+ if (!gpu_s8_ok || limit < 9) { g_live(); return; }
+ if (!gpu_s9_attempted) { g_enter(9); gpu_s9_attempted = 1; g_start(); }
+ if (!gpu_s9_ok || limit < 10) { g_live(); return; }
+ if (!gpu_s10_attempted) { g_enter(10); gpu_s10_attempted = 1; g_gx(); }
+ g_live();
+}
+
 static void gpu_probe(unsigned limit)
 {
  uint32_t *r = gpu_report;
+ /* Once stage8 has touched tables or retention, never replay power/fw setup.
+  * Stages8->9->10 may advance once; reads of old stages return the frozen report. */
+ if (gpu_snapshot_valid) {
+  if (limit >= 8) gpu_m2(limit);
+  r[1] = limit; r[2] = gpu_stage; r[3] = gpu_gmu_started;
+  return;
+ }
  for (int i = 0; i < GPU_REPORT_WORDS; i++) r[i] = 0;
  if (!limit) return;
- if (limit > 7) limit = 7;
+ if (limit != G_STAGE_8A && limit > 10) limit = 10;
  r[0] = 0xa740;          /* magic */
  r[1] = limit;
+ gpu_extra[0][0] = 0xa7400002;
 
  /* ---- Stage 1: read-only snapshot (always safe: same GCC family the UFS /
   * touch probes already read; GPUCC/SMMU/GPU reads are each gated). ---- */
- gpu_stage = 1;
+ g_enter(1);
  uint32_t cfg_ahb = g_rd(GPU_GCC_GPU_PAGE, GCC_GPU_CFG_AHB);
  uint32_t memnoc  = g_rd(GPU_GCC_GPU_PAGE, GCC_GPU_MEMNOC_GFX);
  uint32_t dvm     = g_rd(GPU_GCC_GPU_PAGE, GCC_GPU_SNOC_DVM_GFX);
@@ -208,7 +678,7 @@ static void gpu_probe(unsigned limit)
  if (limit < 2) return;
 
  /* ---- Stage 2: the one write the gcc-sm8550 probe makes. ---- */
- gpu_stage = 2;
+ g_enter(2);
  if (!(cfg_ahb & CBCR_ENABLE)) { g_wr(GPU_GCC_GPU_PAGE, GCC_GPU_CFG_AHB, cfg_ahb | CBCR_ENABLE); r[26] = 1; }
  cfg_ahb = g_rd(GPU_GCC_GPU_PAGE, GCC_GPU_CFG_AHB);
  r[27] = cfg_ahb;
@@ -216,7 +686,7 @@ static void gpu_probe(unsigned limit)
  if (limit < 3) return;
 
  /* ---- Stage 3: CX GDSC + GPUCC AHB + HLOS SMMU vote (gdsc_enable mirror). ---- */
- gpu_stage = 3;
+ g_enter(3);
  cx_gdscr = g_rd(GPU_GPUCC_BASE, CC_CX_GDSCR);
  r[28] = cx_gdscr;
  if (!g_gdsc_on(cx_gdscr)) {
@@ -243,7 +713,7 @@ static void gpu_probe(unsigned limit)
  if (limit < 4) return;
 
  /* ---- Stage 4: now-powered adreno SMMU GR0 + CB0/CB1 snapshot (read-only). ---- */
- gpu_stage = 4;
+ g_enter(4);
  if (g_clk_on(cc_smmu)) {
   r[36] = g_rd(GPU_SMMU_BASE, SMMU_SCR0);
   r[37] = g_rd(GPU_SMMU_BASE, SMMU_ID0);
@@ -263,10 +733,10 @@ static void gpu_probe(unsigned limit)
   }
   r[35] = 1;
  }
- if (limit < 5) return;
+ if (!r[35] || limit < 5) return;
 
  /* ---- Stage 5: GMU clock snapshot (read-only; a6xx_gmu_resume expects XO). ---- */
- gpu_stage = 5;
+ g_enter(5);
  uint32_t pll1_mode = g_rd(GPU_GPUCC_BASE, CC_PLL1 + PLL_MODE);
  uint32_t pll1_op   = g_rd(GPU_GPUCC_BASE, CC_PLL1 + PLL_OPMODE);
  r[48] = pll1_mode; r[49] = pll1_op;
@@ -292,7 +762,7 @@ static void gpu_probe(unsigned limit)
  if (limit < 6) return;
 
  /* ---- Stage 6: GMU clock bring-up (a6xx_gmu_resume + gpucc probe order). ---- */
- gpu_stage = 6;
+ g_enter(6);
  /* 1. GPLL0 GPU votes */
  vote = g_rd(GPU_GCC_VOTE_PAGE, 0);
  if ((vote & GPLL0_VOTES) != GPLL0_VOTES) { g_wr(GPU_GCC_VOTE_PAGE, 0, vote | GPLL0_VOTES); delay(10); }
@@ -343,7 +813,7 @@ static void gpu_probe(unsigned limit)
  if (limit < 7) return;
 
  /* ---- Stage 7: cmd-db read + parse (read-only DRAM; needed for GMU votes). ---- */
- gpu_stage = 7;
+ g_enter(7);
  for (uint64_t i = 0; i < GPU_CMDDB_BYTES / 4; i++)
   { uint32_t w = g_rd(GPU_CMDDB_BASE, (uint32_t)(i * 4)); gpu_cmddb[i*4]=w; gpu_cmddb[i*4+1]=w>>8; gpu_cmddb[i*4+2]=w>>16; gpu_cmddb[i*4+3]=w>>24; }
  r[80] = cdb32(gpu_cmddb);        /* version */
@@ -368,5 +838,10 @@ static void gpu_probe(unsigned limit)
     if (eq) r[83 + nm] = cdb32(e + 16);   /* resource address */
    }
   }
+ if (limit >= 8 && r[65] == 7 && r[80] == 1 && r[81] == 0x0c0330db && r[82]) {
+  g_enter(limit == G_STAGE_8A ? G_STAGE_8A : 8);
+  gpu_m2(limit);
+ }
+ r[2] = gpu_stage; r[3] = gpu_gmu_started;
  /* r[83..90] = gfx.lvl, mx.lvl, cx.lvl, gmxc.lvl, SH0, MC0, ACV, CN0 addresses (0 = absent). */
 }

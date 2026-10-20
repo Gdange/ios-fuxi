@@ -1209,9 +1209,15 @@ ud_setup(void)
             memcpy(data, touch_report, sizeof(touch_report)); n=sizeof(touch_report);
         }
     } else if (type == 0xc0 && req == 0x56 && value == 0x4753 && !monitor_report[MON_LAUNCH]) {
-        /* 'GS': staged GPU power/clock/cmd-db probe; st[4] = last stage (1..7). */
-        gpu_probe(st[4]);
-        memcpy(data, gpu_report, sizeof(gpu_report)); n=sizeof(gpu_report);
+        /* 'GS': stages1..10 / 0x8a snapshot; 0x100..105 read frozen pages. */
+        unsigned index = st[4] | (unsigned)st[5] << 8;
+        if (index >= 0x100 && index < 0x100 + G_PAGES) {
+            const uint32_t *page = index == 0x100 ? gpu_report : gpu_extra[index - 0x101];
+            memcpy(data, page, sizeof(gpu_report)); n=sizeof(gpu_report);
+        } else if ((index >= 1 && index <= 10) || index == G_STAGE_8A) {
+            gpu_probe(index);
+            memcpy(data, gpu_report, sizeof(gpu_report)); n=sizeof(gpu_report);
+        } else ok = false;
     } else if (type == 0xc0 && req == 0x54 && value >= 1 && value <= 60) {
         /* Host-requested reset deadline: now + value minutes (bounded, never disabled). */
         monitor_report[MON_DEADLINE]=rsr("cntpct_el0")+rsr("cntfrq_el0")*60*value;
@@ -1231,7 +1237,7 @@ ud_setup(void)
     } else if (type == 0xc0 && req == 0x48) {
         memcpy(data, monitor_error, sizeof(monitor_error)); n=sizeof(monitor_error);
 #if defined(FUXI_XNU_LOADER)
-    } else if (type == 0xc0 && req == 0x49 && value == 0x584e && monitor_report[MON_ACTIVE]) {
+    } else if (type == 0xc0 && req == 0x49 && value == 0x584e && monitor_report[MON_ACTIVE] && !gpu_gmu_started) {
         monitor_report[MON_LAUNCH]=1;
         memcpy(data, (const void *)monitor_report, sizeof(monitor_report)); n=sizeof(monitor_report);
 #endif
