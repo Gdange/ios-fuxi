@@ -20,7 +20,8 @@ def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--base', type=Path, required=True)
     ap.add_argument('--out', type=Path, default=Path('xnu/out-fuxi-metal1'))
-    ap.add_argument('--lane', choices=('metal1','metal2a','metal2b','metal2c'), default='metal1')
+    ap.add_argument('--lane', choices=('metal1','metal2a','metal2b','metal2c','metal2e'), default='metal1')
+    ap.add_argument('--base-boot', type=Path, default=Path('shim/out/fuxi-metal2c-boot.img'))
     ap.add_argument('--nm', default='llvm-nm-18')
     ap.add_argument('--firmware', type=Path)
     ap.add_argument('--sqe', type=Path)
@@ -48,11 +49,21 @@ def main():
     assert payload[:8]==b'SWEETXNU'
     cmdline=payload[72:680].split(b'\0')[0]
     basecmd=args.base.joinpath('cmdline.txt').read_bytes().strip()
-    if args.lane in ('metal2b','metal2c'):
-        expected=basecmd
-        assert (args.out/'cmdline.txt').read_bytes()==(args.base/'cmdline.txt').read_bytes()
+    if args.lane in ('metal2b','metal2c','metal2e'):
+        if args.lane=='metal2e':
+            assert basecmd.split().count(b'sweetexecswap=bluetoothd:/usr/local/bin/fuxi-gpu-abi-test')==1
+            assert basecmd.split().count(b'sweetnoexec=fairplayd.H2')==1
+            expected=basecmd.replace(b'sweetexecswap=bluetoothd:',b'sweetexecswap=IOMFB_FDR_Loader:').replace(b'sweetnoexec=fairplayd.H2',b'sweetnoexec=bluetoothd,fairplayd.H2')
+            assert b'sweetexecswap=IOMFB_FDR_Loader:/usr/local/bin/fuxi-gpu-abi-test' in expected.split()
+            assert b'sweetnoexec=bluetoothd,fairplayd.H2' in expected.split()
+            assert len(image)==args.base_boot.stat().st_size,'metal2e boot size differs from metal2c'
+            print('PASS: metal2e boot size equals metal2c')
+        else:
+            expected=basecmd
+            assert (args.out/'cmdline.txt').read_bytes()==(args.base/'cmdline.txt').read_bytes()
+            assert b'sweetexecswap=bluetoothd:/usr/local/bin/fuxi-gpu-abi-test' in expected.split()
+        assert (args.out/'cmdline.txt').read_bytes().strip()==expected
         assert b'fuxigpuabi=1' in expected.split() and not any(a.startswith(b'fuxiwlan=') for a in expected.split())
-        assert b'sweetexecswap=bluetoothd:/usr/local/bin/fuxi-gpu-abi-test' in expected.split()
         assert '_fuxi_wlan_init' in symbols and b'SWEET EXECSWAP:' in raw and b'FUXI ABI: result' in raw
         assert b'FUXI GPU ABI: init check' in raw and b'FUXI GPU ABI: init write' in raw
     elif args.lane=='metal2a':
@@ -87,11 +98,23 @@ def main():
     assert platform==2 and signature
     print('PASS: signed arm64 Mach-O, LC_BUILD_VERSION iOS 16.0')
     firmware=[args.firmware,args.sqe,args.zap]
+    if args.lane=='metal2e': assert all(firmware),'metal2e requires all three firmware inputs'
     if any(firmware):
         assert all(firmware),'provide all three firmware inputs'
         loader=Path(f'shim/out/fuxi-{args.lane}-loader.elf').read_bytes()
-        for path in firmware: assert loader.count(path.read_bytes())==1,path.name
-        print('PASS: exact external GMU/SQE/zap blobs appear once in loader ELF')
+        assert loader[:6]==b'\x7fELF\x02\x01','expected ELF64 little-endian loader'
+        shoff=struct.unpack_from('<Q',loader,40)[0]
+        entsize,count,strings=struct.unpack_from('<3H',loader,58)
+        sections=[struct.unpack_from('<II4QII2Q',loader,shoff+i*entsize) for i in range(count)]
+        names=loader[sections[strings][4]:sections[strings][4]+sections[strings][5]]
+        gpu=next(s for s in sections if names[s[0]:].split(b'\0')[0]==b'.gpu_fw')
+        blobs=[path.read_bytes() for path in firmware]
+        assert gpu[5]==sum(map(len,blobs))>0
+        section=loader[gpu[4]:gpu[4]+gpu[5]]
+        assert section==b''.join(blobs) and gpu[2]&2,'GPU firmware must be allocated in the Image'
+        assert arm[gpu[3]:gpu[3]+gpu[5]]==section,'boot image lacks GPU firmware section'
+        for path,blob in zip(firmware,blobs): assert loader.count(blob)==1 and arm.count(blob)==1,path.name
+        print('PASS: allocated .gpu_fw section and exact external GMU/SQE/zap blobs in loader ELF and boot Image')
     for line in args.out.joinpath('SHA256SUMS').read_text().splitlines():
         digest,path=line.split(None,1)
         assert hashlib.sha256(Path(path.strip()).read_bytes()).hexdigest()==digest,path

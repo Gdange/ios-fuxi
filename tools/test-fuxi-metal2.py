@@ -2,6 +2,7 @@
 """Offline execswap parser, actual trace/quota methods and stage migration tests."""
 from pathlib import Path
 import importlib.util
+import os
 import re
 import struct
 import subprocess
@@ -101,6 +102,7 @@ int main(int argc,char **argv) {
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include "sweet_execswap.h"
 using IOReturn=unsigned;
 static constexpr unsigned kIOReturnSuccess=0,kIOReturnIOError=0xe00002bc,kIOReturnBusy=0xe00002d5;
 static int openLock;
@@ -117,6 +119,22 @@ struct Client {
 };
 int main() {
  assert(!execswapTest && !testPasses);
+ assert(abiExecswapTest("IOMFB_FDR_Loader:/usr/local/bin/fuxi-gpu-abi-test"));
+ assert(abiExecswapTest("bluetoothd:/usr/local/bin/fuxi-gpu-abi-test"));
+ assert(!abiExecswapTest("IOMFB_FDR_Loader:/usr/local/bin/other"));
+ assert(!abiExecswapTest("IOMFB_FDR_Loader:/usr/local/bin/fuxi-gpu-abi-test:other"));
+ assert(!abiExecswapTest("IOMFB_FDR_Loader:/usr/local/bin/fuxi-gpu-abi-test,other:/test"));
+ assert(!abiExecswapTest(""));
+ // Compare actual diagnostic recognition against the exec parser's name rules.
+ for (unsigned len=0;len<=32;++len) for (unsigned byte=1;byte<=255;++byte) {
+  char arg[192]={};memset(arg,'a',len);
+  if (len)arg[len/2]=(char)byte;
+  strcat(arg,":/usr/local/bin/fuxi-gpu-abi-test");
+  sweet_execswap s={};strcpy(s.arg,arg);
+  bool parsed=sweet_execswap_parse(&s);
+  assert(abiExecswapTest(arg)==(parsed && !strcmp(s.path,"/usr/local/bin/fuxi-gpu-abi-test")));
+  if(parsed)assert(sweet_execswap_match(&s,s.name)==s.path);
+ }
  Memory mem;Client a;a.bos_[0].memory=&mem;
  assert(a.mount());a.result();assert(!testPasses && strstr(last,"bad-pixels 256"));
  connected=false;
@@ -136,8 +154,51 @@ int main() {
 }'''
         model=re.sub(r'__asm__ volatile\("dsb sy" ::: "memory"\);','(void)0;',model)
         p=temp/'guard.cpp';p.write_text(model)
-        subprocess.run(['clang++','-std=c++17','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',str(p),'-o',str(temp/'guard')],check=True)
+        subprocess.run(['clang++','-std=c++17','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-I',str(ROOT/'xnu/fuxi-exec'),str(p),'-o',str(temp/'guard')],check=True)
         subprocess.run([str(temp/'guard')],check=True)
+        # Run the real lane in an isolated tree, stubbing only the packers.
+        pack=temp/'pack';(pack/'tools').mkdir(parents=True)
+        (pack/'tools/build-fuxi-metal2-images.sh').write_bytes((ROOT/'tools/build-fuxi-metal2-images.sh').read_bytes())
+        base=pack/'base';base.mkdir()
+        basecmd='fuxigpu=1 fuxigpuabi=1 sweetnoexec=fairplayd.H2 sweetexecswap=bluetoothd:/usr/local/bin/fuxi-gpu-abi-test'
+        (base/'cmdline.txt').write_text(basecmd+'\n');(base/'fuxi.adt').write_bytes(b'adt')
+        out=pack/'xnu/out-fuxi-metal2e';out.mkdir(parents=True)
+        for name in ('kernel.development.fuxi','kernel.development.fuxi.unstripped'):
+            (out/name).write_bytes(b'kernel')
+        (pack/'tools/out').mkdir();(pack/'tools/out/fuxi-gpu-abi-test').write_bytes(b'test')
+        (pack/'tools/mkpayload.py').write_text('import pathlib,sys\npathlib.Path(sys.argv[3]).write_bytes(b"payload")\n')
+        (pack/'shim/fuxi-loader').mkdir(parents=True)
+        required=('FUXI_GMU_FIRMWARE','FUXI_SQE_FIRMWARE','FUXI_GPU_ZAP_MBN','MKBOOTIMG')
+        (pack/'shim/fuxi-loader/build.sh').write_text('''#!/bin/bash
+set -eu
+python3 - <<'PY'
+import os
+from pathlib import Path
+for key in ('FUXI_GMU_FIRMWARE','FUXI_SQE_FIRMWARE','FUXI_GPU_ZAP_MBN','MKBOOTIMG'):
+    assert Path(os.environ[key]).is_absolute() and Path(os.environ[key]).is_file()
+out=Path('shim/out/fuxi-loader');out.mkdir(parents=True)
+for name in ('fuxi-xnu-boot.img','loader.elf'): (out/name).write_bytes(b'packed')
+PY
+''')
+        env=dict(os.environ)
+        for key in required:env.pop(key,None)
+        command=['bash','tools/build-fuxi-metal2-images.sh',str(base),'metal2e']
+        for key in required:
+            source=pack/(key+' input');source.write_bytes(b'input');env[key]=str(source)
+        for key in required:
+            for value in (None,'relative/path'):
+                badenv=dict(env)
+                if value is None:badenv.pop(key)
+                else:badenv[key]=value
+                run=subprocess.run(command,cwd=pack,env=badenv,capture_output=True,text=True)
+                assert run.returncode and key in run.stderr,run
+        subprocess.run(command,cwd=pack,env=env,check=True)
+        expected=basecmd.replace('sweetnoexec=fairplayd.H2','sweetnoexec=bluetoothd,fairplayd.H2').replace('sweetexecswap=bluetoothd:','sweetexecswap=IOMFB_FDR_Loader:')
+        assert (out/'cmdline.txt').read_text()==expected+'\n'
+        for invalid in (basecmd+' fuxiwlan=1',basecmd+' sweetexecswap=other:/test',basecmd+' sweetnoexec=other',basecmd+' '+('x'*608)):
+            (base/'cmdline.txt').write_text(invalid+'\n')
+            assert subprocess.run(command,cwd=pack,env=env,capture_output=True).returncode
+        print('PASS: metal2e exact cmdline, malformed/oversize base refusal, mandatory absolute firmware/tool paths forwarded to loader')
         stage=module('stage-fuxi-gpu-abi-test')
         root=temp/'root';cache=root/'System/Library/xpc/launchd.plist';cache.parent.mkdir(parents=True)
         other={'Label':'com.example.other','RunAtLoad':True}
@@ -160,5 +221,7 @@ int main() {
     assert '!(imgp->ip_flags & IMGPF_SWEET_EXECSWAP)' in patch
     assert 'sweet_exec_blocked(swap.name, false)' in patch and 'wins over sweetnoexec' in patch
     assert 'logged < 8' in patch and 'if (!parsed)' in patch
+    assert 'clientHasPrivilege(securityID,kIOClientPrivilegeAdministrator)!=kIOReturnSuccess) return kIOReturnNotPrivileged;' in client
+    assert 'abiExecswapTest(swap)' in client
     print('PASS: execswap precedence marker, bounded logging and serialized parse-once wiring')
 if __name__=='__main__':main()

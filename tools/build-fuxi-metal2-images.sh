@@ -1,16 +1,43 @@
 #!/bin/bash
-# Repack metal2a from 0098i, or metal2b/metal2c with byte-identical base inputs.
+# Repack metal2a from 0098i, metal2b/metal2c with unchanged inputs, or metal2e from metal2c.
 # Supply the same private toolchain/firmware environment used for 0098i.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-base=${1:?Usage: build-fuxi-metal2-images.sh BASE_ARTIFACT_DIR [metal2a|metal2b|metal2c]}
+base=${1:?Usage: build-fuxi-metal2-images.sh BASE_ARTIFACT_DIR [metal2a|metal2b|metal2c|metal2e]}
 lane=${2:-metal2a}
-[[ $lane == metal2a || $lane == metal2b || $lane == metal2c ]]
+[[ $lane == metal2a || $lane == metal2b || $lane == metal2c || $lane == metal2e ]]
+if [[ $lane == metal2e ]]; then
+ for var in FUXI_GMU_FIRMWARE FUXI_SQE_FIRMWARE FUXI_GPU_ZAP_MBN MKBOOTIMG; do
+  [[ -n ${!var:-} ]] || { echo "metal2e: $var must be set" >&2; exit 1; }
+  [[ ${!var} == /* && -f ${!var} ]] || { echo "metal2e: $var must be an absolute path to a file" >&2; exit 1; }
+  export "$var"
+ done
+fi
 out=xnu/out-fuxi-$lane
 mkdir -p "$out" shim/out
 [[ -f $out/kernel.development.fuxi && -f $out/kernel.development.fuxi.unstripped ]]
 cp "$base/fuxi.adt" "$out/fuxi.adt"
-if [[ $lane == metal2b || $lane == metal2c ]]; then
+if [[ $lane == metal2e ]]; then
+ python3 - "$base/cmdline.txt" "$out/cmdline.txt" <<'PY2E'
+from pathlib import Path
+import sys
+args=Path(sys.argv[1]).read_text().split()
+swap='sweetexecswap=bluetoothd:/usr/local/bin/fuxi-gpu-abi-test'
+blocked='sweetnoexec=fairplayd.H2'
+assert args.count(swap)==1 and sum(a.startswith('sweetexecswap=') for a in args)==1
+assert args.count(blocked)==1 and sum(a.startswith('sweetnoexec=') for a in args)==1
+args[args.index(swap)]='sweetexecswap=IOMFB_FDR_Loader:/usr/local/bin/fuxi-gpu-abi-test'
+args[args.index(blocked)]='sweetnoexec=bluetoothd,fairplayd.H2'
+assert 'sweetexecswap=IOMFB_FDR_Loader:/usr/local/bin/fuxi-gpu-abi-test' in args
+assert 'sweetnoexec=bluetoothd,fairplayd.H2' in args
+assert 'fuxigpu=1' in args and 'fuxigpuabi=1' in args
+assert not any(a.startswith('fuxiwlan=') for a in args)
+line=' '.join(args)
+assert len(line.encode())<608
+Path(sys.argv[2]).write_text(line+'\n')
+print('metal2e cmdline:',len(line.encode()),'bytes; root IOMFB_FDR_Loader host; fuxiwlan absent (off)')
+PY2E
+elif [[ $lane == metal2b || $lane == metal2c ]]; then
  cp "$base/cmdline.txt" "$out/cmdline.txt"
  python3 - "$out/cmdline.txt" <<'PY2B'
 from pathlib import Path

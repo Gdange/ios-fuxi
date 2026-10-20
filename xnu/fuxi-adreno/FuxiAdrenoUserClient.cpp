@@ -43,6 +43,16 @@ static IOLock *openLock;
 static bool connected;
 static bool execswapTest;
 static unsigned testPasses, traceLines;
+static bool abiExecswapTest(const char *swap) {
+ size_t n=strnlen(swap,192);
+ if (!n || n>=191) return false;
+ const char *colon=strchr(swap,':');
+ if (!colon || colon==swap || colon-swap>31) return false;
+ /* Match sweet_execswap_parse's basename rules; only this test path counts. */
+ for (const char *p=swap; p<colon; ++p)
+  if (*p<=' ' || *p==',' || *p=='/') return false;
+ return !strcmp(colon+1,"/usr/local/bin/fuxi-gpu-abi-test");
+}
 /* openLock serializes the boot-wide quota and trace budget (including opens
  * denied after the test). No user stdout or root-image update is needed. */
 static void abiTrace(const char *step, int pid, IOReturn rc) {
@@ -363,7 +373,7 @@ extern "C" void fuxi_gpu_abi_publish(void)
 {
  char swap[192]={};
  execswapTest=PE_parse_boot_argn("sweetexecswap",swap,sizeof(swap)) &&
-     !strcmp(swap,"bluetoothd:/usr/local/bin/fuxi-gpu-abi-test");
+     abiExecswapTest(swap);
  openLock=IOLockAlloc();
  auto *service=new NativeAdrenoGpuPublished;
  if (!openLock || !service) { if (service) service->release(); return; }
