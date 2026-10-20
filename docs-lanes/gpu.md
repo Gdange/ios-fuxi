@@ -1,10 +1,12 @@
-# Lane: GPU A740 — milestone 2 implementation, 2026-10-20
+# Lane: GPU A740 — milestone 3 implementation, 2026-10-20
 
-Branch `codex-gpu-m2`, base `43278d1`. Stages 8a/8/9/10 are implemented and
-validated offline; **none has been run on the phone**. The coordinator owns all
-device tests. No phone, USB, adb or fastboot access was used in this lane.
-`NOTES.md` is untouched by explicit task instruction; this file is the handoff.
-Commit: the commit containing this handoff (`git log -1` on the lane).
+Branch `codex-gpu-m3`, base `fuxi-bringup` `09fa2b8`. Stages 1–10 are
+**device-verified by the coordinator** (see Device results). Stages 11–13 are
+implemented and validated offline, **not booted or executed on the phone**.
+The coordinator owns all device tests. This lane used no phone, USB, adb or
+fastboot access and no CI run. `NOTES.md` is untouched by explicit task
+instruction; this file is the active handoff. Commit: the commit containing
+this handoff (`git log -1` on `codex-gpu-m3`).
 
 Stages 1–7 passed on Fuxi (coordinator runs gpu-01, gpu-03..07): CX on,
 PLL1 locked after 6 polls, GMU reset=1, TCM retention=0, RSC idle, HFI not ready.
@@ -108,7 +110,10 @@ DTB) read with `tools/fuxi-inspect-dtb.py`. Register maths: pinned Linux
 GPU code stays in `shim/fuxi-probe/gpu.c`, included by `probe.c`. The dispatch
 changes only add page selection and the XNU handoff guard. Loader MMU/caches
 are off, VA==PA. CPU accesses are uncached; every publication has barriers.
-A bad MMIO may externally abort/reset, so software deadlines cannot recover it.
+New/possibly secure MMIO reads use `probe_safe_rd32`. M3 also uses
+`probe_safe_wr32` for every new MMIO write. Both recover local synchronous
+aborts and record ESR/FAR; interconnect hangs or asynchronous SError can still
+reset the SoC, and a software timeout cannot contain them.
 
 | Stage / wIndex | Operation | Risk / gating |
 |---|---|---|
@@ -122,26 +127,33 @@ A bad MMIO may externally abort/reset, so software deadlines cannot recover it.
 | **8a / 0x008a** | Snapshot all 24 SMR/S2CR pairs and all 22 CBs with CX on | Low additional risk: new register reads; preceding 2/3/6 still write |
 | **8** | Validate firmware/prealloc extents, select unused context/slot/ASID, build 4K tables in fixed RAM, map SID5, FAL veto + TCM retention, load/read back ITCM/DTCM/icache | High: first SMMU programming and about 17 MiB of scratch writes; no CM3 start |
 | **9** | Build cmd-db ARC votes, RSC/PDC init, HFI table, cold GMU config/start, init wait, HFI ready, PERF -> BW -> CORE_FW_START -> START ACKs | High: firmware runs and accesses RAM; permanent handoff lock |
-| **10** | Blocking low-frequency vote, GPU_SET OOB, wait GX, read RBBM_STATUS, release OOB | High: first GX activation; requires stages8/9 complete |
+| **10** | Blocking low-frequency vote, GPU_SET OOB, wait GX, read RBBM_STATUS, release OOB | High, device-verified |
+| **11** | Snapshot/live ownership checks; separate GPU bank/ASID, SMRs for SIDs0/1, GPU page tables and buffers | High: new SMMU context, no SQE start; requires10 PASS |
+| **12** | Hold GPU_SET, A740 CP/UCHE/GBIF/HWCG setup, SQE fetch, a7xx CP init, no-zap TRUST_CNTL fallback | Highest: first GPU DMA/CP execution and potentially protected writes; requires11 PASS |
+| **13** | Append CP_MEM_WRITE, poll CPU fence, rptr/wptr, idle and faults | High: GPU write confined by mappings to scratch; requires12 PASS |
 
-Request: type `0xc0`, request `0x56`, wValue `0x4753`. Stages1..10 and `0x8a`
+Request: type `0xc0`, request `0x56`, wValue `0x4753`. Stages1..13 and `0x8a`
 run through the requested limit and return page0 (512 bytes). Invalid indices
-stall. **Stage8a requires stage7 valid**, and 8–10 require its powered snapshot.
+stall. **Stage8a requires stage7 valid**, and 8–13 require its powered snapshot.
 A failed stage never advances. After 8a the snapshot is frozen; each mutating
-stage8/9/10 is attempted at most once. Later limits may advance the sequence;
+stage8..13 is attempted at most once. Later limits may advance the sequence;
 repeating a failed stage requires a fresh boot. Requests for stages1..7 after
 8a return the existing snapshot, avoiding PLL/TCM reinitialization.
 
-Read-only report fetches: wIndex **0x0100..0x0105** select pages0..5. They only
+Read-only report fetches: wIndex **0x0100..0x0107** select pages0..7. They only
 copy RAM, do not run stages or refresh MMIO. All unused words are zero. Snapshot
 pages2..5 are from immediately before the first stage8 write. Page1 live fields
-are sampled at the end of each stage8a/8/9/10 request, not on page fetch.
+are sampled at the end of each stage8a/8..13 request, not on page fetch.
 
 **XNU request 0x49 is refused (USB stall) from immediately before CM3 reset is
 released onward, including init timeout, ACK failure and subsequent requests.**
 There is no unload/reset operation that clears this latch. Retain tables and
-buffers until the normal loader reset. No zap/secure mode, SQE, GPU user SIDs,
-CP, ring, rendering or XNU GPU driver is implemented by this milestone.
+buffers until the normal loader reset. M3 adds GPU user SIDs, SQE, a fixed ring and a single fence command. No zap
+shader, secure command submission, rendering or XNU GPU driver is included.
+After stage12 obtains GPU_SET it is retained until reset, including errors: no
+IFPC/power collapse is allowed to destroy CP state between stage12 and13.
+Diagnostic snapshots are frozen at stage12/13 completion (or failure while GX
+is confirmed on); report-page fetches never touch hardware.
 
 Timeouts: TLB sync 1000 polls × 1 us; firmware/HFI/GX init each 1000 × 10 us;
 each HFI ACK has one 50 ms counter deadline, including all receive handling.
@@ -198,7 +210,7 @@ Stage8a is encoded as 0x8a in page0[1]/[2].
 
 Page1 (selector 0x101), indices local to that page:
 ```
-[0] 0xa7400002 (report format v2)
+[0] 0xa7400003 (report format v3; existing fields unchanged)
 [1] snapshot status (1 complete) [2] stage8 result [3] stage9 result
 [4] GMU-start/handoff-lock latch
 [5] SMR count [6] CB count [7] register page stride [8] CB region offset
@@ -231,6 +243,10 @@ Page1 (selector 0x101), indices local to that page:
 Page2 (0x102): `[2*i] SMR(i), [2*i+1] S2CR(i)`, i<count (Fuxi24,
 geometry limit32). Additional context controls: `[64+b] ACTLR(b)` and
 `[88+b] CONTEXTIDR(b)`, b<CB count. ACTLR is observed and preserved.
+Snapshot fault accounting lives in **page2[48..52]**, not page1 (where those
+indices hold HFI ACKs): count, first ESR, first SMMU byte offset, stream-slot
+fault mask, bank fault mask.
+
 Pages3..5 (0x103..105): eight banks per page; bank b starts at
 `page=3+b/8, word=16*(b%8)`, with these 16 fields:
 ```
@@ -238,20 +254,20 @@ CBAR, CBA2R, SCTLR, TCR2, TTBR0lo, TTBR0hi, TTBR1lo, TTBR1hi,
 TCR, MAIR0, MAIR1, FSR, FARlo, FARhi, FSYNR0, FSYNR1
 ```
 
-Healthy expectations (predictions for stages8+, not observations):
+Healthy expectations for stages8–10 (now confirmed except FSR; see Device results):
 - 8a: page1[1]=1, [5:8]=24/22/0x1000/0x20000. Review **all** streams and
   enabled banks before the first stage8 run. Existing SID5 match means stop.
 - 8: [2]=1, firmware 66844 B/4 blocks/11 prealloc/66604 data B, 13 table pages;
   SMR=0x80000005, S2CR=selected CB, TTBR=0x8f0000000 | ASID<<48,
-  TCR etc as above; chosen FSR zero. GMU latch remains zero.
+  TCR etc as above; chosen FSR has no defined fault bits. GMU latch remains zero.
 - 9: [3]=1, [4]=1. Init is `0xbabeface` for DTCM version <=0x20010004,
   otherwise `(result & 0x1ff)==0x100`. HFI status bit0=1. Four ACKs must have
-  id126/type1, exact returned command headers and error0. Sent headers are
+  id126 **or echoed command id**, type1, exact returned command headers and error0. Sent headers are
   `0x00103b04 / 0x0020a003 / 0x0030020e / 0x0040010a`.
 - 10: [60]=1, vote ACK error0 (`sent=0x0050041e`), OOB sample bit31=1;
   `(SPTPRAC & 0xc3)==0` (Linux GX-off bits6/7 plus transition bits0/1),
   GX GDSCR bit31=1, [65]=1. RBBM_STATUS is evidence only: no exact idle
-  value is promised before GPU hw_init. Chosen CB FSR should remain zero.
+  value is promised before GPU hw_init. CB1 FSR=0x400 was observed, unexplained; defined fault bits stay clear.
 
 Results: 0=not run, 1=success. Codes (hex):
 
@@ -355,14 +371,18 @@ startup and stage10's live GX status. Offline mocks do not prove power or DMA.
 
 ## 6. Build, validation, and coordinator test order
 
-Optional environment input: `FUXI_GMU_FIRMWARE=/absolute/local/path`. The build
+Optional environment inputs: `FUXI_GMU_FIRMWARE=/absolute/local/path` and
+`FUXI_SQE_FIRMWARE=/absolute/local/a740_sqe.fw`. The build
 writes an `.incbin` assembly file **only in ignored shim/out/fuxi-loader**;
 the input remains external. Omitting the variable emits empty symbols, builds
 normally, and stage8 reports802 without touching scratch or the SMMU context.
-Standalone fuxi-probe builds also remain supported, without embedded firmware.
+With GMU embedded but SQE omitted, stage11 is available and stage12 returns
+`c01` before GPU_SET/hw_init. Standalone fuxi-probe builds remain supported
+without embedded firmware (stage8 returns802).
 
 ```sh
 FUXI_GMU_FIRMWARE=/hdd2/fuxi-ios/research/firmware/gpu/sheng-firmware/gmu_gen70200.bin \
+FUXI_SQE_FIRMWARE=/hdd2/fuxi-ios/research/firmware/gpu/sheng-firmware/a740_sqe.fw \
 CLANG=/hdd2/pixelos/prebuilts/clang/host/linux-x86/clang-r547379/bin/clang \
 LLD=/hdd2/pixelos/prebuilts/clang/host/linux-x86/clang-r547379/bin/ld.lld \
 OBJCOPY=/usr/bin/llvm-objcopy-18 READELF=/usr/bin/llvm-readelf-18 \
@@ -370,14 +390,10 @@ NM=/usr/bin/llvm-nm-18 MKBOOTIMG=/hdd2/fuxi-ios/research/mkbootimg/mkbootimg.py 
 bash shim/fuxi-loader/build.sh /hdd2/fuxi-ios/shim/out/fuxi-integ1-payload.bin
 ```
 
-Payload SHA256 `800b9ea17ce18f1872c0533d5ef13f916c490eb7b1524e677fc2555378f00d66`.
-Firmware SHA256 is in the facts table. Deliverable (this worktree):
-`shim/out/lane-gpu/fuxi-gpu-m2-boot.img` (20,783,104 bytes).
-SHA256 `30569542a86b0a1d448a0bb1dc87d3cfde7ad0807f59c09c44b52f1134293916`.
-Firmware-enabled ELF: `_gpu_fw_start=0xcc1c`, `_gpu_fw_end=0x1d138`
-(66844 bytes), `_bss_start=0x20000`, `_bss_end=0x50000`,
-`_payload_start=0x60000`, `_image_end=0x13d0050`. `.bss` is 192 KiB,
-not the 32 MiB scratch reservation. Loader builds enforce `-Werror`.
+The M2 artifact/history remains in Device results and git history. Current M3
+artifact, size, hash and ELF geometry are recorded in the final handoff below.
+The supplied integ1 payload and firmware inputs remain external/read-only;
+no firmware or boot image is tracked. Loader builds enforce `-Werror`.
 
 Offline checks completed: firmware-enabled loader, no-firmware loader and
 standalone probe all build with **zero warnings**; relocation/Image-size guards
@@ -386,53 +402,252 @@ synthetic firmware and the exact external blob; checks all icache PTEs and holes
 privilege attributes, firmware format bounds/readback, bank/ASID ownership,
 masked SID collision, TLB timeout/readback failure, HFI startup order, ACK
 errors/sequence/size, ring wrap/full/invalid index, bounded init/ACK timeouts,
-and permanent GMU-start latch after init failure. Python decodes all six model
+and permanent GMU-start latch after init failure. M3 adds separate GPU table
+leaves/permissions/holes, two-stream ownership, changed/unreadable ownership
+refusal, TLB timeout/readback, CP packet contents, SQE header removal/readback,
+rptr/idle/fence completion, fence guards, contained SECVID write abort, defined
+FSR faults vs reserved bit10, and no retry/no next stage after failure. Python decodes all eight model
 report pages offline. It does **not** execute firmware or emulate power/SMMU.
 
 ```sh
 python3 tools/test-fuxi-gpu-probe.py
-python3 tools/test-fuxi-gpu-probe.py --firmware /absolute/local/gmu_gen70200.bin
+python3 tools/test-fuxi-gpu-probe.py --firmware /absolute/local/gmu_gen70200.bin \
+  --sqe /absolute/local/a740_sqe.fw
 python3 tools/fuxi-gpu-probe.py --decode /private/captured-report.bin
 ```
 
-Coordinator only, serial tests, after committing and cooling the phone:
-
-1. Fresh temporary boot of the milestone2 image; stage7 regression first.
-2. Stage **8a** on a fresh boot: `tools/fuxi-gpu-probe.py --stage 8a --raw
-   --save research/device/<run>/gpu.bin`. Inspect all SMRs/CBs and confirm SID5
-   is unmatched. This is the gate before running stage8.
-3. Fresh boot stage **8**; verify context, image block counts, FSR and readbacks.
-4. Fresh boot stage **9**; verify init/HFI and all four ACKs. Then coordinator
-   tests request0x49 with value0x584e (with MON_ACTIVE set): **must stall**, and
-   MON_LAUNCH must remain0. This test never starts XNU. Do not bypass the guard.
-5. Only after 8/9 look healthy, fresh boot stage **10**; inspect low vote ACK,
-   OOB, GX predicates and RBBM read-valid. No CP command or rendering claim.
-6. `--read-reports --raw --save ...` rereads frozen pages without any hardware
-   setup. A repeated stage can sample live fault fields but cannot retry setup.
-   Preserve raw reports and exact boot/reset results outside git. Any failure:
-   stop climbing, capture available pages, let the reset occur, report evidence.
-
-`/hdd2/fuxi-ios/research/run-gpu.py` is read-only for this lane and unchanged.
-It mounts the **main checkout** tool into its container. Before using it the
-coordinator must integrate the new tracked tool there (otherwise its parser only
-accepts1..7), or run this worktree's host tool against the already booted probe.
-Pass the explicit milestone2 image path; the runner's old default is milestone1.
-The runner itself was not executed here. No CI run or device boot was attempted.
+Coordinator test order is in the M3 handoff below. The main checkout's
+`research/run-gpu.py` is read-only for this lane and unchanged. It mounts the
+**main checkout's tool**, so integrate this lane's decoder before using that
+runner, or use this worktree's tool against an already temporarily booted probe.
+Pass the explicit M3 image path. The runner was not executed here.
 
 ## 7. Remaining work
 
-First concrete action is coordinator stage8a. If stages8–10 succeed on device,
-next milestone is GPU user SIDs/context, SQE + hw_init, ring/CP_ME_INIT and one
-CP_MEM_WRITE; then an XNU driver and userspace acceleration. Those are outside
-this loader-only implementation. Keep Android, all partitions and private
-artifacts untouched by these probes.
+Run coordinator tests 11, 12, 13 with fresh boots between the initial bisects,
+then prove same-boot 11→12→13 advancement. Hardware outcomes are unknown.
+Rendering, XNU DMA ownership, an XNU GPU driver and userspace acceleration remain
+future work. The GMU-start handoff lock must stay: this scratch still overlaps
+XNU's RAM window, and both processors retain DMA access until reset.
 
 ## Device results (2026-10-20, coordinator)
 - 7 PASS (m2). 8a: first m2 boot reset the SoC (sync abort -> fatal -> PSCI reset), not
-  reproduced on m2b, which reads the snapshot through `probe_safe_rd32` (0 faults; page1[48..52]).
+  reproduced on m2b, which reads the snapshot through `probe_safe_rd32` (0 faults; **page2[48..52]**, corrected from the old handoff).
   Every SMR invalid, S2CR 0x20000, CBAR 0, no bank enabled.
 - 8 PASS (slot0 -> CB1, ASID1, 13 tables, fw read back).
 - 9: m2b 0x906 - the gen70200 GMU ACK header echoes the command id (0x00010304), not 126.
   m2c accepts either (Linux checks only ret_header seq). m2c 9 PASS, all ACK errors 0.
 - 0x49 after GMU start: STALL. 10 PASS: GX_GDSCR 0xf8222800, RBBM_STATUS 0x1.
 
+## Milestone 3: layout, source choices and expected results
+
+The following are implementation facts and predictions, **not new Fuxi device
+observations**. The table pool helper is shared with M2 but receives an explicit
+root/pool cursor; the native model checks that M3 leaves the GMU root unchanged.
+The fixed reservation overlap check in stage8 is a prerequisite of stage11.
+
+| Use | GPU VA | Physical base | Bytes / permission |
+|---|---:|---:|---|
+| GPU table pool | unmapped | `0x8f1200000` | 1 MiB reserved, 3 × 4K pages used |
+| SQE code | `0x40000000` | `0x8f1300000` | 128 KiB, GPU read-only (both privilege levels) |
+| Ring | `0x40020000` | `0x8f1320000` | 32 KiB, RW |
+| BR/BV rptr shadows | `0x40028000` | `0x8f1328000` | 4 KiB, privileged RW; offsets 0/4 |
+| Fence/scratch | `0x40029000` | `0x8f1329000` | 4 KiB, RW; magic at 0, guards at 4/0xffc |
+
+All are inside `[0x8f0000000,0x8f2000000)`. GMU-owned memory ends at
+`0x8f1111000`; M3 does not touch it. M3 uses TTBR0 only, 32-bit GPU VAs,
+36-bit PA, 4K granules, NC memory and walks, AF/inner-shareable leaves.
+All other GPU VAs are unmapped, including the GMU buffers/tables. SQE's leaf AP
+is 3 (read-only); ring/fence AP 1; rptr AP 0. This is a small loader address space,
+not Linux's split TTBR0/TTBR1 16 GiB process address-space design.
+
+Stage11 checks **both** SID0 and SID1 for exact/masked collisions: supplied
+`arch/arm64/boot/dts/qcom/sm8550.dtsi` attaches both to the GPU device. There is
+no LPAC submission/start. Two invalid readable SMRs are selected. Snapshot and
+live stream entries must agree, except the expected M2 SID5 entry. A snapshot
+stream fault refuses selection because a hidden masked match cannot be ruled
+out. Banks must be readable, disabled in the snapshot and live, unreferenced by
+any live translating stream, at/after the stage1 banks, and neither bank0 nor
+the GMU bank. ASIDs exclude the GMU ASID and every readable enabled bank's two
+live TTBR ASIDs. Faulted banks are not candidates. ACTLR/CONTEXTIDR are retained
+and reported; M3 does not guess a replacement implementation ACTLR value.
+Stage11 writes/validates the same context format as verified stage8, invalidates
+by the chosen ASID, waits for TLB sync, enables M, then publishes S2CR/SMR last.
+Expected with the observed empty 8a: **slots1/2, CB2, ASID2**, root
+`0x8f1200000`, TTBR0 `0x00020008f1200000`; this selection is not hardcoded.
+
+Stage12 ports the CP/GBIF/UCHE subset of supplied `adreno/a6xx_gpu.c:hw_init`,
+`a6xx_ucode_load`, `a7xx_cp_init`. `gpu-a740.h` holds source A740 HWCG values
+and the A730 protection table used by Linux's A740 catalog (slots45/46 remain
+untouched). It clears GBIF halts/trusted range, applies A740 HWCG/GMU CGC,
+GBIF QoS, UCHE no-bypass/trap/GMEM range (16 MiB + 3 MiB), cache ways, AHB error
+response, hang detection, UCHE queue/NC mode and expanded BR/BV/LPAC APRIV.
+No GIC/interrupt delivery: `RBBM_INT_0_MASK=0`, raw status is polled. Graphics
+pipeline UBWC setup, LLCC optimization, performance counter routing, preemption
+and IFPC restore lists are omitted: no rendering or preemption is submitted.
+Whether the remaining reset defaults suffice is a **device-test hypothesis**.
+
+`FUXI_SQE_FIRMWARE` embeds a local SQE blob in the ignored output. Stage12
+checks size/alignment/capacity and copies/readbacks all bytes **after dropping
+the first dword**, as `adreno_fw_create_bo` does. The supplied file is 75380 B,
+copy 75376 B / 18844 dwords. The 32 KiB ring uses `CP_RB_CNTL=0x20c`; BR rptr
+shadow is at `0x40028000`, BV at `+4`. It requires reset rptr/wptr=0, starts
+`CP_SQE_CNTL=1`, publishes a barrier then wptr 10, and waits for rptr=wptr=10
+and `(RBBM_STATUS & ~1)==0`. Command dwords:
+```
+70970001 08000000                       CP_THREAD_CONTROL, disable binning
+70c80007 0000014b 00000003 20000000       CP_ME_INIT (7 payload words)
+00000002 00000000 00000000 00000000
+```
+No zap is loaded. Linux's A740 catalog specifies `a740_zap.mdt`; its generic
+`hw_init` attempts zap **after** CP init, then handles `-ENODEV` by writing
+`RBBM_SECVID_TRUST_CNTL=0`. This probe explicitly takes that no-zap fallback,
+with safe read-before/write/read-after and raw A7xx TSB status. It sends no
+`CP_SET_SECURE_MODE`, calls no SCM/PAS, and never maps secure SID2. A contained
+permission fault is `c09`, nonzero trust readback is `c0a`; raw RBBM interrupt,
+CP protection/HW fault, trust and TSB bits are retained. **Fuxi permission and
+result bits are unknown until stage12 is run.** Safe writes only contain local
+synchronous aborts; asynchronous violations/hangs can still reset the SoC.
+
+Stage13 appends exactly four dwords (no wrap or buffer reuse):
+```
+703d8003 40029000 00000000 a740f00d       CP_MEM_WRITE, fence VA, magic
+```
+Expected wptr/rptr 14 and CPU fence 0→`0xa740f00d`, both guards `0x5ac3e17b`, idle
+RBBM (`status & ~1` zero), CP interrupt error bits/global FSR/defined CB FSR
+bits clear. Shadow rptr 10/14 is useful evidence but register rptr is the gate;
+there is no guessed SQE_STAT[1] value. `CP_HW_FAULT`/protection should have no
+active error indicated by CP_INTERRUPT_STATUS; raw values are reported.
+Defined CB fault mask is `0xc00001fe` (same as M2). The observed CB1 FSR 0x400
+is preserved in reports and ignored as a reserved SMMUv2 bit; its cause is still
+unknown. Any defined fault in **either** bank stops submission/completion.
+
+Every stage is attempted once and only after the previous PASS. There is no
+rollback or recovery: partial tables/context/SQE state is retained for diagnosis.
+GPU_SET ACK and GX transition waits are each 1000×10 us; GPU TLB sync 1000×1 us;
+CP init and fence waits each 5000×10 us (50 ms nominal delay budget plus MMIO
+cost), checking CP/RBBM/both-bank/global faults every 16 polls and at completion.
+All loops are bounded. After stage12 obtains the OOB ACK, GPU_SET stays asserted
+through later requests/errors until normal loader reset. Request0x49 still
+stalls from stage9 onward, independent of any M3 failure or missing SQE blob.
+
+### M3 report pages and failures
+
+The v3 decoder accepts legacy 512-byte and v2 six-page 3072-byte captures too.
+New captures have eight 512-byte pages (4096 B), selected by 0x100..0x107.
+Pages0..5 retain their M2 fields; page1[0] becomes `0xa7400003`.
+Page6 (0x106), each index a local little-endian u32:
+```
+[0] 0xa7400003 once 11 entered [1] stage11 attempted
+[2] stage11 result [3] stage12 result [4] stage13 result
+[5] stage12 attempted [6] stage13 attempted [7] GPU_SET ACK/held latch
+[8] GMU CB [9] GMU ASID [10] SID0 slot [11] GPU CB [12] GPU ASID
+[13:14] table PA low/high [15] context config issued [16] TLBSTATUS
+[17] SQE file bytes [18] copied bytes [19] skipped file dword
+[20] first copied dword [21] copied/readback dword count [22] bad file offset
+[23] CBAR [24] CBA2R [25] TCR2 [26] TCR [27:28] TTBR0 low/high
+[29] MAIR0 [30] SCTLR [31] SID0 SMR [32] SID0 S2CR [33] table pages
+[34] SID1 slot [35] SID1 SMR [36] SID1 S2CR
+[37:40] SQE/ring/rptr/fence GPU VAs [41] ring bytes [42] initial CP wptr
+[43] TRUST_CNTL write completed [44] trust before [45] trust after
+[46:47] A7xx TSB_STATUS low/high
+[48] init rptr before [49] after [50] submitted/readback init wptr [51] polls
+[52] CPU fence before [53] last polled value [54] expected magic
+[55] fence rptr before [56] after [57] submitted/readback fence wptr [58] polls
+[59] SQE start issued [60] stage12 substep (1 SQE,2 OOB,3 hw_init,
+     4 SQE start/CP init,5 TRUST fallback,6 complete)
+[61] OOB interrupt [62] SPTPRAC [63] GX_GDSCR
+[64:71] SQE/ring/rptr/fence physical low/high pairs
+[72] preserved GPU ACTLR [73] CONTEXTIDR
+[74:75] GMU FSR before/after11 [76:77] GPU FSR before/after11
+[80:89] ten init command dwords [90:93] four fence command dwords
+[110:111] last faulting MMIO PA [112] ESR [113:114] FAR
+[115] last operation (1 read,2 write) [116] safe MMIO fault count
+[117:118] first faulting MMIO PA
+```
+
+Page7 (0x107): two frozen64-word records, stage12 at 0 and stage13 at 64.
+Snapshot only runs while GX power-on/transition predicates were confirmed.
+A failure before that leaves the record zero; page6's substep/OOB/GX/fault
+fields remain available. Within each record:
+```
+[0] stage captured (12/13;0 absent) [1] CP rptr [2] wptr
+[3] CPU BR shadow [4] BV shadow [5] CPU fence [6] RBBM_STATUS
+[7] CP_SQE_CNTL [8] CP_SQE_STAT_DATA with STAT_ADDR=1
+[9] CP_HW_FAULT [10] CP_INTERRUPT_STATUS [11] CP_PROTECT_STATUS
+[12] RBBM_INT_0_STATUS [13] SECVID_TRUST_CNTL [14:15] TSB_STATUS
+[16] global SMMU GFSR
+[17] GPU CB [18] FSR [19:20] FAR [21:22] FSYNR0/1
+[23] GMU CB [24] FSR [25:26] FAR [27:28] FSYNR0/1
+[29] GMU2HOST_INTR_INFO [30] AO_HOST_INTERRUPT_STATUS
+[31] cumulative safe MMIO fault count [32:33] fence guards
+```
+
+Results 0=not run, 1=PASS. M3 failure codes (hex):
+
+| Code | Meaning |
+|---|---|
+| b01 | Safe SMMU MMIO fault or unreadable snapshot stream ownership |
+| b02 | Snapshot/live ownership changed, bank became active, slot not free, or GMU stream changed |
+| b03 | Existing exact/masked SID0/1 match |
+| b04 | No free readable GPU bank, two free SMRs or unused nonzero ASID |
+| b05 | GPU table capacity/overlap |
+| b06 | GPU context TLB sync timeout |
+| b07 | GPU context/stream readback mismatch |
+| b08 | Defined fault on either bank at stage11 |
+| c01/c02/c03 | Missing SQE / invalid size / payload copy readback mismatch |
+| c04 | GPU_SET/GX timeout or MMIO fault |
+| c05 | hw_init, CP or diagnostic MMIO fault |
+| c06 | CP/RBBM/global SMMU/defined GPU or GMU CB fault |
+| c07 | CP init rptr/wptr/idle timeout |
+| c08 | Initial CP ring was not reset (rptr or wptr nonzero) |
+| c09/c0a | SECVID/TSB access fault / TRUST_CNTL failed to clear |
+| d01/d02/d03 | Fence MMIO fault / CP-RBBM-SMMU fault / fence-rptr-idle timeout |
+| d04/d05 | Lost ring/fence precondition / guard overwritten |
+
+Coordinator test order (serial, temporary boot only, save private binary/logs):
+
+1. Fresh M3 boot stage7 regression, then fresh stage8a; review all streams/banks
+   and page2 fault masks. Fresh stage10 regression, expect known M2 PASSs.
+2. Fresh boot **stage11**. Require result 1, GPU CB≠0/GMU CB, different ASID,
+   slots1/2 as predicted only if snapshot is unchanged, 3 table pages, context
+   readbacks correct, both defined FSR masks zero, no safe MMIO faults. No SQE
+   started; request0x49 must still stall because stage9 ran.
+3. Fresh boot **stage12**. Require result 1, substep 6, copied 18844 dwords,
+   rptr 0→10/wptr 10, OOB held, TRUST write_ok 1/readback 0, no active CP/RBBM/SMMU
+   faults. Record actual TRUST-before and TSB status bits; no prior expectation
+   of their reset values. Inspect page7's stage12 snapshot.
+4. Fresh boot **stage13**. Require stage11/12 PASS and fence result 1,
+   CPU0→magic, rptr 10→14/wptr 14 and guards intact. Inspect both frozen snapshots.
+5. After fresh-boot bisects pass, same boot **11→12→13**, fetching reports between
+   each and delaying between 12/13 to exercise the retained GPU_SET. Repeating 13
+   must return existing results without a new submission; `--read-reports`
+   returns RAM only. Keep the 0x49 refusal check.
+6. Any failure/reset: stop climbing, capture available report pages, record exact
+   boot/reset outcome, and wait for normal loader reset. No retries within a
+   failed boot; no handoff, partition changes or firmware replacement on device.
+
+Use `tools/fuxi-gpu-probe.py --stage 11` (then12/13 as appropriate), `--raw`,
+`--save research/device/<private-run>/gpu.bin`. The new decoder fetches all
+8 pages for v3. `--read-reports` never reruns hardware setup.
+
+### M3 build handoff
+
+Offline only: firmware-enabled loader, no-firmware loader, standalone probe
+builds: **PASS, zero warnings**, linker/Image/relocation guards PASS. Native
+UBSan C model and Python eight-page decode: PASS with synthetic and both exact
+external firmware blobs. These checks model MMIO completion; they do not run
+SQE/GMU code, translate real DMA, test protected-register permissions or prove
+GPU power/CP execution. **No M3 device run, boot result or CI run exists yet.**
+
+Image (this worktree, gitignored):
+`shim/out/lane-gpu/fuxi-gpu-m3-boot.img`, **20,865,024 B**.
+SHA256: `12b193ecf2ae55f26fe9ca553dca496528a8abcfb9ab047f41207baa856a4cdd`.
+Payload SHA256:
+`800b9ea17ce18f1872c0533d5ef13f916c490eb7b1524e677fc2555378f00d66`.
+ELF `_gpu_fw_start/end=0x1028c/0x207a8` (66844 B),
+`_sqe_fw_start/end=0x207a8/0x32e1c` (75380 B),
+`_bss_start/end=0x34000/0x64000` (192 KiB),
+`_payload_start=0x74000`, `_image_end=0x13e4050`.
+No firmware bytes or dumps are committed. Next concrete action: coordinator
+stage7/8a/10 regression with this image, then fresh-boot stage11.

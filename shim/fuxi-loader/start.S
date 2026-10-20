@@ -93,6 +93,24 @@ probe_safe_rd32:
  movk w0, #0xdead, lsl #16
  ret
 
+/* unsigned probe_safe_wr32(uint64_t pa, uint32_t value)
+ * Local synchronous abort recovery only; asynchronous SError still resets.
+ * Both helpers run on the single USB monitor CPU, never concurrently. */
+.global probe_safe_wr32
+probe_safe_wr32:
+ adrp x2, probe_fault_fixup
+ adr x3, 5f
+ str x3, [x2, :lo12:probe_fault_fixup]
+ dsb sy
+ str w1, [x0]
+ dsb sy
+ str xzr, [x2, :lo12:probe_fault_fixup]
+ mov w0, #0
+ ret
+5:
+ mov w0, #1
+ ret
+
 .bss
 .balign 8
 .global probe_fault_esr, probe_fault_far

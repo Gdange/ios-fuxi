@@ -24,7 +24,7 @@ PREFIX = r'''
 static uintptr_t probe_fdt;
 static uint32_t probe_fdt_size;
 char _head[1], _end[1];
-extern uint8_t _gpu_fw_start[];
+extern uint8_t _gpu_fw_start[], _sqe_fw_start[], _sqe_fw_end[];
 static uint64_t ticks;
 #define rsr(reg) (strcmp(reg,"cntfrq_el0") ? ++ticks : 1000000ull)
 static void delay(unsigned us) { ticks += us; }
@@ -33,10 +33,41 @@ static void mock_write(uint64_t at, uint32_t val);
 SUFFIX = r'''
 static int firmware_success = 1, ack_mode, corrupt_readback, tlb_busy;
 static unsigned firmware_releases, mmio_writes;
+static int cp_mode; /* 1 stalled, 2 fault, 3 missing fence, 4 corrupt fence guard */
+static uint64_t abort_read, abort_write;
+uint32_t probe_fault_esr;
+uint64_t probe_fault_far;
+uint32_t probe_safe_rd32(uint64_t pa, uint32_t *faulted)
+{
+ *faulted = pa == abort_read;
+ if (*faulted) { probe_fault_esr=0x96000010; probe_fault_far=pa; return 0xdeadfa17; }
+ return *(volatile uint32_t *)(uintptr_t)pa;
+}
+unsigned probe_safe_wr32(uint64_t pa, uint32_t v)
+{
+ if (pa == abort_write) { probe_fault_esr=0x96000050; probe_fault_far=pa; return 1; }
+ g_wr(pa, 0, v); return 0;
+}
 static uint32_t *ptr(uint64_t at) { return (uint32_t *)(uintptr_t)at; }
 static void mock_write(uint64_t at, uint32_t val)
 {
  mmio_writes++;
+ if (at == GPU_REG_BASE+0x807*4 && val) {
+  assert(gpu_extra[5][7] && g3_bank != g_bank && g3_bank != 0);
+  assert(*ptr(GPU_REG_BASE+0x808*4)==1 && *ptr(GPU_REG_BASE+0x802*4)==0x20c);
+  assert(*ptr(GPU_REG_BASE+0x830*4)==G3_SQE_VA);
+  assert(*ptr(G3_RING_PA)==0x70970001 && *ptr(G3_RING_PA+4)==1u<<27);
+  assert(*ptr(G3_RING_PA+8)==0x70c80007 && *ptr(G3_RING_PA+12)==0x14b);
+  if (cp_mode == 1) return;
+  if (cp_mode == 2) { *ptr(GPU_REG_BASE+0x823*4)=4; return; }
+  *ptr(GPU_REG_BASE+0x806*4)=val; *ptr(G3_PTR_PA)=val;
+  if (val==14) {
+   assert(*ptr(G3_RING_PA+40)==0x703d8003);
+   assert(*ptr(G3_RING_PA+44)==G3_FENCE_VA && !*ptr(G3_RING_PA+48));
+   if (cp_mode != 3) *ptr(G3_FENCE_PA)=*ptr(G3_RING_PA+52);
+   if (cp_mode == 4) *ptr(G3_FENCE_PA+4)=0xbad;
+  }
+ }
  if (at >= GPU_SMMU_BASE + g_cbbase && at < GPU_SMMU_BASE + 0x40000) {
   unsigned off = (at-GPU_SMMU_BASE-g_cbbase)%g_stride;
   if (off == 0x58) *ptr(at) = 0; /* W1C */
@@ -74,6 +105,7 @@ static void reset_model(void)
  gpu_snapshot_valid = gpu_gmu_started = gpu_m2_attempted = gpu_s8_ok = 0;
  gpu_s9_attempted = gpu_s9_ok = gpu_s10_attempted = 0;
  ticks = firmware_releases = mmio_writes = 0;
+ cp_mode=0; abort_read=abort_write=0;
  ack_mode = corrupt_readback = tlb_busy = 0; firmware_success = 1;
  *ptr(GPU_SMMU_BASE+0x20) = 0x4c017e18;
  *ptr(GPU_SMMU_BASE+0x24) = 0x40000016;
@@ -81,7 +113,7 @@ static void reset_model(void)
  *ptr(GPU_SMMU_BASE) = 0x2f0406;
  *ptr(GPU_GMU_CORE+0x5000*4) = 1;
  *ptr(GPU_GMU_CORE+(0x1c00+0xff8)*4) = 0x20010005;
- gpu_extra[0][0] = 0xa7400002;
+ gpu_extra[0][0] = 0xa7400003;
  assert(g_snapshot());
 }
 static void aux_fixture(void)
@@ -156,8 +188,32 @@ int main(int argc, char **argv)
  for(unsigned i=0;i<4;i++) assert(gpu_extra[0][40+i*4]==gpu_extra[0][42+i*4] && gpu_extra[0][43+i*4]==0);
  before=mmio_writes; gpu_probe(9); assert(before==mmio_writes && firmware_releases==1 && gpu_gmu_started);
  gpu_m2(10); assert(gpu_extra[0][60]==1 && gpu_extra[0][65]==1);
+ /* m3: two GPU streams, separate tables/bank/ASID; GMU memory untouched. */
+ uint64_t gmu_root=*(uint64_t *)(uintptr_t)G_MEM;
+ gpu_m2(11); assert(gpu_extra[5][2]==1 && g3_bank==2 && g3_asid==2);
+ assert(g3_slot[0]==1 && g3_slot[1]==2 && gpu_extra[5][33]==3);
+ assert(*(uint64_t *)(uintptr_t)G_MEM==gmu_root && g_bank==1 && g_asid==1);
+ for (unsigned v=G3_SQE_VA;v<G3_FENCE_VA+4096;v+=4096) {
+  uint64_t *l1=(void *)(uintptr_t)G3_PT;
+  uint64_t *l2=(void *)(uintptr_t)(l1[v>>30]&~0xfffull);
+  uint64_t *l3=(void *)(uintptr_t)(l2[(v>>21)&511]&~0xfffull);
+  uint64_t pte=l3[(v>>12)&511];
+  assert((pte&~0xfffull)==G3_SQE_PA+v-G3_SQE_VA);
+  assert((pte&0xc0)==(v<G3_RING_VA?0xc0:v==G3_PTR_VA?0:0x40));
+ }
+ unsigned tail=(G3_FENCE_VA>>12)&511;
+ uint64_t *root=(void *)(uintptr_t)G3_PT;
+ uint64_t *mid=(void *)(uintptr_t)(root[1]&~0xfffull);
+ uint64_t *leaf=(void *)(uintptr_t)(mid[0]&~0xfffull);
+ assert(!root[0] && !root[2] && !leaf[tail+1] && !mid[1]);
+ gpu_m2(12); assert(gpu_extra[5][3]==1 && gpu_extra[5][49]==10 && gpu_extra[5][43]);
+ assert(gpu_extra[5][17]==_sqe_fw_end-_sqe_fw_start && gpu_extra[5][18]==_sqe_fw_end-_sqe_fw_start-4);
+ assert(!memcmp((void *)(uintptr_t)G3_SQE_PA,_sqe_fw_start+4,gpu_extra[5][18]));
+ gpu_m2(13); assert(gpu_extra[5][4]==1 && gpu_extra[5][53]==G3_MAGIC && gpu_extra[5][56]==14);
+ before=mmio_writes; gpu_probe(13); gpu_probe(11); assert(before==mmio_writes);
+ assert(gpu_extra[6][0]==12 && gpu_extra[6][64]==13 && gpu_gmu_started);
  FILE *f=fopen("report.bin","wb"); assert(f); gpu_report[0]=0xa740;
- fwrite(gpu_report,1,512,f); fwrite(gpu_extra,1,5*512,f); fclose(f);
+ fwrite(gpu_report,1,512,f); fwrite(gpu_extra,1,(G_PAGES-1)*512,f); fclose(f);
  /* Queue wrap and each failure are bounded and distinguishable. */
  for(int mode=0;mode<=4;mode++) {
   g_hfi_init(); ack_mode=mode;
@@ -179,7 +235,44 @@ int main(int argc, char **argv)
  before=mmio_writes; gpu_probe(10); gpu_probe(1);
  assert(before==mmio_writes && gpu_gmu_started && firmware_releases==1);
  assert(!g_fw_dest(0x10007ffc,8) && !g_fw_dest(0xfffffffc,8));
- puts("PASS: SMMU snapshot/ownership/readback, all icache PTEs, firmware load, HFI order/ACK/wrap/errors/timeouts, one-shot GMU/handoff latch");
+ /* GPU ownership: masked SID collision, no bank, snapshot fault, timeout. */
+ reset_model(); aux_fixture();
+ *ptr(GPU_SMMU_BASE+SMMU_SMR(3))=0x80000000;
+ assert(g_snapshot()); gpu_m2(13);
+ assert(gpu_extra[5][2]==0xb03 && !gpu_extra[5][5]);
+ reset_model(); aux_fixture(); gpu_m2(10);
+ for (unsigned b=2;b<g_ncb;b++) *ptr(GPU_SMMU_BASE+g_cb(b))=1;
+ gpu_m2(13); assert(gpu_extra[5][2]==0xb04 && !gpu_extra[5][5]);
+ reset_model(); aux_fixture(); gpu_m2(10); gpu_extra[1][51]=1u<<3;
+ gpu_m2(13); assert(gpu_extra[5][2]==0xb01 && !gpu_extra[5][5]);
+ reset_model(); aux_fixture(); gpu_m2(10); tlb_busy=1;
+ gpu_m2(13); assert(gpu_extra[5][2]==0xb06 && !gpu_extra[5][5]);
+ reset_model(); aux_fixture(); gpu_m2(10); corrupt_readback=1;
+ gpu_m2(13); assert(gpu_extra[5][2]==0xb07 && !gpu_extra[5][5]);
+ reset_model(); aux_fixture(); gpu_m2(11);
+ *ptr(GPU_SMMU_BASE+g_cb(g_bank)+0x58)=0x400;
+ *ptr(GPU_SMMU_BASE+g_cb(g3_bank)+0x58)=0x400;
+ gpu_m2(13); assert(gpu_extra[5][4]==1); /* reserved FSR bit10 is evidence only */
+ /* Failed stages are never retried and never unlock the XNU handoff. */
+ for (unsigned mode=1;mode<=4;mode++) {
+  reset_model(); aux_fixture(); gpu_m2(11); cp_mode=mode;
+  unsigned begun=ticks; gpu_m2(13);
+  assert(ticks-begun<100000);
+  if (mode<=2) assert(gpu_extra[5][3]==(mode==1?0xc07:0xc06) && !gpu_extra[5][6]);
+  else assert(gpu_extra[5][4]==(mode==3?0xd03:0xd05));
+  before=mmio_writes; gpu_m2(13); assert(before==mmio_writes && gpu_gmu_started);
+ }
+ reset_model(); aux_fixture(); gpu_m2(11); abort_write=GPU_REG_BASE+0xf400*4;
+ gpu_m2(13); assert(gpu_extra[5][3]==0xc09 && gpu_extra[5][116] && !gpu_extra[5][6]);
+ reset_model(); aux_fixture(); gpu_m2(10); abort_read=GPU_SMMU_BASE+SMMU_SMR(1);
+ gpu_m2(13); assert(gpu_extra[5][2]==0xb01 && !gpu_extra[5][5]);
+ reset_model(); aux_fixture(); gpu_m2(10);
+ *ptr(GPU_SMMU_BASE+SMMU_SMR(1))=0x80000000;
+ gpu_m2(13); assert(gpu_extra[5][2]==0xb02 && !gpu_extra[5][5]);
+ reset_model(); aux_fixture(); gpu_m2(11); tlb_busy=0;
+ *ptr(GPU_SMMU_BASE+g_cb(g3_bank)+0x58)=2;
+ gpu_m2(13); assert(gpu_extra[5][3]==0xc06 && !gpu_extra[5][6]);
+ puts("PASS: SMMU snapshot/ownership/readback, all icache PTEs, firmware load, HFI order/ACK/wrap/errors/timeouts, m3 mappings/CP packets/fence/abort/timeouts, one-shot GMU/handoff latch");
  return 0;
 }
 '''
@@ -187,11 +280,14 @@ int main(int argc, char **argv)
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--sqe', type=Path, help='external local a740_sqe.fw')
     ap.add_argument('--firmware', type=Path, help='external local gmu_gen70200.bin; never copied into git')
     args = ap.parse_args()
     source = (ROOT / 'shim/fuxi-probe/gpu.c').read_text()
     source = source.replace('extern const uint8_t _gpu_fw_start[], _gpu_fw_end[];',
                             'extern uint8_t _gpu_fw_start[], _gpu_fw_end[];')
+    source = source.replace('extern const uint8_t _sqe_fw_start[], _sqe_fw_end[];',
+                            'extern uint8_t _sqe_fw_start[], _sqe_fw_end[];')
     source = re.sub(r'__asm__ volatile\([^;]+;', '', source)
     needle = '*(volatile uint32_t *)(uintptr_t)(base + off) = v;'
     assert source.count(needle) == 1
@@ -204,22 +300,26 @@ def main():
             fw.write_bytes(struct.pack('<4I', 0x10007fe0, 0, 1, 32) +
                            struct.pack('<4I', 0x10007fe0, 32, 0, 0) +
                            struct.pack('<I', 0x20010005) + b'\0'*28)
+        sqe = args.sqe.resolve() if args.sqe else tmp / 'sqe.bin'
+        if not args.sqe:
+            sqe.write_bytes(bytes.fromhex('000000000102030405060708'))
         asm = tmp / 'fw.S'
         import json
         asm.write_text('.section .data\n.global _gpu_fw_start, _gpu_fw_end\n_gpu_fw_start:\n.incbin ' +
-                       json.dumps(str(fw)) + '\n_gpu_fw_end:\n.section .note.GNU-stack,"",@progbits\n')
+                       json.dumps(str(fw)) + '\n_gpu_fw_end:\n.global _sqe_fw_start, _sqe_fw_end\n_sqe_fw_start:\n.incbin ' +
+                       json.dumps(str(sqe)) + '\n_sqe_fw_end:\n.section .note.GNU-stack,"",@progbits\n')
         cfile = tmp / 'test.c'
         cfile.write_text(PREFIX + source + SUFFIX)
         exe = tmp / 'test'
         subprocess.run(['clang', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
-                        '-DFUXI_XNU_LOADER=1', '-DEXPECT_BLOCKS=' + ('4' if args.firmware else '1'),
+                        '-I' + str(ROOT / 'shim/fuxi-probe'), '-DFUXI_XNU_LOADER=1', '-DEXPECT_BLOCKS=' + ('4' if args.firmware else '1'),
                         '-DEXPECT_PREALLOC=' + ('11' if args.firmware else '1'),
                         '-fsanitize=undefined', '-fno-sanitize-recover=all',
                         str(cfile), str(asm), '-o', str(exe)], check=True)
         subprocess.run([str(exe)], check=True, cwd=tmp)
         subprocess.run(['python3', str(ROOT / 'tools/fuxi-gpu-probe.py'), '--decode', str(tmp / 'report.bin')],
                        check=True, stdout=subprocess.DEVNULL)
-        print('PASS: six-page offline Python decoder')
+        print('PASS: eight-page offline Python decoder')
 
 
 if __name__ == '__main__':

@@ -1,12 +1,12 @@
-/* Fuxi A740 staged GPU/GMU probe (lane-gpu, milestones 1 and 2).
+/* Fuxi A740 staged GPU/GMU probe (lane-gpu, milestones 1–3).
  *
  * Single translation unit #included by probe.c before ud_setup(), so these
  * statics share probe.c's helpers (delay(), the volatile memcpy) and the USB
  * report path. Request 0x56 runs a gated, bisectable sequence and returns a
  * fixed 128-word report. Nothing here is reached unless the host asks for it,
  * and every stage runs only if the previous one proved its prerequisite, so a
- * single boot photographs the whole chain and a bad MMIO (which resets the
- * SoC) pins the blame on one stage.
+ * single boot records the whole chain. New MMIO reads recover synchronous
+ * aborts; powered-off interconnect hangs/SError can still reset the SoC.
  *
  * The loader runs with the MMU and caches OFF and VA==PA, so every "window"
  * below is just a physical base; accesses are naturally uncached Device-nGnRE
@@ -174,7 +174,7 @@ static uint32_t cdb32(const uint8_t *p) { return cdb16(p) | (uint32_t)cdb16(p + 
 #define G_HFI_PA    (G_DATA_PA + 0x6000)
 #define G_DEBUG_PA  (G_DATA_PA + 0xa000)
 #define G_IC_SIZE   0xffc000u
-#define G_PAGES     6
+#define G_PAGES     8
 #define G_STAGE_8A  0x8au
 static uint32_t gpu_extra[G_PAGES - 1][GPU_REPORT_WORDS];
 static unsigned gpu_gmu_started; /* monotonic: also covers failed init/ACK */
@@ -268,32 +268,34 @@ static int g_snapshot(void)
  gpu_snapshot_valid = 1; e[1] = 1;
  return 1;
 }
-static uint64_t g_new_table(void)
+static uint64_t g_new_table_at(uint64_t root, unsigned *next)
 {
- if (g_pt_next >= 256) return 0;
- return G_MEM + 4096 * g_pt_next++;
+ if (*next >= 256) return 0;
+ return root + 4096 * (*next)++;
 }
 /* 32-bit IOVA, 4K granules: L1 root -> L2 -> L3 pages. All leafs NC,
  * inner-shareable (MAIR index 0 = 0x44), AF=1. Privileged fixed regions
  * match MSM_BO_MAP_PRIV; log/HFI permit unprivileged GMU accesses. */
-static int g_map(unsigned va, uint64_t pa, unsigned size, unsigned unpriv)
+static int g_map_at(uint64_t root, unsigned *next, unsigned va, uint64_t pa, unsigned size, unsigned attr)
 {
  for (unsigned off = 0; off < size; off += 4096) {
   unsigned v = va + off;
-  volatile uint64_t *l1 = (volatile uint64_t *)(uintptr_t)G_MEM;
+  volatile uint64_t *l1 = (volatile uint64_t *)(uintptr_t)root;
   unsigned a = v >> 30;
-  if (!l1[a]) { uint64_t t = g_new_table(); if (!t) return 0; l1[a] = t | 3; }
+  if (!l1[a]) { uint64_t t = g_new_table_at(root, next); if (!t) return 0; l1[a] = t | 3; }
   volatile uint64_t *l2 = (volatile uint64_t *)(uintptr_t)(l1[a] & ~0xfffull);
   unsigned b = (v >> 21) & 511;
-  if (!l2[b]) { uint64_t t = g_new_table(); if (!t) return 0; l2[b] = t | 3; }
+  if (!l2[b]) { uint64_t t = g_new_table_at(root, next); if (!t) return 0; l2[b] = t | 3; }
   volatile uint64_t *l3 = (volatile uint64_t *)(uintptr_t)(l2[b] & ~0xfffull);
   unsigned c = (v >> 12) & 511;
   if (l3[c]) return 0;
-  l3[c] = (pa + off) | 3 | (3u << 8) | (1u << 10) | (unpriv ? (1u << 6) : 0);
+  l3[c] = (pa + off) | 3 | (3u << 8) | (1u << 10) | attr;
  }
  __asm__ volatile("dsb sy" ::: "memory");
  return 1;
 }
+static int g_map(unsigned va, uint64_t pa, unsigned size, unsigned unpriv)
+{ return g_map_at(G_MEM, &g_pt_next, va, pa, size, unpriv ? (1u << 6) : 0); }
 static int g_range(unsigned addr, unsigned size, unsigned base, unsigned bytes)
 { return addr >= base && addr - base < bytes && size <= bytes - (addr - base); }
 /* Return a physical destination, or zero for an unmapped address. */
@@ -629,6 +631,386 @@ static void g_gx(void)
  e[64] = g_rd(GPU_REG_BASE, GPU_RBBM_STATUS*4); e[65] = 1;
  gm_wr(0x5194, 1u<<31); e[60] = 1;
 }
+
+/* Milestone 3: fixed GPU address space, Linux a7xx CP init, one CP_MEM_WRITE.
+ * Only the USB monitor CPU calls this. All new MMIO accesses recover local
+ * synchronous aborts; an asynchronous SError/power failure can still reset. */
+#define G3_PT       (G_MEM + 0x1200000)
+#define G3_SQE_PA   (G_MEM + 0x1300000)
+#define G3_RING_PA  (G_MEM + 0x1320000)
+#define G3_PTR_PA   (G_MEM + 0x1328000)
+#define G3_FENCE_PA (G_MEM + 0x1329000)
+#define G3_SQE_VA   0x40000000u
+#define G3_RING_VA  0x40020000u
+#define G3_PTR_VA   0x40028000u
+#define G3_FENCE_VA 0x40029000u
+#define G3_MAGIC    0xa740f00du
+#define G3_GUARD    0x5ac3e17bu
+#define G3_FSR_MASK 0xc00001feu /* SMMUv2 defined faults; keep reserved bit10 in report */
+#define G3_CP_ERRORS 0x3fff7u
+#define G3_RBBM_ERRORS 0x33c002c2u
+_Static_assert(G3_PT >= G_DEBUG_PA + 0x7000, "GPU tables overlap GMU buffers");
+_Static_assert(G3_PT + 0x100000 == G3_SQE_PA, "GPU table pool limit");
+_Static_assert(G3_FENCE_PA + 0x1000 <= G_MEM + G_MEM_SIZE, "GPU scratch overflow");
+static unsigned g3_bank, g3_asid, g3_slot[2], g3_next, g3_wptr;
+unsigned probe_safe_wr32(uint64_t pa, uint32_t value);
+static void g3_fault(uint64_t pa, unsigned op)
+{
+ uint32_t *e = gpu_extra[5];
+ if (!e[116]++) { e[117] = pa; e[118] = pa >> 32; }
+ e[110] = pa; e[111] = pa >> 32; e[112] = probe_fault_esr;
+ e[113] = probe_fault_far; e[114] = probe_fault_far >> 32; e[115] = op;
+}
+static uint32_t g3_read(uint64_t pa)
+{
+ uint32_t fault, v = probe_safe_rd32(pa, &fault);
+ if (fault) g3_fault(pa, 1);
+ return v;
+}
+static int g3_write(uint64_t pa, uint32_t v)
+{
+ if (probe_safe_wr32(pa, v)) { g3_fault(pa, 2); return 0; }
+ return 1;
+}
+static uint32_t g3_gr(unsigned reg) { return g3_read(GPU_REG_BASE + reg*4); }
+static int g3_gw(unsigned reg, uint32_t v) { return g3_write(GPU_REG_BASE + reg*4, v); }
+static int g3_gw64(unsigned reg, uint64_t v)
+{ return g3_gw(reg, v) && g3_gw(reg+1, v >> 32); }
+static uint32_t g3_sr(unsigned off) { return g3_read(GPU_SMMU_BASE + off); }
+static int g3_sw(unsigned off, uint32_t v) { return g3_write(GPU_SMMU_BASE + off, v); }
+
+/* Frozen 8a ownership plus a full live recheck: never assume reset junk is an
+ * ASID, never steal any enabled/referenced/unreadable bank, even from ourselves. */
+static int g3_select(void)
+{
+ uint32_t *e = gpu_extra[5]; unsigned used = 1u << g_bank;
+ unsigned free_slots = 0;
+ for (unsigned i = 0; i < g_nsmr; i++) {
+  if (gpu_extra[1][51] & (1u << i)) continue;
+  unsigned smr = g3_sr(SMMU_SMR(i)), s2cr = g3_sr(SMMU_S2CR(i));
+  if (e[116]) return 0xb01;
+  if (i == g_slot) {
+   if (smr != 0x80000005 || s2cr != g_bank) return 0xb02;
+  } else if (smr != gpu_extra[1][2*i] || s2cr != gpu_extra[1][2*i+1]) return 0xb02;
+  if (!(smr & (1u << 31))) {
+   if (free_slots < 2) g3_slot[free_slots++] = i;
+   continue;
+  }
+  unsigned mask = (smr >> 16) & 0x7fff;
+  for (unsigned sid = 0; sid < 2; sid++)
+   if (((smr ^ sid) & ~mask & 0x7fff) == 0) return 0xb03;
+  if (((s2cr >> 16) & 3) == 0 && (s2cr & 255) < g_ncb) used |= 1u << (s2cr & 255);
+ }
+ /* Faulted stream ownership cannot prove the absence of a masked SID0/1. */
+ if (gpu_extra[1][51]) return 0xb01;
+ g3_bank = g_ncb;
+ unsigned s2banks = (g3_sr(SMMU_ID1) >> 16) & 255;
+ for (unsigned b = s2banks ? s2banks : 1; b < g_ncb; b++) {
+  if ((used & (1u << b)) || (gpu_extra[1][52] & (1u << b))) continue;
+  if (!(gpu_extra[2+b/8][b%8*16+2] & 1) && !(g3_sr(g_cb(b)) & 1)) { g3_bank = b; break; }
+ }
+ if (e[116]) return 0xb01;
+ if (free_slots < 2 || g3_bank == g_ncb) return 0xb04;
+ unsigned asids[8] = {0};
+ asids[g_asid/32] |= 1u << (g_asid%32);
+ for (unsigned b = 0; b < g_ncb; b++) {
+  if (gpu_extra[1][52] & (1u << b)) continue;
+  unsigned cb = g_cb(b), ctl = g3_sr(cb);
+  if (ctl & 1) {
+   unsigned a0 = g3_sr(cb+0x24) >> 16, a1 = g3_sr(cb+0x2c) >> 16;
+   asids[(a0&255)/32] |= 1u << (a0%32);
+   asids[(a1&255)/32] |= 1u << (a1%32);
+  }
+ }
+ if (e[116]) return 0xb01;
+ for (g3_asid = 1; g3_asid < 256; g3_asid++)
+  if (!(asids[g3_asid/32] & (1u << (g3_asid%32)))) break;
+ if (g3_asid == 256) return 0xb04;
+ e[8] = g_bank; e[9] = g_asid; e[10] = g3_slot[0]; e[11] = g3_bank;
+ e[12] = g3_asid; e[34] = g3_slot[1];
+ return 0;
+}
+static int g3_context(void)
+{
+ uint32_t *e = gpu_extra[5]; unsigned cb = g_cb(g3_bank);
+ uint64_t ttbr = G3_PT | ((uint64_t)g3_asid << 48);
+ if (g3_sr(cb) & 1) return 0xb02;
+ e[72] = g3_sr(cb+4); e[73] = g3_sr(cb+0x34); /* ACTLR/CONTEXTIDR preserved */
+ if (e[116]) return 0xb01;
+ if (!g3_sw(g_stride+0x800+g3_bank*4, 1) || !g3_sw(g_stride+g3_bank*4, 0x1f300) ||
+     !g3_sw(cb+0x10, 0x38011) || !g3_sw(cb+0x30, 0x80802020) ||
+     !g3_sw(cb+0x20, (uint32_t)ttbr) || !g3_sw(cb+0x24, ttbr >> 32) ||
+     !g3_sw(cb+0x28, 0) || !g3_sw(cb+0x2c, g3_asid << 16) ||
+     !g3_sw(cb+0x38, 0xff44) || !g3_sw(cb+0x3c, 0) ||
+     !g3_sw(cb+0x58, 0xffffffff) || !g3_sw(cb+0x610, g3_asid) || !g3_sw(cb+0x7f0, 0)) return 0xb01;
+ e[15] = 1;
+ unsigned i;
+ for (i = 0; i < 1000; i++) {
+  e[16] = g3_sr(cb+0x7f4);
+  if (e[116]) return 0xb01;
+  if (!(e[16] & 1)) break;
+  delay(1);
+ }
+ if (i == 1000) return 0xb06;
+ e[23] = g3_sr(g_stride+g3_bank*4); e[24] = g3_sr(g_stride+0x800+g3_bank*4);
+ e[25] = g3_sr(cb+0x10); e[26] = g3_sr(cb+0x30);
+ e[27] = g3_sr(cb+0x20); e[28] = g3_sr(cb+0x24); e[29] = g3_sr(cb+0x38);
+ if (e[23] != 0x1f300 || e[24] != 1 || (e[25] & ~0x60u) != 0x38011 ||
+     e[26] != 0x80802020 || e[27] != (uint32_t)ttbr || e[28] != (uint32_t)(ttbr >> 32) ||
+     e[29] != 0xff44 || g3_sr(cb+0x28) || g3_sr(cb+0x2c) != g3_asid << 16 ||
+     g3_sr(cb+0x3c)) return e[116] ? 0xb01 : 0xb07;
+ if (!g3_sw(cb, 0x1067)) return 0xb01;
+ e[30] = g3_sr(cb);
+ if ((e[30] & ~0x1000u) != 0x67) return e[116] ? 0xb01 : 0xb07;
+ for (unsigned sid = 0; sid < 2; sid++) {
+  unsigned slot = g3_slot[sid], word = sid ? 35 : 31;
+  /* Publish stream last; no CP/LPAC DMA has been started yet. */
+  if (g3_sr(SMMU_SMR(slot)) & (1u << 31)) return 0xb02;
+  if (e[116] || !g3_sw(SMMU_S2CR(slot), g3_bank) ||
+      !g3_sw(SMMU_SMR(slot), 0x80000000u | sid)) return 0xb01;
+  e[word] = g3_sr(SMMU_SMR(slot)); e[word+1] = g3_sr(SMMU_S2CR(slot));
+  if (e[word] != (0x80000000u | sid) || e[word+1] != g3_bank) return e[116] ? 0xb01 : 0xb07;
+ }
+ return e[116] ? 0xb01 : 0;
+}
+static int g3_memory(void)
+{
+ uint32_t *e = gpu_extra[5]; e[0] = 0xa7400003;
+ e[37] = G3_SQE_VA; e[38] = G3_RING_VA; e[39] = G3_PTR_VA; e[40] = G3_FENCE_VA;
+ e[41] = 0x8000; e[13] = (uint32_t)G3_PT; e[14] = G3_PT >> 32;
+ const uint64_t pa[] = {G3_SQE_PA,G3_RING_PA,G3_PTR_PA,G3_FENCE_PA};
+ for (unsigned i = 0; i < 4; i++) { e[64+2*i] = pa[i]; e[65+2*i] = pa[i] >> 32; }
+ e[74] = g3_sr(g_cb(g_bank)+0x58);
+ if (e[116]) return 0xb01;
+ if (e[74] & G3_FSR_MASK) return 0xb08;
+ int err = g3_select(); if (err) return err;
+ e[76] = g3_sr(g_cb(g3_bank)+0x58);
+ if (e[116]) return 0xb01;
+ /* Existing reservation was overlap-checked in stage8. Only its unused tail
+  * is zeroed here; neither the GMU mappings nor its page tables are touched. */
+ g_zero(G3_PT, 0x100000); g_zero(G3_SQE_PA, 0x2a000); g3_next = 1;
+ /* SQE GPU-read-only, privileged/unprivileged reads; other pages RW/APRIV.
+  * CP/UCHE uses SID0; Linux sm8550.dtsi also attaches LPAC SID1 to this domain. */
+ if (!g_map_at(G3_PT, &g3_next, G3_SQE_VA, G3_SQE_PA, 0x20000, 3u << 6) ||
+     !g_map_at(G3_PT, &g3_next, G3_RING_VA, G3_RING_PA, 0x8000, 1u << 6) ||
+     !g_map_at(G3_PT, &g3_next, G3_PTR_VA, G3_PTR_PA, 0x1000, 0) ||
+     !g_map_at(G3_PT, &g3_next, G3_FENCE_VA, G3_FENCE_PA, 0x1000, 1u << 6)) return 0xb05;
+ e[33] = g3_next;
+ err = g3_context(); if (err) return err;
+ e[75] = g3_sr(g_cb(g_bank)+0x58); e[77] = g3_sr(g_cb(g3_bank)+0x58);
+ if (e[116]) return 0xb01;
+ return ((e[75] | e[77]) & G3_FSR_MASK) ? 0xb08 : 1;
+}
+
+/* Odd-parity packet7 header, adreno_gpu.h OUT_PKT7 (count excludes header). */
+static unsigned g3_parity(unsigned x)
+{
+ x ^= x >> 16; x ^= x >> 8; x ^= x >> 4;
+ return (0x9669u >> (x & 15)) & 1;
+}
+static uint32_t g3_pkt7(unsigned op, unsigned count)
+{ return 0x70000000u | count | g3_parity(count)<<15 | op<<16 | g3_parity(op)<<23; }
+static void g3_emit(uint32_t word)
+{ g_wr(G3_RING_PA, g3_wptr++ * 4, word); } /* only 14 dwords, no wrap/reuse */
+static int g3_sqe(void)
+{
+ uint32_t *e = gpu_extra[5];
+#if defined(FUXI_XNU_LOADER)
+ extern const uint8_t _sqe_fw_start[], _sqe_fw_end[];
+ const uint8_t *fw = _sqe_fw_start;
+ size_t bytes = (uintptr_t)_sqe_fw_end - (uintptr_t)_sqe_fw_start;
+#else
+ const uint8_t *fw = 0; size_t bytes = 0;
+#endif
+ e[17] = bytes;
+ if (!bytes) return 0xc01;
+ if (bytes <= 4 || (bytes & 3) || bytes - 4 > 0x20000) return 0xc02;
+ e[18] = bytes-4; e[19] = cdb32(fw); e[20] = cdb32(fw+4);
+ /* Linux adreno_fw_create_bo drops the file's leading dword. */
+ for (unsigned i = 4; i < bytes; i += 4) {
+  uint32_t v = cdb32(fw+i); g_wr(G3_SQE_PA, i-4, v);
+  if (g_rd(G3_SQE_PA, i-4) != v) { e[22] = i; return 0xc03; }
+  e[21]++;
+ }
+ return 0;
+}
+static int g3_hold_gx(void)
+{
+ uint32_t *e = gpu_extra[5];
+ if (!g3_write(GPU_GMU_CORE+0x5191*4, 1u<<31) ||
+     !g3_write(GPU_GMU_CORE+0x5194*4, 1u<<30)) return 0xc04;
+ for (unsigned i = 0; i < 1000; i++) {
+  e[61] = g3_read(GPU_GMU_CORE+0x5192*4);
+  if (e[116]) return 0xc04;
+  if (e[61] & (1u<<31)) { e[7] = 1; break; }
+  delay(10);
+ }
+ if (!e[7]) return 0xc04;
+ if (!g3_write(GPU_GMU_CORE+0x5191*4, 1u<<31)) return 0xc04;
+ for (unsigned i = 0; i < 1000; i++) {
+  e[62] = g3_read(GPU_GMU_CORE+0x50d0*4);
+  if (e[116]) return 0xc04;
+  if (!(e[62] & 0xc3)) break;
+  if (i == 999) return 0xc04;
+  delay(10);
+ }
+ e[63] = g3_read(GPU_GPUCC_BASE+CC_GX_GDSCR);
+ return (!e[116] && (e[63] & (1u<<31))) ? 0 : 0xc04;
+}
+
+/* See docs-lanes/gpu.md for the two frozen diagnostic snapshots. */
+static void g3_diagnostics(unsigned stage)
+{
+ uint32_t *d = &gpu_extra[6][stage == 13 ? 64 : 0];
+ d[0] = stage;
+ static const unsigned regs[] = {0x806,0x807,0x210,0x808,0x821,0x823,0x824,0x201,0xf400,0xfc00,0xfc01};
+ static const unsigned words[] = {1,2,6,7,9,10,11,12,13,14,15};
+ for (unsigned i = 0; i < sizeof regs / sizeof regs[0]; i++) d[words[i]] = g3_gr(regs[i]);
+ if (g3_gw(0x908, 1)) d[8] = g3_gr(0x909); /* Linux CP HW fault decoder */
+ d[3] = g_rd(G3_PTR_PA, 0); d[4] = g_rd(G3_PTR_PA, 4); d[5] = g_rd(G3_FENCE_PA, 0);
+ d[16] = g3_sr(SMMU_GFSR);
+ for (unsigned j = 0; j < 2; j++) {
+  unsigned cb = g_cb(j ? g_bank : g3_bank), n = 17 + j*6;
+  d[n] = j ? g_bank : g3_bank;
+  d[n+1] = g3_sr(cb+0x58); d[n+2] = g3_sr(cb+0x60); d[n+3] = g3_sr(cb+0x64);
+  d[n+4] = g3_sr(cb+0x68); d[n+5] = g3_sr(cb+0x6c);
+ }
+ d[29] = g3_read(GPU_GMU_CORE+0x5192*4);
+ d[30] = g3_read(GPU_GMU_CORE+0x9305*4);
+ d[31] = gpu_extra[5][116];
+ d[32] = g_rd(G3_FENCE_PA, 4); d[33] = g_rd(G3_FENCE_PA, 0xffc);
+}
+/* No interrupt delivery is enabled: inspect raw status, both FSRs and ring.
+ * Reserved FSR bit10 was observed on GMU CB1 in m2; retain but don't gate on it. */
+static int g3_faulted(void)
+{
+ uint32_t cp = g3_gr(0x823), irq = g3_gr(0x201);
+ uint32_t fsr = g3_sr(g_cb(g3_bank)+0x58) | g3_sr(g_cb(g_bank)+0x58);
+ uint32_t gf = g3_sr(SMMU_GFSR);
+ return gpu_extra[5][116] || (cp & G3_CP_ERRORS) || (irq & G3_RBBM_ERRORS) || (fsr & G3_FSR_MASK) || gf;
+}
+static int g3_wait(unsigned fence)
+{
+ uint32_t *e = gpu_extra[5]; unsigned off = fence ? 55 : 48;
+ for (unsigned i = 0; i < 5000; i++) {
+  e[off+1] = g3_gr(0x806); e[off+2] = g3_gr(0x807); e[fence ? 58 : 51] = i+1;
+  if (e[116]) return fence ? 0xd01 : 0xc05;
+  if (!(i & 15) && g3_faulted()) return fence ? 0xd02 : 0xc06;
+  if (fence) e[53] = g_rd(G3_FENCE_PA, 0);
+  if (e[off+1] == g3_wptr && e[off+2] == g3_wptr &&
+      (!fence || e[53] == G3_MAGIC) && !(g3_gr(0x210) & ~1u))
+   return g3_faulted() ? (fence ? 0xd02 : 0xc06) : 0;
+  delay(10);
+ }
+ return fence ? 0xd03 : 0xc07;
+}
+#include "gpu-a740.h"
+static int g3_hw_init(void)
+{
+ /* CP/GBIF/UCHE subset of Linux hw_init. No render pipeline or preemption,
+  * no concurrent binning/LPAC start, no IFPC register restore list. */
+ if (!g3_gw(0x3c45, 0) || !g3_gw(0x16, 0) ||
+     !g3_gw(0xf803, 0) || !g3_gw64(0xf800, 0) || !g3_gw(0xf802, 0)) return 0;
+ /* a6xx_set_hwcg(A740), with all sourced A740 register values. */
+ if (!g3_write(GPU_GMU_CORE+0x9309*4, 0x20202) ||
+     !g3_write(GPU_GMU_CORE+0x930a*4, 0x10111) ||
+     !g3_write(GPU_GMU_CORE+0x930b*4, 0x5555)) return 0;
+ for (unsigned i = 0; i < sizeof g3_hwcg / sizeof g3_hwcg[0]; i++)
+  if (!g3_gw(g3_hwcg[i][0], g3_hwcg[i][1])) return 0;
+ static const uint32_t regval[][2] = {
+  {0x3c03,0x71620},{0x3c04,0x71620},{0x3c05,0x71620},{0x3c06,0x71620},
+  {0x11,0x2120212}, /* RBBM_GBIF_CLIENT_QOS_CNTL */
+  {0xe3a,0x10240e0}, /* UCHE_GBIF_GX_CONFIG */
+  {0xe17,1u<<23}, /* A7xx UCHE_CACHE_WAYS */
+  {0x98d,1}, /* CP_AHB_CNTL: AHB default slave ERROR */
+  {0x1f,0x40cfffff}, /* A740 hang detection */
+  {0xe19,0x81}, {0xe3c,0x6690e}, /* UCHE_CLIENT_PF / A7xx CMDQ */
+  {0xe01,3u<<21}, {0x534,1}, /* A740 UCHE/RBBM NC mode (HBB16) */
+  {0x844,0x6f}, {0xad0,0xf}, {0xb31,0xf}, /* BR/BV/LPAC expanded APRIV */
+  {0x84f,0xb}, /* CP_PROTECT_CNTL */
+  {0x38,0}, /* poll raw interrupt status; GIC delivery disabled */
+ };
+ for (unsigned i = 0; i < sizeof regval / sizeof regval[0]; i++)
+  if (!g3_gw(regval[i][0], regval[i][1])) return 0;
+ if (!g3_gw64(0xe09, 0x0001fffffffff000ULL) || !g3_gw64(0xe07, 0x0001fffffffff000ULL) ||
+     !g3_gw64(0xe0b, 0x1000000) || !g3_gw64(0xe0d, 0x12fffff)) return 0;
+ for (unsigned i = 0; i < 48; i++)
+  if (g3_protect[i] && !g3_gw(0x850+i, g3_protect[i])) return 0;
+ /* 32K ring: BUFSZ=log2(32768/8)=12, BLKSZ=log2(32/8)=2.
+  * Expanded APRIV permits the privileged RPTR shadow (NO_UPDATE unset). */
+ return g3_gw64(0x830, G3_SQE_VA) && g3_gw64(0x800, G3_RING_VA) &&
+        g3_gw(0x802, 0x20c) && g3_gw64(0x804, G3_PTR_VA) &&
+        g3_gw64(0xa98, G3_PTR_VA+4);
+}
+static int g3_cp_start(void)
+{
+ uint32_t *e = gpu_extra[5]; e[60] = 1;
+ int err = g3_sqe(); if (err) return err;
+ e[60] = 2; err = g3_hold_gx(); if (err) return err;
+ /* OOB is deliberately retained until reset, on success AND failure. This
+  * avoids an IFPC collapse losing CP state between USB stages12 and13. */
+ e[60] = 3;
+ if (!g3_gw(0x808, 3) || !g3_hw_init()) return 0xc05;
+ e[48] = g3_gr(0x806); e[42] = g3_gr(0x807);
+ if (e[116]) return 0xc05;
+ if (e[48] || e[42]) return 0xc08; /* require reset ring, don't steal a live CP */
+ g3_wptr = 0;
+ g3_emit(g3_pkt7(0x17, 1)); g3_emit(1u<<27); /* disable concurrent binning */
+ g3_emit(g3_pkt7(0x48, 7));
+ g3_emit(0x14b); g3_emit(3); g3_emit(0x20000000); g3_emit(2);
+ g3_emit(0); g3_emit(0); g3_emit(0); /* no power-up list, matches Linux */
+ for (unsigned i = 0; i < 10; i++) e[80+i] = g_rd(G3_RING_PA, i*4);
+ e[50] = g3_wptr; e[60] = 4;
+ if (!g3_gw(0x807, 0) || !g3_gw(0x808, 1)) return 0xc05;
+ e[59] = 1;
+ __asm__ volatile("dsb sy" ::: "memory");
+ if (!g3_gw(0x807, g3_wptr)) return 0xc05;
+ err = g3_wait(0); if (err) return err;
+ /* Linux's -ENODEV zap fallback, after CP init. No SCM/PAS, signed firmware,
+  * secure SID2, or CP_SET_SECURE_MODE is used. Report raw outcome bits. */
+ e[60] = 5; e[44] = g3_gr(0xf400);
+ if (e[116] || !g3_gw(0xf400, 0)) return 0xc09;
+ e[43] = 1; e[45] = g3_gr(0xf400);
+ e[46] = g3_gr(0xfc00); e[47] = g3_gr(0xfc01);
+ if (e[116]) return 0xc09;
+ if (e[45]) return 0xc0a;
+ if (g3_faulted()) return 0xc06;
+ e[60] = 6;
+ return 1;
+}
+static int g3_fence(void)
+{
+ uint32_t *e = gpu_extra[5]; e[54] = G3_MAGIC;
+ e[55] = g3_gr(0x806); e[52] = g_rd(G3_FENCE_PA, 0);
+ if (g3_faulted()) return 0xd02;
+ if (e[55] != 10 || g3_wptr != 10 || g3_gr(0x807) != 10 || e[52]) return 0xd04;
+ g_wr(G3_FENCE_PA, 4, G3_GUARD); g_wr(G3_FENCE_PA, 0xffc, G3_GUARD);
+ g3_emit(g3_pkt7(0x3d, 3)); g3_emit(G3_FENCE_VA); g3_emit(0); g3_emit(G3_MAGIC);
+ for (unsigned i = 0; i < 4; i++) e[90+i] = g_rd(G3_RING_PA, (10+i)*4);
+ e[57] = g3_wptr;
+ __asm__ volatile("dsb sy" ::: "memory");
+ if (!g3_gw(0x807, g3_wptr)) return 0xd01;
+ int err = g3_wait(1); if (err) return err;
+ if (g_rd(G3_FENCE_PA, 4) != G3_GUARD || g_rd(G3_FENCE_PA, 0xffc) != G3_GUARD) return 0xd05;
+ return 1;
+}
+static void gpu_m3(unsigned limit)
+{
+ uint32_t *e = gpu_extra[5];
+ if (!e[1]) { g_enter(11); e[1] = 1; e[2] = g3_memory(); }
+ if (e[2] != 1 || limit < 12) return;
+ if (!e[5]) {
+  g_enter(12); e[5] = 1; e[3] = g3_cp_start();
+  if (e[7] && (e[63] & GDSC_PWR_ON) && !(e[62] & 0xc3)) g3_diagnostics(12);
+  if (e[3] == 1 && e[116]) e[3] = 0xc05;
+ }
+ if (e[3] != 1 || limit < 13) return;
+ if (!e[6]) {
+  g_enter(13); e[6] = 1; e[4] = g3_fence(); g3_diagnostics(13);
+  if (e[4] == 1 && e[116]) e[4] = 0xd01;
+ }
+}
+
 static void gpu_m2(unsigned limit)
 {
  if (!gpu_snapshot_valid && !g_snapshot()) return;
@@ -638,6 +1020,7 @@ static void gpu_m2(unsigned limit)
  if (!gpu_s9_attempted) { g_enter(9); gpu_s9_attempted = 1; g_start(); }
  if (!gpu_s9_ok || limit < 10) { g_live(); return; }
  if (!gpu_s10_attempted) { g_enter(10); gpu_s10_attempted = 1; g_gx(); }
+ if (gpu_extra[0][60] == 1 && limit >= 11) gpu_m3(limit);
  g_live();
 }
 
@@ -645,7 +1028,7 @@ static void gpu_probe(unsigned limit)
 {
  uint32_t *r = gpu_report;
  /* Once stage8 has touched tables or retention, never replay power/fw setup.
-  * Stages8->9->10 may advance once; reads of old stages return the frozen report. */
+  * Stages8->13 may advance once; reads of old stages return the frozen report. */
  if (gpu_snapshot_valid) {
   if (limit >= 8) gpu_m2(limit);
   r[1] = limit; r[2] = gpu_stage; r[3] = gpu_gmu_started;
@@ -653,10 +1036,10 @@ static void gpu_probe(unsigned limit)
  }
  for (int i = 0; i < GPU_REPORT_WORDS; i++) r[i] = 0;
  if (!limit) return;
- if (limit != G_STAGE_8A && limit > 10) limit = 10;
+ if (limit != G_STAGE_8A && limit > 13) limit = 13;
  r[0] = 0xa740;          /* magic */
  r[1] = limit;
- gpu_extra[0][0] = 0xa7400002;
+ gpu_extra[0][0] = 0xa7400003;
 
  /* ---- Stage 1: read-only snapshot (always safe: same GCC family the UFS /
   * touch probes already read; GPUCC/SMMU/GPU reads are each gated). ---- */
