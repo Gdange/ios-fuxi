@@ -56,6 +56,10 @@
 #include <vm/vm_kern.h>
 #include <vm/pmap.h>
 #include <arm/caches_internal.h>
+/* osfmk/vm/pmap.h declares these under MACH_KERNEL_PRIVATE only; bsd/ cannot
+ * see them, but they are in the same kernel image (M6k fuxiwlanprobe=nc). */
+extern unsigned int pmap_cache_attributes(ppnum_t pn);
+extern void pmap_set_cache_attributes(ppnum_t pn, unsigned int cacheattr);
 
 extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
 
