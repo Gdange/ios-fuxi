@@ -1,7 +1,7 @@
 /* Root exec-swap diagnostic: all argv, including argv[0], is ignored. */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
-#import <IOSurface/IOSurface.h>
+#import <IOSurface/IOSurfaceRef.h>
 #import <objc/runtime.h>
 #include <errno.h>
 #include <signal.h>
