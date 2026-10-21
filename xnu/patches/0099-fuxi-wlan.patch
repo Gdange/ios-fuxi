@@ -29,13 +29,14 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,1649 @@
+@@ -0,0 +1,1687 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
 + * Gated by boot-arg fuxiwlan (default 0 = do nothing):
 + *   fuxiwlan=1      run all 28 steps
 + *   fuxiwlan=2..28  stop after that step (bisecting a hang or reset)
++ *   fuxiwlanoldiova=1  use M6f's IOVA pool, retaining the M6g SMMU profile
 + * Steps 17..28 probe DMA safety and load rootfs firmware through BHI/BHIe.
 + * No interrupts, channels or QMI are enabled; see docs-lanes/wlan-bt.md M6.
 + *
@@ -445,7 +446,7 @@
 +/* ---- milestone 5: polling only, no channel start or QMI ----
 + * Register/layout references (independent implementation): Linux MHI common.h,
 + * host/boot.c + pm.c, arm-smmu.h; OpenBSD if_qwz_pci.c READY/FBC sequence.
-+ * M6 uses owned stage-1 translation of low IOVAs to wired XNU pages.
++ * M6 uses owned stage-1 translation of WLAN IOVAs to wired XNU pages.
 + */
 +#define WL5_STEPS 28u
 +#define WL_SMMU 0x15000000ull
@@ -458,9 +459,26 @@
 +static bool wl_mhi_valid;
 +struct wl_dma { vm_offset_t va; vm_size_t size; uint64_t pa, iova; };
 +static struct wl_dma wl_image, wl_vectors, wl_contexts, wl_tables;
-+#define WL_IOVA 0x10000000ull
-+#define WL_IOVA_END 0x11000000ull
-+static uint64_t wl_iova_next = WL_IOVA, wl_cb_base, wl_gr1;
++#define WL_CNSS_IOVA 0xa0000000ull
++#define WL_CNSS_IOVA_END 0xb0000000ull
++#define WL_LEGACY_IOVA 0x10000000ull
++#define WL_LEGACY_IOVA_END 0x11000000ull
++_Static_assert((WL_CNSS_IOVA >> 30) == ((WL_CNSS_IOVA_END - 1) >> 30) &&
++    (WL_LEGACY_IOVA >> 30) == ((WL_LEGACY_IOVA_END - 1) >> 30), "one L2 per pool");
++_Static_assert(!((WL_CNSS_IOVA | WL_CNSS_IOVA_END | WL_LEGACY_IOVA |
++    WL_LEGACY_IOVA_END) & ((1ull << 21) - 1)), "2-MiB pool alignment");
++static uint64_t wl_iova_base = WL_CNSS_IOVA, wl_iova_end = WL_CNSS_IOVA_END;
++static uint64_t wl_iova_next = WL_CNSS_IOVA, wl_cb_base, wl_gr1;
++/* Xiaomi SM8550 arm-smmu + io-pgtable-fast: coherent walk = ISH/WB-WA;
++ * fastmap cached leaves = OSH + MAIR 0xff. See docs-lanes/wlan-bt.md, M6g.
++ * Keep EPD1/T1SZ/TG1 legal, TTBR0 4-KiB granule and 32-bit input. */
++#define WL_CB_TCR (0x80a00000u | (3u << 12) | (1u << 10) | (1u << 8) | 32u)
++/* HUPCF=1, CFCFG=0 (stall-disable), CFRE=0 (no-CFRE), M=1.
++ * ASIDPNE/AFE/TRE retained as optional Linux-style hints. CFIE stays off:
++ * this lane polls FSR and has no context-fault IRQ handler. Coherent SCTLR
++ * bypass overrides only apply with M=0, when we keep bus mastering off. */
++#define WL_CB_SCTLR 0x1107u
++#define WL_DMA_PTE 0x60000000000e63ull /* XN, nG, AF, OSH, RW, NS, AttrIdx 0 */
 +static unsigned wl_slot, wl_cb, wl_smr_count, wl_cb_count, wl_pgshift;
 +static uint32_t wl_old_smr, wl_old_s2cr, wl_old_sctlr;
 +#define WL_CB_PROBE_MAX 8u
@@ -490,6 +508,20 @@
 +_Static_assert(128 * sizeof(struct wl_context) <= WL_ECTX, "channel array");
 +_Static_assert(WL_CR + 2048 <= 16384, "context page");
 +
++/* Select once before the WLAN thread allocates anything. The experiment
++ * changes only IOVAs; both boots use the CNSS coherency/fault profile. */
++static void
++wl_iova_configure(void)
++{
++	int legacy = 0;
++	(void)PE_parse_boot_argn("fuxiwlanoldiova", &legacy, sizeof(legacy));
++	wl_iova_base = legacy == 1 ? WL_LEGACY_IOVA : WL_CNSS_IOVA;
++	wl_iova_end = legacy == 1 ? WL_LEGACY_IOVA_END : WL_CNSS_IOVA_END;
++	wl_iova_next = wl_iova_base;
++	printf("FUXI WLAN: M6g IOVA %s pool [%#llx,%#llx) fuxiwlanoldiova=%d\n",
++	    legacy == 1 ? "legacy" : "cnss", wl_iova_base, wl_iova_end, legacy);
++}
++
 +static void
 +wl_sleep(unsigned ms)
 +{
@@ -509,7 +541,8 @@
 +wl_dma_alloc(struct wl_dma *d, vm_size_t bytes)
 +{
 +	d->size = round_page(bytes);
-+	if (!bytes || d->size > WL_IOVA_END - wl_iova_next) { return 1; }
++	if (!bytes || d->size < bytes || wl_iova_next < wl_iova_base ||
++	    wl_iova_next >= wl_iova_end || d->size > wl_iova_end - wl_iova_next) { return 1; }
 +	kern_return_t kr = kmem_alloc(kernel_map, &d->va, d->size,
 +	    KMA_DATA | KMA_ZERO | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT);
 +	if (kr != KERN_SUCCESS) {
@@ -1012,8 +1045,9 @@
 +	return 1;
 +}
 +
-+/* 4-KiB AArch64 stage-1 tables: L1 root, L2, eight L3 tables for the 16-MiB
-+ * window. Tables themselves are never mapped into endpoint address space. */
++/* 4-KiB AArch64 stage-1 tables: L1 root, L2, one L3 per 2 MiB of the pool.
++ * Only allocated DMA buffers get leaves; page tables never get DMA mappings.
++ * Both selectable pools fit within one L1 entry and are 2-MiB aligned. */
 +static uint64_t
 +wl_pt_pa(unsigned table)
 +{
@@ -1084,21 +1118,23 @@
 +wl_smmu_enable(void)
 +{
 +	if (wl_rc_check()) { return 3; }
-+	if (wl_dma_alloc(&wl_tables, 10 * 4096)) { return 1; }
++	unsigned l3_count = (unsigned)((wl_iova_end - wl_iova_base) >> 21);
++	if (wl_dma_alloc(&wl_tables, (2 + l3_count) * 4096)) { return 1; }
 +	uint64_t *root = (uint64_t *)wl_tables.va;
 +	uint64_t *l2 = (uint64_t *)(wl_tables.va + 4096);
-+	root[0] = wl_pt_pa(1) | 3;
-+	for (unsigned i = 0; i < 8; i++) { l2[128 + i] = wl_pt_pa(2 + i) | 3; }
++	root[wl_iova_base >> 30] = wl_pt_pa(1) | 3;
++	for (unsigned i = 0; i < l3_count; i++) {
++		l2[((wl_iova_base >> 21) & 511) + i] = wl_pt_pa(2 + i) | 3;
++	}
 +	struct wl_dma *bufs[] = { &wl_image, &wl_vectors, &wl_contexts };
 +	for (unsigned i = 0; i < 3; i++) {
 +		struct wl_dma *d = bufs[i];
 +		for (vm_size_t off = 0; off < d->size; off += 4096) {
 +			uint64_t addr = d->iova + off;
-+			if (addr < WL_IOVA || addr >= WL_IOVA_END) { return 2; }
-+			unsigned n = (unsigned)((addr - WL_IOVA) >> 21);
++			if (addr < wl_iova_base || addr >= wl_iova_end) { return 2; }
++			unsigned n = (unsigned)((addr - wl_iova_base) >> 21);
 +			uint64_t *l3 = (uint64_t *)(wl_tables.va + (2 + n) * 4096);
-+			/* RW unprivileged, AF, nG, NS, inner-shareable WB, XN. */
-+			l3[(addr >> 12) & 511] = wl_phys(d->va + off) | 0x60000000000f63ull;
++			l3[(addr >> 12) & 511] = wl_phys(d->va + off) | WL_DMA_PTE;
 +		}
 +	}
 +	wl_dma_clean(&wl_tables);
@@ -1132,8 +1168,7 @@
 +	    wl_smmu_wr("GR1_CBA2R", wl_gr1 + 0x800 + 4 * wl_cb, 1, cba2r_mask) || /* VA64 */
 +	    wl_smmu_wr("GR1_CBAR", wl_gr1 + 4 * wl_cb, 0x1f300, cbar_mask) || /* S1, S2 bypass */
 +	    wl_smmu_wr("CB_TCR2", cb + 0x10, 0x38011, wl_tcr2_mask()) || /* SEP upstream, AS, 36-bit PA */
-+	    /* EPD1, WB/ISH, 32-bit IOVA; legal TG1=4KiB/T1SZ=32 even while disabled. */
-+	    wl_smmu_wr("CB_TCR", cb + 0x30, 0x80a03520, WL_CB_TCR_MASK) ||
++	    wl_smmu_wr("CB_TCR", cb + 0x30, WL_CB_TCR, WL_CB_TCR_MASK) ||
 +	    wl_smmu_wr("CB_TTBR0_HI", cb + 0x24, (uint32_t)(ttbr >> 32), ttbr_hi_mask) ||
 +	    wl_smmu_wr("CB_TTBR0_LO", cb + 0x20, (uint32_t)ttbr, WL_CB_TTBR_LO_MASK) ||
 +	    wl_smmu_wr("CB_TTBR1_HI", cb + 0x2c, wl_cb << 16, ttbr_hi_mask) ||
@@ -1145,12 +1180,14 @@
 +	if (wl_smmu_verify("CB_FSR W1C", cb + 0x58, 0xc00001fe,
 +	    wl_prd(cb + 0x58), 0, 0xc00001fe)) { return 5; }
 +	if (wl_smmu_fault(20) || wl_smmu_sync(false) ||
-+	    wl_smmu_wr("CB_SCTLR enable", cb, 0x1027, WL_CB_SCTLR_MASK) || /* ASIDPNE, CFRE, M; IRQ/stall off */
++	    wl_smmu_wr("CB_SCTLR enable", cb, WL_CB_SCTLR, WL_CB_SCTLR_MASK) ||
 +	    wl_smmu_wr("GR0_S2CR", WL_SMMU + 0xc00 + 4 * wl_slot, wl_cb, ~0u) ||
 +	    wl_smmu_wr("GR0_SMR", WL_SMMU + 0x800 + 4 * wl_slot, 0x80001401, ~0u)) { return 5; }
 +	wl_enabled = true;
 +	printf("FUXI WLAN: SMMU owned stage1 SMR %u CB %u TTBR %#llx IOVA %#llx-%#llx readback verified\n",
-+	    wl_slot, wl_cb, wl_pt_pa(0), WL_IOVA, wl_contexts.iova + wl_contexts.size - 1);
++	    wl_slot, wl_cb, wl_pt_pa(0), wl_iova_base, wl_contexts.iova + wl_contexts.size - 1);
++	printf("FUXI WLAN: M6g CB %u coherent walk TCR %#x IRGN0=1 ORGN0=1 SH0=3; DMA MAIR0 %#x SH=2; SCTLR %#x HUPCF=1 CFCFG=0 CFRE=0 CFIE=0\n",
++	    wl_cb, wl_prd(cb + 0x30), wl_prd(cb + 0x38), wl_prd(cb));
 +	printf("FUXI WLAN: DMA self-test: no standalone BHI host-write cookie; step 21/22 BHI transfer + CB faults is first endpoint proof\n");
 +	return 0;
 +}
@@ -1389,8 +1426,8 @@
 +		    wl_prd(WL_SMMU) != wl5_report[4] ||
 +		    wl_prd(WL_SMMU + 0x800 + 4 * wl_slot) != 0x80001401 ||
 +		    wl_prd(WL_SMMU + 0xc00 + 4 * wl_slot) != wl_cb ||
-+		    wl_smmu_verify("CB_SCTLR pre-DMA", wl_cb_addr(wl_cb), 0x1027,
-+		    wl_prd(wl_cb_addr(wl_cb)), 0x1027, WL_CB_SCTLR_MASK) ||
++		    wl_smmu_verify("CB_SCTLR pre-DMA", wl_cb_addr(wl_cb), WL_CB_SCTLR,
++		    wl_prd(wl_cb_addr(wl_cb)), WL_CB_SCTLR, WL_CB_SCTLR_MASK) ||
 +		    (wl_prd(WL_PARF + 0x2c00) & 1) || wl_prd(WL_PARF + 0x234)) { return 6; }
 +		/* ath12k_mhi_clear_vector: undefined reset status is not a result.
 +		 * Only doorbells/status, no RDDM buffers and no retry. */
@@ -1670,6 +1707,7 @@
 +		return;
 +	}
 +	unsigned limit = (arg == 1 || arg > (int)WL5_STEPS) ? WL5_STEPS : (unsigned)arg;
++	wl_iova_configure();
 +	printf("FUXI WLAN: enabled (fuxiwlan=%d), WCN7850 power-up + PCIe0 + MHI firmware, limit %u\n",
 +	    arg, limit);
 +	if (kernel_thread_start(fw_thread, (void *)(uintptr_t)limit, &thread) == KERN_SUCCESS) {

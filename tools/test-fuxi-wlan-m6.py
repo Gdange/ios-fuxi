@@ -71,6 +71,13 @@ struct ev { char kind; uint64_t pa; uint32_t v; };
 static struct reg regs[4096];
 static struct ev events[8192];
 static unsigned nr, ne, sleeps, frees, allocations;
+static int old_iova_arg;
+static bool old_iova_present;
+static bool PE_parse_boot_argn(const char *name, void *out, int size) {
+    assert(!strcmp(name,"fuxiwlanoldiova") && size==sizeof(int));
+    if(old_iova_present) memcpy(out,&old_iova_arg,size);
+    return old_iova_present;
+}
 static bool progress = true, fail_bm, fail_perst, no_root;
 static bool noncontig, high_memory, fail_alloc, tlb_busy, mismatch, inject_fault;
 static uint64_t mismatch_pa, read_fault_pa, corrupt_write_pa;
@@ -206,7 +213,8 @@ static void init(void) {
     memset(probe_block,0,sizeof(probe_block));
     probe_steal=probe_change_next=false; corrupt_write_pa=0; corrupt_write_mask=1; nread_masks=0;
     memset(&wl_image,0,sizeof(wl_image)); memset(&wl_vectors,0,sizeof(wl_vectors));
-    memset(&wl_tables,0,sizeof(wl_tables)); wl_owned=wl_enabled=wl_route_owned=wl_route_installed=false; wl_iova_next=WL_IOVA;
+    memset(&wl_tables,0,sizeof(wl_tables)); wl_owned=wl_enabled=wl_route_owned=wl_route_installed=false;
+    old_iova_arg=0; old_iova_present=false; wl_iova_configure();
     memset(&wl_contexts,0,sizeof(wl_contexts)); memset(wl5_report,0,sizeof(wl5_report));
     memset(fixture,0,sizeof(fixture)); file_size=sizeof(fixture);
     memcpy(fixture,"\177ELF\1\1\1",7);
@@ -232,7 +240,7 @@ static uint64_t walk(uint64_t addr) {
     if (!root[addr>>30]) return 0;
     uint64_t *l2=(void *)(wl_tables.va+4096);
     if (!l2[(addr>>21)&511]) return 0;
-    unsigned n=(addr-WL_IOVA)>>21;
+    unsigned n=(addr-wl_iova_base)>>21;
     uint64_t *l3=(void *)(wl_tables.va+(2+n)*4096);
     return l3[(addr>>12)&511];
 }
@@ -249,12 +257,20 @@ static void check_mapping(void) {
     assert(wl_prd(wl_cb_addr(wl_cb)+0x2c)==wl_cb<<16);
     assert(wl_prd(wl_cb_addr(wl_cb)+0x38)==0xff);
     assert(wl_prd(wl_cb_addr(wl_cb)+0x3c)==0);
+    uint32_t sctlr=wl_prd(wl_cb_addr(wl_cb));
+    assert((sctlr&0x1e1)==0x101); /* M/HUPCF; CFRE/CFIE/CFCFG clear */
+    const uint64_t *root=(void *)wl_tables.va, *l2=(void *)(wl_tables.va+4096);
+    for(unsigned i=0;i<512;i++) assert(root[i]==(i==(wl_iova_base>>30)?(wl_pt_pa(1)|3):0));
+    unsigned count=(wl_iova_end-wl_iova_base)>>21, first=(wl_iova_base>>21)&511;
+    for(unsigned i=0;i<512;i++)
+        assert(l2[i]==(i>=first && i<first+count?(wl_pt_pa(2+i-first)|3):0));
     for(unsigned i=0;i<3;i++) for(size_t off=0;off<bufs[i]->size;off+=4096) {
         uint64_t pte=walk(bufs[i]->iova+off);
         assert((pte&0xfffffffff000ull)==wl_phys(bufs[i]->va+off));
-        assert((pte&0x60000000000fffull)==0x60000000000f63ull);
+        assert((pte&0x60000000000fffull)==0x60000000000e63ull);
     }
-    assert(!walk(WL_IOVA-4096) && !walk(WL_IOVA_END) && !walk(wl_tables.iova));
+    assert(!walk(wl_iova_base-4096) && !walk(wl_iova_end) && !walk(wl_tables.iova));
+    assert(!walk(wl_iova_base==0xa0000000ull?0x10000000ull:0xa0000000ull));
 }
 static int findwrite(uint64_t pa, uint32_t v, unsigned from) {
     for(unsigned i=from;i<ne;i++) if(events[i].kind=='W' && events[i].pa==pa && events[i].v==v) return i;
@@ -266,7 +282,7 @@ int main(void) {
     for(unsigned s=17;s<=28;s++) assert(wl5_step(s)==0);
     check_mapping();
     assert(strstr(wl_fw_path,"amss20.bin"));
-    assert(wl_fw_size==sizeof(fixture) && wl_image.pa>0x100000000ull && wl_image.iova==WL_IOVA);
+    assert(wl_fw_size==sizeof(fixture) && wl_image.pa>0x100000000ull && wl_image.iova==0xa0000000ull);
     struct wl_vector *v=(void *)wl_vectors.va;
     assert(v[0].size==WL_CHUNK && v[1].size==37 && v[1].addr==wl_image.iova+WL_CHUNK);
     assert(wl5_report[19]==32);
@@ -321,8 +337,9 @@ int main(void) {
         l3[0]=l3[1]; assert(wl5_step(21)==8 && !(wl_prd(WL_EPCFG+4)&4));
         assert(strstr(logbuf,"FAIL reason 5")); l3[0]=saved;
         l3[0]=0; assert(wl_bhi_mapping_check()==1); l3[0]=saved;
-        uint64_t *root=(void *)wl_tables.va, oldroot=root[0];
-        root[0]=0x12345003; assert(wl_bhi_mapping_check()==1); root[0]=oldroot;
+        uint64_t *root=(void *)wl_tables.va, oldroot=root[wl_image.iova>>30];
+        root[wl_image.iova>>30]=0x12345003; assert(wl_bhi_mapping_check()==1);
+        root[wl_image.iova>>30]=oldroot;
         setreg(wl_cb_addr(wl_cb)+0x20,0x1000); assert(wl_bhi_mapping_check()==1);
         setreg(wl_cb_addr(wl_cb)+0x20,(uint32_t)wl_pt_pa(0)); release();
     }
@@ -595,12 +612,21 @@ int main(void) {
     for(unsigned step=17;step<=28;step++) assert(wl5_step(step)==0);
     assert(strstr(logbuf,"CB_SCTLR pre-DMA") && !wl_smmu_mismatches);
     wl5_abort(28); assert(frees==4);
-    const uint32_t enable_bits[]={1,0x20};
+    const uint32_t enable_bits[]={1,0x100}; /* M and HUPCF */
     for(unsigned i=0;i<2;i++) {
         init(); read_masks[nread_masks++]=(struct read_mask){0x15081000,0,enable_bits[i]};
         for(unsigned step=17;step<20;step++) assert(wl5_step(step)==0);
         assert(wl5_step(20)==5 && !wl_enabled && !(wl_prd(WL_EPCFG+4)&4));
         wl5_abort(20); assert(frees==4);
+    }
+    /* A late change to any CNSS fault-control bit must block the BHI DB. */
+    const uint32_t fault_bits[]={0x20,0x40,0x80,0x100};
+    for(unsigned i=0;i<4;i++) {
+        init(); for(unsigned step=17;step<=20;step++) assert(wl5_step(step)==0);
+        setreg(wl_cb_addr(wl_cb),wl_prd(wl_cb_addr(wl_cb))^fault_bits[i]);
+        assert(wl5_step(21)==6 && !(wl_prd(WL_EPCFG+4)&4));
+        assert(findwrite(WL_BAR0+0x118,0x12345,0)<0);
+        wl5_abort(21); assert(frees==4);
     }
     init(); for(unsigned step=17;step<=20;step++) assert(wl5_step(step)==0);
     read_masks[nread_masks++]=(struct read_mask){0x15081000,1,0}; /* M stuck on */
@@ -696,7 +722,7 @@ int main(void) {
     }
     init(); for(unsigned s=17;s<20;s++) assert(wl5_step(s)==0);
     mismatch=true; mismatch_pa=0x15081000;
-    assert(wl5_step(20)==5 && strstr(logbuf,"CB_SCTLR enable offset 0x81000 wrote 0x1027 read 0"));
+    assert(wl5_step(20)==5 && strstr(logbuf,"CB_SCTLR enable offset 0x81000 wrote 0x1107 read 0"));
     mismatch=false; wl5_abort(20); assert(frees==4);
     init(); for(unsigned s=17;s<20;s++) assert(wl5_step(s)==0);
     setreg(0x15081058,2); mismatch=true; mismatch_pa=0x15081058;
@@ -727,6 +753,54 @@ int main(void) {
     /* High noncontiguous XNU pages all translate correctly; no adjacent maps. */
     init(); noncontig=true; for(unsigned s=17;s<=20;s++) assert(wl5_step(s)==0);
     check_mapping(); wl5_abort(20); assert(frees==4);
+
+    /* M6g: one kernel, both address windows, identical coherency/fault profile.
+       Exercise the actual boot-arg parser helper; only exactly 1 opts out. */
+    const int iova_args[]={0,1,2,-1};
+    for(unsigned a=0;a<4;a++) {
+        init(); old_iova_present=true; old_iova_arg=iova_args[a]; wl_iova_configure();
+        uint64_t base=iova_args[a]==1?0x10000000ull:0xa0000000ull;
+        uint64_t end=iova_args[a]==1?0x11000000ull:0xb0000000ull;
+        assert(wl_iova_base==base && wl_iova_end==end && wl_iova_next==base);
+        noncontig=true;
+        for(unsigned s=17;s<=28;s++) assert(wl5_step(s)==0);
+        check_mapping();
+        assert(wl_image.iova==base && wl_vectors.iova>=base && wl_contexts.iova<end);
+        assert(wl_bhi_mapping_check()==0 && strstr(logbuf,"pages 128/128 MATCH"));
+        assert(findwrite(WL_BAR0+0x108,(uint32_t)base,0)>=0);
+        assert(strstr(logbuf,"IRGN0=1 ORGN0=1 SH0=3") && strstr(logbuf,"HUPCF=1 CFCFG=0 CFRE=0"));
+        wl5_abort(28); assert(frees==4);
+    }
+    /* Both allocation limits, including a cursor outside the chosen pool. */
+    for(unsigned a=0;a<2;a++) {
+        init(); old_iova_present=true; old_iova_arg=a; wl_iova_configure();
+        struct wl_dma d={0};
+        wl_iova_next=wl_iova_end-PAGE_SIZE;
+        assert(wl_dma_alloc(&d,PAGE_SIZE+1)==1 && allocations==0);
+        assert(wl_dma_alloc(&d,PAGE_SIZE)==0 && d.iova==wl_iova_end-PAGE_SIZE);
+        wl_dma_free(&d); assert(wl_dma_alloc(&d,1)==1);
+        wl_iova_next=wl_iova_base-1; assert(wl_dma_alloc(&d,1)==1);
+        wl_iova_next=wl_iova_end+1; assert(wl_dma_alloc(&d,1)==1);
+    }
+    /* A leaf in the last 2-MiB slice proves high-pool L2/L3 indexing, while
+       the unused pool still faults and tables remain inaccessible to DMA. */
+    init(); noncontig=true;
+    for(unsigned s=17;s<20;s++) assert(wl5_step(s)==0);
+    assert(wl_dma_alloc(&wl_vectors,16384)==0 && wl_dma_alloc(&wl_contexts,16384)==0);
+    wl_contexts.iova=0xb0000000ull-PAGE_SIZE;
+    assert(wl_smmu_enable()==0); check_mapping();
+    assert(!walk(0xa8000000ull) && !walk(0xafffb000ull));
+    wl5_abort(20); assert(frees==4);
+    /* Max-size firmware spans multiple L3s in either window. */
+    for(unsigned a=0;a<2;a++) {
+        init(); old_iova_present=true; old_iova_arg=a; wl_iova_configure(); noncontig=true;
+        for(unsigned s=17;s<19;s++) assert(wl5_step(s)==0);
+        assert(wl_dma_alloc(&wl_image,WL_FW_MAX)==0); wl_fw_size=WL_FW_MAX;
+        assert(wl5_step(20)==0); check_mapping();
+        struct wl_vector *vectors=(void *)wl_vectors.va;
+        assert(wl5_report[19]==30*16 && vectors[29].addr==wl_image.iova+29*WL_CHUNK);
+        assert(wl_bhi_mapping_check()==0); wl5_abort(20); assert(frees==4);
+    }
 
     /* Every hardware poll terminates, error EEs are never success. */
     init(); assert(wl5_step(17)==0);

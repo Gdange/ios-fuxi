@@ -1598,3 +1598,150 @@ Mac-packed artifact variants passed. Full image SHA-256:
 Stop-at-22 SHA-256:
 `576c77855ef7708955bc154e06cd5858e55d838f68d8cb9db23eb52dbfb602e2`.
 These are build/host results only; no M6f phone test was performed.
+
+## M6g: CNSS IOVA pool and coherent SMMU profile (source only)
+
+The subsequently reported M6f runs fail with the same PBL error with both
+Xiaomi and upstream firmware, despite a matching 128-page CPU walk and no
+global SMMU fault. That weakens an image-specific explanation. Neither the
+CPU walk nor an empty fault register proves that PBL fetched host memory.
+M6g tests the CNSS address aperture and coherency profile; no device result
+or native kernel build is claimed here.
+
+All endpoint-visible buffers now allocate from `[0xa0000000,0xb0000000)`:
+the initial BHI buffer, full-image BHIe segments, vector table, and later
+MHI channel/event/command contexts and rings. The allocator checks both
+ends, rounded-size overflow, and exhaustion. The L1 index is now 2, and the
+L2 indexes begin at 256, rather than M6f's L1 index 0 / L2 index 128.
+Tables cover the 256-MiB pool, but only allocated buffers have valid leaves;
+unused pool addresses and page-table backing memory remain unmapped to DMA.
+There are 130 4-KiB tables (520 KiB, rounded to 528 KiB of wired XNU memory).
+The live-TTBR FNV-1a check still verifies the first 128 physical 4-KiB pages
+immediately before enabling bus mastering. It remains a CPU-view check.
+
+### Qualcomm profile and fault controls
+
+The pinned [Kalama CNSS DT](https://github.com/LineageOS/android_kernel_xiaomi_sm8550-devicetrees/blob/13913424c9d0af031a8b8f9981c003bbb9632f73/qcom/wlan/kalama-cnss.dtsi#L263-L280)
+specifies the pool, fastmap and coherent page tables. This public snapshot
+has stall-disable/HUPCF/non-fatal; the requested no-CFRE setting comes from
+the supplied live DT property, which additionally contains that string.
+
+[Qualcomm arm-smmu's DT parser and context setup](https://github.com/LineageOS/android_kernel_xiaomi_sm8550/blob/2cac706017fd8fd44a1d6a27855ef1b685ce4ea2/drivers/iommu/arm/arm-smmu/arm-smmu.c)
+turn coherent page tables into `force_coherent_walk`, and map the fault
+strings to `no_stall`, `no_cfre`, `hupcf` and `non_fatal`.
+The SCTLR builder uses their inversions for CFCFG and CFRE and the value of
+HUPCF directly. Non-fatal changes the kernel's fault policy, not an SCTLR bit.
+The [register definitions and SCTLR encoder](https://github.com/LineageOS/android_kernel_xiaomi_sm8550/blob/2cac706017fd8fd44a1d6a27855ef1b685ce4ea2/drivers/iommu/arm/arm-smmu/arm-smmu.h#L173-L191)
+give HUPCF bit 8, CFCFG bit 7, CFIE bit 6, CFRE bit 5 and M bit 0.
+The [qcom-iommu utility API](https://github.com/LineageOS/android_kernel_xiaomi_sm8550/blob/2cac706017fd8fd44a1d6a27855ef1b685ce4ea2/drivers/iommu/qcom-iommu-util.c#L403-L417)
+also exposes these four fault-model flags to clients.
+
+| Field | M6g programming and reason |
+|---|---|
+| TCR.IRGN0/ORGN0/SH0 | 1/1/3: inner/outer WB-WA, inner-shareable table walks. `TCR=0x80a03520` already had these values in M6f; retained and made explicit. |
+| Leaf SH / MAIR | SH=2 (outer-shareable), MAIR attribute 0=`0xff` (inner/outer WB, read/write allocate), AttrIdx=0. Leaf flags change from `0x60000000000f63` to `0x60000000000e63`. |
+| SCTLR.HUPCF | 1: subsequent transactions can proceed independently of a previous context fault. |
+| SCTLR.CFCFG | 0: terminate rather than stall on fault. No shared sCR0 change is needed. |
+| SCTLR.CFRE | 0: suppress the fault abort report to the originating client; this does not disable FSR recording or translation checks. |
+| SCTLR.CFIE | 0: retain this lane's polled diagnostics; it has no context-fault interrupt handler. The vendor IRQ-driven driver sets this bit. |
+| SCTLR.M / hints | M=1; ASIDPNE/AFE/TRE writes retained with the existing architectural readback exclusions. Requested SCTLR becomes `0x1107`, previously `0x1027`. |
+
+[Qualcomm fastmap](https://github.com/LineageOS/android_kernel_xiaomi_sm8550/blob/2cac706017fd8fd44a1d6a27855ef1b685ce4ea2/drivers/iommu/io-pgtable-fast.c#L235-L257)
+sets outer-shareable leaves, selects its cached MAIR entry for IOMMU_CACHE,
+and recognizes cached OSH/ISH leaves as coherent. Its allocation path at
+lines 615–666 sets coherent walks to ISH/WB-WA and defines that cached byte
+as `0xff`. We use attribute index 0 for that same byte; unused attribute
+slots need not reproduce the Linux table. Explicit clean/invalidate and
+barriers remain in place. The generic Qualcomm LPAE allocator has the same
+[coherent-walk TCR settings](https://github.com/LineageOS/android_kernel_xiaomi_sm8550/blob/2cac706017fd8fd44a1d6a27855ef1b685ce4ea2/drivers/iommu/io-pgtable-arm.c#L868-L882).
+
+The vendor's coherent SCTLR bypass overrides (WACFG/RACFG/SHCFG/MTCFG/MemAttr)
+are documented in its context setup as taking effect only with M=0.
+M6g uses translated leaves with M=1; bus mastering stays off while the CB
+is disabled. It therefore does not add bypass-mode overrides.
+[Arm's fault-model pseudocode](https://documentation-service.arm.com/static/5f900d34f86e16515cdc08fb)
+distinguishes FSR recording from reporting an abort to the client according
+to CFRE. Existing first-fault snapshots, pre-DMA readback checks, global
+fault checks and stop/containment behavior remain active. No-CFRE is not
+permission to treat a failed transfer as successful.
+
+### Address decoding and other pre-BHI work
+
+The public sources inspected do not establish a KIWI PBL minimum host
+address or explain a device-local decode boundary. Evidence supports
+matching the platform's pool, but not claiming that it fixes ROM decoding:
+
+* [CNSS platform IOMMU setup](https://github.com/LineageOS/android_kernel_xiaomi_sm8550-modules/blob/92a9fde479d3262da080cfd28bab0775b0da500a/qcom/opensource/wlan/platform/cnss2/pci_qcom.c#L625-L648)
+  reads the pool from DT on older kernels and hard-codes the same base/size
+  for kernels >=6.5. The ECAM implementation does the same. Neither gives
+  a silicon-boundary explanation.
+* [qcom-iommu pool processing](https://github.com/LineageOS/android_kernel_xiaomi_sm8550/blob/2cac706017fd8fd44a1d6a27855ef1b685ce4ea2/drivers/iommu/qcom-iommu-util.c#L103-L120)
+  treats the property as allowed DMA ranges; `generate_resv_regions` reserves
+  the complement. Thus `0xa0000000` begins an allowed pool, rather than a
+  reserved block. Fastmap rejects addresses >=4 GiB, without a KIWI-specific
+  lower bound.
+* [ath12k MHI registration](https://github.com/torvalds/linux/blob/v6.6/drivers/net/wireless/ath/ath12k/mhi.c#L377-L381)
+  advertises IOVA start 0 and stop `0xffffffff`. This is evidence against
+  asserting a universal software minimum; it does not prove that a
+  particular low IOVA works on this integrated platform.
+
+The following audit uses pinned
+[SM8550 CNSS pci.c](https://github.com/LineageOS/android_kernel_xiaomi_sm8550-modules/blob/92a9fde479d3262da080cfd28bab0775b0da500a/qcom/opensource/wlan/platform/cnss2/pci.c),
+[CNSS main.c](https://github.com/LineageOS/android_kernel_xiaomi_sm8550-modules/blob/92a9fde479d3262da080cfd28bab0775b0da500a/qcom/opensource/wlan/platform/cnss2/main.c),
+and the pinned vendor
+[MHI boot.c](https://github.com/LineageOS/android_kernel_xiaomi_sm8550/blob/2cac706017fd8fd44a1d6a27855ef1b685ce4ea2/drivers/bus/mhi/host/boot.c)
+and [MHI pm.c](https://github.com/LineageOS/android_kernel_xiaomi_sm8550/blob/2cac706017fd8fd44a1d6a27855ef1b685ce4ea2/drivers/bus/mhi/host/pm.c).
+
+| Candidate prerequisite | Source finding / M6g decision |
+|---|---|
+| `cnss_pci_pre_fw_dl` | No definition or call in the audited Xiaomi CNSS2 tree, nor in the inspected OnePlus SM8550 `pci.c` on `oneplus/sm8550_v_15.0.0_oneplus11`. The relevant Xiaomi path is enable-bus → MHI INIT (`mhi_prepare_for_power_up`) → POWER_ON. No routine from another chipset/tree is assumed to apply. |
+| `cnss_pci_set_dma_mask` | Host DMA API wrapper; enable-bus sets streaming and coherent masks to 36 bits for KIWI. It limits allocation addresses, not a PBL register or minimum IOVA. Our 36-bit PA gate and sub-4-GiB IOVAs remain compatible. |
+| `PCIE_PCIE_LOCAL_REG` | Matching vendor symbols are WCSS debug/status registers used in dump tables, not a host-address aperture initializer. No KIWI pre-BHI remap write was found. ath12k's local wake/global-reset registers belong to separate reset/power flows already audited in M6f. |
+| QRTR instance | `cnss_pci_store_qrtr_node_id` handles QCA6390/QCA6490 and a nonzero configured instance; KIWI takes the no-op path. |
+| BHI image type | No extra image-type register is written by the audited loader. It uses coherent allocation, copies the file prefix, then writes STATUS, address, size and session doorbell. FBC uses 512-KiB SBL/chunk sizes. |
+| `fw_mem` / M3 / dumps | `fw_mem` is allocated in response to a later QMI memory request. `cnss_fw_mem_ready_hdlr` loads M3 and sends its address over QMI after firmware-memory-ready. MHI RDDM buffers describe crash recovery. These are not prerequisites for the first PBL BHI fetch. |
+| Wake | MHI power-up installs wake callbacks, writes INTVEC=0, validates EE, handles existing SYSERR, and queues the PBL loader. That path does not assert a wake doorbell before BHI. CNSS force-wake/runtime-PM operations and the wake GPIO monitor are separate flows. |
+
+The old-address test changes only the aperture. A difference between the
+two boots would implicate the address placement under the new profile.
+A difference between M6f and default M6g alone would not isolate the pool
+from the memory/fault-profile changes. PBL's private error remains undecoded.
+
+### Boot arguments, expected evidence and CI
+
+`fuxiwlan=22` stops after BHI completion; `fuxiwlan=1` runs all 28 steps.
+With either, omit `fuxiwlanoldiova` (or set it to 0) for the CNSS pool.
+Set `fuxiwlanoldiova=1` for `[0x10000000,0x11000000)` while retaining
+the new coherency/fault profile. Only exactly 1 selects the legacy pool.
+This is a boot-time selection in the same kernel; each test needs its
+corresponding boot command line. Both variants preserve the M6f walk/logs.
+
+Expected default lines (templates, not captured device output):
+
+```text
+FUXI WLAN: M6g IOVA cnss pool [0xa0000000,0xb0000000) fuxiwlanoldiova=0
+FUXI WLAN: M6g CB <bank> coherent walk TCR 0x80a03520 IRGN0=1 ORGN0=1 SH0=3; DMA MAIR0 0xff SH=2; SCTLR <raw> HUPCF=1 CFCFG=0 CFRE=0 CFIE=0
+FUXI WLAN: M6f CB <bank> BHI IOVA 0xa0000000+0x80000 FNV1a64 source <hash> walk <same hash> pages 128/128 MATCH reason 0 (CPU view)
+FUXI WLAN: M6e BHI preflight addr 0:a0000000 size 0x80000 INTVEC 0 STATUS 0 EE 0 image/tables cache-clean + dsb sy
+```
+
+The legacy boot prints `legacy pool [0x10000000,0x11000000)` and uses
+`0x10000000` in the mapping/preflight lines. Raw SCTLR may omit the
+optional hint bits; HUPCF/M and clear CFRE/CFCFG/CFIE are verified.
+The next decisive evidence is successful step 22 followed by READY/SBL,
+or the same bounded PBL/transport/fault diagnostics at the new address.
+
+CI entrypoint: `tools/build-fuxi-wlan6g-images.sh BASE_METAL2A_ARTIFACT_DIR`.
+It is M6f's repacker with milestone/output names changed: an already-built
+kernel and unstripped kernel, base ADT/cmdline, limits 1 and 22, unchanged
+payload/loader packing and SHA256 manifest structure. The legacy argument
+is optional and is not appended by default. No remote build was started.
+The artifact verifier now accepts `--milestone m6g`; run it after CI has
+produced real artifacts. Artifact packing was not claimed as verified here.
+
+Linux `tools/test-fuxi-wlan-m6.py` passes ASan/UBSan with actual C extracted
+from the driver and matching integration patch. Coverage includes both
+boot-arg selections, invalid/absent values, allocator limits, highest pool
+slice, maximum-size firmware, noncontiguous physical backing, leaf and
+register attributes, mapping corruption before BME, sequencing, faults and
+cleanup. Builder shell syntax and artifact-verifier CLI checks also pass.
