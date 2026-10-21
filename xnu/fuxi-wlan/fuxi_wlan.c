@@ -11,6 +11,9 @@
  *   fuxiwlaniboff=1  disable stale inbound iATU windows before BHI (opt-in)
  *   fuxiwlanprobe=unmapped|pattern|civac|nc  one BHI experiment, then contain
  *   fuxiwlanaspm=1  retain inherited ASPM (revert download safeguard)
+ *   fuxiwlanpre=qfprom|warm|reset|wake  M6l pre-BHI experiment
+ *   fuxiwlanbhi=full  M6l whole-file BHI size experiment
+ *   fuxiwlanvec=early|rddm  M6l TX staging or RDDM RX experiment
  * Steps 17..28 probe DMA safety and load rootfs firmware through BHI/BHIe.
  * No interrupts, channels or QMI are enabled; see docs-lanes/wlan-bt.md M6.
  *
@@ -690,6 +693,28 @@ static const char *wl_fw_path;
 static bool wl_mhi_valid;
 struct wl_dma { vm_offset_t va; vm_size_t size; uint64_t pa, iova; bool nc; };
 static struct wl_dma wl_image, wl_vectors, wl_contexts, wl_tables;
+static struct wl_dma wl_rddm, wl_rxvectors;
+#define WL_RDDM_SIZE 0x780000u /* ath12k WCN7850; crash sink only, never dumped */
+static unsigned wl_pre, wl_full, wl_vec;
+static bool wl_variant_invalid;
+static const char *const wl_pre_names[] = {"off", "qfprom", "warm", "reset", "wake"};
+static const char *const wl_vec_names[] = {"off", "early", "rddm"};
+
+static unsigned
+wl_variant_arg(const char *name, const char *const *names, unsigned count)
+{
+	char arg[16] = {0};
+	if (!PE_parse_boot_argn(name, arg, sizeof(arg))) { return 0; }
+	arg[sizeof(arg) - 1] = 0;
+	for (unsigned i = 0; i < count; i++) {
+		if (!strcmp(arg, names[i])) { return i; }
+	}
+	wl_variant_invalid = true;
+	return 0;
+}
+
+static bool wl_variant_active(void) { return wl_pre || wl_full || wl_vec; }
+static unsigned wl_bhi_bytes(void) { return wl_full ? wl_fw_size : WL_CHUNK; }
 enum wl_probe_mode { WL_PROBE_OFF, WL_PROBE_UNMAPPED, WL_PROBE_PATTERN,
     WL_PROBE_CIVAC, WL_PROBE_NC, WL_PROBE_INVALID };
 static enum wl_probe_mode wl_probe;
@@ -701,6 +726,11 @@ static void
 wl_probe_configure(void)
 {
 	char arg[16] = {0};
+	const char *const sizes[] = {"off", "full"};
+	wl_variant_invalid = false;
+	wl_pre = wl_variant_arg("fuxiwlanpre", wl_pre_names, 5);
+	wl_full = wl_variant_arg("fuxiwlanbhi", sizes, 2);
+	wl_vec = wl_variant_arg("fuxiwlanvec", wl_vec_names, 3);
 	wl_probe = WL_PROBE_OFF; wl_probe_fired = false;
 	if (PE_parse_boot_argn("fuxiwlanprobe", arg, sizeof(arg))) {
 		arg[sizeof(arg) - 1] = 0;
@@ -709,6 +739,11 @@ wl_probe_configure(void)
 			if (!strcmp(arg, wl_probe_names[i])) { wl_probe = (enum wl_probe_mode)i; break; }
 		}
 	}
+	if (wl_variant_active() && (wl_probe == WL_PROBE_UNMAPPED || wl_probe == WL_PROBE_PATTERN)) {
+		wl_variant_invalid = true;
+	}
+	printf("FUXI WLAN: M6l pre=%s bhi=%s vec=%s valid=%u (variants stop at 22)\n",
+	    wl_pre_names[wl_pre], sizes[wl_full], wl_vec_names[wl_vec], !wl_variant_invalid);
 	printf("FUXI WLAN: M6k probe=%s (one BHI doorbell; diagnostic modes stop at 22)\n", wl_probe_names[wl_probe]);
 }
 #define WL_CNSS_IOVA 0xa0000000ull
@@ -854,6 +889,7 @@ wl_probe_publish(void)
 	if (wl_probe != WL_PROBE_CIVAC) { return; }
 	wl_dma_civac(&wl_image); wl_dma_civac(&wl_vectors);
 	wl_dma_civac(&wl_contexts); wl_dma_civac(&wl_tables);
+	if (wl_rddm.va) { wl_dma_civac(&wl_rddm); wl_dma_civac(&wl_rxvectors); }
 	printf("FUXI WLAN: M6k DC CIVAC + DSB SY image/vectors/contexts/tables before BHI doorbell\n");
 }
 
@@ -896,6 +932,90 @@ wl_soc_read(uint32_t off, uint32_t *val)
 	/* Containment writes remain possible after a latched synchronous fault. */
 	if (wl_contain_wr(WL_BAR0 + 0x310c, saved) || wl_mrd(0x310c) != saved) { e = 1; }
 	return e || fw_faults;
+}
+
+/* Independent register transactions; behavioral references and chip-specific
+ * addresses are linked in docs/wlan-m6l.md. Preserve/verify the dynamic window
+ * even on an exception. No raw arbitrary-address boot argument is accepted. */
+static int
+wl_soc_write(uint32_t off, uint32_t value, bool verify)
+{
+	if (fw_faults || (off & 3) || off >= 0x02000000) { return 1; }
+	uint32_t saved = wl_mrd(0x310c), win = (saved & ~0x3fu) | 0x40000000 | (off >> 19);
+	if (saved == ~0u || fw_faults) { return 1; }
+	wl_mwr(0x310c, win);
+	int e = wl_mrd(0x310c) != win || fw_faults;
+	if (!e) {
+		uint64_t pa = WL_BAR0 + 0x80000ull + (off & 0x7ffff);
+		wl_pwr(pa, value);
+		e = fw_faults || (verify && wl_prd(pa) != value);
+	}
+	if (wl_contain_wr(WL_BAR0 + 0x310c, saved) || wl_mrd(0x310c) != saved) { e = 1; }
+	printf("FUXI WLAN: M6l SOC write [%#x] %#x %s window restore checked\n", off, value, e ? "FAILED" : "ok");
+	return e || fw_faults;
+}
+
+static int
+wl_pre_bhi(void)
+{
+	if (!wl_pre) { return 0; }
+	if (wl_probe_fired || fw_faults || wl_prd(WL_EPCFG) != 0x110717cb ||
+	    ((wl5_report[16] >> 8) & 15) != 2 || (wl_prd(WL_EPCFG + 4) & 4) ||
+	    wl_mrd(wl_bhi + 0x28) != 0) { return 1; }
+	uint32_t v, cookie, cause;
+	printf("FUXI WLAN: M6l pre-BHI %s begin BME off EE PBL\n", wl_pre_names[wl_pre]);
+	if (wl_pre == 4) {
+		wl_mwr(0x3004, 1); wl_sleep(5);
+		if (fw_faults || wl_mrd(0x3004) != 1) { return 1; }
+	}
+	if (wl_pre == 3) {
+		if (wl_soc_read(0x01e081b0, &v) || v == ~0u) { return 1; }
+		if (v != 0x111 && wl_soc_write(0x01e081b0, 0x111, true)) { return 1; }
+		/* WCN7850 corrected hot-reset register, NOT v6.6's QCN9274 address. */
+		if (wl_soc_read(0x01e40304, &v) || v == ~0u ||
+		    wl_soc_write(0x01e40304, v | 0x10, true)) { return 1; }
+		wl_sleep(5);
+		if (wl_soc_write(0x01e08228, ~0u, false)) { return 1; } /* W1C */
+	}
+	if (wl_pre == 1 || wl_pre == 3) {
+		if (wl_soc_read(0x01f8031c, &v) || v == ~0u) { return 1; }
+		unsigned mask = wl_pre == 1 ? 5 : 4; /* CNSS vs ath12k */
+		printf("FUXI WLAN: M6l QFPROM before %#x clear mask %#x\n", v, mask);
+		if (wl_soc_write(0x01f8031c, v & ~mask, true)) { return 1; }
+	}
+	if (wl_pre == 3) {
+		const unsigned clear[] = {0x3c, 0x44, 0x70, 0x78};
+		for (unsigned i = 0; i < 4; i++) {
+			wl_mwr(wl_bhie + clear[i], 0);
+			if (wl_mrd(wl_bhie + clear[i]) || fw_faults) { return 1; }
+		}
+	}
+	if (wl_pre == 2 || wl_pre == 3) {
+		if (wl_soc_read(0x01f80500, &cookie) || cookie == ~0u ||
+		    wl_soc_read(0x01f80504, &v) || v == ~0u) { return 1; }
+		printf("FUXI WLAN: M6l warm cookie %#x entry %#x\n", cookie, v);
+		wl_sleep(10);
+		if (wl_soc_write(0x01f80504, 0, true)) { return 1; }
+		wl_sleep(10);
+		if (wl_soc_read(0x01f8060c, &cause) || cause == ~0u) { return 1; } /* read-clear */
+		printf("FUXI WLAN: M6l warm entry cleared reset cause %#x (read-clear)\n", cause);
+	}
+	if (wl_pre == 3) {
+		v = wl_mrd(0x3008);
+		if (v == ~0u || fw_faults) { return 1; }
+		wl_mwr(0x3008, v | 1); wl_sleep(10);
+		/* Always try to release our reset even if the intervening read faults. */
+		if (wl_contain_wr(WL_BAR0 + 0x3008, v & ~1u)) { return 1; }
+		wl_sleep(10);
+		if (wl_mrd(0x3008) == ~0u || (wl_mrd(0x3008) & 1) || fw_faults) { return 1; }
+		wl_mwr(0x38, 2); wl_sleep(10);
+		for (unsigned i = 0; i < 40 && (wl_mrd(0x38) & 2) && !fw_faults; i++) { wl_sleep(25); }
+		if (fw_faults || (wl_mrd(0x38) & 2) || (wl_mrd(0x48) & 0xff04) ||
+		    wl_mrd(0x28) != wl_bhi || wl_mrd(0x2c) != wl_bhie) { return 1; }
+	}
+	if (fw_faults || wl_mrd(wl_bhi + 0x28) != 0 || (wl_prd(WL_EPCFG + 4) & 4)) { return 1; }
+	printf("FUXI WLAN: M6l pre-BHI %s complete BME off EE PBL\n", wl_pre_names[wl_pre]);
+	return 0;
 }
 
 /* CNSS KIWI bootloader diagnostics only, <=27 words, no arbitrary SRAM dump.
@@ -1506,8 +1626,8 @@ wl_pt_pa(unsigned table)
 static vm_offset_t
 wl_owned_alias(uint64_t pa, unsigned bytes, bool tables_only)
 {
-	struct wl_dma *bufs[] = { &wl_tables, &wl_image, &wl_vectors, &wl_contexts };
-	for (unsigned i = 0; i < (tables_only ? 1u : 4u); i++) {
+	struct wl_dma *bufs[] = { &wl_tables, &wl_image, &wl_vectors, &wl_contexts, &wl_rddm, &wl_rxvectors };
+	for (unsigned i = 0; i < (tables_only ? 1u : 6u); i++) {
 		struct wl_dma *d = bufs[i];
 		for (vm_size_t off = 0; d->va && off < d->size; off += PAGE_SIZE) {
 			uint64_t base = wl_phys(d->va + off);
@@ -1530,7 +1650,8 @@ static int
 wl_bhi_mapping_check(void)
 {
 	const uint64_t mask = 0x0000000ffffff000ull, seed = 0xcbf29ce484222325ull;
-	uint64_t source = wl_hash_bytes(seed, (const uint8_t *)wl_image.va, WL_CHUNK), mapped = seed;
+	unsigned bytes = wl_bhi_bytes();
+	uint64_t source = wl_hash_bytes(seed, (const uint8_t *)wl_image.va, bytes), mapped = seed;
 	/* flush_dcache64 is clean+invalidate to PoC on this ARM64 target.
 	 * Force the physical-page hash to reload after the source hash. */
 	wl_dma_clean(&wl_image); wl_dma_clean(&wl_tables);
@@ -1538,7 +1659,7 @@ wl_bhi_mapping_check(void)
 	unsigned pages = 0, bad = 0;
 	/* Walk the live CB TTBR, not fixed virtual indexes used by the builder. */
 	if ((root & mask) != wl_pt_pa(0) || fw_faults) { bad = 1; }
-	for (unsigned off = 0; !bad && off < WL_CHUNK; off += 4096) {
+	for (unsigned off = 0; !bad && off < bytes; off += 4096) {
 		uint64_t iova = wl_image.iova + off, table = root & mask, leaf = 0;
 		const unsigned shifts[] = {30, 21, 12};
 		for (unsigned level = 0; level < 3; level++) {
@@ -1557,17 +1678,17 @@ wl_bhi_mapping_check(void)
 		if (wl_probe == WL_PROBE_UNMAPPED) { pages++; continue; }
 		vm_offset_t alias = wl_owned_alias(leaf, 4096, false);
 		if (!alias) { bad = 4; break; }
-		mapped = wl_hash_bytes(mapped, (const uint8_t *)alias, 4096); pages++;
+		mapped = wl_hash_bytes(mapped, (const uint8_t *)alias, MIN(4096, bytes - off)); pages++;
 		if (leaf != wl_phys(wl_image.va + off)) { bad = 5; }
 	}
-	int e = bad || pages != WL_CHUNK / 4096 || (wl_probe != WL_PROBE_UNMAPPED && source != mapped);
+	int e = bad || pages != (bytes + 4095) / 4096 || (wl_probe != WL_PROBE_UNMAPPED && source != mapped);
 	if (wl_probe == WL_PROBE_UNMAPPED) {
 		printf("FUXI WLAN: M6k hole IOVA %#llx+%#x invalid leaves %u/128 %s reason %u (live CB walk)\n",
 		    wl_image.iova, WL_CHUNK, pages, e ? "FAIL" : "VERIFIED", bad);
 		return e;
 	}
-	printf("FUXI WLAN: M6f CB %u BHI IOVA %#llx+%#x FNV1a64 source %016llx walk %016llx pages %u/128 %s reason %u (CPU view)\n",
-	    wl_cb, wl_image.iova, WL_CHUNK, source, mapped, pages, e ? "FAIL" : "MATCH", bad);
+	printf("FUXI WLAN: M6f CB %u BHI IOVA %#llx+%#x FNV1a64 source %016llx walk %016llx pages %u/%u %s reason %u (CPU view)\n",
+	    wl_cb, wl_image.iova, bytes, source, mapped, pages, (bytes + 4095) / 4096, e ? "FAIL" : "MATCH", bad);
 	return e;
 }
 
@@ -1583,8 +1704,8 @@ wl_smmu_enable(void)
 	for (unsigned i = 0; i < l3_count; i++) {
 		l2[((wl_iova_base >> 21) & 511) + i] = wl_pt_pa(2 + i) | 3;
 	}
-	struct wl_dma *bufs[] = { &wl_image, &wl_vectors, &wl_contexts };
-	for (unsigned i = 0; i < 3; i++) {
+	struct wl_dma *bufs[] = { &wl_image, &wl_vectors, &wl_contexts, &wl_rddm, &wl_rxvectors };
+	for (unsigned i = 0; i < 5; i++) {
 		struct wl_dma *d = bufs[i];
 		if (d == &wl_image && wl_probe == WL_PROBE_UNMAPPED) { continue; }
 		for (vm_size_t off = 0; off < d->size; off += 4096) {
@@ -1643,7 +1764,8 @@ wl_smmu_enable(void)
 	    wl_smmu_wr("GR0_SMR", WL_SMMU + 0x800 + 4 * wl_slot, 0x80001401, ~0u)) { return 5; }
 	wl_enabled = true;
 	printf("FUXI WLAN: SMMU owned stage1 SMR %u CB %u TTBR %#llx IOVA %#llx-%#llx readback verified\n",
-	    wl_slot, wl_cb, wl_pt_pa(0), wl_iova_base, wl_contexts.iova + wl_contexts.size - 1);
+	    wl_slot, wl_cb, wl_pt_pa(0), wl_iova_base,
+	    wl_vec == 2 ? wl_rxvectors.iova + wl_rxvectors.size - 1 : wl_contexts.iova + wl_contexts.size - 1);
 	printf("FUXI WLAN: M6g CB %u coherent walk TCR %#x IRGN0=1 ORGN0=1 SH0=3; DMA MAIR0 %#x SH=2; SCTLR %#x HUPCF=1 CFCFG=0 CFRE=0 CFIE=0\n",
 	    wl_cb, wl_prd(cb + 0x30), wl_prd(cb + 0x38), wl_prd(cb));
 	printf("FUXI WLAN: DMA self-test: no standalone BHI host-write cookie; step 21/22 BHI transfer + CB faults is first endpoint proof\n");
@@ -1859,7 +1981,7 @@ wl_probe_observe(void)
 	uint32_t sid = wl_prd(wl_gr1 + 0x400 + 4 * wl_cb) & 0xffff;
 	const char *result = "no-CB-translation-fault";
 	if (fsr & 2) {
-		result = far >= wl_image.iova && far - wl_image.iova < WL_CHUNK && sid == 0x1401 ?
+		result = far >= wl_image.iova && far - wl_image.iova < wl_bhi_bytes() && sid == 0x1401 ?
 		    "target-translation-fault" : "other-translation-fault";
 	}
 	if (fw_faults || (flags & WL_DIAG_TRANSPORT)) { result = "transport-inconclusive"; }
@@ -1867,6 +1989,12 @@ wl_probe_observe(void)
 	    wl_probe_names[wl_probe], result, fsr, far, sid);
 	wl_host_diag("probe-completion");
 	if (!fw_faults && !(flags & WL_DIAG_TRANSPORT)) { wl_boot_logs(); }
+	if (wl_variant_active()) {
+		printf("FUXI WLAN: M6l result pre=%s bhi=%s vec=%s EE %#x ERRCODE %#x observation 5000 ms; stop/contain\n",
+		    wl_pre_names[wl_pre], wl_full ? "full" : "off", wl_vec_names[wl_vec],
+		    wl_mrd(wl_bhi + 0x28), wl_mrd(wl_bhi + 0x30));
+		return 0x6c;
+	}
 	return 0x6b; /* deliberate diagnostic stop, including unexpected BHI success */
 }
 
@@ -1875,6 +2003,7 @@ wl5_step(unsigned s)
 {
 	switch (s) {
 	case 17:
+		if (wl_variant_invalid) { return 0x6c; }
 		if (wl_probe == WL_PROBE_INVALID) { return 0x6b; }
 		/* M4 validated BHIOFF; independently validate all M5 block extents. */
 		wl_bhi = wl4_report[25]; wl_bhie = wl4_report[26];
@@ -1893,7 +2022,7 @@ wl5_step(unsigned s)
 		wl_fw_path = ((hw >> 8) & 15) == 2 ?
 		    "/usr/local/share/fuxi/wlan/amss20.bin" : "/usr/local/share/fuxi/wlan/amss.bin";
 		printf("FUXI WLAN: TCSR_SOC_HW_VERSION %#x major %u minor %u firmware %s (CNSS kiwi major-version rule)\n", hw, (hw >> 8) & 15, hw & 255, wl_fw_path);
-		return 0;
+		return wl_pre_bhi() ? 0x6c : 0;
 	}
 	case 19: return wl_read_firmware();
 	case 20: {
@@ -1918,6 +2047,16 @@ wl5_step(unsigned s)
 		c->base = c->rp = c->wp = wl_contexts.iova + WL_CR; c->len = 2048;
 		wl_dma_clean(&wl_contexts); wl_dma_clean(&wl_vectors);
 		wl5_report[19] = n * sizeof(struct wl_vector);
+		if (wl_vec == 2) {
+			unsigned rxn = WL_RDDM_SIZE / WL_CHUNK;
+			if (wl_dma_alloc(&wl_rddm, WL_RDDM_SIZE) ||
+			    wl_dma_alloc(&wl_rxvectors, rxn * sizeof(struct wl_vector))) { return 2; }
+			struct wl_vector *rx = (struct wl_vector *)wl_rxvectors.va;
+			for (unsigned i = 0; i < rxn; i++) {
+				rx[i].addr = wl_rddm.iova + i * WL_CHUNK; rx[i].size = WL_CHUNK;
+			}
+			wl_dma_clean(&wl_rddm); wl_dma_clean(&wl_rxvectors);
+		}
 		wl5_report[20] = (uint32_t)wl_vectors.iova; wl5_report[21] = (uint32_t)wl_contexts.iova;
 		printf("FUXI WLAN: prepared %u vectors (%u bytes), 44-byte contexts, channels disabled; bus master off\n", n, wl5_report[19]);
 		return fw_faults ? 3 : wl_smmu_enable();
@@ -1943,10 +2082,33 @@ wl5_step(unsigned s)
 		for (unsigned i = 0; i < 4; i++) {
 			if (wl_mrd(wl_bhie + clear[i]) || fw_faults) { return 9; }
 		}
-		printf("FUXI WLAN: M6f BHIe TX/RX doorbells/status cleared; no RX buffers\n");
+		printf("FUXI WLAN: M6f BHIe TX/RX doorbells/status cleared; %s\n",
+		    wl_vec == 2 ? "RX buffers prepared" : "no RX buffers");
+		if (wl_vec) {
+			bool rx = wl_vec == 2;
+			uint32_t off = rx ? 0x60 : 0x2c;
+			uint64_t addr = rx ? wl_rxvectors.iova : wl_vectors.iova;
+			unsigned bytes = rx ? (WL_RDDM_SIZE / WL_CHUNK) * sizeof(struct wl_vector) : wl5_report[19];
+			if (rx) {
+				/* Clear complete RX setup, not only DB/status, as MHI prepare does. */
+				for (unsigned o = 0x60; o <= 0x78; o += 4) { wl_mwr(wl_bhie + o, 0); }
+			}
+			wl_mwr64(wl_bhie + off, addr); wl_mwr(wl_bhie + off + 8, bytes);
+			if (wl_mrd(wl_bhie + off) != (uint32_t)addr ||
+			    wl_mrd(wl_bhie + off + 4) != (uint32_t)(addr >> 32) ||
+			    wl_mrd(wl_bhie + off + 8) != bytes || fw_faults) { return 12; }
+			if (rx) {
+				uint32_t seq; read_random(&seq, sizeof(seq));
+				seq &= WL_SEQ_MASK; if (!seq) { seq = 1; }
+				wl_mwr(wl_bhie + 0x70, seq);
+				if (wl_mrd(wl_bhie + 0x70) != seq || fw_faults) { return 12; }
+			}
+			printf("FUXI WLAN: M6l BHIe %s staged bytes %u before BHI; %s\n",
+			    rx ? "RDDM RX" : "AMSS TX", bytes, rx ? "RX doorbell armed; sink only" : "TX doorbell remains zero");
+		}
 		wl_probe_pattern();
 		wl_mwr(wl_bhi + 0x20, 0); wl_mwr(wl_bhi + 0x2c, 0);
-		wl_mwr64(wl_bhi + 8, wl_image.iova); wl_mwr(wl_bhi + 0x10, WL_CHUNK);
+		wl_mwr64(wl_bhi + 8, wl_image.iova); wl_mwr(wl_bhi + 0x10, wl_bhi_bytes());
 		wl_dma_clean(&wl_image);
 		if (wl_bhi_mapping_check()) { return 8; }
 		/* Flush posted setup writes and verify the exact Linux BHI tuple before
@@ -1958,7 +2120,7 @@ wl5_step(unsigned s)
 		    hi, lo, size, ivec, status, ee);
 		if (fw_faults) { return 1; }
 		if (hi != (uint32_t)(wl_image.iova >> 32) || lo != (uint32_t)wl_image.iova ||
-		    size != WL_CHUNK || ivec || status || ee != 0 || (wl_image.iova & 4095)) { return 7; }
+		    size != wl_bhi_bytes() || ivec || status || ee != 0 || (wl_image.iova & 4095)) { return 7; }
 		/* Only now, immediately before the first image doorbell, allow DMA.
 		 * Disable legacy INTx; MSI/MSI-X remain unconfigured/disabled. */
 		wl_pwr(WL_EPCFG + 4, (wl_prd(WL_EPCFG + 4) & 0xffff) | 0x404);
@@ -1978,11 +2140,11 @@ wl5_step(unsigned s)
 		    perst_ns / 1000000ull, link_ns / 1000000ull);
 		wl_probe_fired = true;
 		wl_mwr(wl_bhi + 0x18, wl_seq);
-		printf("FUXI WLAN: M6f BHI doorbell random seq %#x mask %#x bytes %#x bus master on\n", wl_seq, WL_SEQ_MASK, WL_CHUNK);
+		printf("FUXI WLAN: M6f BHI doorbell random seq %#x mask %#x bytes %#x bus master on\n", wl_seq, WL_SEQ_MASK, wl_bhi_bytes());
 		return fw_faults ? 3 : 0;
 	}
 	case 22: {
-		if (wl_probe != WL_PROBE_OFF) { return wl_probe_observe(); }
+		if (wl_probe != WL_PROBE_OFF || wl_variant_active()) { return wl_probe_observe(); }
 		int e = wl_poll(0);
 		uint32_t first = wl_bhi_diag(0);
 		wl5_report[124] = wl5_report[67]; wl5_report[125] = wl5_report[68];
@@ -2084,6 +2246,7 @@ wl5_abort(unsigned step)
 	 * unproven. This is a bounded leak on an MMIO fault, never a panic/UAF. */
 	if (!bm_bad && !perst_bad && !wl_smmu_undo()) {
 		wl_dma_free(&wl_tables);
+		wl_dma_free(&wl_rxvectors); wl_dma_free(&wl_rddm);
 		wl_dma_free(&wl_contexts); wl_dma_free(&wl_vectors); wl_dma_free(&wl_image);
 		printf("FUXI WLAN: abort buffers freed\n");
 	} else {

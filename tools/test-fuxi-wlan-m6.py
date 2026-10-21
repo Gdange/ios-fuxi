@@ -78,7 +78,7 @@ static int old_iova_arg;
 static bool old_iova_present;
 static int clock_arg, iboff_arg;
 static int aspm_arg;
-static const char *probe_arg;
+static const char *probe_arg, *pre_arg, *bhi_arg, *vec_arg;
 static unsigned cache_attrs[32][1024];
 static bool cache_drop;
 static unsigned clock_delays;
@@ -89,6 +89,13 @@ static void fw_delay(unsigned us) { clock_delays+=us; }
 static bool PE_parse_boot_argn(const char *name, void *out, int size) {
     if(!strcmp(name,"fuxiwlanprobe")) {
         if(probe_arg) { strncpy(out,probe_arg,size); return true; }
+        return false;
+    }
+    const char *arg = !strcmp(name,"fuxiwlanpre") ? pre_arg :
+                      !strcmp(name,"fuxiwlanbhi") ? bhi_arg :
+                      !strcmp(name,"fuxiwlanvec") ? vec_arg : NULL;
+    if(!strcmp(name,"fuxiwlanpre") || !strcmp(name,"fuxiwlanbhi") || !strcmp(name,"fuxiwlanvec")) {
+        if(arg) { strncpy(out,arg,size); return true; }
         return false;
     }
     assert(size==sizeof(int));
@@ -151,6 +158,10 @@ static void raw_pwr(uint64_t pa, uint32_t v) {
     if (fail_perst && pa==TS_TLMM+0x1000*94+4) return;
     if (mismatch && pa==mismatch_pa) return;
     if (pa>=0x15080000ull && pa<0x15100000ull && (pa&0xfff)==0x58) {setreg(pa,wl_prd(pa)&~v); return;}
+    if (pa>=WL_BAR0+0x80000 && pa<WL_BAR0+0x100000) {
+        uint32_t off=((wl_prd(WL_BAR0+0x310c)&63)<<19)+(pa-WL_BAR0-0x80000);
+        record('S',off,v); setreg(0x200000000ull+off,v);
+    }
     setreg(pa,v);
     if (inject_fault && pa==WL_BAR0+0x118) setreg(0x15081058ull,2);
     if (pa==WL_BAR0+0x38 && v==2) setreg(pa,0);
@@ -248,6 +259,8 @@ static void init(void) {
     memset(&wl_image,0,sizeof(wl_image)); memset(&wl_vectors,0,sizeof(wl_vectors));
     memset(&wl_tables,0,sizeof(wl_tables)); wl_owned=wl_enabled=wl_route_owned=wl_route_installed=false;
     old_iova_arg=0; old_iova_present=false; probe_arg=NULL; aspm_arg=0;
+    pre_arg=bhi_arg=vec_arg=NULL;
+    memset(&wl_rddm,0,sizeof(wl_rddm)); memset(&wl_rxvectors,0,sizeof(wl_rxvectors));
     cache_drop=false; memset(cache_attrs,0,sizeof(cache_attrs)); wl_iova_configure();
     clock_arg=iboff_arg=0; clock_delays=nreads=0; track_reads=false;
     memset(&wl_contexts,0,sizeof(wl_contexts)); memset(wl5_report,0,sizeof(wl5_report));
@@ -264,6 +277,7 @@ static void init(void) {
     setreg(WL_DBI+0x80,1u<<29); setreg(WL_DBI+0xf28,0x400); setreg(WL_PARF+0x1b0,0x111);
     setreg(WL_EPCFG,0x110717cb); setreg(WL_EPCFG+0x10,WL_BAR0|4);
     setreg(WL_BAR0,0x100);
+    setreg(WL_BAR0+0x28,0x100); setreg(WL_BAR0+0x2c,0x224);
     setreg(WL_BAR0+0x80000,0x201); setreg(WL_BAR0+0x10,0x800080);
     setreg(WL_BAR0+0x268,0xcab04cf5); /* undefined before first BHIe DB */
     setreg(WL_BAR0+0x20,0x700); setreg(WL_EPCFG+4,0x100002);
