@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Native Mac ASan/UBSan frontend + actual smoke control-flow tests with CPU model.
+"""Linux runtime-model tests; native Mac frontend/smoke tests with CPU model.
 
 Synthetic 528-byte base/root/registry ID and CPU transfers; no iOS discovery or
 GPU execution is qualified by these tests. Production backend tested separately.
@@ -11,12 +11,27 @@ import tempfile
 ROOT=Path(__file__).resolve().parents[1]
 
 def main():
-    if os.uname().sysname!='Darwin':raise SystemExit('requires Mac Foundation/Metal')
     with tempfile.TemporaryDirectory() as tmp:
         d=Path(tmp);conf=d/'smoke.conf'
+        compiler=['xcrun','clang++'] if os.uname().sysname=='Darwin' else ['clang++']
+        subprocess.run([*compiler,'-std=c++17','-O1','-g','-Wall','-Wextra','-Werror',
+                        '-fsanitize=address,undefined','-pthread',
+                        str(ROOT/'tools/fuxi-metal/ConstantHooksTests.cpp'),'-o',str(d/'constant-hooks')],check=True)
+        subprocess.run([str(d/'constant-hooks')],check=True,timeout=15)
+        if os.uname().sysname!='Darwin':
+            print('SKIP: native Objective-C frontend/smoke tests require Mac Foundation/Metal')
+            return
         flags=['-O1','-g','-Wall','-Wextra','-Werror','-fno-objc-arc','-fblocks','-fsanitize=address,undefined']
         frameworks=['-framework','Foundation','-framework','Metal','-framework','IOSurface']
         def call(command):subprocess.run(command,check=True)
+        call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/ConstantFrontendTests.mm'),*frameworks,'-o',str(d/'constant-frontend')])
+        constants=subprocess.run([str(d/'constant-frontend')],env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0'),text=True,capture_output=True,check=True,timeout=15)
+        failures=[line for line in constants.stderr.splitlines() if 'constants snapshot FAIL' in line]
+        assert len(failures)==8,constants.stderr
+        assert all(len(line)<4096 and 'chain=' in line and 'ctor_us=' in line and 'gate_us=' in line and 'install_us=' in line
+                   and 'record=' in line and 'setConstantValue:type:atIndex:=' in line and 'imp=actual/hook/original' in line for line in failures),constants.stderr
+        assert 'AddressSanitizer' not in constants.stderr and 'runtime error:' not in constants.stderr,constants.stderr
+        print(constants.stdout,end='')
         call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/FrontendTests.mm'),*frameworks,'-o',str(d/'frontend')])
         env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0')
         call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/PipelineFrontendTests.mm'),*frameworks,'-o',str(d/'pipeline-frontend')])

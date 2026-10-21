@@ -8,6 +8,9 @@
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
 #include <mutex>
+#include <atomic>
+#include <chrono>
+#include "ConstantHooks.hpp"
 #include <cmath>
 #include <cfloat>
 #include <fcntl.h>
@@ -27,6 +30,8 @@ static char clientProcess[64]="unknown";
 #ifndef FUXI_MTL_READ_CLIENTS
 #define FUXI_MTL_READ_CLIENTS fuxi::readClients
 #endif
+static uint64_t observationMicros() {return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();}
+static std::atomic<uint64_t> clientCheckUs{0};
 static void checkClient() {
  static std::once_flag once;
  std::call_once(once,[]{
@@ -37,6 +42,7 @@ static void checkClient() {
    if(fuxi::clientName(name)) {memcpy(clientProcess,name,strlen(name)+1);identified=true;}
   }
   clientMode=identified?FUXI_MTL_READ_CLIENTS(FUXI_MTL_CLIENTS_CONF,clientProcess):fuxi::ClientMode::deny;
+  clientCheckUs=observationMicros();
   fprintf(stderr,"FUXI MTL: gate %s %s\n",clientMode==fuxi::ClientMode::deny?"deny":"allow",clientProcess);
   if(clientMode==fuxi::ClientMode::census)fprintf(stderr,"FUXI MTL: census enabled %s (no GPU)\n",clientProcess);
  });
@@ -119,53 +125,138 @@ static id metalError(NSError **error,const char *why) {
  fprintf(stderr,"FUXI MTL: pipeline/library FAIL %s\n",why);
  if(error)*error=[NSError errorWithDomain:@"org.fuxi.metal" code:1 userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithUTF8String:why]}];return nil;
 }
-// Track public setter calls after plugin load. Never inspect Apple's private object layout.
-// Objects created before these hooks, unobserved subclasses, and unsupported types fail closed.
-static char constantsKey;
+// Track only public calls. Allocation provenance and method-coverage epochs
+// prevent pre-hook objects or missed overrides from acquiring a trusted snapshot.
+static char constantsKey,constantsAllocationKey;
+static std::atomic<uint64_t> constantsConstructorUs{0},constantsInstallUs{0};
+static fuxi::ClientMode constantsConstructorMode=fuxi::ClientMode::deny;
+static IMP makeConstantHook(fuxi::ConstantMethod,IMP,SEL);
+#ifndef FUXI_MTL_CONSTANT_CLASS
+#define FUXI_MTL_CONSTANT_CLASS MTLFunctionConstantValues
+#endif
+static fuxi::ConstantHooks &constantHooks() {
+ // Function-local state is safe even when the dyld constructor precedes C++
+ // dynamic initializers. Each method gets its own captured original IMP, so
+ // subclass overrides calling super cannot recurse through a global original.
+ // The installed IMPs can run during process teardown; keep their registry alive.
+ static auto *hooks=new fuxi::ConstantHooks([FUXI_MTL_CONSTANT_CLASS class],makeConstantHook);return *hooks;
+}
 static size_t constantSize(MTLDataType t) {
  switch(t){case MTLDataTypeBool:case MTLDataTypeChar:case MTLDataTypeUChar:return 1;
  case MTLDataTypeHalf:case MTLDataTypeShort:case MTLDataTypeUShort:return 2;
  case MTLDataTypeFloat:case MTLDataTypeInt:case MTLDataTypeUInt:return 4;default:return 0;}
 }
-static id (*constantInit)(id,SEL);static id (*constantCopy)(id,SEL,NSZone *);
-static void (*constantIndex)(id,SEL,const void *,MTLDataType,NSUInteger);
-static void (*constantName)(id,SEL,const void *,MTLDataType,NSString *);
-static void (*constantRange)(id,SEL,const void *,MTLDataType,NSRange);
-static void (*constantReset)(id,SEL);
-static id initConstants(id self,SEL sel) {id result=constantInit(self,sel);if(result)objc_setAssociatedObject(result,&constantsKey,@{},OBJC_ASSOCIATION_COPY_NONATOMIC);return result;}
+static bool constantsObserved(id self) {
+ uint64_t stamp=constantHooks().stamp(object_getClass(self));
+ id allocation=objc_getAssociatedObject(self,&constantsAllocationKey);
+ return stamp && [allocation isKindOfClass:[NSNumber class]] && [allocation unsignedLongLongValue]==stamp;
+}
 static void rememberConstant(id self,const void *value,MTLDataType type,id key) {
  id old=objc_getAssociatedObject(self,&constantsKey);size_t size=constantSize(type);
- if(![old isKindOfClass:[NSDictionary class]] || !value || !size || !key || ([old count]>=32 && !old[key])) {objc_setAssociatedObject(self,&constantsKey,@NO,OBJC_ASSOCIATION_RETAIN_NONATOMIC);return;}
+ if(!constantsObserved(self) || ![old isKindOfClass:[NSDictionary class]] || !value || !size || !key || ([old count]>=32 && !old[key])) {objc_setAssociatedObject(self,&constantsKey,@NO,OBJC_ASSOCIATION_RETAIN_NONATOMIC);return;}
  NSMutableDictionary *next=[old mutableCopy];next[key]=@[@(type),[NSData dataWithBytes:value length:size]];
  objc_setAssociatedObject(self,&constantsKey,next,OBJC_ASSOCIATION_COPY_NONATOMIC);[next release];
 }
-static void indexConstant(id self,SEL sel,const void *value,MTLDataType type,NSUInteger index) {@synchronized(self){constantIndex(self,sel,value,type,index);rememberConstant(self,value,type,index<=65535?@(index):nil);}}
-static void nameConstant(id self,SEL sel,const void *value,MTLDataType type,NSString *name) {@synchronized(self){constantName(self,sel,value,type,name);const char *utf8=name.UTF8String;size_t n=[name lengthOfBytesUsingEncoding:NSUTF8StringEncoding];rememberConstant(self,value,type,utf8 && n && n<128 && strlen(utf8)==n?name:nil);}}
-static void rangeConstants(id self,SEL sel,const void *value,MTLDataType type,NSRange range) {@synchronized(self){constantRange(self,sel,value,type,range);size_t size=constantSize(type);
- if(!size || range.length>32 || range.location>65535 || range.length>65536-range.location || !value){objc_setAssociatedObject(self,&constantsKey,@NO,OBJC_ASSOCIATION_RETAIN_NONATOMIC);return;}
- for(NSUInteger i=0;i<range.length;++i)rememberConstant(self,(const uint8_t *)value+i*size,type,@(range.location+i));}}
-static void resetConstants(id self,SEL sel) {@synchronized(self){constantReset(self,sel);objc_setAssociatedObject(self,&constantsKey,@{},OBJC_ASSOCIATION_COPY_NONATOMIC);}}
-static id copyConstants(id self,SEL sel,NSZone *zone) {@synchronized(self){id result=constantCopy(self,sel,zone);objc_setAssociatedObject(result,&constantsKey,objc_getAssociatedObject(self,&constantsKey),OBJC_ASSOCIATION_COPY_NONATOMIC);return result;}}
-__attribute__((constructor)) static void observeConstants() {
+static id allocatedConstants(id result) {
+ if(result) {constantHooks().install(object_getClass(result));@synchronized(result){
+  if(!objc_getAssociatedObject(result,&constantsAllocationKey)) {
+   uint64_t stamp=constantHooks().stamp(object_getClass(result));
+   if(stamp) {objc_setAssociatedObject(result,&constantsAllocationKey,@(stamp),OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(result,&constantsKey,@{},OBJC_ASSOCIATION_COPY_NONATOMIC);}
+  }
+ }}return result;
+}
+static IMP makeConstantHook(fuxi::ConstantMethod kind,IMP original,SEL sel) {
+ switch(kind) {
+ case fuxi::ConstantInit:return imp_implementationWithBlock(^id(id self){return ((id(*)(id,SEL))original)(self,sel);});
+ case fuxi::ConstantCopy:return imp_implementationWithBlock(^id(id self,NSZone *zone){@synchronized(self){
+  bool observed=constantsObserved(self);id records=[objc_getAssociatedObject(self,&constantsKey) retain];
+  id result=((id(*)(id,SEL,NSZone *))original)(self,sel,zone);
+  if(result && result!=self) {constantHooks().install(object_getClass(result));
+   uint64_t stamp=constantHooks().stamp(object_getClass(result));
+   objc_setAssociatedObject(result,&constantsAllocationKey,observed && stamp?@(stamp):nil,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+   objc_setAssociatedObject(result,&constantsKey,observed?records:nil,OBJC_ASSOCIATION_COPY_NONATOMIC);}
+  [records release];return result;
+ }});
+ case fuxi::ConstantIndex:return imp_implementationWithBlock(^(id self,const void *value,MTLDataType type,NSUInteger index){@synchronized(self){
+  ((void(*)(id,SEL,const void *,MTLDataType,NSUInteger))original)(self,sel,value,type,index);
+  rememberConstant(self,value,type,index<=65535?@(index):nil);
+ }});
+ case fuxi::ConstantName:return imp_implementationWithBlock(^(id self,const void *value,MTLDataType type,NSString *name){@synchronized(self){
+  ((void(*)(id,SEL,const void *,MTLDataType,NSString *))original)(self,sel,value,type,name);
+  const char *utf8=name.UTF8String;size_t n=[name lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+  rememberConstant(self,value,type,utf8 && n && n<128 && strlen(utf8)==n?name:nil);
+ }});
+ case fuxi::ConstantRange:return imp_implementationWithBlock(^(id self,const void *value,MTLDataType type,NSRange range){@synchronized(self){
+  ((void(*)(id,SEL,const void *,MTLDataType,NSRange))original)(self,sel,value,type,range);size_t size=constantSize(type);
+  if(!constantsObserved(self) || !size || range.length>32 || range.location>65535 || range.length>65536-range.location || !value){objc_setAssociatedObject(self,&constantsKey,@NO,OBJC_ASSOCIATION_RETAIN_NONATOMIC);return;}
+  for(NSUInteger i=0;i<range.length;++i)rememberConstant(self,(const uint8_t *)value+i*size,type,@(range.location+i));
+ }});
+ case fuxi::ConstantReset:return imp_implementationWithBlock(^(id self){@synchronized(self){
+  ((void(*)(id,SEL))original)(self,sel);
+  objc_setAssociatedObject(self,&constantsKey,constantsObserved(self)?@{}:nil,OBJC_ASSOCIATION_COPY_NONATOMIC);
+ }});
+ case fuxi::ConstantAlloc:return imp_implementationWithBlock(^id(id self,NSZone *zone){
+  // Inherited factories cover late-registered subclasses before init/setters.
+  constantHooks().install((Class)self);
+  return allocatedConstants(((id(*)(id,SEL,NSZone *))original)(self,sel,zone));
+ });
+ case fuxi::ConstantNew:return imp_implementationWithBlock(^id(id self){
+  constantHooks().install((Class)self);return ((id(*)(id,SEL))original)(self,sel);
+ });
+ case fuxi::ConstantPlainAlloc:return imp_implementationWithBlock(^id(id self){
+  constantHooks().install((Class)self);return allocatedConstants(((id(*)(id,SEL))original)(self,sel));
+ });
+ case fuxi::ConstantMethodCount:break;
+ }return nullptr;
+}
+static void refreshConstantHooks() {
 #ifndef FUXI_MTL_FRONTEND_TEST
- checkClient();if(clientMode!=fuxi::ClientMode::allow)return;
+ if(clientMode!=fuxi::ClientMode::allow)return;
 #endif
- Class c=[MTLFunctionConstantValues class];
-#define HOOK(name,original,hook) do {Method m=class_getInstanceMethod(c,@selector(name));if(m){original=(decltype(original))method_getImplementation(m);class_replaceMethod(c,@selector(name),(IMP)hook,method_getTypeEncoding(m));}}while(0)
- HOOK(init,constantInit,initConstants);HOOK(copyWithZone:,constantCopy,copyConstants);
- HOOK(setConstantValue:type:atIndex:,constantIndex,indexConstant);HOOK(setConstantValue:type:withName:,constantName,nameConstant);
- HOOK(setConstantValues:type:withRange:,constantRange,rangeConstants);HOOK(reset,constantReset,resetConstants);
-#undef HOOK
+ constantHooks().refresh();uint64_t unset=0;
+ constantsInstallUs.compare_exchange_strong(unset,observationMicros());
+}
+__attribute__((constructor)) static void observeConstants() {
+ constantsConstructorUs=observationMicros();
+#ifndef FUXI_MTL_FRONTEND_TEST
+ checkClient();
+#endif
+ constantsConstructorMode=clientMode;refreshConstantHooks();
+ fprintf(stderr,"FUXI MTL: constants observe mode=%s ctor_us=%llu gate_us=%llu install_us=%llu hooks=%zu\n",
+  clientMode==fuxi::ClientMode::allow?"allow":clientMode==fuxi::ClientMode::census?"census":"deny",
+  (unsigned long long)constantsConstructorUs.load(),(unsigned long long)clientCheckUs.load(),(unsigned long long)constantsInstallUs.load(),constantsInstallUs.load()?constantHooks().count():0);
+}
+static NSData *constantFailure(id values,const char *reason) {
+ // Eight lines/process maximum; no private layout, constant bytes or paths.
+ static std::atomic<unsigned> failures{0};if(failures.fetch_add(1)>=8)return nil;
+ fuxi::ConstantDiagnostic diagnostic;
+ Class cls=object_getClass(values);id record=objc_getAssociatedObject(values,&constantsKey);
+ diagnostic.append("FUXI MTL: constants snapshot FAIL reason=%s class=%.96s chain=",reason,cls?class_getName(cls):"nil");
+ Class c=cls;unsigned depth=0;for(;c && depth<8;c=class_getSuperclass(c),++depth)diagnostic.append("%s%.80s",depth?">":"",class_getName(c));if(c)diagnostic.append(">...");
+ diagnostic.append(" ctor_us=%llu gate_us=%llu install_us=%llu ctor_mode=%u mode=%u hooks=%zu record=%.80s/count=%ld allocation=%llu coverage=%llu",
+  (unsigned long long)constantsConstructorUs.load(),(unsigned long long)clientCheckUs.load(),(unsigned long long)constantsInstallUs.load(),
+  (unsigned)constantsConstructorMode,(unsigned)clientMode,constantHooks().count(),record?object_getClassName(record):"nil",
+  [record isKindOfClass:[NSDictionary class]]?(long)[record count]:-1L,
+  (unsigned long long)[objc_getAssociatedObject(values,&constantsAllocationKey) unsignedLongLongValue],(unsigned long long)constantHooks().stamp(cls));
+ for(unsigned i=0;i<fuxi::ConstantMethodCount;++i) {
+  auto h=constantHooks().resolved(cls,(fuxi::ConstantMethod)i);Class target=i>=fuxi::ConstantAlloc?object_getClass((id)cls):cls;
+  IMP actual=class_getMethodImplementation(target,sel_registerName(fuxi::constantSelectors[i]));
+  diagnostic.append(" %s=%p/%p/%p",fuxi::constantSelectors[i],(void *)actual,(void *)h.hook,(void *)h.original);
+ }
+ diagnostic.append(" imp=actual/hook/original");fprintf(stderr,"%s\n",diagnostic.line);return nil;
 }
 static NSData *constantSnapshot(MTLFunctionConstantValues *values) {
- if(values && (class_getMethodImplementation(object_getClass(values),@selector(setConstantValue:type:atIndex:))!=(IMP)indexConstant || class_getMethodImplementation(object_getClass(values),@selector(setConstantValue:type:withName:))!=(IMP)nameConstant || class_getMethodImplementation(object_getClass(values),@selector(setConstantValues:type:withRange:))!=(IMP)rangeConstants || class_getMethodImplementation(object_getClass(values),@selector(reset))!=(IMP)resetConstants))return nil;
- if(!values)return [NSData data];@synchronized(values){id records=objc_getAssociatedObject(values,&constantsKey);
- if(![records isKindOfClass:[NSDictionary class]] || [records count]>32)return nil;
+ if(!values)return [NSData data];refreshConstantHooks();@synchronized(values){
+ if(!objc_getAssociatedObject(values,&constantsAllocationKey))return constantFailure(values,"unobserved-allocation");
+ if(!constantsObserved(values))return constantFailure(values,"changed-or-unhooked-method");
+ id records=objc_getAssociatedObject(values,&constantsKey);
+ if(![records isKindOfClass:[NSDictionary class]] || [records count]>32)return constantFailure(values,"unsupported-record");
  NSMutableData *data=[NSMutableData data];
  // Deterministic order makes equal constants share the translator cache.
  NSArray *keys=[[records allKeys] sortedArrayUsingComparator:^NSComparisonResult(id a,id b){return [[a description] compare:[b description]];}];
  for(id key in keys){NSArray *record=records[key];fuxi::Constant c{};c.type=[record[0] unsignedIntValue];NSData *bytes=record[1];c.size=(uint32_t)bytes.length;memcpy(c.bytes,bytes.bytes,bytes.length);
- if([key isKindOfClass:[NSNumber class]])c.index=[key unsignedIntValue];else {const char *name=[key UTF8String];if(!name || strlen(name)>=128)return nil;strcpy(c.name,name);}
+ if([key isKindOfClass:[NSNumber class]])c.index=[key unsignedIntValue];else {const char *name=[key UTF8String];if(!name || strlen(name)>=128)return constantFailure(values,"unsupported-name");strcpy(c.name,name);}
  [data appendBytes:&c length:sizeof(c)];}return data;}
 }
 @interface FuxiLibrary : FuxiObject { @public id _device; void *_library; }
