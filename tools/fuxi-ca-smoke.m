@@ -123,7 +123,7 @@ int main(int argc,char **argv) {
    size_t row=IOSurfaceGetBytesPerRow(surface);uint8_t *base=IOSurfaceGetBaseAddress(surface);
    if(!base || row<1024)fail("IOSurface mapping/stride");memset(base,0x39,row*256);
    if(IOSurfaceUnlock(surface,0,NULL))fail("IOSurface unlock");
-   uint8_t *reference=NULL;uint64_t rendered=0;
+   uint8_t *reference=NULL,*mirrored=NULL;uint64_t rendered=0;
    @autoreleasepool {
    MTLTextureDescriptor *td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:256 height:256 mipmapped:NO];
    td.storageMode=MTLStorageModeShared;td.usage=MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget;
@@ -135,8 +135,16 @@ int main(int argc,char **argv) {
     if(![renderer respondsToSelector:NSSelectorFromString(selector)])fail("unsupported selector CARenderer %.96s",selector.UTF8String);
    [CATransaction begin];[CATransaction setDisableActions:YES];CALayer *root=scene(stage,space);
    [renderer setLayer:root];[renderer setBounds:CGRectMake(0,0,256,256)];[CATransaction commit];
+   // Stage 1 on device drew nothing until the transaction was flushed to the renderer.
+   [CATransaction flush];
    reference=calloc(256*256,4);if(!reference)fail("reference allocation");
    CGContextRef cpu=CGBitmapContextCreate(reference,256,256,8,1024,space,kCGBitmapByteOrder32Little|kCGImageAlphaPremultipliedFirst);
+   if(!cpu)fail("reference context");
+   // iOS layer geometry has a top-left origin, as UIKit's flipped bitmap contexts do;
+   // a raw CGBitmapContext is bottom-left. Keep the unflipped render for diagnostics.
+   CGContextTranslateCTM(cpu,0,256);CGContextScaleCTM(cpu,1,-1);[root renderInContext:cpu];CGContextRelease(cpu);
+   mirrored=calloc(256*256,4);if(!mirrored)fail("reference allocation");
+   cpu=CGBitmapContextCreate(mirrored,256,256,8,1024,space,kCGBitmapByteOrder32Little|kCGImageAlphaPremultipliedFirst);
    if(!cpu)fail("reference context");[root renderInContext:cpu];CGContextRelease(cpu);
    uint64_t beforeRender=draws();
    [renderer beginFrameAtTime:CACurrentMediaTime() timeStamp:NULL];[renderer addUpdateRect:CGRectMake(0,0,256,256)];
@@ -163,12 +171,15 @@ int main(int argc,char **argv) {
    } // Drain CA and all imported texture retains before the CPU consumer lock.
    if(IOSurfaceLock(surface,kIOSurfaceLockReadOnly,NULL))fail("consumer lock");
    base=IOSurfaceGetBaseAddress(surface);if(!base)fail("consumer mapping");
-   struct FuxiCAComparison m=fuxiCACompare(base,row,reference);
+   struct FuxiCAComparison m=fuxiCACompare(base,row,reference),u=fuxiCACompare(base,row,mirrored);
+   const uint8_t *top=base+60*row+96*4,*bottom=base+196*row+96*4;
+   printf("FUXI CA: stage %u orientation top-left bad=%u unflipped bad=%u probe(96,60)=%02x%02x%02x%02x probe(96,196)=%02x%02x%02x%02x\n",
+    stage,m.bad_pixels,u.bad_pixels,top[2],top[1],top[0],top[3],bottom[2],bottom[1],bottom[0],bottom[3]);
    if(IOSurfaceUnlock(surface,kIOSurfaceLockReadOnly,NULL))fail("consumer unlock");
    if(!fuxiCAAccept(m))fail("pixels=65536 max=%u mean=%.4f bad=%u tol=8/64/256/1",m.max_error,m.mean_error,m.bad_pixels);
    if(failures())fail("frontend_errors=%llu",(unsigned long long)failures());
    printf("FUXI CA: stage %u %s PASS pixels=65536 max=%u mean=%.4f bad=%u gpu_draws=%llu total_draws=%llu\n",stage,names[stage],m.max_error,m.mean_error,m.bad_pixels,(unsigned long long)rendered,(unsigned long long)(draws()-startDraws));
-   free(reference);CFRelease(surface);
+   free(reference);free(mirrored);CFRelease(surface);
   }}
   stage=maximum;arm(10);CGColorSpaceRelease(space);[device release];dlclose(plugin);alarm(0);puts("FUXI CA: done PASS");
  }@catch(NSException *exception) {fail("exception %.96s",exception.name.UTF8String);}}
