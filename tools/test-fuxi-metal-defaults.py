@@ -10,7 +10,7 @@ ROOT=Path(__file__).resolve().parents[1]
 
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--translator',type=Path,required=True,help='native host ABI-v3 dylib at the pinned revision')
+    ap.add_argument('--translator',type=Path,required=True,help='native host ABI-v4 dylib at the pinned revision')
     ap.add_argument('--metallib',type=Path,required=True)
     a=ap.parse_args()
     if os.uname().sysname!='Darwin':raise SystemExit('requires Mac Foundation/Metal')

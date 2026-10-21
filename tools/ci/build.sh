@@ -241,10 +241,10 @@ metal() {
     bash tools/build-fuxi-metal.sh "$work/mesa/include" "$work/outputs"
     # Explicit allowlist preserves the complete ad-hoc signed bundle; no AIR,
     # SDK libraries, intermediate build directories or external fixture blobs.
-    # Stages 5/6 share our metal-smoke.metallib; no new artifact names.
+    # The CA diagnostic loads system CA resources; no Apple shaders are shipped.
     cp -R "$work/outputs/FuxiMetal.bundle" "$out/"
     local name
-    for name in fuxi-metal-smoke metal-smoke.metallib libmetal2vulkan.dylib \
+    for name in fuxi-metal-smoke fuxi-ca-smoke ca-smoke.conf metal-smoke.metallib libmetal2vulkan.dylib \
         metal2vulkan-source.tar.gz metal-smoke.conf metal-clients.conf; do
         cp "$work/outputs/$name" "$out/"
     done

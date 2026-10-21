@@ -1,5 +1,5 @@
 // Original Fuxi adapter, compiled only into the separate external LGPL library.
-// No translator code is copied here. ABI v3: synchronous, owned handles, bounded input.
+// No translator code is copied here. ABI v4: synchronous, owned handles, bounded input.
 use std::{ffi::{c_char,c_void,CStr,CString}, panic::{catch_unwind,AssertUnwindSafe}};
 use std::{collections::VecDeque, sync::{Mutex,OnceLock}};
 use ash::vk::{self,Handle};
@@ -8,6 +8,13 @@ use metal2vulkan::{library::Library, device::{Device,DeviceDescription,DevicePol
     metal::{PixelFormat,TextureType,SamplerMinMagFilter,sampler::OpaqueBlackBorder},
     pipeline::{Stage,SlotClass,RuntimeDependency,RuntimeFact,Mechanism},
     bind::{BindState,DrawCall,BoundTexture,TextureFacts,BoundSampler,SamplerDescriptor,StageTable,WriteSource,ImageSource,SamplerSource},Budget};
+// Public Metal scalar/vector ordinals, packed payload (vector3 padding omitted).
+fn constant_payload_size(ty:u32)->u32 {
+ for (base,width) in [(3,4),(16,2),(29,4),(33,4),(37,2),(41,2),(45,1),(49,1),(53,1)] {
+  if ty>=base && ty<base+4 {return (ty-base+1)*width;}
+ }
+ 0
+}
 #[repr(C)]
 #[derive(Clone,Copy,Debug)]
 pub struct Constant {index:u32,ty:u32,size:u32,bytes:[u8;16],name:[u8;128]}
@@ -17,7 +24,7 @@ pub struct Attribute {format:u32,offset:u32,buffer:u32}
 #[repr(C)]
 #[derive(Clone,Copy,Debug)]
 pub struct CompileOptions {format:u32,blend:u32,src_rgb:u32,dst_rgb:u32,rgb_op:u32,src_alpha:u32,dst_alpha:u32,alpha_op:u32,mask:u32,strip:u32,
- attributes:[Attribute;8],strides:[u32;4],constant_count:[u32;2],constants:[[Constant;32];2]}
+ attributes:[Attribute;8],strides:[u32;4],constant_count:[u32;2],constants:[[Constant;128];2]}
 #[repr(C)]
 #[derive(Clone,Copy,Debug,Default)]
 pub struct Descriptor {binding:u32,ty:u32,stages:u32,slot:u32,sampler:u32,format:u32,components:[u32;4],offset:u64,range:u64}
@@ -119,7 +126,7 @@ unsafe fn name<'a>(p:*const c_char)->Result<&'a str,String> {
     if bytes.is_empty() || bytes.len()>127{return Err("function name length".into());}
     std::str::from_utf8(bytes).map_err(|e|e.to_string())
 }
-#[no_mangle] pub extern "C" fn fuxi_m2v_abi()->u32 {3}
+#[no_mangle] pub extern "C" fn fuxi_m2v_abi()->u32 {4}
 #[no_mangle] pub unsafe extern "C" fn fuxi_m2v_open(p:*const u8,n:usize,err:*mut c_char,cap:usize)->*mut c_void {
     attempt(err,cap,|| {
         if p.is_null() || n==0 || n>4*1024*1024{return Err("library outside 1..4 MiB".into());}
@@ -163,9 +170,9 @@ unsafe fn name<'a>(p:*const c_char)->Result<&'a str,String> {
         let mut vertex=FunctionDescriptor::new(vf);
         let mut fragment=FunctionDescriptor::new(ff);
         for (i,function) in [&mut vertex,&mut fragment].into_iter().enumerate() {
-            if options.constant_count[i]>32{return Err("constant count".into());}
+            if options.constant_count[i]>128{return Err("constant count".into());}
             for c in &options.constants[i][..options.constant_count[i] as usize] {
-                if c.size==0 || c.size>16{return Err("constant size".into());}
+                if c.size==0 || c.size!=constant_payload_size(c.ty){return Err("constant size".into());}
                 let ty=metal2vulkan::metal::DataType::try_from(c.ty).map_err(|e|e.to_string())?;
                 let value=metal2vulkan::library::FunctionConstantValue::new(ty,c.bytes[..c.size as usize].to_vec());
                 if c.name[0]==0 {function.constants=function.constants.clone().with_index(c.index,value);}
@@ -208,6 +215,18 @@ unsafe fn name<'a>(p:*const c_char)->Result<&'a str,String> {
 mod tests {
     use super::*;
     use metal2vulkan::pipeline::SlotRef;
+    #[test]
+    fn constant_abi4_layout_and_vectors() {
+        assert_eq!(fuxi_m2v_abi(),4);
+        assert_eq!(std::mem::size_of::<Constant>(),156);
+        assert_eq!(std::mem::size_of::<CompileOptions>(),40096);
+        assert_eq!(std::mem::offset_of!(CompileOptions,constants),160);
+        for (base,width) in [(3,4),(16,2),(29,4),(33,4),(37,2),(41,2),(45,1),(49,1),(53,1)] {
+            for lane in 0..4 {assert_eq!(constant_payload_size(base+lane),width*(lane+1));}
+        }
+        assert_eq!(constant_payload_size(51),3);
+        for ty in [0,7,20,28,57,60,80] {assert_eq!(constant_payload_size(ty),0);}
+    }
     #[test]
     fn dependencies_are_slot_and_mechanism_scoped() {
         let sampler=SlotRef{stage:Stage::Fragment,class:SlotClass::Sampler,index:0};

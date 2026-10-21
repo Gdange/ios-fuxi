@@ -77,6 +77,19 @@ int main() {
    [c commit];[c waitUntilCompleted];assert(c.status==MTLCommandBufferStatusError && c.error && calls==1);
    unsetenv("FUXI_TEST_LOST");
   }
+  // CA must not submit a valid prefix after an earlier swallowed refusal.
+  @autoreleasepool {
+   strcpy(clientProcess,"fuxi-ca-smoke");assert(fuxi_metal_failure_count()>0);
+   id<MTLBuffer>b=[device newBufferWithLength:64 options:0];
+   id<MTLCommandBuffer>c=q.commandBuffer;id<MTLBlitCommandEncoder>e=c.blitCommandEncoder;
+   [e fillBuffer:b range:NSMakeRange(0,64) value:9];[e endEncoding];
+   int before=fuxi::Backend::submissions;[c commit];
+   assert(c.status==MTLCommandBufferStatusError && fuxi::Backend::submissions==before);
+   for(unsigned i=0;i<64;++i)assert(!((uint8_t *)b.contents)[i]);[b release];
+   uint64_t count=fuxi_metal_failure_count();
+   for(unsigned i=0;i<100;++i)failureLog("FUXI MTL: test refusal\n");
+   assert(fuxi_metal_failure_count()==count+100); // Counter outlives log cap.
+  }
   [q release];[device release];
  }
  puts("PASS: Objective-C size guard/subclass/protocols, capabilities, unsupported selectors, retained resources, fill/copy, 16 rounds, completion/error states, bounds/alignment/overlap rejection");

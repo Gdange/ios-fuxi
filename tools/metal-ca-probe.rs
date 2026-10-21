@@ -47,17 +47,13 @@ mod shipped {
         for (i, (l, name)) in [(v, vn), (f, fn_)].into_iter().enumerate() {
             let fun = l.function(name).unwrap();
             let info = fun.info();
-            if info.constants.len() > 32 {
+            if info.constants.len() > 128 {
                 return "bridge/constant-count-bound".into();
             }
             options.constant_count[i] = info.constants.len() as u32;
             for (j, c) in info.constants.iter().enumerate() {
-                let size = match c.ty.map(|t| t as u32) {
-                    Some(3 | 29 | 33) => 4,
-                    Some(16 | 37 | 41) => 2,
-                    Some(45 | 49 | 53) => 1,
-                    _ => return "bridge/non-scalar-constant".into(),
-                };
+                let size = constant_payload_size(c.ty.map(|t|t as u32).unwrap_or(0));
+                if size==0 {return "bridge/unsupported-constant-type".into();}
                 let dst = &mut options.constants[i][j];
                 dst.ty = c.ty.unwrap() as u32;
                 dst.size = size;

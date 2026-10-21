@@ -28,15 +28,18 @@ cp tools/fuxi-metal/Info.plist "$bundle/Info.plist"
  -install_name /System/Library/Extensions/FuxiMetal.bundle/FuxiMetal \
  -framework Foundation -framework Metal -framework IOSurface -o "$bundle/FuxiMetal"
 "$cc" "${flags[@]}" tools/fuxi-metal-smoke.m -framework Foundation -framework Metal -framework IOSurface -o "$out/fuxi-metal-smoke"
+"$cc" "${flags[@]}" tools/fuxi-ca-smoke.m -framework Foundation -framework Metal -framework IOSurface \
+ -framework QuartzCore -framework CoreGraphics -o "$out/fuxi-ca-smoke"
+cp tools/ca-smoke.conf "$out/ca-smoke.conf"
 cp tools/metal-clients.conf "$out/metal-clients.conf"
 cp tools/metal-smoke.conf "$out/metal-smoke.conf"
-for binary in "$bundle" "$out/fuxi-metal-smoke"; do
+for binary in "$bundle" "$out/fuxi-metal-smoke" "$out/fuxi-ca-smoke"; do
  codesign -f -s - "$binary"
  codesign --verify --strict "$binary"
 done
-python3 tools/audit-fuxi-metal.py "$bundle/FuxiMetal" "$out/fuxi-metal-smoke" "$out/libmetal2vulkan.dylib"
+python3 tools/audit-fuxi-metal.py "$bundle/FuxiMetal" "$out/fuxi-metal-smoke" "$out/fuxi-ca-smoke" "$out/libmetal2vulkan.dylib"
 codesign --verify --strict "$bundle"
 shasum -a 256 "$bundle/FuxiMetal" "$bundle/Info.plist" "$bundle/_CodeSignature/CodeResources" \
  "$out/libmetal2vulkan.dylib" "$out/metal-smoke.metallib" "$out/metal2vulkan-source.tar.gz" \
- "$out/fuxi-metal-smoke" "$out/metal-smoke.conf" "$out/metal-clients.conf" > "$out/M5b-SHA256SUMS"
+ "$out/fuxi-ca-smoke" "$out/ca-smoke.conf" "$out/fuxi-metal-smoke" "$out/metal-smoke.conf" "$out/metal-clients.conf" > "$out/M5b-SHA256SUMS"
 cat "$out/M5b-SHA256SUMS"

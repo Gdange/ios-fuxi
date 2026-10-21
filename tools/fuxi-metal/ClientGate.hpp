@@ -14,6 +14,7 @@ static inline bool clientName(const char *s) {
  return true;
 }
 static inline ClientMode parseClients(char *data,size_t length,const char *process) {
+ if(!strcmp(process,"backboardd") || !strcmp(process,"SpringBoard"))return ClientMode::deny;
  if(!clientName(process)||memchr(data,0,length))return ClientMode::deny;
  data[length]=0;ClientMode result=ClientMode::deny;
  for(char *line=data;line;) {

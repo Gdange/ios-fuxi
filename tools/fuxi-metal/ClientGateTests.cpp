@@ -7,9 +7,14 @@ static fuxi::ClientMode parse(std::string text,const char *name="fuxi-metal-smok
 int main() {
  using M=fuxi::ClientMode;
  assert(parse("fuxi-metal-smoke\n")==M::allow);
+ assert(parse("fuxi-ca-smoke\n","fuxi-ca-smoke")==M::allow);
+ for(const char *name:{"backboardd","SpringBoard"}) {
+  assert(parse(std::string(name)+"\n",name)==M::deny);
+  assert(parse(std::string("census ")+name+"\n",name)==M::deny);
+ }
  assert(parse("fuxi-metal-smoke\n","backboardd")==M::deny);
  assert(parse("# comment\n\tfuxi-metal-smoke \r\n")==M::allow);
- assert(parse("census backboardd\n","backboardd")==M::census);
+ assert(parse("census backboardd\n","backboardd")==M::deny);
  assert(parse("backboardd\ncensus backboardd\n","backboardd")==M::deny);
  assert(parse("fuxi-metal-smoke\nbad name\n")==M::deny);
  assert(parse(std::string("fuxi-metal-smoke\n\0",18))==M::deny);

@@ -9,6 +9,7 @@
 #include <mach-o/dyld.h>
 #include <mutex>
 #include <atomic>
+#include <cstdarg>
 #include <chrono>
 #include "ConstantHooks.hpp"
 #include <cmath>
@@ -61,12 +62,22 @@ static void censusLog(id object,SEL selector,bool implemented) {
  if(censusCount==256)fprintf(stderr,"FUXI MTL: census limit %s 256\n",clientProcess);
 }
 #define CENSUS() censusLog(self,_cmd,true)
+// Diagnostic-only process counters. A client can refuse an entire candidate
+// after CA swallowed a nil/error; these counters never grant client admission.
+static std::atomic<uint64_t> failureCount{0},completedDraws{0};
+extern "C" uint64_t fuxi_metal_failure_count() {return failureCount.load();}
+extern "C" uint64_t fuxi_metal_completed_draws() {return completedDraws.load();}
+static void failureLog(const char *format,...) {
+ uint64_t n=failureCount.fetch_add(1);if(n>=64)return;
+ va_list args;va_start(args,format);vfprintf(stderr,format,args);va_end(args);
+ if(n==63)fprintf(stderr,"FUXI MTL: failure log limit 64 (counter continues)\n");
+}
 static void unsupported(id object, SEL selector) {
  if(clientMode==fuxi::ClientMode::census) {censusLog(object,selector,false);return;}
- fprintf(stderr,"FUXI MTL: unsupported %s %s\n",class_getName(object_getClass(object)),sel_getName(selector));
+ failureLog("FUXI MTL: unsupported %.96s %.160s\n",class_getName(object_getClass(object)),sel_getName(selector));
 }
 static void invalid(NSString *why) {
- fprintf(stderr,"FUXI MTL: invalid %s\n",why.UTF8String);
+ failureLog("FUXI MTL: invalid %s\n",why.UTF8String);
  [NSException raise:NSInvalidArgumentException format:@"Fuxi Metal: %@",why];
 }
 @interface FuxiObject : NSObject
@@ -122,7 +133,7 @@ static FuxiOwner *owner(id obj) {return (FuxiOwner *)objc_getAssociatedObject(ob
 - (void)setLabel:(NSString *)s {CENSUS();[_label release];_label=[s copy];}
 @end
 static id metalError(NSError **error,const char *why) {
- fprintf(stderr,"FUXI MTL: pipeline/library FAIL %s\n",why);
+ failureLog("FUXI MTL: pipeline/library FAIL %.256s\n",why);
  if(error)*error=[NSError errorWithDomain:@"org.fuxi.metal" code:1 userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithUTF8String:why]}];return nil;
 }
 // Track only public calls. Allocation provenance and method-coverage epochs
@@ -141,11 +152,7 @@ static fuxi::ConstantHooks &constantHooks() {
  // The installed IMPs can run during process teardown; keep their registry alive.
  static auto *hooks=new fuxi::ConstantHooks([FUXI_MTL_CONSTANT_CLASS class],makeConstantHook);return *hooks;
 }
-static size_t constantSize(MTLDataType t) {
- switch(t){case MTLDataTypeBool:case MTLDataTypeChar:case MTLDataTypeUChar:return 1;
- case MTLDataTypeHalf:case MTLDataTypeShort:case MTLDataTypeUShort:return 2;
- case MTLDataTypeFloat:case MTLDataTypeInt:case MTLDataTypeUInt:return 4;default:return 0;}
-}
+static size_t constantSize(MTLDataType t) {return fuxi::constantPayloadSize((uint32_t)t);}
 static bool constantsObserved(id self) {
  uint64_t stamp=constantHooks().stamp(object_getClass(self));
  id allocation=objc_getAssociatedObject(self,&constantsAllocationKey);
@@ -153,7 +160,7 @@ static bool constantsObserved(id self) {
 }
 static void rememberConstant(id self,const void *value,MTLDataType type,id key) {
  id old=objc_getAssociatedObject(self,&constantsKey);size_t size=constantSize(type);
- if(!constantsObserved(self) || ![old isKindOfClass:[NSDictionary class]] || !value || !size || !key || ([old count]>=32 && !old[key])) {objc_setAssociatedObject(self,&constantsKey,@NO,OBJC_ASSOCIATION_RETAIN_NONATOMIC);return;}
+ if(!constantsObserved(self) || ![old isKindOfClass:[NSDictionary class]] || !value || !size || !key || ([old count]>=fuxi::maxFunctionConstants && !old[key])) {failureLog("FUXI MTL: constant reject type=%u bytes=%zu records=%lu\n",(unsigned)type,size,[old isKindOfClass:[NSDictionary class]]?(unsigned long)[old count]:0UL);objc_setAssociatedObject(self,&constantsKey,@NO,OBJC_ASSOCIATION_RETAIN_NONATOMIC);return;}
  NSMutableDictionary *next=[old mutableCopy];next[key]=@[@(type),[NSData dataWithBytes:value length:size]];
  objc_setAssociatedObject(self,&constantsKey,next,OBJC_ASSOCIATION_COPY_NONATOMIC);[next release];
 }
@@ -189,8 +196,8 @@ static IMP makeConstantHook(fuxi::ConstantMethod kind,IMP original,SEL sel) {
  }});
  case fuxi::ConstantRange:return imp_implementationWithBlock(^(id self,const void *value,MTLDataType type,NSRange range){@synchronized(self){
   ((void(*)(id,SEL,const void *,MTLDataType,NSRange))original)(self,sel,value,type,range);size_t size=constantSize(type);
-  if(!constantsObserved(self) || !size || range.length>32 || range.location>65535 || range.length>65536-range.location || !value){objc_setAssociatedObject(self,&constantsKey,@NO,OBJC_ASSOCIATION_RETAIN_NONATOMIC);return;}
-  for(NSUInteger i=0;i<range.length;++i)rememberConstant(self,(const uint8_t *)value+i*size,type,@(range.location+i));
+  if(!constantsObserved(self) || !size || range.length>fuxi::maxFunctionConstants || range.location>65535 || range.length>65536-range.location || !value){failureLog("FUXI MTL: constant range reject type=%u location=%lu length=%lu\n",(unsigned)type,(unsigned long)range.location,(unsigned long)range.length);objc_setAssociatedObject(self,&constantsKey,@NO,OBJC_ASSOCIATION_RETAIN_NONATOMIC);return;}
+  for(NSUInteger i=0;i<range.length;++i)rememberConstant(self,(const uint8_t *)value+i*fuxi::constantElementStride((uint32_t)type),type,@(range.location+i));
  }});
  case fuxi::ConstantReset:return imp_implementationWithBlock(^(id self){@synchronized(self){
   ((void(*)(id,SEL))original)(self,sel);
@@ -228,6 +235,10 @@ __attribute__((constructor)) static void observeConstants() {
   (unsigned long long)constantsConstructorUs.load(),(unsigned long long)clientCheckUs.load(),(unsigned long long)constantsInstallUs.load(),constantsInstallUs.load()?constantHooks().count():0);
 }
 static NSData *constantFailure(id values,const char *reason) {
+ if(!strcmp(clientProcess,"fuxi-ca-smoke")) {
+  failureLog("FUXI MTL: constants snapshot FAIL reason=%.96s class=%.96s\n",reason,values?object_getClassName(values):"nil");return nil;
+ }
+ failureCount.fetch_add(1);
  // Eight lines/process maximum; no private layout, constant bytes or paths.
  static std::atomic<unsigned> failures{0};if(failures.fetch_add(1)>=8)return nil;
  fuxi::ConstantDiagnostic diagnostic;
@@ -251,7 +262,7 @@ static NSData *constantSnapshot(MTLFunctionConstantValues *values) {
  if(!objc_getAssociatedObject(values,&constantsAllocationKey))return constantFailure(values,"unobserved-allocation");
  if(!constantsObserved(values))return constantFailure(values,"changed-or-unhooked-method");
  id records=objc_getAssociatedObject(values,&constantsKey);
- if(![records isKindOfClass:[NSDictionary class]] || [records count]>32)return constantFailure(values,"unsupported-record");
+ if(![records isKindOfClass:[NSDictionary class]] || [records count]>fuxi::maxFunctionConstants)return constantFailure(values,"unsupported-record");
  NSMutableData *data=[NSMutableData data];
  // Deterministic order makes equal constants share the translator cache.
  NSArray *keys=[[records allKeys] sortedArrayUsingComparator:^NSComparisonResult(id a,id b){return [[a description] compare:[b description]];}];
@@ -296,12 +307,12 @@ static NSData *constantSnapshot(MTLFunctionConstantValues *values) {
 @end
 // Log the public value that failed, without inspecting Apple's object layout.
 static bool stage4Value(const char *scope,const char *field,uint64_t value,bool accepted) {
- if(!accepted)fprintf(stderr,"FUXI MTL: %s reject %s %llu\n",scope,field,(unsigned long long)value);
+ if(!accepted)failureLog("FUXI MTL: %s reject %s %llu\n",scope,field,(unsigned long long)value);
  return accepted;
 }
 static bool stage4Class(const char *scope,const char *field,id object,Class expected) {
  if([object isKindOfClass:expected])return true;
- fprintf(stderr,"FUXI MTL: %s reject %s %s\n",scope,field,object?object_getClassName(object):"nil");return false;
+ failureLog("FUXI MTL: %s reject %s %s\n",scope,field,object?object_getClassName(object):"nil");return false;
 }
 static void stage4Require(const char *scope,const char *field,uint64_t value,bool accepted) {
  if(!stage4Value(scope,field,value,accepted))invalid([NSString stringWithFormat:@"%s %s",scope,field]);
@@ -536,7 +547,7 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
  }
  MTLClearColor c=a.clearColor;unsigned component=0;
  for(double x:{c.red,c.green,c.blue,c.alpha}) {
-  if(!std::isfinite(x) || x<0 || x>1) {fprintf(stderr,"FUXI MTL: renderPass reject clearColor[%u] %.17g\n",component,x);invalid(@"clear colour outside 0..1");}++component;
+  if(!std::isfinite(x) || x<0 || x>1) {failureLog("FUXI MTL: renderPass reject clearColor[%u] %.17g\n",component,x);invalid(@"clear colour outside 0..1");}++component;
  }
 #undef CHECK
  FuxiRender *e=[FuxiRender new];e->_state={};e->_command=[self retain];e->_target=[t retain];e->_clear=c;e->_load=(uint32_t)a.loadAction;e->_store=(uint32_t)a.storeAction;_encoding=YES;return [e autorelease];
@@ -551,9 +562,9 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
  if(_encoding)[self rejectSelector:_cmd];
  _status=MTLCommandBufferStatusCommitted;
  // Deliberately synchronous M4 queue: no dispatch worker or asynchronous promise.
- try {if(_rejected)throw std::runtime_error("unsupported command: GPU submission refused");if(clientMode==fuxi::ClientMode::census)throw std::runtime_error("census: no GPU submission");owner(_queue->_device)->backend->submit(_ops);_status=MTLCommandBufferStatusCompleted;}
+ try {if(!strcmp(clientProcess,"fuxi-ca-smoke") && failureCount.load())throw std::runtime_error("CA diagnostic failure latched: GPU submission refused");if(_rejected)throw std::runtime_error("unsupported command: GPU submission refused");if(clientMode==fuxi::ClientMode::census)throw std::runtime_error("census: no GPU submission");owner(_queue->_device)->backend->submit(_ops);for(const auto &op:_ops)if(op.pipeline)completedDraws.fetch_add(1);_status=MTLCommandBufferStatusCompleted;}
  catch(const std::exception &e) {
-  fprintf(stderr,"FUXI MTL: submit FAIL %s\n",e.what());_status=MTLCommandBufferStatusError;
+  failureLog("FUXI MTL: submit FAIL %.256s\n",e.what());_status=MTLCommandBufferStatusError;
   if(!_error)_error=[[NSError alloc] initWithDomain:MTLCommandBufferErrorDomain code:MTLCommandBufferErrorInternal
       userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithUTF8String:e.what()]}];
  }
@@ -649,10 +660,10 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
  auto getID=io?(int(*)(uint32_t,uint64_t *))dlsym(io,"IORegistryEntryGetRegistryEntryID"):nullptr;
  uint64_t registry=0;int rc=getID?getID(port,&registry):-1;
  if(io)dlclose(io);
- if(rc || !registry) {fprintf(stderr,"FUXI MTL: registryID FAIL\n");[self release];return nil;}
+ if(rc || !registry) {failureLog("FUXI MTL: registryID FAIL\n");[self release];return nil;}
  FuxiOwner *state=[FuxiOwner new];state->registry=registry;
  try {if(clientMode!=fuxi::ClientMode::census)state->backend=new fuxi::Backend;}
- catch(const std::exception &e) {fprintf(stderr,"FUXI MTL: device FAIL %s\n",e.what());[state release];[self release];return nil;}
+ catch(const std::exception &e) {failureLog("FUXI MTL: device FAIL %s\n",e.what());[state release];[self release];return nil;}
  // CA's documented late library/pipeline failures can abort, rather than fall
  // back. Refuse discovery on the current no-import kernel even after a root
  // allow-list edit; no partially usable CA device enters Metal's device cache.
@@ -716,7 +727,7 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
  if(options!=MTLResourceStorageModeShared) {unsupported(self,_cmd);return nil;}
  FuxiBuffer *b=[FuxiBuffer new];b->_device=[self retain];
  try {b->_buffer=owner(self)->backend->allocate(n);}
- catch(const std::exception &e) {fprintf(stderr,"FUXI MTL: buffer FAIL %s\n",e.what());[b release];return nil;}
+ catch(const std::exception &e) {failureLog("FUXI MTL: buffer FAIL %s\n",e.what());[b release];return nil;}
  return b;
 }
 - (id)newBufferWithBytes:(const void *)bytes length:(NSUInteger)n options:(MTLResourceOptions)o {CENSUS();
@@ -760,13 +771,13 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
  // allowGPUOptimizedContents is an implementation hint, not pixel semantics.
 #undef CHECK
  FuxiTexture *t=[FuxiTexture new];t->_device=[self retain];t->_usage=d.usage;
- try {t->_texture=owner(self)->backend->allocateTexture((uint32_t)d.pixelFormat,(uint32_t)d.usage);}catch(const std::exception &e) {fprintf(stderr,"FUXI MTL: texture FAIL %s\n",e.what());[t release];return nil;}return t;
+ try {t->_texture=owner(self)->backend->allocateTexture((uint32_t)d.pixelFormat,(uint32_t)d.usage);}catch(const std::exception &e) {failureLog("FUXI MTL: texture FAIL %s\n",e.what());[t release];return nil;}return t;
 }
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane {CENSUS();
  if(clientMode==fuxi::ClientMode::census)return nil;
  // Scope is deliberately one BGRA plane, 256 square, no external producer/fence.
  if(!owner(self)->backend->supportsHostImport()) {
-  unsupported(self,_cmd);fprintf(stderr,"FUXI MTL: IOSurface import FAIL NativeAdreno HostImport / VK_EXT_external_memory_host unavailable\n");return nil;
+  unsupported(self,_cmd);failureLog("FUXI MTL: IOSurface import FAIL NativeAdreno HostImport / VK_EXT_external_memory_host unavailable\n");return nil;
  }
  if(!d || !surface || plane || IOSurfaceGetPlaneCount(surface)!=0 || IOSurfaceGetPixelFormat(surface)!=0x42475241 ||
     IOSurfaceGetWidth(surface)!=256 || IOSurfaceGetHeight(surface)!=256 || IOSurfaceGetBytesPerElement(surface)!=4 ||
@@ -778,7 +789,7 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
  FuxiTexture *t=[FuxiTexture new];t->_device=[self retain];t->_usage=d.usage;
  t->_surface=(IOSurfaceRef)CFRetain(surface);IOSurfaceIncrementUseCount(surface);
  try {t->_texture=owner(self)->backend->importTexture(IOSurfaceGetBaseAddress(surface),IOSurfaceGetAllocSize(surface),IOSurfaceGetBytesPerRow(surface));}
- catch(const std::exception &e) {unsupported(self,_cmd);fprintf(stderr,"FUXI MTL: IOSurface import FAIL %s\n",e.what());[t release];return nil;}
+ catch(const std::exception &e) {unsupported(self,_cmd);failureLog("FUXI MTL: IOSurface import FAIL %s\n",e.what());[t release];return nil;}
  fprintf(stderr,"FUXI MTL: IOSurface import PASS BGRA8 256x256 same-memory\n");return t;
 }
 - (id)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)d {CENSUS();
@@ -790,7 +801,7 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
     d.lodMinClamp!=0 || d.lodMaxClamp!=FLT_MAX || d.lodAverage || d.supportArgumentBuffers) {unsupported(self,_cmd);return nil;}
  FuxiSampler *state=[FuxiSampler new];state->_device=[self retain];state->_label=[d.label copy];
  try {state->_sampler=owner(self)->backend->allocateSampler(d.minFilter==MTLSamplerMinMagFilterLinear,d.magFilter==MTLSamplerMinMagFilterLinear);}
- catch(const std::exception &e) {unsupported(self,_cmd);fprintf(stderr,"FUXI MTL: sampler FAIL %s\n",e.what());[state release];return nil;}return state;
+ catch(const std::exception &e) {unsupported(self,_cmd);failureLog("FUXI MTL: sampler FAIL %s\n",e.what());[state release];return nil;}return state;
 }
 - (id)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {CENSUS();
  if(error)*error=nil;if(clientMode==fuxi::ClientMode::census)return nil;
@@ -803,7 +814,7 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
   o.srcAlpha=(uint32_t)color.sourceAlphaBlendFactor;o.dstAlpha=(uint32_t)color.destinationAlphaBlendFactor;o.alphaOp=(uint32_t)color.alphaBlendOperation;
   for(unsigned i=0;i<8;++i){auto attr=d.vertexDescriptor.attributes[i];o.attributes[i]={(uint32_t)attr.format,(uint32_t)attr.offset,(uint32_t)attr.bufferIndex};}
   for(unsigned i=0;i<4;++i)o.strides[i]=(uint32_t)d.vertexDescriptor.layouts[i].stride;
-  NSData *constants[2]={a->_constants,b->_constants};for(unsigned i=0;i<2;++i){o.constantCount[i]=(uint32_t)(constants[i].length/sizeof(fuxi::Constant));if(o.constantCount[i]>32)throw std::runtime_error("constants bound");if(constants[i].length)memcpy(o.constants[i],constants[i].bytes,constants[i].length);}
+  NSData *constants[2]={a->_constants,b->_constants};for(unsigned i=0;i<2;++i){o.constantCount[i]=(uint32_t)(constants[i].length/sizeof(fuxi::Constant));if(o.constantCount[i]>fuxi::maxFunctionConstants)throw std::runtime_error("constants bound");if(constants[i].length)memcpy(o.constants[i],constants[i].bytes,constants[i].length);}
   p->_pipeline=owner(self)->backend->compilePipeline(a->_library->_library,a->_name.UTF8String,b->_library->_library,b->_name.UTF8String,o);}
  catch(const std::exception &e) {[p release];return metalError(error,e.what());}return p;
 }
@@ -834,7 +845,7 @@ static void rejectProtocol(Class cls,Protocol *proto) {
 // A constructor runs during NSBundle load, before principalClass lookup.
 static Class makeDeviceClass(Class base) {
  if(!base || class_getInstanceSize(base)!=528) {
-  fprintf(stderr,"FUXI MTL: _MTLDevice size guard FAIL got %zu expected 528\n",base?class_getInstanceSize(base):0);return Nil;
+  failureLog("FUXI MTL: _MTLDevice size guard FAIL got %zu expected 528\n",base?class_getInstanceSize(base):0);return Nil;
  }
  Class cls=objc_allocateClassPair(base,"FuxiMTLDevice",0);if(!cls)return Nil;
  // Override inherited private implementations: unimplemented selectors must

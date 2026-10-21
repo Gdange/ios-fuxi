@@ -18,13 +18,16 @@ def main():
         d=Path(tmp);root=d/'root';(root/'System/Library').mkdir(parents=True)
         icd=a.out/'libvulkan_freedreno.dylib';bundle=a.out/'FuxiMetal.bundle';smoke=a.out/'fuxi-metal-smoke'
         conf=d/'conf';conf.write_bytes(b'4\n')
-        clients=d/'clients';clients.write_bytes(b'fuxi-metal-smoke\ncensus backboardd\n')
-        def stage():m.stage(root,icd,bundle,smoke,conf,clients)
+        ca_conf=d/'ca-conf';ca_conf.write_bytes(b'4\n')
+        clients=d/'clients';clients.write_bytes(b'fuxi-metal-smoke\nfuxi-ca-smoke\n')
+        def stage():m.stage(root,icd,bundle,smoke,conf,clients,ca_conf=ca_conf)
         with patch.object(m.os,'geteuid',return_value=0),patch.object(m.os,'chown') as chown:
             stage();stage();conf.write_bytes(b'5\n');stage();conf.write_bytes(b'6\n');stage();conf.write_bytes(b'4\n');stage()
             if os.uname().sysname=='Darwin':
                 subprocess.run(['codesign','--verify','--strict',str(root/'System/Library/Extensions/FuxiMetal.bundle')],check=True)
             for src,rel,mode in ((icd,'usr/local/lib/libvulkan_freedreno.dylib',0o755),(smoke,'usr/local/bin/fuxi-metal-smoke',0o755),
+                (a.out/'fuxi-ca-smoke','usr/local/bin/fuxi-ca-smoke',0o755),
+                (ca_conf,'usr/local/share/fuxi/ca-smoke.conf',0o644),
                 (a.out/'libmetal2vulkan.dylib','usr/local/lib/libmetal2vulkan.dylib',0o755),
                 (a.out/'metal-smoke.metallib','usr/local/share/fuxi/metal-smoke.metallib',0o644),
                 (a.out/'metal2vulkan-source.tar.gz','usr/local/share/fuxi/metal2vulkan-source.tar.gz',0o644),
@@ -38,7 +41,14 @@ def main():
                 try:stage();raise AssertionError('bad config accepted')
                 except ValueError:pass
             conf.write_bytes(b'4\n')
-            for raw in (b'x\0',b'census x y',b'census backboardd\nbackboardd',b'x'*8193,b'../bad'):
+            for raw in (b'',b'5',b'-1',b'4\0',b'4'*32):
+                ca_conf.write_bytes(raw)
+                try:stage();raise AssertionError('bad CA config accepted')
+                except ValueError:pass
+            for maximum in range(5):
+                ca_conf.write_bytes(str(maximum).encode());stage()
+            ca_conf.write_bytes(b'4\n')
+            for raw in (b'x\0',b'census x y',b'census backboardd\nbackboardd',b'x'*8193,b'../bad',b'backboardd',b'SpringBoard',b'census backboardd',b'census SpringBoard'):
                 clients.write_bytes(raw)
                 try:stage();raise AssertionError('bad clients accepted')
                 except ValueError:pass

@@ -62,7 +62,23 @@ int main() {@autoreleasepool {
  BOOL range[2]={YES,NO};[model setConstantValues:range type:MTLDataTypeBool withRange:NSMakeRange(2,2)];
  assert(constant(snapshot(model),2,1) && constant(snapshot(model),3,0));
  [model setConstantValue:&value type:MTLDataTypeBool withName:@"flag"];assert(snapshot(model).length==3*sizeof(fuxi::Constant));
- [model setConstantValue:&value type:MTLDataTypeFloat4 atIndex:0];assert(!snapshot(model));
+ float vector[4]={1,2,3,4};[model setConstantValue:vector type:MTLDataTypeFloat4 atIndex:0];assert(snapshot(model));
+ [model reset];
+ // CA fixed fragments carry 58 entries, including a three-byte uchar3.
+ for(unsigned i=0;i<58;++i) {uint8_t v[4]={(uint8_t)i,2,3,0xee};
+  [model setConstantValue:v type:MTLDataTypeUChar3 withName:[NSString stringWithFormat:@"constant%u",i]];
+ }
+ NSData *many=snapshot(model);assert(many.length==58*sizeof(fuxi::Constant));
+ for(size_t i=0;i<58;++i) {const auto &c=((const fuxi::Constant *)many.bytes)[i];assert(c.type==MTLDataTypeUChar3 && c.size==3 && c.bytes[1]==2 && c.bytes[2]==3 && c.bytes[3]==0);}
+ [model reset];uint8_t triples[2][4]={{1,2,3,0xee},{4,5,6,0xff}};
+ [model setConstantValues:triples type:MTLDataTypeUChar3 withRange:NSMakeRange(0,2)];
+ const auto *packed=(const fuxi::Constant *)snapshot(model).bytes;assert(packed[0].bytes[0]==1 && packed[1].bytes[0]==4);
+ [model reset];uint8_t byte=7;
+ for(unsigned i=0;i<fuxi::maxFunctionConstants;++i)[model setConstantValue:&byte type:MTLDataTypeUChar atIndex:i];
+ assert(snapshot(model).length==fuxi::maxFunctionConstants*sizeof(fuxi::Constant));
+ [model setConstantValue:&byte type:MTLDataTypeUChar atIndex:127];assert(snapshot(model));
+ [model setConstantValue:&byte type:MTLDataTypeUChar atIndex:128];assert(!snapshot(model));
+ [model reset];[model setConstantValue:&value type:MTLDataTypeFloat4x4 atIndex:0];assert(!snapshot(model));
  [model reset];assert(snapshot(model).length==0);[model release];
  // Public allocator returns an internal subclass; its init never calls super.
  clusterClass=[FuxiConstantChild class];model=[FuxiConstantModel new];
