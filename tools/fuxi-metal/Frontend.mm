@@ -151,7 +151,7 @@ __attribute__((constructor)) static void observeConstants() {
  checkClient();if(clientMode!=fuxi::ClientMode::allow)return;
 #endif
  Class c=[MTLFunctionConstantValues class];
-#define HOOK(selector,original,hook) do {Method m=class_getInstanceMethod(c,@selector(selector));if(m){original=(decltype(original))method_getImplementation(m);class_replaceMethod(c,@selector(selector),(IMP)hook,method_getTypeEncoding(m));}}while(0)
+#define HOOK(name,original,hook) do {Method m=class_getInstanceMethod(c,@selector(name));if(m){original=(decltype(original))method_getImplementation(m);class_replaceMethod(c,@selector(name),(IMP)hook,method_getTypeEncoding(m));}}while(0)
  HOOK(init,constantInit,initConstants);HOOK(copyWithZone:,constantCopy,copyConstants);
  HOOK(setConstantValue:type:atIndex:,constantIndex,indexConstant);HOOK(setConstantValue:type:withName:,constantName,nameConstant);
  HOOK(setConstantValues:type:withRange:,constantRange,rangeConstants);HOOK(reset,constantReset,resetConstants);
