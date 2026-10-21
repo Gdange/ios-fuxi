@@ -60,7 +60,11 @@ static unsigned configuration(void) {
 static CGColorRef color(CGColorSpaceRef space,CGFloat r,CGFloat g,CGFloat b) {
  CGFloat v[]={r,g,b,1};CGColorRef c=CGColorCreate(space,v);if(!c)fail("color allocation");return c;
 }
-static CALayer *scene(unsigned n,CGColorSpaceRef space) {
+// mirror: the CPU reference's image rows bottom-up. CARenderer samples a layer's image
+// contents with v=1 at the layer's top on an unflipped tree (observed on device: the
+// image quad's top vertices carry v=1 over a linear view of the top-down CGImage
+// bytes), which Metal resolves to the last row; renderInContext draws them top-down.
+static CALayer *scene(unsigned n,CGColorSpaceRef space,BOOL mirror) {
  CALayer *root=[CALayer layer];root.frame=CGRectMake(0,0,256,256);root.contentsScale=1;
  CGColorRef bg=color(space,0.125,0.25,0.5);root.backgroundColor=bg;CGColorRelease(bg);
  if(n>=1) {
@@ -75,7 +79,7 @@ static CALayer *scene(unsigned n,CGColorSpaceRef space) {
  if(n>=3) {
   uint8_t *bytes=malloc(256*256*4);if(!bytes)fail("image allocation");
   for(unsigned y=0;y<256;++y)for(unsigned x=0;x<256;++x) {
-   uint8_t *p=bytes+(y*256+x)*4;p[0]=x<96?32:224;p[1]=y<160?192:48;p[2]=x<y?208:64;p[3]=255;
+   uint8_t *p=bytes+((mirror?255-y:y)*256+x)*4;p[0]=x<96?32:224;p[1]=y<160?192:48;p[2]=x<y?208:64;p[3]=255;
   }
   CGContextRef ctx=CGBitmapContextCreate(bytes,256,256,8,1024,space,kCGBitmapByteOrder32Little|kCGImageAlphaPremultipliedFirst);
   if(!ctx)fail("image bitmap context");CGImageRef image=CGBitmapContextCreateImage(ctx);if(!image)fail("image snapshot");
@@ -133,7 +137,7 @@ int main(int argc,char **argv) {
    if(!renderer)fail("nil CARenderer");
    for(NSString *selector in @[@"setLayer:",@"setBounds:",@"beginFrameAtTime:timeStamp:",@"addUpdateRect:",@"render",@"endFrame"])
     if(![renderer respondsToSelector:NSSelectorFromString(selector)])fail("unsupported selector CARenderer %.96s",selector.UTF8String);
-   [CATransaction begin];[CATransaction setDisableActions:YES];CALayer *root=scene(stage,space);
+   [CATransaction begin];[CATransaction setDisableActions:YES];CALayer *root=scene(stage,space,NO);
    [renderer setLayer:root];[renderer setBounds:CGRectMake(0,0,256,256)];[CATransaction commit];
    // Stage 1 on device drew nothing until the transaction was flushed to the renderer.
    [CATransaction flush];
@@ -142,10 +146,11 @@ int main(int argc,char **argv) {
    if(!cpu)fail("reference context");
    // iOS layer geometry has a top-left origin, as UIKit's flipped bitmap contexts do;
    // a raw CGBitmapContext is bottom-left. Keep the unflipped render for diagnostics.
-   CGContextTranslateCTM(cpu,0,256);CGContextScaleCTM(cpu,1,-1);[root renderInContext:cpu];CGContextRelease(cpu);
+   CALayer *expected=scene(stage,space,YES);
+   CGContextTranslateCTM(cpu,0,256);CGContextScaleCTM(cpu,1,-1);[expected renderInContext:cpu];CGContextRelease(cpu);
    mirrored=calloc(256*256,4);if(!mirrored)fail("reference allocation");
    cpu=CGBitmapContextCreate(mirrored,256,256,8,1024,space,kCGBitmapByteOrder32Little|kCGImageAlphaPremultipliedFirst);
-   if(!cpu)fail("reference context");[root renderInContext:cpu];CGContextRelease(cpu);
+   if(!cpu)fail("reference context");[expected renderInContext:cpu];CGContextRelease(cpu);
    uint64_t beforeRender=draws();
    [renderer beginFrameAtTime:CACurrentMediaTime() timeStamp:NULL];[renderer addUpdateRect:CGRectMake(0,0,256,256)];
    if([renderer respondsToSelector:@selector(updateBounds)]) {CGRect u=[renderer updateBounds];
