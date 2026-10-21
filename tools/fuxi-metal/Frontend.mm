@@ -301,6 +301,7 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count {@try {CENSUS();[self active];
  stage4Require("draw","pipeline",(uint64_t)_pipeline,_pipeline!=nil);stage4Require("draw","alreadyDrawn",_drawn,!_drawn);
  stage4Require("draw","primitiveType",t,t==MTLPrimitiveTypeTriangle);stage4Require("draw","vertexStart",start,!start);stage4Require("draw","vertexCount",count,count==3 || (count==6 && _sample && _sampler));
+ stage4Require("draw","sampledResources",_sample && _sampler,!owner(_command->_queue->_device)->backend->requiresSampling(_pipeline->_pipeline) || (_sample && _sampler));
  fuxi::Operation op{};op.texture=_target->_texture;op.pipeline=_pipeline->_pipeline;op.vertices=(uint32_t)count;
  op.sourceTexture=_sample?_sample->_texture:nullptr;op.sampler=_sampler?_sampler->_sampler:nullptr;
  if(_sample)[_command->_resources addObject:_sample];if(_sampler)[_command->_resources addObject:_sampler];

@@ -46,6 +46,9 @@ int main() {@autoreleasepool {
  refuses(c,^{[r setRenderPipelineState:(id)t];});[r setRenderPipelineState:(id)p];
  refuses(c,^{[r drawPrimitives:MTLPrimitiveTypeLine vertexStart:0 vertexCount:3];});
  refuses(c,^{[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:1 vertexCount:3];});
+ p->_pipeline->sampled=true;
+ refuses(c,^{[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];});
+ p->_pipeline->sampled=false;
  [r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
  refuses(c,^{[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];});
  [r endEncoding];refuses(c,^{[r endEncoding];});

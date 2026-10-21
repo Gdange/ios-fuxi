@@ -228,12 +228,14 @@ public:
   std::lock_guard<std::mutex> guard(mutex);if(!p)return;
   if(!poisoned) {if(p->setLayout)DestroyDescriptorSetLayout(device,p->setLayout,nullptr);if(p->pipeline)DestroyPipeline(device,p->pipeline,nullptr);if(p->layout)DestroyPipelineLayout(device,p->layout,nullptr);if(p->render)DestroyRenderPass(device,p->render,nullptr);}delete p;
  }
+ bool requiresSampling(const Pipeline *p) const {return !p->descriptors.empty();}
  Pipeline *compilePipeline(void *v,const char *vn,void *f,const char *fn) {
   std::unique_lock<std::mutex> guard(mutex);requireLive();Translation translated{};auto &tr=Translator::get();char error[2048]{};
   auto start=std::chrono::steady_clock::now();
   int ok=tr.compile(v,vn,f,fn,(void *)gipa,(uint64_t)instance,(uint64_t)physical,&translated,error,sizeof(error));
   double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
-  fprintf(stderr,"FUXI MTL: translation %s %.3f ms (bounded translator cache) %s\n",ok?"PASS":"FAIL",ms,ok?"":error);
+  if(ok)fprintf(stderr,"FUXI MTL: translation PASS %.3f ms (bounded translator cache)\n",ms);
+  else fprintf(stderr,"FUXI MTL: translation FAIL %.160s\n",error);
   if(!ok)throw std::runtime_error(error[0]?error:"translation failed");
   auto *p=new Pipeline{};VkShaderModule modules[2]{};
   auto cleanup=[&]{for(auto m:modules)if(m)DestroyShaderModule(device,m,nullptr);tr.free(translated.handle);};
@@ -250,10 +252,10 @@ public:
    deps[1].dstStageMask=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;deps[1].srcAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;deps[1].dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
    VkRenderPassCreateInfo ri{};ri.sType=VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;ri.attachmentCount=1;ri.pAttachments=&attachment;ri.subpassCount=1;ri.pSubpasses=&sub;ri.dependencyCount=2;ri.pDependencies=deps;
    check(CreateRenderPass(device,&ri,nullptr,&p->render));
-   if(!translated.pushSize || translated.pushOffset>128 || translated.pushSize>128-translated.pushOffset || (translated.pushSize&3) || translated.pushStages!=VK_SHADER_STAGE_FRAGMENT_BIT)throw std::runtime_error("invalid translator push constant range");
+   if(!translated.pushSize || translated.pushOffset>128 || translated.pushSize>128-translated.pushOffset || (translated.pushOffset&3) || (translated.pushSize&3) || translated.pushStages!=VK_SHADER_STAGE_FRAGMENT_BIT)throw std::runtime_error("invalid translator push constant range");
    p->pushOffset=translated.pushOffset;p->pushSize=translated.pushSize;p->pushStages=translated.pushStages;memcpy(p->pushBytes,translated.pushBytes,p->pushSize);
    VkPushConstantRange range{p->pushStages,p->pushOffset,p->pushSize};
-   if(translated.descriptorCount>4)throw std::runtime_error("descriptor count");
+   if(translated.descriptorCount>1)throw std::runtime_error("descriptor count>1");
    std::vector<VkDescriptorSetLayoutBinding> bindings;
    for(uint32_t i=0;i<translated.descriptorCount;++i) {
     auto d=translated.descriptors[i];
@@ -299,6 +301,13 @@ public:
   VkCommandPool pool{};VkFence fence{};bool submitted=false,completed=false;std::vector<VkFramebuffer> frames;std::vector<VkDescriptorPool> descriptorPools;std::vector<Texture *> textures;std::vector<VkImageLayout> oldLayouts;std::vector<bool> oldDefined;
   auto cleanup=[&] {for(auto dp:descriptorPools)DestroyDescriptorPool(device,dp,nullptr);for(auto frame:frames)DestroyFramebuffer(device,frame,nullptr);if(fence) DestroyFence(device,fence,nullptr);if(pool) DestroyCommandPool(device,pool,nullptr);};
   try {
+   // Validate before recording any transitions (especially attachment feedback).
+   for(const auto &op:ops)if(op.pipeline) {
+    if(!op.texture || (op.vertices!=3 && op.vertices!=6))throw std::runtime_error("invalid bounded draw");
+    if(!op.pipeline->descriptors.empty() && (!op.sourceTexture || !op.sampler || op.sourceTexture==op.texture
+        || (op.sourceTexture->imported && op.texture->imported && op.sourceTexture->mapped==op.texture->mapped)))
+     throw std::runtime_error("missing sampled texture/sampler or attachment feedback");
+   }
    std::vector<Buffer *> buffers;
    for(const auto &op:ops) for(auto *b:{op.src,op.dst}) if(b && std::find(buffers.begin(),buffers.end(),b)==buffers.end()) buffers.push_back(b);
    for(const auto &op:ops)for(auto *t:{op.texture,op.sourceTexture})if(t && std::find(textures.begin(),textures.end(),t)==textures.end())textures.push_back(t);
@@ -333,7 +342,6 @@ public:
      ri.renderArea={{0,0},{256,256}};ri.clearValueCount=1;ri.pClearValues=&clear;
      CmdBeginRenderPass(cmd,&ri,VK_SUBPASS_CONTENTS_INLINE);CmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,op.pipeline->pipeline);
      if(!op.pipeline->descriptors.empty()) {
-      if(!op.sourceTexture || !op.sampler || op.sourceTexture==op.texture)throw std::runtime_error("missing sampled texture/sampler or attachment feedback");
       VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,(uint32_t)op.pipeline->descriptors.size()};
       VkDescriptorPoolCreateInfo pci{};pci.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;pci.maxSets=1;pci.poolSizeCount=1;pci.pPoolSizes=&ps;
       VkDescriptorPool poolForDraw{};check(CreateDescriptorPool(device,&pci,nullptr,&poolForDraw));descriptorPools.push_back(poolForDraw);
