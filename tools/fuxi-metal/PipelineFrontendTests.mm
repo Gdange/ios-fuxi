@@ -3,6 +3,7 @@
 #define FUXI_MTL_BACKEND_HEADER "TestBackend.hpp"
 #include "Frontend.mm"
 #include <cassert>
+#include "IOS16Defaults.hpp"
 @interface FuxiPipelineTestBase : NSObject {uint8_t bytes[520];}
 @end
 @implementation FuxiPipelineTestBase
@@ -20,11 +21,19 @@ int main() {@autoreleasepool {
  error=nil;assert(![device newRenderPipelineStateWithDescriptor:[[MTLRenderPipelineDescriptor new] autorelease] error:&error] && error);
  MTLTextureDescriptor *td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:256 height:256 mipmapped:NO];
  assert(![device newTextureWithDescriptor:td]);
- MTLRenderPassDescriptor *pass=[MTLRenderPassDescriptor renderPassDescriptor];pass.colorAttachments[0].texture=(id)t;
+ MTLRenderPassDescriptor *pass=ios16PassDefaults();pass.colorAttachments[0].texture=(id)t;
  pass.colorAttachments[0].loadAction=MTLLoadActionClear;pass.colorAttachments[0].storeAction=MTLStoreActionStore;
  FuxiCommandBuffer *c=(id)queue.commandBuffer;
  pass.colorAttachments[0].loadAction=MTLLoadActionLoad;
  refuses(^{[c renderCommandEncoderWithDescriptor:pass];});pass.colorAttachments[0].loadAction=MTLLoadActionClear;
+ pass.defaultRasterSampleCount=4;refuses(^{[c renderCommandEncoderWithDescriptor:pass];});pass.defaultRasterSampleCount=0;
+ pass.renderTargetArrayLength=2;refuses(^{[c renderCommandEncoderWithDescriptor:pass];});pass.renderTargetArrayLength=0;
+ pass.renderTargetWidth=128;refuses(^{[c renderCommandEncoderWithDescriptor:pass];});pass.renderTargetWidth=0;
+ pass.depthAttachment.texture=(id)t;refuses(^{[c renderCommandEncoderWithDescriptor:pass];});pass.depthAttachment.texture=nil;
+ pass.colorAttachments[7].resolveTexture=(id)t;refuses(^{[c renderCommandEncoderWithDescriptor:pass];});pass.colorAttachments[7].resolveTexture=nil;
+ MTLRenderPassDescriptor *samplePass=[[pass copy] autorelease];
+ MTLSamplePosition positions[4]={{0.25f,0.25f},{0.75f,0.25f},{0.25f,0.75f},{0.75f,0.75f}};[samplePass setSamplePositions:positions count:4];
+ refuses(^{[c renderCommandEncoderWithDescriptor:samplePass];});
  FuxiRender *r=[c renderCommandEncoderWithDescriptor:pass];assert(r);
  refuses(^{[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];});
  refuses(^{[r setRenderPipelineState:(id)t];});[r setRenderPipelineState:(id)p];

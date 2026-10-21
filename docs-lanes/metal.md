@@ -1,3 +1,224 @@
+# Metal lane M5c: accept the iOS 16.7 descriptor defaults
+
+2026-10-21. **Built, signed and host-verified; M5c device run pending.**
+The coordinator reports M5b on the metal4 kernel: stages 0–3 PASS (34 fences,
+no hang), then the combined pipeline descriptor/functions rejection before
+translation. backboardd/SpringBoard remained denied; no crash/panic reported.
+
+The root-cause hypothesis is now specific: **`vertexDescriptor` is a lazy
+getter on 20H392**, so reading the untouched default produces a non-nil empty
+`MTLVertexDescriptorInternal`. M5b rejected `d.vertexDescriptor` merely for
+being present. The same lazy behavior is visible on the current Mac host;
+the earlier positive Vulkan tests called the backend directly, and frontend
+encoder tests constructed a pipeline object manually. Neither tested a valid
+library/function/descriptor combination through the frontend pipeline gate.
+
+M5c accepts only nil or the public empty vertex shape: all 31 attribute formats
+invalid, offsets/buffer indices zero, and all 31 layouts stride zero,
+per-vertex/1 stepping. Configured vertex descriptors still reject. An explicitly
+supplied empty descriptor and the lazy default are indistinguishable through
+public properties and have the same rendering meaning. No private ivar reads,
+selector probes or object-layout assumptions were added.
+
+Each pipeline attempt prints one descriptor line before validation, then the
+first failing field and actual value as `FUXI MTL: pipeline reject <field> <value>`.
+Class failures print the actual class name (or nil); device failures print the
+actual object address. Indexed vertex/attachment failures include the index.
+The NSError also names the rejected field. Texture, render-pass, encoder,
+draw and readback checks use the same named-rejection convention. Render-pass
+resolve targets on otherwise unused attachments now also reject. All settings
+that affect the supported rendering remain checked: owning device/stages,
+vertex input, BGRA8 target 0 only, full target-0 write mask, no blending,
+one sample, rasterization, no depth/stencil, one direct triangle and whole
+texture readback with bounds/alignment/earlier-render checks.
+
+Tessellation format/max factor are dumped but ignored for this non-patch draw.
+`supportIndirectCommandBuffers` is likewise inert for the sole direct draw;
+no indirect encoder API is supplied. Unspecified or triangle input topology
+is compatible; point/line reject. Blend/mask settings on absent targets and
+`allowGPUOptimizedContents` (a storage optimization hint) cannot change these
+pixels and no longer gate acceptance. Amplification remains bounded to 1.
+The external translator's independent graphics/resource checks remain intact.
+
+`newFunctionWithName:` still resolves stage metadata through the dlopened,
+pinned translator. The new Mac regression loads the actual smoke metallib
+through both FuxiLibrary URL/data paths and verifies FuxiFunction class,
+`_stage` **1/2**, public vertex/fragment type and the same owning device.
+Production function creation now logs those identities. The test checks that
+the real-default descriptor reaches backend compilation, where the CPU model
+explicitly stops, and tests rendering-changing mutations at the frontend gate.
+
+`translation PASS` is intentionally lazy: library loading parses AIR, function
+creation queries metadata, and `Backend::compilePipeline` invokes the translator
+and prints its timing only **after** descriptor validation. Thus M5b's missing
+translation line matches the earlier rejection; it does not show a translator
+failure. No translator/source-pin/backend/smoke/shader/kernel changes were made.
+
+## 20H392 defaults and reproduction
+
+Source: the supplied iOS 16.7 / 20H392 arm64 shared cache, main-file SHA256
+`76874e8375252ee643011ff8063f0cce12355f05cf5f9897a34e5679667a65aa`,
+UUID `8F970452-C9E3-3E88-B114-FEB1864BC9E0`. `ipsw dyld info` reports iOS 16.7.
+The table records public values inferred from init/reset, corresponding getters,
+zero-initialized object storage and lazily created child descriptors. It contains
+facts about the interface, not Apple implementation code. No disassembly, cache,
+firmware or Apple code is tracked.
+
+| Pipeline property | 20H392 init/reset default; smoke change |
+| --- | --- |
+| `vertexFunction`, `fragmentFunction` | nil; smoke assigns the Fuxi functions (stage 1/2, owning device) |
+| `vertexDescriptor` | backing reference nil; getter lazily returns an empty object, including after reset |
+| Vertex attributes 0–30 `format`, `offset`, `bufferIndex` | Invalid/0, 0, 0 (zero-init; array getter allocates children) |
+| Vertex layouts 0–30 `stride`, `stepFunction`, `stepRate` | 0, PerVertex/1, 1 |
+| `rasterSampleCount` | 1 |
+| `alphaToCoverageEnabled`, `alphaToOneEnabled`, `rasterizationEnabled` | NO, NO, YES |
+| `depthAttachmentPixelFormat`, `stencilAttachmentPixelFormat` | Invalid/0, Invalid/0 |
+| `inputPrimitiveTopology` | Unspecified/0 |
+| `tessellationFactorFormat`, `maxTessellationFactor` | Half/0, 16 (inert here) |
+| `supportIndirectCommandBuffers` | NO (inert here) |
+| `maxVertexAmplificationCount` | 1 |
+| `vertexLinkedFunctions`, `fragmentLinkedFunctions` | backing references nil; getters lazily return empty objects |
+| Linked `functions`, `binaryFunctions`, `privateFunctions`, `groups` | nil / count 0; nil and empty collections are accepted |
+| Color attachments 0–7 `pixelFormat`, `blendingEnabled`, `writeMask` | Invalid/0, NO, All/15; smoke sets only attachment 0 format to BGRA8Unorm/80 |
+
+Evidence entry addresses: pipeline init `0x181a31690`, reset `0x181b0f66c`,
+vertex-descriptor getter `0x181a452e0`, vertex-layout init `0x181a314b0`,
+vertex attribute array getter `0x181b22360`, color-attachment init `0x181a315cc`,
+linked getters `0x181a480f8` / `0x181a49800`. Getter values are mapped back to
+init/reset writes, including the sample-count constants; assumptions about
+SDK enum defaults alone are insufficient.
+
+| Remaining stage-4 properties | 20H392 defaults; smoke change / validation |
+| --- | --- |
+| Render pass `renderTargetWidth`, `renderTargetHeight`, `renderTargetArrayLength`, `defaultRasterSampleCount` | all 0, derive from attachments; accept 0 or matching 256/256/1/1 |
+| Pass `visibilityResultBuffer`, `rasterizationRateMap` | nil |
+| Pass `imageblockSampleLength`, `tileWidth`, `tileHeight`, `threadgroupMemoryLength`, custom sample-position count | all 0 |
+| Pass color `texture`, `resolveTexture`, `level`, `slice`, `depthPlane` | nil, nil, 0, 0, 0; smoke supplies color-0 texture |
+| Pass color `loadAction`, `storeAction` | DontCare/0, Store/1; smoke explicitly sets Clear/2, Store/1 |
+| Pass color `clearColor` | (0,0,0,1); smoke explicitly sets the same; all components must be finite and in 0..1 |
+| Pass depth/stencil attachment objects | lazy objects; texture/resolveTexture nil (check those, not object presence) |
+| Texture `textureType`, `pixelFormat`, width/height | init is 2D/2, RGBA8Unorm/70, 1/1; smoke factory sets BGRA8Unorm/80, 256/256 |
+| Texture `depth`, `mipmapLevelCount`, `arrayLength`, `sampleCount` | all 1; nonmipmapped smoke factory retains these |
+| Texture `cpuCacheMode`, `storageMode`, `hazardTrackingMode` | default-cache/0, shared/0, default/0; smoke changes storage to private/2; default/0 and tracked/2 hazards accepted |
+| Texture `usage`, `allowGPUOptimizedContents` | usage is SDK-conditioned 0/1 at init (smoke explicitly sets RenderTarget/4); optimization YES (ignored hint) |
+| Render encoder and draw | our original objects; no Apple encoder defaults consumed. One explicit Triangle/3, vertexStart 0, vertexCount 3; backend sets viewport/scissor/raster state |
+| Readback | explicit slice/level/origin 0, size 256x256x1, offset 256, row 1024, image 262144; no default-valued descriptor involved |
+
+Render-pass init is `0x181a3e6d4`, color-attachment init `0x181a3d52c`,
+texture init `0x181a36b2c`, 2D factory `0x181a1a4b8`. Read constants as raw
+bytes: `dump --addr` applies pointer decoding and can distort nonpointer data
+such as doubles. The color load/store constant is (0,1), and clear color is
+(0,0,0,1). The public-default host
+fixtures assign the checked values explicitly instead of borrowing host defaults.
+No additional host/device default mismatch was found in the remaining path.
+
+Reproduce against the same external cache; set `ANALYSIS` to an ignored analysis
+directory, and keep every generated output there:
+
+```sh
+"$IPSW" dyld info "$DSC" > "$ANALYSIS/cache-info.txt"
+shasum -a 256 "$DSC"
+"$IPSW" dyld disass "$DSC" --image Metal > "$ANALYSIS/Metal.disass"
+# Focused reproductions of the gate/default findings:
+"$IPSW" dyld disass "$DSC" --symbol-image Metal \
+  --symbol '-[MTLRenderPipelineDescriptorInternal init]'
+"$IPSW" dyld disass "$DSC" --symbol-image Metal \
+  --symbol '-[MTLRenderPipelineDescriptorInternal reset]'
+"$IPSW" dyld disass "$DSC" --symbol-image Metal \
+  --symbol '-[MTLRenderPipelineDescriptorInternal vertexDescriptor]'
+"$IPSW" dyld disass "$DSC" --symbol-image Metal \
+  --symbol '-[MTLRenderPassDescriptorInternal init]'
+"$IPSW" dyld disass "$DSC" --symbol-image Metal \
+  --symbol '-[MTLTextureDescriptorInternal init]'
+# Constants referenced by pipeline init/reset and texture init:
+"$IPSW" dyld dump "$DSC" 0x181b60200 --bytes --size 16 | xxd
+"$IPSW" dyld dump "$DSC" 0x181b52e20 --bytes --size 16 | xxd
+"$IPSW" dyld dump "$DSC" 0x181b5f1e0 --bytes --size 16 | xxd
+"$IPSW" dyld dump "$DSC" 0x181b5fef0 --bytes --size 32 | xxd
+```
+
+## M5c build, checks and staging
+
+The assigned Mac lane built only the changed frontend with the same M5b
+compiler flags, external Vulkan headers and ad-hoc signing. It retained the
+byte-identical M5b smoke, translator, metallib, configs, source archive and ICD.
+The external translator cache is clean at
+`720ef1ce9ae2a2068999a8675717418b9416283e`; it remains dlopened, with no
+translator load command or linked translator objects in FuxiMetal.
+
+Reproduce the frontend-only rebuild from an existing verified M5b output set:
+
+```sh
+SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+"$(xcrun --sdk iphoneos --find clang++)" \
+  -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -Wall -Wextra -Werror \
+  -Werror=unguarded-availability-new -fstack-protector-strong -fno-objc-arc -fblocks \
+  -std=c++17 -I"$VULKAN_HEADERS" -dynamiclib tools/fuxi-metal/Frontend.mm \
+  -install_name /System/Library/Extensions/FuxiMetal.bundle/FuxiMetal \
+  -framework Foundation -framework Metal -o tools/out/FuxiMetal.bundle/FuxiMetal
+codesign -f -s - tools/out/FuxiMetal.bundle
+codesign --verify --strict tools/out/FuxiMetal.bundle
+python3 tools/audit-fuxi-metal.py tools/out/FuxiMetal.bundle/FuxiMetal \
+  tools/out/fuxi-metal-smoke tools/out/libmetal2vulkan.dylib
+# Build the host ABI-v1 translator from the existing external pin/adapter:
+cargo +1.98.0 build --locked --offline --release \
+  --manifest-path deps/metal2vulkan-bridge/Cargo.toml
+python3 tools/test-fuxi-metal-defaults.py \
+  --translator deps/metal2vulkan-bridge/target/release/libmetal2vulkan.dylib \
+  --metallib tools/out/metal-smoke.metallib
+python3 tools/test-fuxi-metal-frontend.py
+python3 tools/test-fuxi-metal-stage.py
+```
+
+Passed: the new real-library/public-default ASan/UBSan regression, the full
+frontend/gate/census/smoke suite (including stages 0–3), render-pass/draw/readback
+refusals, retained resource ownership and temporary-root staging/idempotence/
+signature checks. Mach-O checks passed for arm64 iOS 16.0, only system loads,
+no RPATH and no CTR_EL0 reads. All **211** strong imports across frontend,
+smoke and translator resolve in the supplied cache's expected system providers.
+The unchanged backend/translator rendering result remains M5b's host evidence;
+no M5c device/GPU render is claimed. No phone, mounted production root or push
+was used.
+
+Signed artifacts and logs are under ignored `tools/out/` on the assigned Mac
+lane; the complete staging set and `M5c-SHA256SUMS` are also mirrored to this
+worktree's ignored `tools/out/`. Only the bundle executable changed; stage the
+whole signed bundle with its existing resource-signature files. All destinations
+are root:wheel (0:0), directories 0755. The staging helper and metal4 boot image
+remain unchanged.
+
+| Artifact under `tools/out/` | iOS destination | Mode | SHA256 |
+| --- | --- | --- | --- |
+| `FuxiMetal.bundle/FuxiMetal` | `/System/Library/Extensions/FuxiMetal.bundle/FuxiMetal` | 0755 | `c4fc86b16613bf55b2474ead9768ce6f269803d2678e8df3a636becf13d222de` |
+| `FuxiMetal.bundle/Info.plist` | `/System/Library/Extensions/FuxiMetal.bundle/Info.plist` | 0644 | `2578f53d73942a55e0163fa5c80c29beb00839bfb8db477a4060e0a81ab5fd06` |
+| `FuxiMetal.bundle/_CodeSignature/CodeResources` | `/System/Library/Extensions/FuxiMetal.bundle/_CodeSignature/CodeResources` | 0644 | `9fcd9223ba2b40aee792c83c8edf32c7c1847f01369fbb0f230e1108a493451b` |
+| `libmetal2vulkan.dylib` | `/usr/local/lib/libmetal2vulkan.dylib` | 0755 | `015d536f2617827cb7c83fd4a58682d370881c59a9bb719f19b00908bae4bd88` |
+| `metal-smoke.metallib` | `/usr/local/share/fuxi/metal-smoke.metallib` | 0644 | `c1da69afc209598f775022dae5325894c1128935334efa024d378a179c6c6464` |
+| `metal2vulkan-source.tar.gz` | `/usr/local/share/fuxi/metal2vulkan-source.tar.gz` | 0644 | `9eb4d8ab39fcb53cf169ec0b450e71fe3fcdbb88bf88641f68b631a2f4d8770b` |
+| `fuxi-metal-smoke` | `/usr/local/bin/fuxi-metal-smoke` | 0755 | `87e652a1915c5830b7ebda274f6f4ef1f8a63b0936a01a74f9a0a293c8b9e1a4` |
+| `metal-smoke.conf` | `/usr/local/share/fuxi/metal-smoke.conf` | 0644 | `7de1555df0c2700329e815b93b32c571c3ea54dc967b89e81ab73b9972b72d1d` |
+| `metal-clients.conf` | `/usr/local/share/fuxi/metal-clients.conf` | 0644 | `8d5b163a382ff4eca7579803ec5dd9e2f24f8c0a4e3d65fc6965c539b3e7e6cc` |
+| `libvulkan_freedreno.dylib` | `/usr/local/lib/libvulkan_freedreno.dylib` | 0755 | `5661a054b5e4be57fe54bc38f3cccf6d264ae20562473caf72e50d2adc158a8c` |
+
+Expected additional device lines, after stages 0–3 (the descriptor line below
+is abbreviated; actual output includes every scalar/linked count and all eight
+attachment format/blend/mask tuples):
+
+```text
+FUXI MTL: function fuxi_vertex class=FuxiFunction stage=1 device=1
+FUXI MTL: function fuxi_fragment class=FuxiFunction stage=2 device=1
+FUXI MTL: pipeline descriptor present=1 vertex=FuxiFunction/stage1/device1 fragment=FuxiFunction/stage2/device1 vertexDescriptor=1 samples=1 ...
+FUXI MTL: translation PASS <milliseconds> ms (no cache)
+FUXI MTL: stage 4 pipeline PASS BGRA8 256x256 inside/outside 6 red 8192 clear 57344 + sentinel edges
+FUXI MTL: done PASS
+```
+
+Any remaining unsupported descriptor value should instead produce exactly the
+field/value rejection line before the existing NSError/exception/stage FAIL.
+Translation and device pixels still need the coordinator's next run.
+
+---
+
 # Metal lane M5b: external shader pipeline
 
 ## M5b external translator and offscreen pipeline

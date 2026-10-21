@@ -134,9 +134,75 @@ static id metalError(NSError **error,const char *why) {
  if(!name || !name.length || name.length>127 || strlen(name.UTF8String)!=[name lengthOfBytesUsingEncoding:NSUTF8StringEncoding]) {unsupported(self,_cmd);return nil;}
  char error[2048]{};int stage=fuxi::Translator::get().function(_library,name.UTF8String,error,sizeof(error));
  if(!stage)return metalError(nullptr,error);
- FuxiFunction *f=[FuxiFunction new];f->_library=[self retain];f->_name=[name copy];f->_stage=stage;return f;
+ FuxiFunction *f=[FuxiFunction new];f->_library=[self retain];f->_name=[name copy];f->_stage=stage;
+ fprintf(stderr,"FUXI MTL: function %s class=%s stage=%d device=%u\n",name.UTF8String,object_getClassName(f),stage,[f device]==_device);return f;
 }
 @end
+// Log the public value that failed, without inspecting Apple's object layout.
+static bool stage4Value(const char *scope,const char *field,uint64_t value,bool accepted) {
+ if(!accepted)fprintf(stderr,"FUXI MTL: %s reject %s %llu\n",scope,field,(unsigned long long)value);
+ return accepted;
+}
+static bool stage4Class(const char *scope,const char *field,id object,Class expected) {
+ if([object isKindOfClass:expected])return true;
+ fprintf(stderr,"FUXI MTL: %s reject %s %s\n",scope,field,object?object_getClassName(object):"nil");return false;
+}
+static void stage4Require(const char *scope,const char *field,uint64_t value,bool accepted) {
+ if(!stage4Value(scope,field,value,accepted))invalid([NSString stringWithFormat:@"%s %s",scope,field]);
+}
+static NSString *pipelineRejection(MTLRenderPipelineDescriptor *d,id device) {
+ id v=d.vertexFunction,f=d.fragmentFunction;MTLVertexDescriptor *vd=d.vertexDescriptor;
+ bool vertex=[v isKindOfClass:[FuxiFunction class]],fragment=[f isKindOfClass:[FuxiFunction class]];
+ int vs=vertex?((FuxiFunction *)v)->_stage:0,fs=fragment?((FuxiFunction *)f)->_stage:0;
+ auto vl=d.vertexLinkedFunctions,fl=d.fragmentLinkedFunctions;
+ char colors[640]{};size_t used=0;
+ for(unsigned i=0;i<8;++i) {auto a=d.colorAttachments[i];used+=(size_t)snprintf(colors+used,sizeof(colors)-used,"%s%u:%lu/%u/%lu",i?",":"",i,(unsigned long)a.pixelFormat,a.blendingEnabled,(unsigned long)a.writeMask);}
+ fprintf(stderr,"FUXI MTL: pipeline descriptor present=%u vertex=%s/stage%d/device%u fragment=%s/stage%d/device%u vertexDescriptor=%u samples=%lu alphaCoverage=%u alphaOne=%u raster=%u depth=%lu stencil=%lu topology=%lu tessFormat=%lu tessMax=%lu indirect=%u amplification=%lu vertexLinked=%u/%lu/%lu/%lu/%lu fragmentLinked=%u/%lu/%lu/%lu/%lu colors(format/blend/mask)=%s\n",
+  d!=nil,v?object_getClassName(v):"nil",vs,vertex && [v device]==device,f?object_getClassName(f):"nil",fs,fragment && [f device]==device,vd!=nil,
+  (unsigned long)d.rasterSampleCount,d.alphaToCoverageEnabled,d.alphaToOneEnabled,d.rasterizationEnabled,(unsigned long)d.depthAttachmentPixelFormat,(unsigned long)d.stencilAttachmentPixelFormat,
+  (unsigned long)d.inputPrimitiveTopology,(unsigned long)d.tessellationFactorFormat,(unsigned long)d.maxTessellationFactor,d.supportIndirectCommandBuffers,(unsigned long)d.maxVertexAmplificationCount,
+  vl!=nil,(unsigned long)vl.functions.count,(unsigned long)vl.binaryFunctions.count,(unsigned long)vl.privateFunctions.count,(unsigned long)vl.groups.count,
+  fl!=nil,(unsigned long)fl.functions.count,(unsigned long)fl.binaryFunctions.count,(unsigned long)fl.privateFunctions.count,(unsigned long)fl.groups.count,colors);
+#define CHECK(field,value,accepted) do {__typeof__(value) actual=(value);if(!stage4Value("pipeline",field,(uint64_t)actual,(accepted)))return [NSString stringWithUTF8String:field];}while(0)
+ CHECK("descriptor",d,d!=nil);
+ if(!stage4Class("pipeline","vertexFunction.class",v,[FuxiFunction class]))return @"vertexFunction.class";
+ if(!stage4Class("pipeline","fragmentFunction.class",f,[FuxiFunction class]))return @"fragmentFunction.class";
+ CHECK("vertexFunction.device",[v device],actual==device);
+ CHECK("fragmentFunction.device",[f device],actual==device);
+ CHECK("vertexFunction.stage",vs,actual==1);
+ CHECK("fragmentFunction.stage",fs,actual==2);
+ // 20H392's getter lazily creates an empty descriptor. Presence alone cannot
+ // distinguish the untouched default from an explicitly supplied empty object.
+ // Accept only that empty shape; any configured vertex input still fails closed.
+ if(vd)for(unsigned i=0;i<31;++i) {
+  auto a=vd.attributes[i];auto l=vd.layouts[i];char field[96];
+#define VCHECK(member,property,value,expected) do {snprintf(field,sizeof(field),"vertexDescriptor.%s[%u].%s",member,i,property);if(!stage4Value("pipeline",field,(uint64_t)(value),(value)==(expected)))return [NSString stringWithUTF8String:field];}while(0)
+  VCHECK("attributes","format",a.format,MTLVertexFormatInvalid);VCHECK("attributes","offset",a.offset,0);VCHECK("attributes","bufferIndex",a.bufferIndex,0);
+  VCHECK("layouts","stride",l.stride,0);VCHECK("layouts","stepFunction",l.stepFunction,MTLVertexStepFunctionPerVertex);VCHECK("layouts","stepRate",l.stepRate,1);
+#undef VCHECK
+ }
+ CHECK("rasterSampleCount",d.rasterSampleCount,actual==1);
+ CHECK("alphaToCoverageEnabled",d.alphaToCoverageEnabled,!actual);
+ CHECK("alphaToOneEnabled",d.alphaToOneEnabled,!actual);
+ CHECK("rasterizationEnabled",d.rasterizationEnabled,actual);
+ CHECK("depthAttachmentPixelFormat",d.depthAttachmentPixelFormat,actual==MTLPixelFormatInvalid);
+ CHECK("stencilAttachmentPixelFormat",d.stencilAttachmentPixelFormat,actual==MTLPixelFormatInvalid);
+ CHECK("inputPrimitiveTopology",d.inputPrimitiveTopology,actual==MTLPrimitiveTopologyClassUnspecified || actual==MTLPrimitiveTopologyClassTriangle);
+ CHECK("maxVertexAmplificationCount",d.maxVertexAmplificationCount,actual==1);
+ // Tessellation settings have no effect without a patch draw; indirect support
+ // is a capability request, not state for our sole direct draw. Do not gate them.
+#define LINKED(prefix,obj) CHECK(prefix ".functions",obj.functions.count,!actual);CHECK(prefix ".binaryFunctions",obj.binaryFunctions.count,!actual);CHECK(prefix ".privateFunctions",obj.privateFunctions.count,!actual);CHECK(prefix ".groups",obj.groups.count,!actual)
+ LINKED("vertexLinkedFunctions",vl);LINKED("fragmentLinkedFunctions",fl);
+#undef LINKED
+ for(unsigned i=0;i<8;++i) {
+  auto a=d.colorAttachments[i];char field[96];
+  snprintf(field,sizeof(field),"colorAttachments[%u].pixelFormat",i);CHECK(field,a.pixelFormat,actual==(i?MTLPixelFormatInvalid:MTLPixelFormatBGRA8Unorm));
+  // Blend and write-mask state on an absent target cannot affect this pipeline.
+  if(!i) {CHECK("colorAttachments[0].blendingEnabled",a.blendingEnabled,!actual);CHECK("colorAttachments[0].writeMask",a.writeMask,actual==MTLColorWriteMaskAll);}
+ }
+#undef CHECK
+ return nil;
+}
 @interface FuxiTexture : FuxiObject { @public id _device; fuxi::Texture *_texture; }
 @end
 @implementation FuxiTexture
@@ -174,18 +240,21 @@ static id metalError(NSError **error,const char *why) {
 @end
 @implementation FuxiRender
 - (void)dealloc {[_command release];[_target release];[_pipeline release];[super dealloc];}
-- (void)active {if(_ended || !_command->_encoding || _command->_status!=MTLCommandBufferStatusNotEnqueued)invalid(@"inactive render encoder");}
+- (void)active {stage4Require("renderEncoder","ended",_ended,!_ended);stage4Require("renderEncoder","encoding",_command->_encoding,_command->_encoding);
+ stage4Require("renderEncoder","commandStatus",_command->_status,_command->_status==MTLCommandBufferStatusNotEnqueued);}
 - (void)setRenderPipelineState:(id)p {CENSUS();[self active];
- if(![p isKindOfClass:[FuxiPipeline class]] || [p device]!=_command->_queue->_device)invalid(@"foreign render pipeline/device");
+ if(!stage4Class("renderEncoder","pipeline.class",p,[FuxiPipeline class]))invalid(@"renderEncoder pipeline.class");
+ stage4Require("renderEncoder","pipeline.device",(uint64_t)[p device],[p device]==_command->_queue->_device);
  [_pipeline release];_pipeline=[p retain];
 }
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count {CENSUS();[self active];
- if(!_pipeline || _drawn || t!=MTLPrimitiveTypeTriangle || start || count!=3)invalid(@"M5b requires exactly one nonindexed triangle, start 0, count 3");
+ stage4Require("draw","pipeline",(uint64_t)_pipeline,_pipeline!=nil);stage4Require("draw","alreadyDrawn",_drawn,!_drawn);
+ stage4Require("draw","primitiveType",t,t==MTLPrimitiveTypeTriangle);stage4Require("draw","vertexStart",start,!start);stage4Require("draw","vertexCount",count,count==3);
  fuxi::Operation op{};op.texture=_target->_texture;op.pipeline=_pipeline->_pipeline;
  op.clear[0]=_clear.red;op.clear[1]=_clear.green;op.clear[2]=_clear.blue;op.clear[3]=_clear.alpha;
  [_command->_resources addObject:_target];[_command->_resources addObject:_pipeline];_command->_ops.push_back(op);_drawn=YES;
 }
-- (void)endEncoding {CENSUS();[self active];if(!_drawn)invalid(@"M5b render encoder requires one draw");_ended=YES;_command->_encoding=NO;}
+- (void)endEncoding {CENSUS();[self active];stage4Require("renderEncoder","drawn",_drawn,_drawn);_ended=YES;_command->_encoding=NO;}
 @end
 @implementation FuxiQueue
 - (void)dealloc {[_device release];[_label release];[super dealloc];}
@@ -212,17 +281,35 @@ static id metalError(NSError **error,const char *why) {
 }
 - (id)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {CENSUS();
  if(clientMode==fuxi::ClientMode::census)return nil;
- if(_status!=MTLCommandBufferStatusNotEnqueued || _encoding) {unsupported(self,_cmd);return nil;}
- if(!d)invalid(@"nil render pass");
+ if(!stage4Value("renderEncoder","commandStatus",_status,_status==MTLCommandBufferStatusNotEnqueued) ||
+    !stage4Value("renderEncoder","encoding",_encoding,!_encoding))return nil;
+#define CHECK(field,value,accepted) do {__typeof__(value) actual=(value);stage4Require("renderPass",field,(uint64_t)actual,(accepted));}while(0)
+ CHECK("descriptor",d,actual!=nil);
  auto a=d.colorAttachments[0];id t=a.texture;
- if(![t isKindOfClass:[FuxiTexture class]] || [t device]!=[self device] || a.level || a.slice || a.depthPlane || a.resolveTexture ||
-    a.loadAction!=MTLLoadActionClear || a.storeAction!=MTLStoreActionStore || d.depthAttachment.texture || d.stencilAttachment.texture ||
-    d.visibilityResultBuffer || d.renderTargetArrayLength>1 || d.imageblockSampleLength || d.tileWidth || d.tileHeight ||
-    d.threadgroupMemoryLength || d.defaultRasterSampleCount>1 || d.rasterizationRateMap ||
-    (d.renderTargetWidth && d.renderTargetWidth!=256) || (d.renderTargetHeight && d.renderTargetHeight!=256) || [d getSamplePositions:nullptr count:0])invalid(@"unsupported M5b render pass");
- for(unsigned i=1;i<8;++i)if(d.colorAttachments[i].texture)invalid(@"multiple render targets");
- MTLClearColor c=a.clearColor;
- for(double x:{c.red,c.green,c.blue,c.alpha})if(!std::isfinite(x) || x<0 || x>1)invalid(@"clear colour outside 0..1");
+ if(!stage4Class("renderPass","colorAttachments[0].texture.class",t,[FuxiTexture class]))invalid(@"renderPass texture.class");
+ CHECK("colorAttachments[0].texture.device",[t device],actual==[self device]);
+ CHECK("colorAttachments[0].level",a.level,!actual);CHECK("colorAttachments[0].slice",a.slice,!actual);CHECK("colorAttachments[0].depthPlane",a.depthPlane,!actual);
+ CHECK("colorAttachments[0].resolveTexture",a.resolveTexture,!actual);
+ CHECK("colorAttachments[0].loadAction",a.loadAction,actual==MTLLoadActionClear);CHECK("colorAttachments[0].storeAction",a.storeAction,actual==MTLStoreActionStore);
+ // Attachment objects are lazily created on iOS too: gate their textures.
+ CHECK("depthAttachment.texture",d.depthAttachment.texture,!actual);CHECK("stencilAttachment.texture",d.stencilAttachment.texture,!actual);
+ CHECK("depthAttachment.resolveTexture",d.depthAttachment.resolveTexture,!actual);CHECK("stencilAttachment.resolveTexture",d.stencilAttachment.resolveTexture,!actual);
+ CHECK("visibilityResultBuffer",d.visibilityResultBuffer,!actual);
+ CHECK("renderTargetArrayLength",d.renderTargetArrayLength,actual<=1);
+ CHECK("imageblockSampleLength",d.imageblockSampleLength,!actual);CHECK("tileWidth",d.tileWidth,!actual);CHECK("tileHeight",d.tileHeight,!actual);
+ CHECK("threadgroupMemoryLength",d.threadgroupMemoryLength,!actual);CHECK("defaultRasterSampleCount",d.defaultRasterSampleCount,actual<=1);
+ CHECK("rasterizationRateMap",d.rasterizationRateMap,!actual);
+ CHECK("renderTargetWidth",d.renderTargetWidth,!actual || actual==256);CHECK("renderTargetHeight",d.renderTargetHeight,!actual || actual==256);
+ CHECK("samplePositions.count",[d getSamplePositions:nullptr count:0],!actual);
+ for(unsigned i=1;i<8;++i) {
+  char field[80];snprintf(field,sizeof(field),"colorAttachments[%u].texture",i);CHECK(field,d.colorAttachments[i].texture,!actual);
+  snprintf(field,sizeof(field),"colorAttachments[%u].resolveTexture",i);CHECK(field,d.colorAttachments[i].resolveTexture,!actual);
+ }
+ MTLClearColor c=a.clearColor;unsigned component=0;
+ for(double x:{c.red,c.green,c.blue,c.alpha}) {
+  if(!std::isfinite(x) || x<0 || x>1) {fprintf(stderr,"FUXI MTL: renderPass reject clearColor[%u] %.17g\n",component,x);invalid(@"clear colour outside 0..1");}++component;
+ }
+#undef CHECK
  FuxiRender *e=[FuxiRender new];e->_command=[self retain];e->_target=[t retain];e->_clear=c;_encoding=YES;return [e autorelease];
 }
 - (void)addCompletedHandler:(MTLCommandBufferHandler)handler {CENSUS();
@@ -271,12 +358,24 @@ static id metalError(NSError **error,const char *why) {
 }
 - (void)copyFromTexture:(id)t sourceSlice:(NSUInteger)s sourceLevel:(NSUInteger)l sourceOrigin:(MTLOrigin)o sourceSize:(MTLSize)z
  toBuffer:(id)b destinationOffset:(NSUInteger)offset destinationBytesPerRow:(NSUInteger)row destinationBytesPerImage:(NSUInteger)image {CENSUS();
- FuxiBuffer *dst=[self validate:b offset:offset size:256*256*4];
- if(![t isKindOfClass:[FuxiTexture class]] || [t device]!=_command->_queue->_device || s || l || o.x || o.y || o.z ||
-    z.width!=256 || z.height!=256 || z.depth!=1 || row!=1024 || image!=256*256*4 || (offset&255))invalid(@"M5b requires whole 256x256 BGRA texture readback");
+ stage4Require("readback","ended",_ended,!_ended);stage4Require("readback","encoding",_command->_encoding,_command->_encoding);
+ stage4Require("readback","commandStatus",_command->_status,_command->_status==MTLCommandBufferStatusNotEnqueued);
+ if(!stage4Class("readback","buffer.class",b,[FuxiBuffer class]))invalid(@"readback buffer.class");
+ stage4Require("readback","buffer.device",(uint64_t)[b device],[b device]==_command->_queue->_device);
+ FuxiBuffer *dst=b;
+ stage4Require("readback","destinationOffset",offset,offset<=dst->_buffer->length);
+ stage4Require("readback","buffer.length",dst->_buffer->length,dst->_buffer->length-offset>=256*256*4);
+#define CHECK(field,value,accepted) do {__typeof__(value) actual=(value);stage4Require("readback",field,(uint64_t)actual,(accepted));}while(0)
+ if(!stage4Class("readback","texture.class",t,[FuxiTexture class]))invalid(@"readback texture.class");
+ CHECK("texture.device",[t device],actual==_command->_queue->_device);
+ CHECK("sourceSlice",s,!actual);CHECK("sourceLevel",l,!actual);CHECK("sourceOrigin.x",o.x,!actual);CHECK("sourceOrigin.y",o.y,!actual);CHECK("sourceOrigin.z",o.z,!actual);
+ CHECK("sourceSize.width",z.width,actual==256);CHECK("sourceSize.height",z.height,actual==256);CHECK("sourceSize.depth",z.depth,actual==1);
+ CHECK("destinationBytesPerRow",row,actual==1024);CHECK("destinationBytesPerImage",image,actual==256*256*4);
+ CHECK("destinationOffset",offset,!(actual&255));
+#undef CHECK
  // Refuse reads without an earlier render in this command; no untracked image layout.
  bool rendered=false;for(const auto &op:_command->_ops)if(op.texture==((FuxiTexture *)t)->_texture && op.pipeline)rendered=true;
- if(!rendered)invalid(@"readback requires earlier render in same command");
+ stage4Require("readback","earlierRender",rendered,rendered);
  fuxi::Operation op{};op.dst=dst->_buffer;op.to=offset;op.texture=((FuxiTexture *)t)->_texture;
  [_command->_resources addObject:t];[_command->_resources addObject:dst];_command->_ops.push_back(op);
 }
@@ -375,27 +474,23 @@ static id metalError(NSError **error,const char *why) {
 }
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d {CENSUS();
  if(clientMode==fuxi::ClientMode::census)return nil;
- if(!d || d.textureType!=MTLTextureType2D || d.pixelFormat!=MTLPixelFormatBGRA8Unorm || d.width!=256 || d.height!=256 || d.depth!=1 ||
-    d.mipmapLevelCount!=1 || d.arrayLength!=1 || d.sampleCount!=1 || d.storageMode!=MTLStorageModePrivate || d.cpuCacheMode!=MTLCPUCacheModeDefaultCache ||
-    d.hazardTrackingMode==MTLHazardTrackingModeUntracked || d.usage!=MTLTextureUsageRenderTarget || d.allowGPUOptimizedContents!=YES) {unsupported(self,_cmd);return nil;}
+#define CHECK(field,value,accepted) do {__typeof__(value) actual=(value);if(!stage4Value("texture",field,(uint64_t)actual,(accepted)))return nil;}while(0)
+ CHECK("descriptor",d,actual!=nil);
+ CHECK("textureType",d.textureType,actual==MTLTextureType2D);CHECK("pixelFormat",d.pixelFormat,actual==MTLPixelFormatBGRA8Unorm);
+ CHECK("width",d.width,actual==256);CHECK("height",d.height,actual==256);CHECK("depth",d.depth,actual==1);
+ CHECK("mipmapLevelCount",d.mipmapLevelCount,actual==1);CHECK("arrayLength",d.arrayLength,actual==1);CHECK("sampleCount",d.sampleCount,actual==1);
+ CHECK("storageMode",d.storageMode,actual==MTLStorageModePrivate);CHECK("cpuCacheMode",d.cpuCacheMode,actual==MTLCPUCacheModeDefaultCache);
+ CHECK("hazardTrackingMode",d.hazardTrackingMode,actual==MTLHazardTrackingModeDefault || actual==MTLHazardTrackingModeTracked);
+ CHECK("usage",d.usage,actual==MTLTextureUsageRenderTarget);
+ // allowGPUOptimizedContents is an implementation hint, not pixel semantics.
+#undef CHECK
  FuxiTexture *t=[FuxiTexture new];t->_device=[self retain];
  try {t->_texture=owner(self)->backend->allocateTexture();}catch(const std::exception &e) {fprintf(stderr,"FUXI MTL: texture FAIL %s\n",e.what());[t release];return nil;}return t;
 }
 - (id)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {CENSUS();
  if(error)*error=nil;if(clientMode==fuxi::ClientMode::census)return nil;
+ if(NSString *field=pipelineRejection(d,self))return metalError(error,field.UTF8String);
  id v=d.vertexFunction,f=d.fragmentFunction;
- if(!d || ![v isKindOfClass:[FuxiFunction class]] || ![f isKindOfClass:[FuxiFunction class]] || [v device]!=self || [f device]!=self ||
-    ((FuxiFunction *)v)->_stage!=1 || ((FuxiFunction *)f)->_stage!=2 || d.vertexDescriptor || d.rasterSampleCount!=1 ||
-    d.alphaToCoverageEnabled || d.alphaToOneEnabled || !d.rasterizationEnabled || d.depthAttachmentPixelFormat!=MTLPixelFormatInvalid ||
-    d.stencilAttachmentPixelFormat!=MTLPixelFormatInvalid || d.inputPrimitiveTopology!=MTLPrimitiveTopologyClassUnspecified ||
-    d.tessellationFactorFormat!=MTLTessellationFactorFormatHalf || d.maxTessellationFactor!=16 || d.supportIndirectCommandBuffers ||
-    d.maxVertexAmplificationCount!=1 || d.vertexLinkedFunctions.functions.count || d.vertexLinkedFunctions.binaryFunctions.count ||
-    d.vertexLinkedFunctions.privateFunctions.count || d.vertexLinkedFunctions.groups.count || d.fragmentLinkedFunctions.functions.count ||
-    d.fragmentLinkedFunctions.binaryFunctions.count || d.fragmentLinkedFunctions.privateFunctions.count || d.fragmentLinkedFunctions.groups.count)return metalError(error,"unsupported M5b pipeline descriptor/functions");
- for(unsigned i=0;i<8;++i) {
-  auto a=d.colorAttachments[i];if(a.pixelFormat!=(i?MTLPixelFormatInvalid:MTLPixelFormatBGRA8Unorm) || a.blendingEnabled || a.writeMask!=MTLColorWriteMaskAll)
-   return metalError(error,"M5b requires BGRA8 attachment 0, no blending, full write mask");
- }
  FuxiPipeline *p=[FuxiPipeline new];p->_device=[self retain];
  try {auto a=(FuxiFunction *)v,b=(FuxiFunction *)f;p->_pipeline=owner(self)->backend->compilePipeline(a->_library->_library,a->_name.UTF8String,b->_library->_library,b->_name.UTF8String);}
  catch(const std::exception &e) {[p release];return metalError(error,e.what());}return p;
