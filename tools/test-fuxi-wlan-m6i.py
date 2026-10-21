@@ -35,7 +35,7 @@ static uint32_t rsc[1024], cfg, revision, fw_faults, fw_fault_esr, wl3_faults;
 static uint64_t fw_fault_far;
 static uint32_t wl3_report[128], wl4_report[64], wl5_report[128], link;
 static unsigned writes, triggers, delays, stages[32], nstages, bhi, aborts;
-static unsigned fail_irq, fail_trigger, idle_busy, bad_cleanup;
+static unsigned fail_irq, fail_trigger, idle_busy, bad_cleanup, fail_cstat;
 static uint32_t cmd_status;
 static unsigned status_reads;
 static uint64_t fault_read, fault_write, drop_write;
@@ -84,7 +84,7 @@ static void ts_wr(uintptr_t base, uint32_t off, uint32_t v) {
             assert(nsent<32);
             sent[nsent++]=(struct sent){rsc[(0x38+i*24)/4],rsc[(0x3c+i*24)/4],
                 rsc[(0x34+i*24)/4],rsc[0x20/4],triggers,i};
-            rsc[(0x40+i*24)/4]=cmd_status;
+            rsc[(0x40+i*24)/4]=fail_cstat && (!fail_trigger || fail_trigger==triggers) ? 0x100 : cmd_status;
         }
         if(!fail_irq || (fail_trigger && fail_trigger!=triggers)) rsc[1]|=1;
         rsc[0x28/4]=idle_busy ? 0 : 1;
@@ -125,7 +125,8 @@ static void fixture(void) {
     memset(db,0,sizeof(db)); memset(rsc,0,sizeof(rsc));
     memset(wl3_report,0,sizeof(wl3_report)); memset(wl5_report,0,sizeof(wl5_report));
     fw_faults=wl3_faults=writes=triggers=delays=nstages=bhi=aborts=nsent=0;
-    fault_read=fault_write=drop_write=0; fail_irq=fail_trigger=idle_busy=bad_cleanup=cmd_status=status_reads=0;
+    fault_read=fault_write=drop_write=0; fail_irq=fail_trigger=idle_busy=bad_cleanup=fail_cstat=status_reads=0;
+    cmd_status=0x10101; /* device M6j: ISSUED|COMPLETED|bit0, IRQ_STATUS 0 */
     cfg=(16u<<27)|(8u<<12); revision=3u<<16;
     rsc[0x28/4]=1; rsc[0]=0xa5; rsc[1]=0x80;
     rsc[(0x2a0+0x2c)/4]=0xdead; /* another slot must survive */
@@ -189,7 +190,7 @@ int main(void) {
     b=(struct wl_bcm){.unit=2000,.width=4};
     wl_bcm_bandwidth(&b,127,127,16,4); assert(b.x==3 && b.y==15);
     wl_bcm_bandwidth(&b,0,1,16,4); assert(b.x==0 && b.y==1);
-    fixture(); assert(!wl_icc_step(2)); assert(triggers==4 && wl_icc_acks==1 && nsent==6 && !status_reads);
+    fixture(); assert(!wl_icc_step(2)); assert(triggers==4 && wl_icc_acks==1 && nsent==6 && status_reads==6);
     /* One trigger per VCD; response on all, commit/wait on final only. */
     const unsigned order[]={3,4,1,2,5,0};
     const unsigned commit[]={0,1,0,1,1,1};
@@ -235,21 +236,24 @@ int main(void) {
         assert(!wl_icc_step(2) && !wl_icc_step(12));
         assert((wl_bcms[0].x != 0)==(row != 0));
     }
-    /* IRQ completion accepts any per-command status, as v6.18 does. */
+    /* BCM requests complete on ISSUED|COMPLETED (last cmd of a VCD waits)
+       with the TCS idle; the device leaves IRQ_STATUS 0 for them. */
     const uint32_t statuses[]={0,0x100,0x10000,0x10100,0xdeadbeef};
     for(unsigned i=0;i<sizeof(statuses)/sizeof(statuses[0]);i++) {
-        fixture(); cmd_status=statuses[i]; assert(!wl_icc_step(2));
-        assert(triggers==4 && !status_reads && !rh_poisoned);
+        fixture(); fail_irq=1; cmd_status=statuses[i];
+        bool ok=(statuses[i]&0x10100)==0x10100;
+        assert(!wl_icc_step(2)==ok);
+        assert(ok ? triggers==4 && !rh_poisoned : triggers==1 && rh_poisoned);
     }
     /* A missing fresh IRQ stops at each possible group, logs every command
        in that group exactly once, and never triggers a later group. */
     for(unsigned group=1;group<=4;group++) {
-        fixture(); fail_irq=1; fail_trigger=group; cmd_status=0x100;
+        fixture(); fail_irq=1; fail_cstat=1; fail_trigger=group;
         assert(wl_icc_step(2));
         const unsigned counts[]={0,2,2,1,1}, totals[]={0,2,4,5,6};
         assert(triggers==group && nsent==totals[group] && delays==100000);
         assert(rh_poisoned && wl_icc_failed && !wl_icc_acks);
-        assert(status_reads==counts[group]);
+        assert(status_reads==totals[group]-counts[group]+100001*counts[group]);
         const char *at=logs;
         for(unsigned i=0;i<counts[group];i++) {
             const struct sent *c=&sent[totals[group]-counts[group]+i];
@@ -287,7 +291,7 @@ int main(void) {
     fixture(); fault_write=RH_TCS_PA+0x3c; assert(wl_icc_step(2)); assert(!triggers && rh_poisoned);
     fixture(); fail_irq=1; fault_read=RH_TCS_PA+0x40;
     assert(wl_icc_step(2)); assert(triggers==1 && rh_poisoned && fw_faults);
-    assert(strstr(logs,"CMD_STATUS 0xffffffff") && strstr(logs,"faults 1"));
+    assert(strstr(logs,"CMD_STATUS 0xffffffff") && strstr(logs,"faults 2")); /* poll + log read */
     /* Regulator retains its exact one-command request and BOTH status bits. */
     fixture(); cmd_status=0x10100; assert(!rh_send(0,0x40000,1000));
     assert(nsent==1 && sent[0].addr==0x40000 && sent[0].data==1000);
@@ -317,7 +321,7 @@ int main(void) {
        update before endpoint setup; either failure prevents the BHI step. */
     fixture(); fw_run(22); assert(triggers==8 && bhi==1 && aborts==1 && wl_icc_acks==2);
     for(unsigned phase=0;phase<2;phase++) for(unsigned group=1;group<=4;group++) {
-        fixture(); fail_irq=1; fail_trigger=phase*4+group; fw_run(22);
+        fixture(); fail_irq=1; fail_cstat=1; fail_trigger=phase*4+group; fw_run(22);
         assert(triggers==fail_trigger && !bhi && wl_icc_failed && rh_poisoned);
         assert(wl_icc_acks==phase && wl5_report[2]==(phase ? 12 : 2));
         assert(nstages==(phase ? 11 : 1) && stages[nstages-1]==(phase ? 11 : 1));
