@@ -189,6 +189,13 @@ setup() {
 
 kernel() {
     local dxb=$work/dxb variant=${target#kernel-}
+    if [[ $target == kernel-wlan6g ]]; then
+        # M6h keeps the existing artifact/target and cmdlines. Exercise the
+        # exact C carried by patch 0099 before spending a hosted kernel build.
+        python3 tools/test-fuxi-wlan-m6.py
+        shasum -a 256 xnu/fuxi-wlan/fuxi_wlan.c xnu/patches/0099-fuxi-wlan.patch \
+            shim/fuxi-probe/wlan.c > "$out/wlan-source-SHA256SUMS.txt"
+    fi
     source_checkout dxb https://github.com/blacktop/darwin-xnu-build.git "$DXB_SHA" "$dxb"
     python3 tools/ci/prepare-kernel.py "$dxb"
     # MACOS_VERSION selects xnu-8796.141.3 + KDK 13.5/22G74. The pinned

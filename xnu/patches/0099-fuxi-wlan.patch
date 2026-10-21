@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,1687 @@
+@@ -0,0 +1,1827 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -37,6 +37,8 @@
 + *   fuxiwlan=1      run all 28 steps
 + *   fuxiwlan=2..28  stop after that step (bisecting a hang or reset)
 + *   fuxiwlanoldiova=1  use M6f's IOVA pool, retaining the M6g SMMU profile
++ *   fuxiwlanclk=1  add missing PCIe fabric clock votes (default: observe)
++ *   fuxiwlaniboff=1  disable stale inbound iATU windows before BHI (opt-in)
 + * Steps 17..28 probe DMA safety and load rootfs firmware through BHI/BHIe.
 + * No interrupts, channels or QMI are enabled; see docs-lanes/wlan-bt.md M6.
 + *
@@ -762,6 +764,132 @@
 +	return hash;
 +}
 +
++/* M6h upstream DMA audit. Sources and limits: docs/wlan-m6h.md.
++ * The DT iATU aperture is 0x1000 bytes: eight unrolled 0x200-byte pairs,
++ * inbound at +0x100. Read only within that aperture, including unused slots;
++ * do not probe implementation by writing all-ones as Linux detection does.
++ * Snapshots never clear PCI status/AER, nor alter route/ATU/clock state. */
++#define WL_IB_SLOTS 8u
++#define WL_IB(n) (WL_DBI + 0x1100ull + (uint64_t)(n) * 0x200)
++#define WL_GCC_PA 0x00100000ull
++static const uint32_t wl_fabric_cb[] = {
++	0x1003c, 0x10030, 0x6b02c, 0x6b020, 0x6b01c, 0x1004c, 0x10028
++};
++
++static void
++wl_host_diag(const char *phase)
++{
++	uint32_t flags = 0, cs = wl_prd(WL_DBI + 4), sec = wl_prd(WL_DBI + 0x1c) >> 16;
++	unsigned aer = wl_diag_cap(WL_DBI, 1, true, &flags);
++	printf("FUXI WLAN: M6h %s RC cmd/status %#x BME %u abort STA/RTA/RMA %u/%u/%u SEC %#x abort STA/RTA/RMA %u/%u/%u MEM %#x PREF %#x upper %#x/%#x AER unc/root %#x/%#x capflags %#x AXI_RESP %#x/%#x\n",
++	    phase, cs, (cs >> 2) & 1, (cs >> 27) & 1, (cs >> 28) & 1, (cs >> 29) & 1,
++	    sec, (sec >> 11) & 1, (sec >> 12) & 1, (sec >> 13) & 1,
++	    wl_prd(WL_DBI + 0x20), wl_prd(WL_DBI + 0x24), wl_prd(WL_DBI + 0x28), wl_prd(WL_DBI + 0x2c),
++	    aer ? wl_prd(WL_DBI + aer + 4) : ~0u, aer ? wl_prd(WL_DBI + aer + 0x30) : ~0u,
++	    flags, wl_prd(WL_DBI + 0x818), wl_prd(WL_DBI + 0x81c));
++	printf("FUXI WLAN: M6h %s PARF SYS %#x PM %#x PHY %#x MHI_CLK %#x BYPASS %u HALT v1/v2 %#x/%#x Q2A %#x LTSSM %#x TYPE %#x NOSNOOP %#x\n",
++	    phase, wl_prd(WL_PARF), wl_prd(WL_PARF + 0x20), wl_prd(WL_PARF + 0x40),
++	    wl_prd(WL_PARF + 0x174), (wl_prd(WL_PARF + 0x174) >> 4) & 1,
++	    wl_prd(WL_PARF + 0x178), wl_prd(WL_PARF + 0x1a8), wl_prd(WL_PARF + 0x1ac),
++	    wl_prd(WL_PARF + 0x1b0), wl_prd(WL_PARF + 0x1000), wl_prd(WL_PARF + 0x3d4));
++	printf("FUXI WLAN: M6h %s PARF ADDR DBI/SLV v1 %#x/%#x DBI v2 %#x:%08x SLV v2 %#x:%08x ATU %#x:%08x BDF_TRANSLATE %#x\n",
++	    phase, wl_prd(WL_PARF + 0x168), wl_prd(WL_PARF + 0x16c),
++	    wl_prd(WL_PARF + 0x354), wl_prd(WL_PARF + 0x350),
++	    wl_prd(WL_PARF + 0x35c), wl_prd(WL_PARF + 0x358),
++	    wl_prd(WL_PARF + 0x638), wl_prd(WL_PARF + 0x634), wl_prd(WL_PARF + 0x24c));
++	unsigned hash = wl_rc_hash(0x100), nonzero = 0, mismatch = 0;
++	uint32_t entry = 0, root = 0, digest = 2166136261u;
++	for (unsigned i = 0; i < 256; i++) {
++		uint32_t v = wl_prd(WL_PARF + 0x2000 + 4 * i);
++		if (i == hash) { entry = v; }
++		if (!i) { root = v; }
++		nonzero += !!v;
++		mismatch += v != (i == hash ? WL_RC_ENTRY : 0);
++		digest = (digest ^ v) * 16777619u;
++	}
++	printf("FUXI WLAN: M6h %s SID RID 0x100 DTbase 0x1400 cfg %#x offset %#x hash %#x entry %#x BDF %#x SIDoff %#x NEXT %#x root %#x nonzero %u mismatch %u digest %#x\n",
++	    phase, wl_prd(WL_PARF + 0x2c00), wl_prd(WL_PARF + 0x234), hash, entry,
++	    entry >> 16, (entry >> 8) & 255, entry & 255, root, nonzero, mismatch, digest);
++	uint32_t ib[WL_IB_SLOTS], enabled = 0;
++	for (unsigned i = 0; i < WL_IB_SLOTS; i++) {
++		ib[i] = wl_prd(WL_IB(i) + 4);
++		if (ib[i] & (1u << 31)) { enabled |= 1u << i; }
++	}
++	printf("FUXI WLAN: M6h %s iATU IB slots 0..7 enabled %#x ctrl2 %#x/%#x/%#x/%#x/%#x/%#x/%#x/%#x IOVA %#llx\n",
++	    phase, enabled, ib[0], ib[1], ib[2], ib[3], ib[4], ib[5], ib[6], ib[7], wl_image.iova);
++	for (unsigned i = 0; i < WL_IB_SLOTS; i++) {
++		if (!(enabled & (1u << i))) { continue; }
++		uint64_t p = WL_IB(i);
++		printf("FUXI WLAN: M6h %s iATU IB%u ctrl1/2 %#x/%#x BARmatch %u base %#x:%08x limit %#x:%08x target %#x:%08x\n",
++		    phase, i, wl_prd(p), ib[i], (ib[i] >> 30) & 1,
++		    wl_prd(p + 0x0c), wl_prd(p + 8), wl_prd(p + 0x20), wl_prd(p + 0x10),
++		    wl_prd(p + 0x18), wl_prd(p + 0x14));
++	}
++	uint32_t cb[7], off = 0, ungated = 0;
++	for (unsigned i = 0; i < 7; i++) {
++		cb[i] = wl_prd(WL_GCC_PA + wl_fabric_cb[i]);
++		if (cb[i] & (1u << 31)) { off |= 1u << i; }
++		if ((cb[i] & (1u << 31)) && !(cb[i] & 2)) { ungated |= 1u << i; }
++	}
++	printf("FUXI WLAN: M6h %s GCC vote0/8 %#x/%#x CB aggre/cnoc/master/slave/q2a/ddrss/cfg %#x/%#x/%#x/%#x/%#x/%#x/%#x OFF %#x OFF_no_HWCG %#x\n",
++	    phase, wl_prd(WL_GCC_PA + 0x52000), wl_prd(WL_GCC_PA + 0x52008),
++	    cb[0], cb[1], cb[2], cb[3], cb[4], cb[5], cb[6], off, ungated);
++	unsigned cap = wl_diag_cap(WL_DBI, 0x10, false, &flags);
++	uint32_t link = cap ? wl_prd(WL_DBI + cap + 0x10) : 0;
++	unsigned speed = (link >> 16) & 15, width = (link >> 20) & 63;
++	unsigned peak = speed == 1 ? 250000 : speed == 2 ? 500000 : speed == 3 ? 984500 : 0;
++	/* No BCM register reads: cmd-db gives RPMh command addresses, not MMIO.
++	 * Firmware/other clients' aggregated votes cannot be inferred from GCC. */
++	printf("FUXI WLAN: M6h %s ICC XNU_votes=none Linux pcie-mem init 0/250000 link 0/%u kBps cpu-pcie 0/1 kBps Gen%u x%u BCM SN7/SH1/SH0/MC0/ACV/CN0 firmware_votes=unknown faults %u\n",
++	    phase, peak * width, speed, width, fw_faults);
++}
++
++/* SM8550 gcc clock drivers: existing M3 votes cover master/slave/Q2A,
++ * aggregation and DDRSS; missing CNOC SF is vote8 bit6, ANOC config is
++ * vote0 bit20. Add only those shared votes; never remove another client's
++ * vote. Exactly 1 opts in. No PARF recipe from a different IP revision. */
++static int
++wl_fabric_prepare(void)
++{
++	int clocks = 0, iboff = 0;
++	(void)PE_parse_boot_argn("fuxiwlanclk", &clocks, sizeof(clocks));
++	(void)PE_parse_boot_argn("fuxiwlaniboff", &iboff, sizeof(iboff));
++	printf("FUXI WLAN: M6h fixes fuxiwlanclk=%d fuxiwlaniboff=%d (only 1 enables)\n", clocks, iboff);
++	if (fw_faults || !wl_route_installed || (wl_prd(WL_EPCFG + 4) & 4)) { return 1; }
++	if (clocks == 1) {
++		uint32_t v0 = wl_prd(WL_GCC_PA + 0x52000), v8 = wl_prd(WL_GCC_PA + 0x52008);
++		wl_pwr(WL_GCC_PA + 0x52000, v0 | (1u << 20));
++		wl_pwr(WL_GCC_PA + 0x52008, v8 | (1u << 6));
++		uint32_t a0 = wl_prd(WL_GCC_PA + 0x52000), a8 = wl_prd(WL_GCC_PA + 0x52008);
++		printf("FUXI WLAN: M6h clock votes %#x/%#x -> %#x/%#x retained for boot\n", v0, v8, a0, a8);
++		if (fw_faults || !(a0 & (1u << 20)) || !(a8 & (1u << 6))) { return 2; }
++		for (unsigned i = 0; i < 2; i++) {
++			uint32_t off = i ? 0x10030 : 0x10028, v = 0;
++			unsigned n;
++			for (n = 0; n < 500; n++) {
++				v = wl_prd(WL_GCC_PA + off);
++				if (fw_faults || !(v & (1u << 31)) || (v & 2)) { break; }
++				fw_delay(1);
++			}
++			printf("FUXI WLAN: M6h clock CB %#x value %#x polls %u\n", off, v, n);
++			if (fw_faults || n == 500) { return 3; }
++		}
++	}
++	if (iboff == 1) {
++		for (unsigned i = 0; i < WL_IB_SLOTS; i++) {
++			uint64_t p = WL_IB(i) + 4;
++			uint32_t v = wl_prd(p);
++			if (fw_faults) { return 4; }
++			if (!(v & (1u << 31))) { continue; }
++			wl_pwr(p, v & ~(1u << 31));
++			uint32_t after = wl_prd(p);
++			printf("FUXI WLAN: M6h iATU disable IB%u ctrl2 %#x -> %#x\n", i, v, after);
++			if (fw_faults || after != (v & ~(1u << 31))) { return 4; }
++		}
++	}
++	return !!fw_faults;
++}
++
 +/* Read-only capability walk: never disable an existing user to claim a table. */
 +static int
 +wl_rc_irqs_busy(uint64_t cfg)
@@ -1429,6 +1557,10 @@
 +		    wl_smmu_verify("CB_SCTLR pre-DMA", wl_cb_addr(wl_cb), WL_CB_SCTLR,
 +		    wl_prd(wl_cb_addr(wl_cb)), WL_CB_SCTLR, WL_CB_SCTLR_MASK) ||
 +		    (wl_prd(WL_PARF + 0x2c00) & 1) || wl_prd(WL_PARF + 0x234)) { return 6; }
++		if (wl_fabric_prepare()) {
++			wl_host_diag("preflight-blocked");
++			return 10;
++		}
 +		/* ath12k_mhi_clear_vector: undefined reset status is not a result.
 +		 * Only doorbells/status, no RDDM buffers and no retry. */
 +		const unsigned clear[] = {0x3c, 0x44, 0x70, 0x78};
@@ -1455,6 +1587,10 @@
 +		 * Disable legacy INTx; MSI/MSI-X remain unconfigured/disabled. */
 +		wl_pwr(WL_EPCFG + 4, (wl_prd(WL_EPCFG + 4) & 0xffff) | 0x404);
 +		if ((wl_prd(WL_EPCFG + 4) & 0x406) != 0x406 || fw_faults) { return 2; }
++		wl_host_diag("preflight");
++		/* Step 14 sets RC BME already. Prove it survived; do not silently
++		 * repair changed command state or emit the BHI doorbell after a fault. */
++		if (fw_faults || !(wl_prd(WL_DBI + 4) & 4)) { return 10; }
 +		read_random(&wl_seq, sizeof(wl_seq));
 +		wl_seq &= WL_SEQ_MASK;
 +		if (!wl_seq) { wl_seq = 1; } /* bounded nonzero fallback */
@@ -1469,6 +1605,10 @@
 +		wl5_report[126] = first; wl5_report[127] = (uint32_t)e;
 +		wl_sleep(10); /* diagnostic repeat only; never retry a failed transfer */
 +		uint32_t again = wl_bhi_diag(1);
++		bool failed = e || ((first | again) & (WL_DIAG_PBL_ERROR | WL_DIAG_TRANSPORT)) ||
++		    (wl5_report[67] >> 30) == 3 || wl5_report[64] == 3 || wl5_report[64] == 6 ||
++		    (wl5_report[65] & 4) || ((wl5_report[65] >> 8) & 255) == 255 || (wl5_report[66] & 2);
++		wl_host_diag(failed ? "failure" : "completion");
 +		if (e || ((first | again) & WL_DIAG_PBL_ERROR)) {
 +			if (!((first | again) & WL_DIAG_TRANSPORT)) { wl_boot_logs(); }
 +			else { printf("FUXI WLAN: M6f boot logs skipped transport flags %#x\n", first | again); }

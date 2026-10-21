@@ -73,8 +73,17 @@ static struct ev events[8192];
 static unsigned nr, ne, sleeps, frees, allocations;
 static int old_iova_arg;
 static bool old_iova_present;
+static int clock_arg, iboff_arg;
+static unsigned clock_delays;
+static bool track_reads;
+static uint64_t reads[4096];
+static unsigned nreads;
+static void fw_delay(unsigned us) { clock_delays+=us; }
 static bool PE_parse_boot_argn(const char *name, void *out, int size) {
-    assert(!strcmp(name,"fuxiwlanoldiova") && size==sizeof(int));
+    assert(size==sizeof(int));
+    if(!strcmp(name,"fuxiwlanclk")) { memcpy(out,&clock_arg,size); return true; }
+    if(!strcmp(name,"fuxiwlaniboff")) { memcpy(out,&iboff_arg,size); return true; }
+    assert(!strcmp(name,"fuxiwlanoldiova"));
     if(old_iova_present) memcpy(out,&old_iova_arg,size);
     return old_iova_present;
 }
@@ -97,6 +106,7 @@ static void record(char k, uint64_t pa, uint32_t v) {
     assert(ne < 8192); events[ne++] = (struct ev){k,pa,v};
 }
 static uint32_t wl_prd(uint64_t pa) {
+    if(track_reads) { assert(nreads<4096); reads[nreads++]=pa; }
     if (read_fault_pa && pa==read_fault_pa) {fw_faults++; return ~0u;}
     uint32_t v=0;
     for (unsigned i=0;i<nr;i++) if(regs[i].pa==pa) {v=regs[i].v; break;}
@@ -215,6 +225,7 @@ static void init(void) {
     memset(&wl_image,0,sizeof(wl_image)); memset(&wl_vectors,0,sizeof(wl_vectors));
     memset(&wl_tables,0,sizeof(wl_tables)); wl_owned=wl_enabled=wl_route_owned=wl_route_installed=false;
     old_iova_arg=0; old_iova_present=false; wl_iova_configure();
+    clock_arg=iboff_arg=0; clock_delays=nreads=0; track_reads=false;
     memset(&wl_contexts,0,sizeof(wl_contexts)); memset(wl5_report,0,sizeof(wl5_report));
     memset(fixture,0,sizeof(fixture)); file_size=sizeof(fixture);
     memcpy(fixture,"\177ELF\1\1\1",7);
@@ -224,6 +235,7 @@ static void init(void) {
     setreg(WL_SMMU+0x28,0x1000|0x22);
     for(unsigned i=0;i<4;i++) setreg(WL_SMMU+0xc00+4*i,0x20000);
     setreg(WL_DBI+0x34,0x70); setreg(WL_DBI+0x70,0x10);
+    setreg(WL_DBI+4,0x107); /* step 14 RC IO|MEM|MASTER|SERR */
     setreg(WL_DBI+0x80,1u<<29); setreg(WL_DBI+0xf28,0x400); setreg(WL_PARF+0x1b0,0x111);
     setreg(WL_EPCFG,0x110717cb); setreg(WL_EPCFG+0x10,WL_BAR0|4);
     setreg(WL_BAR0,0x100);
@@ -277,6 +289,96 @@ static int findwrite(uint64_t pa, uint32_t v, unsigned from) {
     return -1;
 }
 int main(void) {
+    /* M6h snapshots are read-only, include the last IB slot and every SID
+       slot, and decode aborts from the correct half of the PCI dwords. */
+    init();
+    setreg(WL_DBI+4,0x38000107); setreg(WL_DBI+0x1c,0x38000000);
+    setreg(WL_DBI+0x20,0x60506040); setreg(WL_DBI+0x24,0xfff0);
+    setreg(WL_DBI+0x100,0x10001); setreg(WL_DBI+0x104,0x1234);
+    setreg(WL_DBI+0x130,0x5678); setreg(WL_DBI+0x80,0x20220000);
+    setreg(WL_PARF+0x2054,0x01000100); setreg(WL_PARF+0x2c00,0);
+    setreg(WL_GCC_PA+0x10030,0x80000000); setreg(WL_GCC_PA+0x1003c,0x80000002);
+    setreg(WL_IB(7)+4,0xc0000000); setreg(WL_IB(7)+8,0xa0000000);
+    setreg(WL_IB(7)+0x10,0xafffffff); setreg(WL_IB(7)+0x14,0x12300000);
+    track_reads=true; wl_host_diag("fixture"); track_reads=false;
+    assert(!ne && !fw_faults);
+    assert(strstr(logbuf,"fixture RC cmd/status 0x38000107 BME 1 abort STA/RTA/RMA 1/1/1 SEC 0x3800 abort STA/RTA/RMA 1/1/1"));
+    assert(strstr(logbuf,"MEM 0x60506040 PREF 0xfff0") && strstr(logbuf,"AER unc/root 0x1234/0x5678"));
+    assert(strstr(logbuf,"hash 0x15 entry 0x1000100 BDF 0x100 SIDoff 0x1 NEXT 0 root 0 nonzero 1 mismatch 0"));
+    assert(strstr(logbuf,"slots 0..7 enabled 0x80") && strstr(logbuf,"fixture iATU IB7"));
+    assert(strstr(logbuf,"OFF 0x3 OFF_no_HWCG 0x2"));
+    assert(strstr(logbuf,"ICC XNU_votes=none Linux pcie-mem init 0/250000 link 0/1000000 kBps cpu-pcie 0/1 kBps Gen2 x2"));
+    for(unsigned i=0;i<256;i++) {
+        bool found=false;
+        for(unsigned j=0;j<nreads;j++) if(reads[j]==WL_PARF+0x2000+4*i) found=true;
+        assert(found);
+    }
+    for(unsigned i=0;i<8;i++) {
+        bool found=false;
+        for(unsigned j=0;j<nreads;j++) if(reads[j]==WL_IB(i)+4) found=true;
+        assert(found);
+    }
+    for(unsigned j=0;j<nreads;j++) {
+        assert(reads[j]!=WL_BAR0+0x140); /* never BHI serial number */
+        if(reads[j]>=WL_DBI+0x1000 && reads[j]<WL_DBI+0x4000)
+            assert(reads[j]<WL_DBI+0x2000); /* stay in DT iATU aperture */
+    }
+
+    /* Exactly 1 enables each fix; preserve unrelated shared vote bits,
+       outbound iATU and all inbound fields except REGION_EN. */
+    const struct { int clock, ib; } fix_args[]={
+        {0,0}, {1,0}, {0,1}, {1,1}, {2,-1}, {-1,2}
+    };
+    for(unsigned a=0;a<sizeof(fix_args)/sizeof(*fix_args);a++) {
+        init(); for(unsigned s=17;s<=20;s++) assert(wl5_step(s)==0);
+        clock_arg=fix_args[a].clock; iboff_arg=fix_args[a].ib;
+        bool clock_on=clock_arg==1, ib_on=iboff_arg==1;
+        setreg(WL_GCC_PA+0x52000,0x80081000); setreg(WL_GCC_PA+0x52008,0x4000002f);
+        setreg(WL_GCC_PA+0x10028,0x80000002); setreg(WL_GCC_PA+0x10030,0x80000002);
+        setreg(WL_DBI+0x1204,0x80000000); /* outbound 1 */
+        setreg(WL_IB(0)+4,0xc0000123); setreg(WL_IB(7)+4,0x80000002);
+        setreg(WL_IB(7)+0x14,0xdead0000);
+        unsigned start=ne;
+        assert(wl5_step(21)==0);
+        assert(wl_prd(WL_GCC_PA+0x52000)==(clock_on?0x80181000:0x80081000));
+        assert(wl_prd(WL_GCC_PA+0x52008)==(clock_on?0x4000006f:0x4000002f));
+        assert(wl_prd(WL_IB(0)+4)==(ib_on?0x40000123:0xc0000123));
+        assert(wl_prd(WL_IB(7)+4)==(ib_on?2:0x80000002));
+        assert(wl_prd(WL_IB(7)+0x14)==0xdead0000 && wl_prd(WL_DBI+0x1204)==0x80000000);
+        assert(findwrite(WL_DBI+0x1204,0,start)<0 && clock_delays==0);
+        assert(strstr(logbuf,"M6h preflight RC") && strstr(logbuf,"M6h preflight SID"));
+        assert(strstr(logbuf,"M6h preflight GCC") && strstr(logbuf,"M6h preflight ICC"));
+        if(ib_on) assert(findwrite(WL_IB(7)+4,2,start)<findwrite(WL_BAR0+0x118,0x12345,start));
+        wl5_abort(21); assert(frees==4);
+        assert(wl_prd(WL_GCC_PA+0x52008)==(clock_on?0x4000006f:0x4000002f));
+    }
+
+    /* Vote RAZ/WI, stopped clocks, stale-IB disable RAZ/WI, RC BME loss and
+       snapshot aborts all block the first BHI doorbell; no retry. */
+    for(unsigned kind=0;kind<6;kind++) {
+        init(); for(unsigned s=17;s<=20;s++) assert(wl5_step(s)==0);
+        if(kind<2) {
+            clock_arg=1;
+            if(!kind) { corrupt_write_pa=WL_GCC_PA+0x52008; corrupt_write_mask=1u<<6; }
+            else setreg(WL_GCC_PA+0x10030,0x80000000);
+        }
+        if(kind==2) {
+            iboff_arg=1; setreg(WL_IB(7)+4,0x80000000);
+            mismatch=true; mismatch_pa=WL_IB(7)+4;
+        }
+        if(kind==3) setreg(WL_DBI+4,0x103);
+        if(kind==4) read_fault_pa=WL_PARF+0x3d4;
+        if(kind==5) read_fault_pa=WL_IB(7)+4;
+        assert(wl5_step(21)==10);
+        assert(findwrite(WL_BAR0+0x118,0x12345,0)<0);
+        if(kind==1) assert(clock_delays==500);
+        corrupt_write_pa=read_fault_pa=0; mismatch=false;
+        wl5_abort(21); assert(frees==4);
+    }
+    init(); clock_arg=iboff_arg=1; wl_route_installed=true;
+    setreg(WL_EPCFG+4,6);
+    assert(wl_fabric_prepare()==1 && !ne); /* never alter active DMA */
+
     /* End-to-end fake device: ELF, image/table bounds, context ABI, DMA ordering. */
     init();
     for(unsigned s=17;s<=28;s++) assert(wl5_step(s)==0);
@@ -384,6 +486,9 @@ int main(void) {
     setreg(WL_BAR0+0x128,0);
     unsigned diag_start=ne, diag_sleeps=sleeps;
     assert(wl5_step(22)==1 && sleeps==diag_sleeps+10);
+    assert(strstr(logbuf,"M6h failure RC") && strstr(logbuf,"M6h failure PARF ADDR"));
+    assert(strstr(logbuf,"M6h failure SID") && strstr(logbuf,"M6h failure iATU"));
+    assert(strstr(logbuf,"M6h failure GCC") && strstr(logbuf,"M6h failure ICC"));
     for(unsigned i=diag_start;i<ne;i++) assert(events[i].kind=='W' && events[i].pa==WL_BAR0+0x310c);
     assert(wl_mrd(0x310c)==0 && strstr(logbuf,"TCSR_PBL_LOGGING") && strstr(logbuf,"PBL log"));
     assert(wl5_report[109]==129 && wl5_report[126]==129 && wl5_report[124]==~0u);
@@ -875,7 +980,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='fuxi-wlan-m6-') as tmp:
         cfile, binary = Path(tmp) / 'm6.c', Path(tmp) / 'm6'
         cfile.write_text(PREAMBLE + block + TESTS)
-        subprocess.run(['cc', '-std=c11', '-D_DEFAULT_SOURCE', '-g',
+        subprocess.run([os.environ.get('CC', 'cc'), '-std=c11', '-D_DEFAULT_SOURCE', '-g',
                         '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
                         str(cfile), '-o', str(binary)], check=True)
         subprocess.run([str(binary)], check=True)

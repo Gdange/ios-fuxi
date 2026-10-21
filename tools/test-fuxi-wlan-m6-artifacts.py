@@ -26,7 +26,7 @@ def sections(elf):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parents[1])
-    parser.add_argument('--milestone', choices=('m6', 'm6b', 'm6c', 'm6d', 'm6e', 'm6f', 'm6g'), default='m6')
+    parser.add_argument('--milestone', choices=('m6', 'm6b', 'm6c', 'm6d', 'm6e', 'm6f', 'm6g', 'm6h'), default='m6')
     args = parser.parse_args()
     root = args.root
     lane = 'wlan' + args.milestone[1:]
@@ -37,9 +37,9 @@ def main():
     assert cmdline == (old / 'cmdline.txt').read_text().strip(), 'M5 boot arguments changed'
     assert cmdline.split().count('fuxiwlan=1') == 1 and len(cmdline.encode()) < 608
     verify_variant(root, out, old, args.milestone, '', 1)
-    if args.milestone in ('m6b', 'm6c', 'm6d', 'm6e', 'm6f', 'm6g'):
-        verify_variant(root, out, old, args.milestone, '-s22' if args.milestone in ('m6e', 'm6f', 'm6g') else '-s20',
-                       22 if args.milestone in ('m6e', 'm6f', 'm6g') else 20)
+    if args.milestone in ('m6b', 'm6c', 'm6d', 'm6e', 'm6f', 'm6g', 'm6h'):
+        verify_variant(root, out, old, args.milestone, '-s22' if args.milestone in ('m6e', 'm6f', 'm6g', 'm6h') else '-s20',
+                       22 if args.milestone in ('m6e', 'm6f', 'm6g', 'm6h') else 20)
     for line in (out / 'SHA256SUMS').read_text().splitlines():
         digest, filename = line.split(maxsplit=1)
         assert hashlib.sha256((root / filename).read_bytes()).hexdigest() == digest
@@ -59,25 +59,30 @@ def verify_variant(root, out, old, milestone, suffix, limit):
     assert payload == rebuilt, 'payload differs from packed kernel/ADT/cmdline'
     assert struct.unpack_from('<QQ', payload, 56) == (0x8c0000000, 0x13e000000)
     assert b'M6 apps_smmu' in payload and b'SMMU owned stage1' in payload
-    if milestone in ('m6b', 'm6c', 'm6d', 'm6e', 'm6f', 'm6g'):
+    if milestone in ('m6b', 'm6c', 'm6d', 'm6e', 'm6f', 'm6g', 'm6h'):
         assert b'M6b RC bypassed table zeroed' in payload and b'RC table in use' in payload
     if milestone == 'm6c':
         assert b'M6c CB probe' in payload and b'M6c SMMU mismatch' in payload
-    if milestone in ('m6d', 'm6e', 'm6f', 'm6g'):
+    if milestone in ('m6d', 'm6e', 'm6f', 'm6g', 'm6h'):
         assert b'M6d CB probe' in payload and b'M6d SMMU %s' in payload
         assert b' mask %#x faults' in payload
-    if milestone in ('m6e', 'm6f', 'm6g'):
+    if milestone in ('m6e', 'm6f', 'm6g', 'm6h'):
         for line in (b'M6e BHI preflight', b'M6e BHI sample', b'M6e link sample',
                      b'M6e AER sample', b'CNSS kiwi major-version rule',
                      b'PBL error evidence', b'transport inaccessible/changed'):
             assert line in payload
-    if milestone in ('m6f', 'm6g'):
+    if milestone in ('m6f', 'm6g', 'm6h'):
         for line in (b'M6f CB %u BHI IOVA', b'M6f PBL log', b'M6f SBL log',
                      b'M6f BHIe TX/RX', b'M6f BHI doorbell random'):
             assert line in payload
-    if milestone == 'm6g':
+    if milestone in ('m6g', 'm6h'):
         for line in (b'M6g IOVA %s pool', b'fuxiwlanoldiova', b'M6g CB %u coherent walk',
                      b'IRGN0=1 ORGN0=1 SH0=3', b'HUPCF=1 CFCFG=0 CFRE=0 CFIE=0'):
+            assert line in payload
+    if milestone == 'm6h':
+        for line in (b'M6h %s RC', b'M6h %s PARF', b'M6h %s SID',
+                     b'M6h %s iATU', b'M6h %s GCC', b'M6h %s ICC',
+                     b'fuxiwlanclk', b'fuxiwlaniboff'):
             assert line in payload
     elf = (shim / f'{stem}-loader.elf').read_bytes()
     sec = sections(elf)
