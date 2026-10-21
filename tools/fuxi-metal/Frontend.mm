@@ -575,6 +575,7 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
 @end
 @implementation FuxiBuffer (CATextures)
 - (id)newLinearTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image {CENSUS();
+ if(caTrace() && d)fprintf(stderr,"FUXI MTL: trace linearTexture %lux%lu offset %lu row %lu image %lu format %lu usage %lu length %lu\n",(unsigned long)d.width,(unsigned long)d.height,(unsigned long)offset,(unsigned long)row,(unsigned long)image,(unsigned long)d.pixelFormat,(unsigned long)d.usage,(unsigned long)_wrappedLength);
  if(!d || d.textureType!=MTLTextureType2D || d.storageMode!=MTLStorageModeShared || d.cpuCacheMode!=MTLCPUCacheModeDefaultCache ||
     (d.hazardTrackingMode!=MTLHazardTrackingModeDefault && d.hazardTrackingMode!=MTLHazardTrackingModeTracked) ||
     d.depth!=1 || d.arrayLength!=1 || d.mipmapLevelCount!=1 || d.sampleCount!=1 || !identitySwizzle(d.swizzle) || !row || d.width>256 || d.height>256 || (image && (d.height>SIZE_MAX/row || image<row*d.height))){unsupported(self,_cmd);return nil;}
@@ -584,7 +585,6 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
  t->_backingBuffer=[self retain];t->_backingOffset=offset;t->_backingRow=row;return t;
 }
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)row {
- if(caTrace())fprintf(stderr,"FUXI MTL: trace linearTexture %lux%lu offset %lu row %lu format %lu usage %lu\n",(unsigned long)d.width,(unsigned long)d.height,(unsigned long)offset,(unsigned long)row,(unsigned long)d.pixelFormat,(unsigned long)d.usage);
  return [self newLinearTextureWithDescriptor:d offset:offset bytesPerRow:row bytesPerImage:0];
 }
 @end
@@ -812,6 +812,15 @@ static thread_local FuxiCommandBuffer *completionCommand;
  if(indices && (![indices isKindOfClass:[FuxiBuffer class]] || [indices device]!=_command->_queue->_device || (offset&1) || offset>[indices length] || count*2>[indices length]-offset))invalid(@"index bounds/device");
  fuxi::Operation op=_state;op.texture=_target->_texture;op.pipeline=_pipeline->_pipeline;op.vertices=(uint32_t)count;op.first=(uint32_t)start;op.strip=t==MTLPrimitiveTypeTriangleStrip;
  op.indices=indices?((FuxiBuffer *)indices)->_buffer:nullptr;op.indexOffset=offset;
+ // CA smoke diagnostic: a textured draw's CA stage-0 vertices (buffer 1, stride 48: float4 position, float2 @16, float2 @24).
+ if(caTrace() && _samples[0] && _buffers[0][1].buffer && !_buffers[0][1].bytes) {
+  const fuxi::BufferBind &v=_buffers[0][1];
+  for(NSUInteger k=start;k<start+count && k<start+4;++k) {
+   uint64_t at=v.offset+k*48;if(at+32>v.buffer->length)break;const float *f=(const float *)((const uint8_t *)v.buffer->contents+at);
+   fprintf(stderr,"FUXI MTL: trace textured vertex %lu pos %.3f,%.3f,%.3f,%.3f a1 %.4f,%.4f a2 %.4f,%.4f tex %lux%lu\n",(unsigned long)k,f[0],f[1],f[2],f[3],f[4],f[5],f[6],f[7],
+    (unsigned long)[_samples[0] width],(unsigned long)[_samples[0] height]);
+  }
+ }
  op.load=_drawn?1:_load;op.store=1;
  for(unsigned i=0;i<fuxi::resourceSlots;++i){op.samples[i]=_samples[i]?_samples[i]->_texture:nullptr;op.samplers[i]=_samplers[i]?_samplers[i]->_sampler:nullptr;
  if(_samples[i])[_command->_resources addObject:_samples[i]];if(_samplers[i])[_command->_resources addObject:_samplers[i]];}
