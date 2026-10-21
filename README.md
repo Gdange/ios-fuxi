@@ -70,6 +70,8 @@ You need an unlocked bootloader, a rooted recovery for installing the root file,
 
 ## Credits
 
+- **[metal2vulkan](https://github.com/steelbrain/metal2vulkan)** by Anees Iqbal and contributors: external AIR-to-SPIR-V translator, pinned to `720ef1ce9ae2a2068999a8675717418b9416283e`. Its declared licence is GPL-2.0-or-later OR LGPL-3.0-or-later; the Metal lane selects **LGPL-3.0-or-later** for a separate, replaceable `libmetal2vulkan.dylib` loaded with `dlopen`. No translator source is vendored or statically linked into FuxiMetal/XNU. The ignored build output includes corresponding library/adapter/dependency source, lockfile, LGPL/GPL texts, notices and an offline rebuild recipe. Preserve those materials and the rights/information needed to replace and debug modifications to the library when distributing it; dynamic loading alone does not discharge the obligations. Our original code retains its existing repository terms. See [Metal build, licensing and installation details](docs-lanes/metal.md#m5b-external-translator-and-offscreen-pipeline).
+
 - **[UniXNU](https://github.com/UniXNU/UniXNU) / NativeAdreno contributors**: MIT NativeAdreno wire ABI and A7xx BR/BV submission framing; retained notice in `xnu/fuxi-adreno/LICENSE.NativeAdreno`. Their sheng board work also informed the GPU port.
 
 - **[ios-sweet](https://github.com/dipa-studio/ios-sweet) by [dipa-studio](https://github.com/dipa-studio)**: the original project this repository is forked from. The XNU port, the iOS userland bring-up, the kernel patches up to 0081 and most of the tooling come from it.

@@ -42,18 +42,29 @@ def validate_clients(path):
         seen[line]=mode
 
 
-def stage(root,icd,bundle,smoke,conf,clients=Path(__file__).with_name('metal-clients.conf')):
+def stage(root,icd,bundle,smoke,conf,clients=Path(__file__).with_name('metal-clients.conf'),translator=None,metallib=None,source=None):
     if os.geteuid()!=0:raise PermissionError('run as root to set root:wheel 0:0')
     root=root.resolve()
     if not (root/'System/Library').is_dir():raise ValueError('expected mounted iOS root')
-    if not re.fullmatch(rb'[ \t\r\n]*[0-3][ \t\r\n]*',conf.read_bytes()) or conf.stat().st_size>31:
-        raise ValueError('config must contain max stage 0..3')
+    if not re.fullmatch(rb'[ \t\r\n]*[0-4][ \t\r\n]*',conf.read_bytes()) or conf.stat().st_size>31:
+        raise ValueError('config must contain max stage 0..4')
+    if translator is None:translator=smoke.parent/'libmetal2vulkan.dylib'
+    if metallib is None:metallib=smoke.parent/'metal-smoke.metallib'
+    if source is None:source=smoke.parent/'metal2vulkan-source.tar.gz'
     validate_clients(clients)
     info=plistlib.loads((bundle/'Info.plist').read_bytes())
     if any(info.get(k)!=v for k,v in {'CFBundleExecutable':'FuxiMetal','NSPrincipalClass':'FuxiMTLDevice','CFBundleIdentifier':'org.fuxi.metal'}.items()):
         raise ValueError('unexpected plugin plist')
-    macho(icd,6);macho(bundle/'FuxiMetal',6);macho(smoke,2)
+    macho(icd,6);macho(bundle/'FuxiMetal',6);macho(smoke,2);macho(translator,6)
+    if not metallib.is_file() or metallib.stat().st_size>4*1024*1024 or metallib.read_bytes()[:4]!=b'MTLB':
+        raise ValueError('expected owned-source metallib')
+    if not source.is_file():raise ValueError('missing translator corresponding source archive')
+    with source.open('rb') as archive:
+        if archive.read(2)!=b'\x1f\x8b':raise ValueError('invalid translator corresponding source archive')
     artifacts=[(icd,'usr/local/lib/libvulkan_freedreno.dylib',0o755),
+        (translator,'usr/local/lib/libmetal2vulkan.dylib',0o755),
+        (metallib,'usr/local/share/fuxi/metal-smoke.metallib',0o644),
+        (source,'usr/local/share/fuxi/metal2vulkan-source.tar.gz',0o644),
         (smoke,'usr/local/bin/fuxi-metal-smoke',0o755),
         (clients,'usr/local/share/fuxi/metal-clients.conf',0o644),(conf,'usr/local/share/fuxi/metal-smoke.conf',0o644)]
     for src in ('FuxiMetal','Info.plist','_CodeSignature/CodeResources'):
@@ -81,4 +92,7 @@ if __name__=='__main__':
     ap.add_argument('root',type=Path);ap.add_argument('icd',type=Path);ap.add_argument('bundle',type=Path);ap.add_argument('smoke',type=Path)
     ap.add_argument('--conf',type=Path,default=Path(__file__).with_name('metal-smoke.conf'))
     ap.add_argument('--clients',type=Path,default=Path(__file__).with_name('metal-clients.conf'))
-    a=ap.parse_args();stage(a.root,a.icd,a.bundle,a.smoke,a.conf,a.clients)
+    ap.add_argument('--translator',type=Path)
+    ap.add_argument('--metallib',type=Path)
+    ap.add_argument('--source',type=Path,help='external library corresponding source and licence archive')
+    a=ap.parse_args();stage(a.root,a.icd,a.bundle,a.smoke,a.conf,a.clients,a.translator,a.metallib,a.source)

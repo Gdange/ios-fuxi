@@ -1,4 +1,4 @@
-/* Transfer-only Metal diagnostic. Original implementation; no Apple code. */
+/* Bounded Metal diagnostic. Original implementation; no Apple code. */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
@@ -7,7 +7,11 @@
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
 #include <mutex>
+#include <cmath>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include "ClientGate.hpp"
+#include "Translator.hpp"
 #ifndef FUXI_MTL_BACKEND_HEADER
 #define FUXI_MTL_BACKEND_HEADER "Backend.hpp"
 #endif
@@ -109,6 +113,53 @@ static FuxiOwner *owner(id obj) {return (FuxiOwner *)objc_getAssociatedObject(ob
 - (NSString *)label {CENSUS();return _label;}
 - (void)setLabel:(NSString *)s {CENSUS();[_label release];_label=[s copy];}
 @end
+static id metalError(NSError **error,const char *why) {
+ fprintf(stderr,"FUXI MTL: pipeline/library FAIL %s\n",why);
+ if(error)*error=[NSError errorWithDomain:@"org.fuxi.metal" code:1 userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithUTF8String:why]}];return nil;
+}
+@interface FuxiLibrary : FuxiObject { @public id _device; void *_library; }
+@end
+@interface FuxiFunction : FuxiObject { @public FuxiLibrary *_library; NSString *_name; int _stage; }
+@end
+@implementation FuxiFunction
+- (void)dealloc {[_library release];[_name release];[super dealloc];}
+- (id)device {CENSUS();return _library->_device;}
+- (NSString *)name {CENSUS();return _name;}
+- (MTLFunctionType)functionType {CENSUS();return _stage==1?MTLFunctionTypeVertex:MTLFunctionTypeFragment;}
+@end
+@implementation FuxiLibrary
+- (void)dealloc {if(_library)fuxi::Translator::get().close(_library);[_device release];[super dealloc];}
+- (id)device {CENSUS();return _device;}
+- (id)newFunctionWithName:(NSString *)name {CENSUS();
+ if(!name || !name.length || name.length>127 || strlen(name.UTF8String)!=[name lengthOfBytesUsingEncoding:NSUTF8StringEncoding]) {unsupported(self,_cmd);return nil;}
+ char error[2048]{};int stage=fuxi::Translator::get().function(_library,name.UTF8String,error,sizeof(error));
+ if(!stage)return metalError(nullptr,error);
+ FuxiFunction *f=[FuxiFunction new];f->_library=[self retain];f->_name=[name copy];f->_stage=stage;return f;
+}
+@end
+@interface FuxiTexture : FuxiObject { @public id _device; fuxi::Texture *_texture; }
+@end
+@implementation FuxiTexture
+- (void)dealloc {owner(_device)->backend->destroy(_texture);[_device release];[super dealloc];}
+- (id)device {CENSUS();return _device;}
+- (NSUInteger)width {CENSUS();return 256;}
+- (NSUInteger)height {CENSUS();return 256;}
+- (NSUInteger)depth {CENSUS();return 1;}
+- (NSUInteger)arrayLength {CENSUS();return 1;}
+- (NSUInteger)mipmapLevelCount {CENSUS();return 1;}
+- (NSUInteger)sampleCount {CENSUS();return 1;}
+- (MTLTextureType)textureType {CENSUS();return MTLTextureType2D;}
+- (MTLPixelFormat)pixelFormat {CENSUS();return MTLPixelFormatBGRA8Unorm;}
+- (MTLStorageMode)storageMode {CENSUS();return MTLStorageModePrivate;}
+- (MTLTextureUsage)usage {CENSUS();return MTLTextureUsageRenderTarget;}
+- (NSUInteger)allocatedSize {CENSUS();return _texture->allocated;}
+@end
+@interface FuxiPipeline : FuxiObject { @public id _device; fuxi::Pipeline *_pipeline; }
+@end
+@implementation FuxiPipeline
+- (void)dealloc {owner(_device)->backend->destroy(_pipeline);[_device release];[super dealloc];}
+- (id)device {CENSUS();return _device;}
+@end
 @class FuxiCommandBuffer;
 @interface FuxiQueue : FuxiObject { @public id _device; NSString *_label; }
 @end
@@ -118,6 +169,23 @@ static FuxiOwner *owner(id obj) {return (FuxiOwner *)objc_getAssociatedObject(ob
 }
 @end
 @interface FuxiBlit : FuxiObject { @public FuxiCommandBuffer *_command; BOOL _ended; NSString *_label; }
+@end
+@interface FuxiRender : FuxiObject { @public FuxiCommandBuffer *_command; FuxiTexture *_target; FuxiPipeline *_pipeline; MTLClearColor _clear; BOOL _ended,_drawn; }
+@end
+@implementation FuxiRender
+- (void)dealloc {[_command release];[_target release];[_pipeline release];[super dealloc];}
+- (void)active {if(_ended || !_command->_encoding || _command->_status!=MTLCommandBufferStatusNotEnqueued)invalid(@"inactive render encoder");}
+- (void)setRenderPipelineState:(id)p {CENSUS();[self active];
+ if(![p isKindOfClass:[FuxiPipeline class]] || [p device]!=_command->_queue->_device)invalid(@"foreign render pipeline/device");
+ [_pipeline release];_pipeline=[p retain];
+}
+- (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count {CENSUS();[self active];
+ if(!_pipeline || _drawn || t!=MTLPrimitiveTypeTriangle || start || count!=3)invalid(@"M5b requires exactly one nonindexed triangle, start 0, count 3");
+ fuxi::Operation op{};op.texture=_target->_texture;op.pipeline=_pipeline->_pipeline;
+ op.clear[0]=_clear.red;op.clear[1]=_clear.green;op.clear[2]=_clear.blue;op.clear[3]=_clear.alpha;
+ [_command->_resources addObject:_target];[_command->_resources addObject:_pipeline];_command->_ops.push_back(op);_drawn=YES;
+}
+- (void)endEncoding {CENSUS();[self active];if(!_drawn)invalid(@"M5b render encoder requires one draw");_ended=YES;_command->_encoding=NO;}
 @end
 @implementation FuxiQueue
 - (void)dealloc {[_device release];[_label release];[super dealloc];}
@@ -142,6 +210,21 @@ static FuxiOwner *owner(id obj) {return (FuxiOwner *)objc_getAssociatedObject(ob
  if(_status!=MTLCommandBufferStatusNotEnqueued || _encoding) {unsupported(self,_cmd);return nil;}
  FuxiBlit *e=[FuxiBlit new];e->_command=[self retain];_encoding=YES;return [e autorelease];
 }
+- (id)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {CENSUS();
+ if(clientMode==fuxi::ClientMode::census)return nil;
+ if(_status!=MTLCommandBufferStatusNotEnqueued || _encoding) {unsupported(self,_cmd);return nil;}
+ if(!d)invalid(@"nil render pass");
+ auto a=d.colorAttachments[0];id t=a.texture;
+ if(![t isKindOfClass:[FuxiTexture class]] || [t device]!=[self device] || a.level || a.slice || a.depthPlane || a.resolveTexture ||
+    a.loadAction!=MTLLoadActionClear || a.storeAction!=MTLStoreActionStore || d.depthAttachment.texture || d.stencilAttachment.texture ||
+    d.visibilityResultBuffer || d.renderTargetArrayLength>1 || d.imageblockSampleLength || d.tileWidth || d.tileHeight ||
+    d.threadgroupMemoryLength || d.defaultRasterSampleCount>1 || d.rasterizationRateMap ||
+    (d.renderTargetWidth && d.renderTargetWidth!=256) || (d.renderTargetHeight && d.renderTargetHeight!=256) || [d getSamplePositions:nullptr count:0])invalid(@"unsupported M5b render pass");
+ for(unsigned i=1;i<8;++i)if(d.colorAttachments[i].texture)invalid(@"multiple render targets");
+ MTLClearColor c=a.clearColor;
+ for(double x:{c.red,c.green,c.blue,c.alpha})if(!std::isfinite(x) || x<0 || x>1)invalid(@"clear colour outside 0..1");
+ FuxiRender *e=[FuxiRender new];e->_command=[self retain];e->_target=[t retain];e->_clear=c;_encoding=YES;return [e autorelease];
+}
 - (void)addCompletedHandler:(MTLCommandBufferHandler)handler {CENSUS();
  if(!handler) invalid(@"nil completion handler");
  if(_status>=MTLCommandBufferStatusCompleted) {handler((id)self);return;}
@@ -165,12 +248,12 @@ static FuxiOwner *owner(id obj) {return (FuxiOwner *)objc_getAssociatedObject(ob
 @end
 @implementation FuxiBlit
 - (void)dealloc {[_command release];[_label release];[super dealloc];}
-- (id)device {CENSUS();return [_command device];}
+- (id)device {CENSUS();return _command->_queue->_device;}
 - (NSString *)label {CENSUS();return _label;}
 - (void)setLabel:(NSString *)s {CENSUS();[_label release];_label=[s copy];}
 - (FuxiBuffer *)validate:(id)b offset:(NSUInteger)o size:(NSUInteger)n {CENSUS();
  if(_ended || !_command->_encoding || _command->_status!=MTLCommandBufferStatusNotEnqueued) invalid(@"inactive encoder");
- if(![b isKindOfClass:[FuxiBuffer class]] || [b device]!=[_command device]) invalid(@"foreign buffer/device");
+ if(![b isKindOfClass:[FuxiBuffer class]] || [b device]!=_command->_queue->_device) invalid(@"foreign buffer/device");
  FuxiBuffer *buffer=b;
  if(o>buffer->_buffer->length || n>buffer->_buffer->length-o || ((o|n)&3)) invalid(@"M4 transfers require in-bounds 4-byte aligned offset and length");
  return buffer;
@@ -185,6 +268,17 @@ static FuxiOwner *owner(id obj) {return (FuxiOwner *)objc_getAssociatedObject(ob
  if(!n)return;
  [_command->_resources addObject:src];[_command->_resources addObject:dst];
  _command->_ops.push_back({src->_buffer,dst->_buffer,so,to,n,0});
+}
+- (void)copyFromTexture:(id)t sourceSlice:(NSUInteger)s sourceLevel:(NSUInteger)l sourceOrigin:(MTLOrigin)o sourceSize:(MTLSize)z
+ toBuffer:(id)b destinationOffset:(NSUInteger)offset destinationBytesPerRow:(NSUInteger)row destinationBytesPerImage:(NSUInteger)image {CENSUS();
+ FuxiBuffer *dst=[self validate:b offset:offset size:256*256*4];
+ if(![t isKindOfClass:[FuxiTexture class]] || [t device]!=_command->_queue->_device || s || l || o.x || o.y || o.z ||
+    z.width!=256 || z.height!=256 || z.depth!=1 || row!=1024 || image!=256*256*4 || (offset&255))invalid(@"M5b requires whole 256x256 BGRA texture readback");
+ // Refuse reads without an earlier render in this command; no untracked image layout.
+ bool rendered=false;for(const auto &op:_command->_ops)if(op.texture==((FuxiTexture *)t)->_texture && op.pipeline)rendered=true;
+ if(!rendered)invalid(@"readback requires earlier render in same command");
+ fuxi::Operation op{};op.dst=dst->_buffer;op.to=offset;op.texture=((FuxiTexture *)t)->_texture;
+ [_command->_resources addObject:t];[_command->_resources addObject:dst];_command->_ops.push_back(op);
 }
 - (void)endEncoding {CENSUS();if(_ended)invalid(@"endEncoding twice");_ended=YES;_command->_encoding=NO;}
 @end
@@ -221,7 +315,7 @@ static FuxiOwner *owner(id obj) {return (FuxiOwner *)objc_getAssociatedObject(ob
  object_dispose(self);
 }
 #pragma clang diagnostic pop
-- (NSString *)name {CENSUS();return @"Fuxi Turnip Adreno 740 (M4 transfers only)";}
+- (NSString *)name {CENSUS();return @"Fuxi Turnip Adreno 740 (M5b bounded offscreen)";}
 - (uint64_t)registryID {CENSUS();return owner(self)->registry;}
 - (NSUInteger)maxBufferLength {CENSUS();return fuxi::Backend::maxBufferLength;}
 - (BOOL)hasUnifiedMemory {CENSUS();return YES;}
@@ -254,6 +348,57 @@ static FuxiOwner *owner(id obj) {return (FuxiOwner *)objc_getAssociatedObject(ob
 - (id)newBufferWithBytes:(const void *)bytes length:(NSUInteger)n options:(MTLResourceOptions)o {CENSUS();
  if(!bytes) {unsupported(self,_cmd);return nil;}
  FuxiBuffer *b=[self newBufferWithLength:n options:o];if(b)memcpy([b contents],bytes,n);return b;
+}
+- (id)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {CENSUS();
+ if(error)*error=nil;if(clientMode==fuxi::ClientMode::census)return nil;
+ if(!data || !dispatch_data_get_size(data) || dispatch_data_get_size(data)>4*1024*1024)return metalError(error,"library outside 1..4 MiB");
+ const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);
+ if(!mapped)return metalError(error,"map library failed");
+ FuxiLibrary *lib=[FuxiLibrary new];lib->_device=[self retain];char why[2048]{};
+ try {lib->_library=fuxi::Translator::get().open((const uint8_t *)bytes,size,why,sizeof(why));}
+ catch(const std::exception &e) {dispatch_release(mapped);[lib release];return metalError(error,e.what());}
+ dispatch_release(mapped);if(!lib->_library) {[lib release];return metalError(error,why);}return lib;
+}
+- (id)newLibraryWithURL:(NSURL *)url error:(NSError **)error {CENSUS();
+ if(error)*error=nil;if(clientMode==fuxi::ClientMode::census)return nil;
+ if(!url.isFileURL)return metalError(error,"library requires a file URL");
+ int fd=open(url.fileSystemRepresentation,O_RDONLY|O_CLOEXEC|O_NOFOLLOW);struct stat st{};
+ if(fd<0)return metalError(error,"open library failed");
+ if(fstat(fd,&st) || !S_ISREG(st.st_mode) || st.st_size<=0 || st.st_size>4*1024*1024) {::close(fd);return metalError(error,"library file type/length");}
+ NSMutableData *bytes=[NSMutableData dataWithLength:(NSUInteger)st.st_size];size_t done=0;
+ while(done<bytes.length) {ssize_t n=read(fd,(uint8_t *)bytes.mutableBytes+done,bytes.length-done);
+  if(n<0 && errno==EINTR)continue;if(n<=0) {::close(fd);return metalError(error,"read library failed");}done+=(size_t)n;}
+ uint8_t extra;ssize_t tail;do {tail=read(fd,&extra,1);}while(tail<0 && errno==EINTR);::close(fd);
+ if(tail!=0)return metalError(error,"library changed length during read");
+ dispatch_data_t data=dispatch_data_create(bytes.bytes,bytes.length,dispatch_get_global_queue(0,0),DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+ id result=[self newLibraryWithData:data error:error];dispatch_release(data);return result;
+}
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d {CENSUS();
+ if(clientMode==fuxi::ClientMode::census)return nil;
+ if(!d || d.textureType!=MTLTextureType2D || d.pixelFormat!=MTLPixelFormatBGRA8Unorm || d.width!=256 || d.height!=256 || d.depth!=1 ||
+    d.mipmapLevelCount!=1 || d.arrayLength!=1 || d.sampleCount!=1 || d.storageMode!=MTLStorageModePrivate || d.cpuCacheMode!=MTLCPUCacheModeDefaultCache ||
+    d.hazardTrackingMode==MTLHazardTrackingModeUntracked || d.usage!=MTLTextureUsageRenderTarget || d.allowGPUOptimizedContents!=YES) {unsupported(self,_cmd);return nil;}
+ FuxiTexture *t=[FuxiTexture new];t->_device=[self retain];
+ try {t->_texture=owner(self)->backend->allocateTexture();}catch(const std::exception &e) {fprintf(stderr,"FUXI MTL: texture FAIL %s\n",e.what());[t release];return nil;}return t;
+}
+- (id)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {CENSUS();
+ if(error)*error=nil;if(clientMode==fuxi::ClientMode::census)return nil;
+ id v=d.vertexFunction,f=d.fragmentFunction;
+ if(!d || ![v isKindOfClass:[FuxiFunction class]] || ![f isKindOfClass:[FuxiFunction class]] || [v device]!=self || [f device]!=self ||
+    ((FuxiFunction *)v)->_stage!=1 || ((FuxiFunction *)f)->_stage!=2 || d.vertexDescriptor || d.rasterSampleCount!=1 ||
+    d.alphaToCoverageEnabled || d.alphaToOneEnabled || !d.rasterizationEnabled || d.depthAttachmentPixelFormat!=MTLPixelFormatInvalid ||
+    d.stencilAttachmentPixelFormat!=MTLPixelFormatInvalid || d.inputPrimitiveTopology!=MTLPrimitiveTopologyClassUnspecified ||
+    d.tessellationFactorFormat!=MTLTessellationFactorFormatHalf || d.maxTessellationFactor!=16 || d.supportIndirectCommandBuffers ||
+    d.maxVertexAmplificationCount!=1 || d.vertexLinkedFunctions.functions.count || d.vertexLinkedFunctions.binaryFunctions.count ||
+    d.vertexLinkedFunctions.privateFunctions.count || d.vertexLinkedFunctions.groups.count || d.fragmentLinkedFunctions.functions.count ||
+    d.fragmentLinkedFunctions.binaryFunctions.count || d.fragmentLinkedFunctions.privateFunctions.count || d.fragmentLinkedFunctions.groups.count)return metalError(error,"unsupported M5b pipeline descriptor/functions");
+ for(unsigned i=0;i<8;++i) {
+  auto a=d.colorAttachments[i];if(a.pixelFormat!=(i?MTLPixelFormatInvalid:MTLPixelFormatBGRA8Unorm) || a.blendingEnabled || a.writeMask!=MTLColorWriteMaskAll)
+   return metalError(error,"M5b requires BGRA8 attachment 0, no blending, full write mask");
+ }
+ FuxiPipeline *p=[FuxiPipeline new];p->_device=[self retain];
+ try {auto a=(FuxiFunction *)v,b=(FuxiFunction *)f;p->_pipeline=owner(self)->backend->compilePipeline(a->_library->_library,a->_name.UTF8String,b->_library->_library,b->_name.UTF8String);}
+ catch(const std::exception &e) {[p release];return metalError(error,e.what());}return p;
 }
 // MTLAddDevice on 16.7 calls these hooks. Capabilities come exclusively from
 // our overrides; no Apple family/limit table is installed in the base object.
@@ -306,7 +451,8 @@ __attribute__((constructor)) static void registerDevice() {makeDeviceClass(objc_
 // Public protocol selectors on resource classes also forward with real signatures.
 __attribute__((constructor)) static void registerResources() {
  for(auto entry: {std::pair<Class,const char *>{[FuxiBuffer class],"MTLBuffer"},
-      {[FuxiQueue class],"MTLCommandQueue"},{[FuxiCommandBuffer class],"MTLCommandBuffer"},{[FuxiBlit class],"MTLBlitCommandEncoder"}}) {
+      {[FuxiQueue class],"MTLCommandQueue"},{[FuxiCommandBuffer class],"MTLCommandBuffer"},{[FuxiBlit class],"MTLBlitCommandEncoder"},{[FuxiRender class],"MTLRenderCommandEncoder"},
+      {[FuxiTexture class],"MTLTexture"},{[FuxiLibrary class],"MTLLibrary"},{[FuxiFunction class],"MTLFunction"},{[FuxiPipeline class],"MTLRenderPipelineState"}}) {
   Protocol *p=objc_getProtocol(entry.second);rejectProtocol(entry.first,p);if(p)class_addProtocol(entry.first,p);
  }
 }

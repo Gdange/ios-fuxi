@@ -19,6 +19,8 @@ def main():
         def call(command):subprocess.run(command,check=True)
         call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/FrontendTests.mm'),*frameworks,'-o',str(d/'frontend')])
         env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0')
+        call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/PipelineFrontendTests.mm'),*frameworks,'-o',str(d/'pipeline-frontend')])
+        subprocess.run([str(d/'pipeline-frontend')],env=env,check=True,timeout=15)
         call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/GateFrontendTests.mm'),*frameworks,'-o',str(d/'gate')])
         gate=subprocess.run([str(d/'gate'),'daemon-argv'],env=env,text=True,capture_output=True,check=True,timeout=10)
         assert gate.stderr.count('FUXI MTL: gate deny gate-test')==1,gate.stderr
@@ -50,7 +52,8 @@ def main():
         for stage in range(4):
             out=run(str(stage).encode());assert 'stage %u '%stage in out and 'done PASS' in out
             assert 'stage %u '%(stage+1) not in out
-        for bad in (b'',b'4',b'-1',b'1junk',b'3\0',b'1'*32):assert 'stage 0 discovery FAIL' in run(bad,1)
+        for bad in (b'',b'5',b'-1',b'1junk',b'3\0',b'1'*32):assert 'stage 0 discovery FAIL' in run(bad,1)
+        assert 'stage 4 pipeline FAIL' in run(b'4',1)
         assert 'stage 0 discovery FAIL' in run(b'3',1,FUXI_TEST_NOT_ROOT='1')
         assert 'returned nil' in run(b'3',1,FUXI_TEST_NO_DEVICE='1')
         assert 'stage 1 fill FAIL' in run(b'3',1,FUXI_TEST_LOST='1')

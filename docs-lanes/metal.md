@@ -1,4 +1,205 @@
-# Metal lane M5a: process safety gate
+# Metal lane M5b: external shader pipeline
+
+## M5b external translator and offscreen pipeline
+
+2026-10-21. **Built and host-verified; device verification pending.** No new
+M5a device observation was supplied in this task; its gate/census device report
+will be recorded when available. M4's reported device PASS remains the baseline.
+No phone, mounted production root, kernel build/change or push was involved.
+The boot image remains **metal4**, SHA256
+`e10f981a0bae32ad5c892d978a786eabe4cc21acda6e35ed064f1ad68a53c4b6`.
+
+The original source `tools/shaders/metal-smoke.metal` defines `fuxi_vertex`
+(`vertex_id`, three positions) and `fuxi_fragment` (constant opaque red).
+Xcode compiles this source to AIR/metallib **at build time** on the Mac.
+No Apple shaders/metallibs, CA inputs, translated replacement blobs, copied
+Apple implementation or firmware are tracked or used for this test.
+
+The smoke's stages 0–3 retain their existing fill/copy/reuse flow. Stage 4,
+**pipeline**, exercises both `newLibraryWithURL:error:` and
+`newLibraryWithData:error:`, `newFunctionWithName:` and
+`newRenderPipelineStateWithDescriptor:error:`. It renders one triangle over
+opaque black into a **private 256x256 BGRA8Unorm** texture, then blits the whole
+image into a shared buffer at offset 256. CPU verification checks all 65,536
+pixels, six inside/outside samples, colour counts (8,192 ±128 red) and 256-byte
+sentinels at both ends. A failed API, command, translation or verification
+prints FAIL and terminates; there is no replacement shader/success fallback.
+
+The original frontend owns Metal library/function/pipeline/texture/render
+objects and retains command resources through submission. Its independent C
+ABI v1 wrapper calls the external translator's library and render-pipeline
+APIs. The translator queries the actual Vulkan physical device, restricted to
+Vulkan **1.2** and the empty enable set used at `vkCreateDevice`; it supplies
+SPIR-V and its planned fragment `ColorWriteRule` push bytes. Fuxi creates
+Turnip shader modules, a pipeline/layout/render pass, framebuffer, render and
+image-to-buffer copy commands. Negative viewport height preserves Metal's
+upper-left viewport convention. The existing two-second fence wait and
+poisoned-device/quarantine behavior also apply to stage 4.
+
+This is deliberately bounded: one sample, one BGRA8 attachment, no blending,
+depth/stencil, vertex attributes, shader resource bindings, specialization,
+linked functions, additional draws or partial texture copies. Other descriptor
+shapes/encoders fail explicitly. Only a four-byte fragment push write from the
+translator's own draw planner is accepted. The gate still defaults to only
+`fuxi-metal-smoke`; census mode still stops at a nil command queue before any
+GPU/translator construction. Normal clients still require unsandboxed root.
+The shipped `metal-smoke.conf` is **4**; accepted maximum stages are 0–4.
+Missing config retains the earlier stage-3 default. `metal-clients.conf` is
+byte-identical to M5a's default.
+
+### External build and licence boundary
+
+Source: [steelbrain/metal2vulkan](https://github.com/steelbrain/metal2vulkan),
+revision **720ef1ce9ae2a2068999a8675717418b9416283e**. All workspace crates
+state **GPL-2.0-or-later OR LGPL-3.0-or-later**. The approved choice for this
+separate dynamic library is **LGPL-3.0-or-later**. Fuxi's own code keeps its
+existing repository terms. No translator/Mesa source or objects enter the
+tracked tree, kernel or FuxiMetal binary. The original adapter source is ours;
+Cargo builds it and the translator into their own `libmetal2vulkan.dylib` in
+ignored `deps/` caches. FuxiMetal resolves its versioned C symbols with `dlopen`
+and does not link against Rust/translator archives. The dylib has only a system
+`libSystem` load; FuxiMetal/smoke retain system framework/library loads.
+
+On the assigned Mac tree, with external Vulkan headers and Xcode installed:
+
+```sh
+# Requires Rust/rustup and the Xcode Metal compiler component.
+xcodebuild -downloadComponent MetalToolchain
+# If Xcode's default component mapping is stale, select/install the matching
+# component explicitly and set FUXI_METAL_TOOLS to its usr/bin directory.
+# This build used Metal component 27A266a, compiler 32023.921.6, iPhoneOS 27.1 SDK.
+xcodebuild -downloadComponent MetalToolchain -buildVersion 27A266a
+bash tools/build-fuxi-metal.sh "$VULKAN_HEADERS"
+```
+
+`build-fuxi-metal-translator.sh` fetches/checks the pin into ignored
+`deps/metal2vulkan`, creates the adapter crate in ignored
+`deps/metal2vulkan-bridge`, installs **Rust 1.98.0** and target
+`aarch64-apple-ios`, and runs:
+
+```sh
+export IPHONEOS_DEPLOYMENT_TARGET=16.0
+export SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
+export CARGO_TARGET_AARCH64_APPLE_IOS_LINKER="$(xcrun --sdk iphoneos --find clang)"
+export CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS='-C link-arg=-miphoneos-version-min=16.0 -C link-arg=-Wl,-install_name,/usr/local/lib/libmetal2vulkan.dylib'
+cargo +1.98.0 build --manifest-path deps/metal2vulkan-bridge/Cargo.toml \
+  --release --target aarch64-apple-ios
+# The main build then compiles our shader and frontend:
+"$METAL" -isysroot "$SDKROOT" -std=ios-metal2.4 -mios-version-min=16.0 \
+  -fno-fast-math -c tools/shaders/metal-smoke.metal -o tools/out/metal-smoke.air
+"$METALLIB" tools/out/metal-smoke.air -o tools/out/metal-smoke.metallib
+```
+
+All three Mach-O artifacts target plain arm64 **iOS 16.0**, are ad-hoc signed,
+strict-signature verified and audited for system imports/load paths and no
+EL0 `CTR_EL0` reads. All **210** strong imports across these artifacts were
+found in the supplied iOS 16.7 cache (same SHA256 as the M5a analysis).
+`libSystem`'s explicit reexports include `libdispatch` and `libcommonCrypto`;
+the cache audit now recognizes those actual providers. Translation is measured at pipeline creation with
+`steady_clock`; every call prints elapsed milliseconds and PASS/FAIL.
+No persistent shader or pipeline cache is implemented. The translator's optional
+runtime/cache crate is not built. No independent AIR subset alternative was
+needed: the pin accepted our compiler's actual AIR.
+
+The source archive distributed **beside** the dylib contains the library source,
+original adapter, exact Cargo lockfile, registry dependency sources/notices,
+Rust notices, upstream LGPL-3.0/GPL-3.0 texts and notice, build script and
+`metal2vulkan-bridge/REBUILD.sh`. It omits upstream shader fixtures/corpus,
+build outputs, SDKs/toolchains and git history. Extract it in an ignored cache
+and run that rebuild script on a Mac with the stated toolchain; it rewrites the
+external source path and uses the included registry sources with
+`--locked --offline`. Ad-hoc sign the modified library and replace the same
+installed dylib through the coordinator's offline root-image procedure.
+The packaged source was extracted into a fresh ignored directory and successfully
+rebuilt with `--locked --offline` on the Mac. This checks rebuildability, not
+bit-for-bit reproducibility across source paths. No FuxiMetal relink or kernel
+change is required for an ABI-compatible replacement.
+
+Distribution must retain the LGPL/GPL texts and prominent library/use notices,
+provide corresponding library source and modifications (including this adapter,
+lockfile and build inputs), preserve dependency notices, and permit library
+replacement/relinking and reverse engineering for debugging those modifications.
+Supply installation/replacement information where required; do not impose terms
+that remove these rights. This lane supplies source and the replacement recipe
+instead of relying solely on a download link or on dynamic loading as an
+exemption. No upstream translator code was modified.
+
+### Validation and coordinator staging
+
+Host evidence: real external translator + lavapipe, under frontend/backend
+ASan/UBSan checks, produced **8,192 red / 57,344 clear pixels** in four renders
+(two reuse rounds across two device opens). Each emitted module passes
+`spirv-val --target-env vulkan1.2`. Invalid library header, missing function,
+fence timeout, device loss and last-pixel corruption fail. Measured Linux-host
+translation calls in the recorded run were **9.547 ms and 5.140 ms**; these are
+not iOS/A740 timings. Native Mac frontend tests retain M5a gate/census coverage
+and add descriptor/encoder/ownership refusal checks; the CPU model never
+submits a render. Native smoke tests retain stages 0–3 and verify stage-4 failure
+when its required library is unavailable. Staging tests use the real signed
+artifacts on a temporary root and check ownership/modes, idempotence, stage-4
+config and linked/invalid destination refusal.
+
+```sh
+python3 tools/test-fuxi-metal-frontend.py                 # Mac
+python3 tools/test-fuxi-metal-stage.py                    # Mac, temporary root
+python3 tools/test-fuxi-metal-backend.py --headers "$VULKAN_HEADERS"  # Linux
+python3 tools/test-fuxi-metal-pipeline.py --headers "$VULKAN_HEADERS" \
+  --translator "$HOST_M2V_DYLIB" --metallib tools/out/metal-smoke.metallib
+# Coordinator only, on an already mounted writable iOS root:
+python3 tools/stage-fuxi-metal.py "$IOS_ROOT" \
+  tools/out/libvulkan_freedreno.dylib tools/out/FuxiMetal.bundle \
+  tools/out/fuxi-metal-smoke
+```
+
+All destinations are **root:wheel (0:0)**; new directories are 0755.
+
+| Artifact under `tools/out/` | iOS destination | Mode |
+| --- | --- | --- |
+| `libvulkan_freedreno.dylib` (unchanged) | `/usr/local/lib/libvulkan_freedreno.dylib` | 0755 |
+| `libmetal2vulkan.dylib` | `/usr/local/lib/libmetal2vulkan.dylib` | 0755 |
+| `fuxi-metal-smoke` | `/usr/local/bin/fuxi-metal-smoke` | 0755 |
+| `metal-smoke.metallib` (our compiled source) | `/usr/local/share/fuxi/metal-smoke.metallib` | 0644 |
+| `metal2vulkan-source.tar.gz` | `/usr/local/share/fuxi/metal2vulkan-source.tar.gz` | 0644 |
+| `metal-smoke.conf` (`4`) | `/usr/local/share/fuxi/metal-smoke.conf` | 0644 |
+| `metal-clients.conf` (unchanged) | `/usr/local/share/fuxi/metal-clients.conf` | 0644 |
+| `FuxiMetal.bundle/FuxiMetal` | `/System/Library/Extensions/FuxiMetal.bundle/FuxiMetal` | 0755 |
+| `FuxiMetal.bundle/Info.plist` | `/System/Library/Extensions/FuxiMetal.bundle/Info.plist` | 0644 |
+| `FuxiMetal.bundle/_CodeSignature/CodeResources` | `/System/Library/Extensions/FuxiMetal.bundle/_CodeSignature/CodeResources` | 0644 |
+
+Expected additional lines on a successful **future device run** (timing and
+boundary coverage counts may vary within the verified bounds):
+
+```text
+FUXI MTL: translation PASS <milliseconds> ms (no cache)
+FUXI MTL: stage 4 pipeline PASS BGRA8 256x256 inside/outside 6 red 8192 clear 57344 + sentinel edges
+FUXI MTL: done PASS
+```
+
+Risks: the actual iOS `dlopen`/AIR translation/Turnip stage-4 submission and
+pixels remain unobserved; host/software-driver success is not device success.
+The in-process Rust translator has its own standard 20-second cooperative budget
+and the diagnostic's 60-second stage alarm, not a separate hard memory-isolated
+worker. Alpha translator correctness, cold RSS/latency and driver compilation
+on A740 still need measurement. This does not enable CA, IOSurface import,
+sampling, presentation or additional processes. Keep the gate/census stop.
+
+Complete signed output manifest: `tools/out/M5b-SHA256SUMS`.
+
+| M5b artifact | SHA256 |
+| --- | --- |
+| `tools/out/FuxiMetal.bundle/FuxiMetal` | `bb071e27f1a3b7e4f4e6b5fc369a475df826ad0e1590bdc4502da0de199edb2c` |
+| `tools/out/FuxiMetal.bundle/Info.plist` | `2578f53d73942a55e0163fa5c80c29beb00839bfb8db477a4060e0a81ab5fd06` |
+| `tools/out/FuxiMetal.bundle/_CodeSignature/CodeResources` | `9fcd9223ba2b40aee792c83c8edf32c7c1847f01369fbb0f230e1108a493451b` |
+| `tools/out/libmetal2vulkan.dylib` | `015d536f2617827cb7c83fd4a58682d370881c59a9bb719f19b00908bae4bd88` |
+| `tools/out/metal-smoke.metallib` | `c1da69afc209598f775022dae5325894c1128935334efa024d378a179c6c6464` |
+| `tools/out/metal2vulkan-source.tar.gz` | `9eb4d8ab39fcb53cf169ec0b450e71fe3fcdbb88bf88641f68b631a2f4d8770b` |
+| `tools/out/fuxi-metal-smoke` | `87e652a1915c5830b7ebda274f6f4ef1f8a63b0936a01a74f9a0a293c8b9e1a4` |
+| `tools/out/metal-smoke.conf` | `7de1555df0c2700329e815b93b32c571c3ea54dc967b89e81ab73b9972b72d1d` |
+| `tools/out/metal-clients.conf` | `8d5b163a382ff4eca7579803ec5dd9e2f24f8c0a4e3d65fc6965c539b3e7e6cc` |
+| `tools/out/libvulkan_freedreno.dylib` (unchanged) | `5661a054b5e4be57fe54bc38f3cccf6d264ae20562473caf72e50d2adc158a8c` |
+
+
+## M5a process safety gate
 
 2026-10-20. The coordinator reports **M4 observed PASS**: native metaclass
 matching, system Metal discovery (528-byte base and subclass), 64 KiB fill,
@@ -170,8 +371,10 @@ belongs in git:
 
 ## Shader translation decision
 
-**Recommend (a), an external dynamically loaded metal2vulkan adapter, for M5b's
-isolated offscreen experiment.** M5a links none of it. Reviewed the actual pin
+**The user approved (a) for M5b: an external dynamically loaded metal2vulkan
+adapter.** M5a itself links none of it. M5b starts with our own constant-colour
+MSL, not the CA shader candidates in this earlier survey. Cache design below
+is future work; M5b has no shader/pipeline cache. Reviewed the actual pin
 `720ef1ce9ae2a2068999a8675717418b9416283e`, including Cargo manifests, API,
 AIR front end and cache documentation. The repository identifies itself as
 alpha; this is a candidate, not an established CA/A740 translator. No CA

@@ -9,7 +9,9 @@
 #include <unistd.h>
 namespace fuxi {
 struct Buffer {void *contents;size_t length,allocated;};
-struct Operation {Buffer *src,*dst;size_t from,to,size;uint8_t value;};
+struct Texture {size_t allocated{};};
+struct Pipeline {};
+struct Operation {Buffer *src,*dst;size_t from,to,size;uint8_t value;Texture *texture{};Pipeline *pipeline{};float clear[4]{};};
 class Backend {
 public:
  static constexpr size_t maxBufferLength=16*1024*1024;
@@ -20,6 +22,10 @@ public:
   auto *b=new Buffer{calloc(1,n),n,n};++live;return b;
  }
  void destroy(Buffer *b) {if(b){free(b->contents);delete b;--live;}}
+ Texture *allocateTexture() {throw std::runtime_error("M4 CPU model has no rendering");}
+ Pipeline *compilePipeline(void *,const char *,void *,const char *) {throw std::runtime_error("M4 CPU model has no translation");}
+ void destroy(Texture *t) {delete t;}
+ void destroy(Pipeline *p) {delete p;}
  void submit(const std::vector<Operation>& ops) {
   if(getenv("FUXI_TEST_LOST")) {poisoned=true;throw std::runtime_error("modeled device loss");}
   if(getenv("FUXI_TEST_HANG"))for(;;)pause();

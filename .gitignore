@@ -4,6 +4,8 @@ dtb/
 recovery/
 # third-party/Apple sources fetched for reading
 research/
+# External translator/dependency source and build caches (never vendored)
+deps/
 shim/out/
 xnu/out/
 xnu/out-*/

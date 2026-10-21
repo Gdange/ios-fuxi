@@ -14,5 +14,5 @@ for binary in args.binaries:
     required.update(audit.audit(binary,required_export=None))
     report=binary.with_suffix(binary.suffix+'.undefined.txt')
     if report.parent!=out:report.replace(out/report.name)
-(out/'M5a-required-symbol-libs.json').write_text(json.dumps(required,indent=2))
-(out/'M5a-required-symbols.json').write_text(json.dumps([{'pattern':'^('+'|'.join(re.escape(s) for s in sorted(required))+')$'}]))
+(out/'M5b-required-symbol-libs.json').write_text(json.dumps(required,indent=2))
+(out/'M5b-required-symbols.json').write_text(json.dumps([{'pattern':'^('+'|'.join(re.escape(s) for s in sorted(required))+')$'}]))

@@ -70,8 +70,10 @@ def audit(path, required_export="_vk_icdGetInstanceProcAddr"):
 def check_cache(symbols, required):
     records=json.loads(symbols.read_text());needed=json.loads(required.read_text())
     def provider(lib, image):
+        # The supplied iOS 16.7 libSystem explicitly reexports these providers.
         if lib=='libSystem':
-            return image.startswith('libsystem_') or image in ('libdyld.dylib','libunwind.dylib','dyld')
+            return image.startswith('libsystem_') or image in ('libdyld.dylib','libunwind.dylib','dyld',
+                'libdispatch.dylib','libcommonCrypto.dylib')
         if lib=='libc++': return image in ('libc++.1.dylib','libc++abi.dylib')
         names={'libz':'libz.1.dylib','libobjc':'libobjc.A.dylib'}
         return image==names.get(lib,lib)

@@ -17,7 +17,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         d=Path(tmp);root=d/'root';(root/'System/Library').mkdir(parents=True)
         icd=a.out/'libvulkan_freedreno.dylib';bundle=a.out/'FuxiMetal.bundle';smoke=a.out/'fuxi-metal-smoke'
-        conf=d/'conf';conf.write_bytes(b'3\n')
+        conf=d/'conf';conf.write_bytes(b'4\n')
         clients=d/'clients';clients.write_bytes(b'fuxi-metal-smoke\ncensus backboardd\n')
         def stage():m.stage(root,icd,bundle,smoke,conf,clients)
         with patch.object(m.os,'geteuid',return_value=0),patch.object(m.os,'chown') as chown:
@@ -25,16 +25,19 @@ def main():
             if os.uname().sysname=='Darwin':
                 subprocess.run(['codesign','--verify','--strict',str(root/'System/Library/Extensions/FuxiMetal.bundle')],check=True)
             for src,rel,mode in ((icd,'usr/local/lib/libvulkan_freedreno.dylib',0o755),(smoke,'usr/local/bin/fuxi-metal-smoke',0o755),
+                (a.out/'libmetal2vulkan.dylib','usr/local/lib/libmetal2vulkan.dylib',0o755),
+                (a.out/'metal-smoke.metallib','usr/local/share/fuxi/metal-smoke.metallib',0o644),
+                (a.out/'metal2vulkan-source.tar.gz','usr/local/share/fuxi/metal2vulkan-source.tar.gz',0o644),
                 (conf,'usr/local/share/fuxi/metal-smoke.conf',0o644),(clients,'usr/local/share/fuxi/metal-clients.conf',0o644),(bundle/'FuxiMetal','System/Library/Extensions/FuxiMetal.bundle/FuxiMetal',0o755),
                 (bundle/'Info.plist','System/Library/Extensions/FuxiMetal.bundle/Info.plist',0o644),
                 (bundle/'_CodeSignature/CodeResources','System/Library/Extensions/FuxiMetal.bundle/_CodeSignature/CodeResources',0o644)):
                 p=root/rel;assert p.read_bytes()==src.read_bytes() and p.stat().st_mode&0o777==mode
             assert all(c.args[1:]==(0,0) for c in chown.call_args_list)
-            for raw in (b'',b'4',b'3\0',b'1'*32):
+            for raw in (b'',b'5',b'3\0',b'1'*32):
                 conf.write_bytes(raw)
                 try:stage();raise AssertionError('bad config accepted')
                 except ValueError:pass
-            conf.write_bytes(b'3\n')
+            conf.write_bytes(b'4\n')
             for raw in (b'x\0',b'census x y',b'census backboardd\nbackboardd',b'x'*8193,b'../bad'):
                 clients.write_bytes(raw)
                 try:stage();raise AssertionError('bad clients accepted')
