@@ -15,7 +15,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         d=Path(tmp);conf=d/'smoke.conf'
         flags=['-O1','-g','-Wall','-Wextra','-Werror','-fno-objc-arc','-fblocks','-fsanitize=address,undefined']
-        frameworks=['-framework','Foundation','-framework','Metal']
+        frameworks=['-framework','Foundation','-framework','Metal','-framework','IOSurface']
         def call(command):subprocess.run(command,check=True)
         call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/FrontendTests.mm'),*frameworks,'-o',str(d/'frontend')])
         env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0')
@@ -52,7 +52,7 @@ def main():
         for stage in range(4):
             out=run(str(stage).encode());assert 'stage %u '%stage in out and 'done PASS' in out
             assert 'stage %u '%(stage+1) not in out
-        for bad in (b'',b'5',b'-1',b'1junk',b'3\0',b'1'*32):assert 'stage 0 discovery FAIL' in run(bad,1)
+        for bad in (b'',b'6',b'-1',b'1junk',b'3\0',b'1'*32):assert 'stage 0 discovery FAIL' in run(bad,1)
         assert 'stage 4 pipeline FAIL' in run(b'4',1)
         assert 'stage 0 discovery FAIL' in run(b'3',1,FUXI_TEST_NOT_ROOT='1')
         assert 'returned nil' in run(b'3',1,FUXI_TEST_NO_DEVICE='1')

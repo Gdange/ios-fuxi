@@ -11,10 +11,12 @@
 #define FUXI_MTL_TRANSLATOR "/usr/local/lib/libmetal2vulkan.dylib"
 #endif
 namespace fuxi {
+struct Descriptor {uint32_t binding{},type{},stages{};};
+struct Specialization {uint32_t id{},offset{},size{};};
 struct Translation {
  void *handle{}; const uint32_t *vertex{}; size_t vertexCount{}; const char *vertexEntry{};
  const uint32_t *fragment{}; size_t fragmentCount{}; const char *fragmentEntry{};
- uint32_t pushOffset{},pushSize{},pushStages{};uint8_t pushBytes[128]{};
+ uint32_t pushOffset{},pushSize{},pushStages{};uint8_t pushBytes[128]{};uint32_t descriptorCount{};Descriptor descriptors[4]{};uint32_t specCount{},specSize{};Specialization specs[32]{};uint8_t specData[256]{};
 };
 class Translator {
  void *dylib{};
@@ -28,7 +30,7 @@ public:
   dylib=dlopen(FUXI_MTL_TRANSLATOR,RTLD_NOW|RTLD_LOCAL);
   if(!dylib)throw std::runtime_error("dlopen external metal2vulkan failed");
   auto abi=(uint32_t (*)())dlsym(dylib,"fuxi_m2v_abi");
-  if(!abi || abi()!=1) {dlclose(dylib);throw std::runtime_error("metal2vulkan C ABI mismatch");}
+  if(!abi || abi()!=2) {dlclose(dylib);throw std::runtime_error("metal2vulkan C ABI mismatch");}
 #define LOAD(n) n=(decltype(n))dlsym(dylib,"fuxi_m2v_" #n);if(!n) {dlclose(dylib);throw std::runtime_error("missing translator " #n);}
   LOAD(open) LOAD(close) LOAD(function) LOAD(compile) LOAD(free)
 #undef LOAD

@@ -25,8 +25,8 @@ rm -f "$bundle/FuxiMetal.undefined.txt"
 cp tools/fuxi-metal/Info.plist "$bundle/Info.plist"
 "$cxx" "${flags[@]}" -std=c++17 -I"$headers" -dynamiclib tools/fuxi-metal/Frontend.mm \
  -install_name /System/Library/Extensions/FuxiMetal.bundle/FuxiMetal \
- -framework Foundation -framework Metal -o "$bundle/FuxiMetal"
-"$cc" "${flags[@]}" tools/fuxi-metal-smoke.m -framework Foundation -framework Metal -o "$out/fuxi-metal-smoke"
+ -framework Foundation -framework Metal -framework IOSurface -o "$bundle/FuxiMetal"
+"$cc" "${flags[@]}" tools/fuxi-metal-smoke.m -framework Foundation -framework Metal -framework IOSurface -o "$out/fuxi-metal-smoke"
 cp tools/metal-clients.conf "$out/metal-clients.conf"
 cp tools/metal-smoke.conf "$out/metal-smoke.conf"
 for binary in "$bundle" "$out/fuxi-metal-smoke"; do

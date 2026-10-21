@@ -10,7 +10,7 @@ ROOT=Path(__file__).resolve().parents[1]
 
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--translator',type=Path,required=True,help='native host ABI-v1 dylib at the pinned revision')
+    ap.add_argument('--translator',type=Path,required=True,help='native host ABI-v2 dylib at the pinned revision')
     ap.add_argument('--metallib',type=Path,required=True)
     a=ap.parse_args()
     if os.uname().sysname!='Darwin':raise SystemExit('requires Mac Foundation/Metal')
@@ -19,7 +19,7 @@ def main():
         subprocess.run(['xcrun','clang++','-std=c++17','-O1','-g','-Wall','-Wextra','-Werror',
             '-fno-objc-arc','-fblocks','-fsanitize=address,undefined',
             '-DFUXI_MTL_TRANSLATOR="'+str(a.translator.resolve())+'"',
-            str(ROOT/'tools/fuxi-metal/PipelineDefaultsTests.mm'),'-framework','Foundation','-framework','Metal','-o',str(binary)],check=True)
+            str(ROOT/'tools/fuxi-metal/PipelineDefaultsTests.mm'),'-framework','Foundation','-framework','Metal','-framework','IOSurface','-o',str(binary)],check=True)
         p=subprocess.run([str(binary),str(a.metallib.resolve())],env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0'),
             text=True,capture_output=True,timeout=30)
         assert p.returncode==0,(p.stdout,p.stderr)

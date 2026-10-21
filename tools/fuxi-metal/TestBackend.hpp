@@ -11,7 +11,8 @@ namespace fuxi {
 struct Buffer {void *contents;size_t length,allocated;};
 struct Texture {size_t allocated{};};
 struct Pipeline {};
-struct Operation {Buffer *src,*dst;size_t from,to,size;uint8_t value;Texture *texture{};Pipeline *pipeline{};float clear[4]{};};
+struct Sampler {};
+struct Operation {Buffer *src,*dst;size_t from,to,size;uint8_t value;Texture *texture{};Pipeline *pipeline{};float clear[4]{};Texture *sourceTexture{};Sampler *sampler{};uint32_t vertices=3;bool upload=false;};
 class Backend {
 public:
  static constexpr size_t maxBufferLength=16*1024*1024;
@@ -22,9 +23,13 @@ public:
   auto *b=new Buffer{calloc(1,n),n,n};++live;return b;
  }
  void destroy(Buffer *b) {if(b){free(b->contents);delete b;--live;}}
+ bool supportsHostImport() const {return false;}
+ Texture *importTexture(void *,size_t,size_t) {throw std::runtime_error("no modeled host import");}
+ Sampler *allocateSampler(bool,bool) {return new Sampler{};}
+ void destroy(Sampler *s) {delete s;}
  Texture *allocateTexture() {throw std::runtime_error("M4 CPU model has no rendering");}
  Pipeline *compilePipeline(void *,const char *,void *,const char *) {throw std::runtime_error("M4 CPU model has no translation");}
- void destroy(Texture *t) {delete t;}
+ bool destroy(Texture *t) {delete t;return !poisoned;}
  void destroy(Pipeline *p) {delete p;}
  void submit(const std::vector<Operation>& ops) {
   if(getenv("FUXI_TEST_LOST")) {poisoned=true;throw std::runtime_error("modeled device loss");}

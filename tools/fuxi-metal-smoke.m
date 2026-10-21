@@ -1,6 +1,7 @@
 /* Root exec-swap diagnostic: all argv, including argv[0], is ignored. */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <IOSurface/IOSurface.h>
 #import <objc/runtime.h>
 #include <errno.h>
 #include <signal.h>
@@ -30,7 +31,7 @@ static unsigned configuration(void) {
  char raw[32];size_t n=fread(raw,1,sizeof(raw),f);BOOL bad=ferror(f);fclose(f);
  if(bad || n==sizeof(raw))fail("config read/length");
  size_t i=0;while(i<n && strchr(" \t\r\n",raw[i]) && raw[i])++i;
- if(i==n || raw[i]<'0' || raw[i]>'4')fail("config expected max stage 0..4");
+ if(i==n || raw[i]<'0' || raw[i]>'5')fail("config expected max stage 0..5");
  unsigned result=(unsigned)(raw[i++]-'0');while(i<n && raw[i] && strchr(" \t\r\n",raw[i]))++i;
  if(i!=n)fail("config trailing data");return result;
 }
@@ -104,6 +105,67 @@ static void pipeline(id<MTLDevice>device,id<MTLCommandQueue>q) {
  printf("FUXI MTL: stage 4 pipeline PASS BGRA8 256x256 inside/outside 6 red %u clear %u + sentinel edges\n",red,black);
  [b release];[t release];[p release];[pd release];[v release];[f release];[library release];[dataLibrary release];
 }
+static IOSurfaceRef surface(void) {
+ NSDictionary *properties=@{(id)kIOSurfaceWidth:@256,(id)kIOSurfaceHeight:@256,
+  (id)kIOSurfaceBytesPerElement:@4,(id)kIOSurfaceBytesPerRow:@1024,
+  (id)kIOSurfacePixelFormat:@(0x42475241),(id)kIOSurfaceAllocSize:@262144};
+ IOSurfaceRef result=IOSurfaceCreate((CFDictionaryRef)properties);
+ if(!result)fail("IOSurfaceCreate");return result;
+}
+static void texel(unsigned x,unsigned y,uint8_t *out) {
+ // Four different opaque quadrants expose channel swaps, stale reads and flips.
+ out[0]=y>=128?255:0;out[1]=x>=128?255:0;out[2]=y<128 && x<128?255:0;out[3]=255;
+}
+static void composition(id<MTLDevice>device,id<MTLCommandQueue>q) {
+ IOSurfaceRef src=surface(),dst=surface();
+ if(IOSurfaceLock(src,0,NULL))fail("IOSurface source lock");
+ uint8_t *base=IOSurfaceGetBaseAddress(src);size_t row=IOSurfaceGetBytesPerRow(src);
+ if(!base || row<1024)fail("IOSurface source mapping/stride");
+ for(unsigned y=0;y<256;++y)for(unsigned x=0;x<256;++x)texel(x,y,base+y*row+x*4);
+ if(IOSurfaceUnlock(src,0,NULL))fail("IOSurface source unlock");
+ MTLTextureDescriptor *td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:256 height:256 mipmapped:NO];
+ td.storageMode=MTLStorageModeShared;td.usage=MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget;
+ id<MTLTexture>input=[device newTextureWithDescriptor:td iosurface:src plane:0];
+ if(!input)fail("IOSurface source import unavailable (same-memory required)");
+ id<MTLTexture>target=[device newTextureWithDescriptor:td iosurface:dst plane:0];
+ if(!target || input.iosurface!=src || target.iosurface!=dst || input.iosurfacePlane || target.iosurfacePlane)fail("IOSurface target/identity");
+ NSError *error=nil;id<MTLLibrary>lib=[device newLibraryWithURL:[NSURL fileURLWithPath:@FUXI_MTL_METALLIB] error:&error];
+ if(!lib || error)fail("quad library %s",error.description.UTF8String);
+ id<MTLFunction>v=[lib newFunctionWithName:@"fuxi_quad"],f=[lib newFunctionWithName:@"fuxi_sample"];
+ if(!v || !f)fail("quad functions");
+ MTLRenderPipelineDescriptor *pd=[MTLRenderPipelineDescriptor new];pd.vertexFunction=v;pd.fragmentFunction=f;pd.colorAttachments[0].pixelFormat=MTLPixelFormatBGRA8Unorm;
+ id<MTLRenderPipelineState>p=[device newRenderPipelineStateWithDescriptor:pd error:&error];
+ if(!p || error)fail("sampled pipeline %s",error.description.UTF8String);
+ // The second creation must use the translator's process cache.
+ id<MTLRenderPipelineState>cached=[device newRenderPipelineStateWithDescriptor:pd error:&error];
+ if(!cached || error)fail("cached sampled pipeline");[cached release];
+ MTLSamplerDescriptor *sd=[MTLSamplerDescriptor new];id<MTLSamplerState>sampler=[device newSamplerStateWithDescriptor:sd];
+ id<MTLBuffer>readback=[device newBufferWithLength:262656 options:MTLResourceStorageModeShared];
+ if(!sampler || !readback)fail("sampler/readback allocation");memset(readback.contents,0x39,readback.length);
+ @autoreleasepool {
+  MTLRenderPassDescriptor *pass=[MTLRenderPassDescriptor renderPassDescriptor];pass.colorAttachments[0].texture=target;
+  pass.colorAttachments[0].loadAction=MTLLoadActionClear;pass.colorAttachments[0].storeAction=MTLStoreActionStore;
+  pass.colorAttachments[0].clearColor=MTLClearColorMake(0,0,0,1);
+  id<MTLCommandBuffer>command=q.commandBuffer;id<MTLRenderCommandEncoder>r=[command renderCommandEncoderWithDescriptor:pass];
+  if(!r)fail("nil sampled render encoder");[r setRenderPipelineState:p];[r setFragmentTexture:input atIndex:0];[r setFragmentSamplerState:sampler atIndex:0];
+  [r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];[r endEncoding];
+  id<MTLBlitCommandEncoder>b=command.blitCommandEncoder;if(!b)fail("nil sampled readback encoder");
+  [b copyFromTexture:target sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(256,256,1)
+   toBuffer:readback destinationOffset:256 destinationBytesPerRow:1024 destinationBytesPerImage:262144];[b endEncoding];finish(command);
+ }
+ verify(readback,0,256,0x39);verify(readback,262400,256,0x39);
+ const uint8_t *pixels=(const uint8_t *)readback.contents+256;
+ for(unsigned y=0;y<256;++y)for(unsigned x=0;x<256;++x) {uint8_t want[4];texel(x,y,want);
+  if(memcmp(pixels+(y*256+x)*4,want,4))fail("sampled pixel %u,%u",x,y);
+ }
+ [input release];[target release]; // Release import locks before the CPU consumer.
+ if(IOSurfaceLock(dst,kIOSurfaceLockReadOnly,NULL))fail("IOSurface target lock");
+ base=IOSurfaceGetBaseAddress(dst);row=IOSurfaceGetBytesPerRow(dst);if(!base || row<1024)fail("IOSurface target mapping/stride");
+ for(unsigned y=0;y<256;++y)if(memcmp(base+y*row,pixels+y*1024,1024))fail("IOSurface same-memory row %u",y);
+ if(IOSurfaceUnlock(dst,kIOSurfaceLockReadOnly,NULL))fail("IOSurface target unlock");
+ puts("FUXI MTL: stage 5 composition PASS IOSurface BGRA8 256x256 textured quad 65536 pixels + same-memory target + sentinel edges");
+ [readback release];[sampler release];[sd release];[p release];[pd release];[v release];[f release];[lib release];CFRelease(src);CFRelease(dst);
+}
 int main(int argc,char **argv) {
  (void)argc;(void)argv;setvbuf(stdout,NULL,_IONBF,0);setvbuf(stderr,NULL,_IONBF,0);signal(SIGALRM,expired);arm(30);
  @autoreleasepool { @try {
@@ -129,6 +191,7 @@ int main(int argc,char **argv) {
     [b release];
    }
    if(maximum>=4) {stage=4;name="pipeline";arm(60);@autoreleasepool {pipeline(device,q);}}
+   if(maximum>=5) {stage=5;name="composition";arm(60);@autoreleasepool {composition(device,q);}}
    arm(10);[a release];[q release];
   }
   [device release];alarm(0);puts("FUXI MTL: done PASS");

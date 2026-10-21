@@ -10,6 +10,10 @@
 @implementation FuxiTestBase
 - (id)dangerousInheritedSelector {abort();}
 @end
+static void refuses(id<MTLCommandBuffer>command,void (^body)()) {
+ FuxiCommandBuffer *c=(id)command;size_t n=c->_ops.size();body();assert(c->_rejected && c.error && c->_ops.size()==n);
+ c->_rejected=NO;[c->_error release];c->_error=nil; // isolate modeled validation cases
+}
 int main() {
  @autoreleasepool {
   assert(!makeDeviceClass([NSObject class])); // Wrong-size base rejected before registration.
@@ -20,6 +24,9 @@ int main() {
   objc_setAssociatedObject(device,&ownerKey,state,OBJC_ASSOCIATION_RETAIN_NONATOMIC);[state release];
   assert([(id)device isKindOfClass:[FuxiTestBase class]] && [device conformsToProtocol:@protocol(MTLDevice)]);
   assert(![device supportsFamily:MTLGPUFamilyApple1] && device.registryID==123);
+  assert(!device.currentAllocatedSize); // Missing public scalar returns typed zero.
+  MTLSizeAndAlign unsupportedSize=[device heapBufferSizeAndAlignWithLength:64 options:0];
+  assert(!unsupportedSize.size && !unsupportedSize.align); // Missing struct ABI too.
   assert(![(FuxiTestBase *)device dangerousInheritedSelector]);
   assert(![device newBufferWithLength:0 options:0]);
   assert(![device newBufferWithLength:4 options:MTLResourceStorageModePrivate]);
@@ -34,23 +41,35 @@ int main() {
    id<MTLCommandBuffer>c=q.commandBuffer;
    id<MTLBlitCommandEncoder>e=c.blitCommandEncoder;
    assert(!c.blitCommandEncoder);
-   @try {[c commit];assert(false);}@catch(NSException *error) {(void)error;}
-   @try {[e fillBuffer:src range:NSMakeRange(1,4) value:1];assert(false);}@catch(NSException *error) {(void)error;}
-   @try {[e copyFromBuffer:src sourceOffset:0 toBuffer:src destinationOffset:4 size:16];assert(false);}@catch(NSException *error) {(void)error;}
-   @try {[e fillBuffer:dst range:NSMakeRange(NSUIntegerMax,4) value:1];assert(false);}@catch(NSException *error) {(void)error;}
+   refuses(c,^{[e fillBuffer:src range:NSMakeRange(1,4) value:1];});
+   refuses(c,^{[e copyFromBuffer:src sourceOffset:0 toBuffer:src destinationOffset:4 size:16];});
+   refuses(c,^{[e fillBuffer:dst range:NSMakeRange(NSUIntegerMax,4) value:1];});
    [e fillBuffer:src range:NSMakeRange(4,56) value:(uint8_t)i];
    [e copyFromBuffer:src sourceOffset:4 toBuffer:dst destinationOffset:8 size:48];[e endEncoding];
-   @try {[e endEncoding];assert(false);}@catch(NSException *error) {(void)error;}
+   refuses(c,^{[e endEncoding];});
    __block unsigned calls=0;
    [c addCompletedHandler:^(id<MTLCommandBuffer>b){assert(b.status==MTLCommandBufferStatusCompleted);++calls;}];
    [src release]; // Command buffer must retain resources through submission.
    [c commit];[c waitUntilCompleted];assert(c.status==MTLCommandBufferStatusCompleted && !c.error && calls==1);
    [c addCompletedHandler:^(id<MTLCommandBuffer>b){assert(b.status==MTLCommandBufferStatusCompleted);++calls;}];assert(calls==2);
    for(unsigned j=0;j<64;j++)assert(((uint8_t *)dst.contents)[j]==(j>=8 && j<56?i:0));
-   @try {[c commit];assert(false);}@catch(NSException *error) {(void)error;}
+   [c commit];assert(c.status==MTLCommandBufferStatusCompleted); // idempotent after completion
    assert(!c.blitCommandEncoder);[dst release];
   }}
   assert(fuxi::Backend::live==0 && fuxi::Backend::submissions==16);
+  @autoreleasepool {
+   id<MTLCommandBuffer>c=q.commandBuffer;id<MTLBlitCommandEncoder>e=c.blitCommandEncoder;
+   // A missing encoder entry must name the selector, return without throwing,
+   // retain prior resources, and never send even the valid prefix to the GPU.
+   id<MTLBuffer>b=[device newBufferWithLength:64 options:0];[e fillBuffer:b range:NSMakeRange(0,64) value:7];
+   unsigned before=fuxi::Backend::submissions;[e generateMipmapsForTexture:nil];[e endEncoding];
+   [c commit];assert(c.status==MTLCommandBufferStatusError && c.error && fuxi::Backend::submissions==(int)before);
+   for(unsigned i=0;i<64;++i)assert(!((uint8_t *)b.contents)[i]);[b release];
+  }
+  @autoreleasepool {
+   id<MTLCommandBuffer>c=q.commandBuffer;(void)c.blitCommandEncoder;[c commit];
+   assert(c.status==MTLCommandBufferStatusError && c.error);
+  }
   @autoreleasepool {
    id<MTLCommandBuffer>c=q.commandBuffer;
    setenv("FUXI_TEST_LOST","1",1);

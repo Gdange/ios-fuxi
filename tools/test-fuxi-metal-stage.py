@@ -21,7 +21,7 @@ def main():
         clients=d/'clients';clients.write_bytes(b'fuxi-metal-smoke\ncensus backboardd\n')
         def stage():m.stage(root,icd,bundle,smoke,conf,clients)
         with patch.object(m.os,'geteuid',return_value=0),patch.object(m.os,'chown') as chown:
-            stage();stage()
+            stage();stage();conf.write_bytes(b'5\n');stage();conf.write_bytes(b'4\n');stage()
             if os.uname().sysname=='Darwin':
                 subprocess.run(['codesign','--verify','--strict',str(root/'System/Library/Extensions/FuxiMetal.bundle')],check=True)
             for src,rel,mode in ((icd,'usr/local/lib/libvulkan_freedreno.dylib',0o755),(smoke,'usr/local/bin/fuxi-metal-smoke',0o755),
@@ -33,7 +33,7 @@ def main():
                 (bundle/'_CodeSignature/CodeResources','System/Library/Extensions/FuxiMetal.bundle/_CodeSignature/CodeResources',0o644)):
                 p=root/rel;assert p.read_bytes()==src.read_bytes() and p.stat().st_mode&0o777==mode
             assert all(c.args[1:]==(0,0) for c in chown.call_args_list)
-            for raw in (b'',b'5',b'3\0',b'1'*32):
+            for raw in (b'',b'6',b'3\0',b'1'*32):
                 conf.write_bytes(raw)
                 try:stage();raise AssertionError('bad config accepted')
                 except ValueError:pass
