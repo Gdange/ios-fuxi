@@ -42,7 +42,9 @@ check() {  # fsck problems other than orphaned open-unlinked files fail
 }
 python3 -I /tools/hfs-journal-replay.py "$IMG" --apply
 vol=$(python3 -I -c "import struct,sys;f=open(sys.argv[1],\"rb\");f.seek(1064);b,n=struct.unpack(\">II\",f.read(8));print(b*n)" "$IMG")
-dev=$(losetup -f --show --sizelimit "$vol" "$IMG"); trap "umount $MNT 2>/dev/null || true; losetup -d $dev" EXIT
+# The container gets a snapshot of /dev: a loop node the host creates later is missing.
+dev=$(losetup -f); [ -e "$dev" ] || mknod "$dev" b 7 "${dev#/dev/loop}"
+losetup --sizelimit "$vol" "$dev" "$IMG"; trap "umount $MNT 2>/dev/null || true; losetup -d $dev" EXIT
 echo "volume $vol bytes on $dev"
 check before
 python3 -I /tools/hfs-journal-replay.py "$IMG" --mark-unmounted
