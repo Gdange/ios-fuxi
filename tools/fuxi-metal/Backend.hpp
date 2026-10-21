@@ -28,22 +28,27 @@ inline void check(VkResult r) { if(r!=VK_SUCCESS) throw std::runtime_error("Vulk
  X(AllocateDescriptorSets) X(UpdateDescriptorSets) X(CmdBindDescriptorSets) X(CreateImageView) X(DestroyImageView) X(CreateRenderPass) X(DestroyRenderPass) \
  X(CreateFramebuffer) X(DestroyFramebuffer) X(CreateShaderModule) X(DestroyShaderModule) \
  X(CreatePipelineLayout) X(DestroyPipelineLayout) X(CreateGraphicsPipelines) X(DestroyPipeline) \
- X(CmdPushConstants) X(CmdBeginRenderPass) X(CmdEndRenderPass) X(CmdBindPipeline) X(CmdDraw) X(CmdCopyImageToBuffer) X(CmdPipelineBarrier) X(CreateFence) X(DestroyFence) X(QueueSubmit) X(WaitForFences)
+ X(CmdBindVertexBuffers) X(CmdBindIndexBuffer) X(CmdDrawIndexed) X(CmdSetViewport) X(CmdSetScissor) X(CmdPushConstants) X(CmdBeginRenderPass) X(CmdEndRenderPass) X(CmdBindPipeline) X(CmdDraw) X(CmdCopyImageToBuffer) X(CmdPipelineBarrier) X(CreateFence) X(DestroyFence) X(QueueSubmit) X(WaitForFences)
 struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; void *contents{}; size_t length{}, allocated{}; };
 struct Texture {VkImage image{};VkDeviceMemory memory{};VkImageView view{};size_t allocated{};
+ uint32_t format=80;VkFormat vkFormat=VK_FORMAT_B8G8R8A8_UNORM;
  VkImageLayout layout=VK_IMAGE_LAYOUT_UNDEFINED;void *mapped{};bool imported=false,defined=false;};
-struct Sampler {VkSampler sampler{};};
-struct Pipeline {VkPipeline pipeline{};VkPipelineLayout layout{};VkRenderPass render{};uint32_t pushOffset{},pushSize{},pushStages{};uint8_t pushBytes[128]{};VkDescriptorSetLayout setLayout{};std::vector<Descriptor> descriptors;};
+struct Sampler {VkSampler sampler{};uint32_t filters=1;};
+struct Pipeline {void *translation{};CompileOptions options{};VkRenderPass renders[3][2]{};VkPipeline pipeline{},stripPipeline{};VkPipelineLayout layout{};VkRenderPass render{};uint32_t pushOffset{},pushSize{},pushStages{};uint8_t pushBytes[128]{};VkDescriptorSetLayout setLayout{};std::vector<Descriptor> descriptors;std::vector<std::pair<std::string,Pipeline *>> variants;};
+struct BufferBind {Buffer *buffer{};uint64_t offset{};bool bytes=false;};
 struct Operation {
  Buffer *src, *dst; size_t from, to, size; uint8_t value;
  Texture *texture{};Pipeline *pipeline{};float clear[4]{};
  Texture *sourceTexture{};Sampler *sampler{};uint32_t vertices=3;bool upload=false;
+ Texture *samples[4]{};Sampler *samplers[4]{};BufferBind buffers[2][4]{};Buffer *indices{};uint64_t indexOffset{};uint32_t first{},strip{},load=2,store=1;
+ VkViewport viewport{0,256,256,-256,0,1};VkRect2D scissor{{0,0},{256,256}};
 };
 class Backend {
  void *library{};
  VkInstance instance{}; VkPhysicalDevice physical{}; VkDevice device{}; VkQueue queue{};
  VkPhysicalDeviceMemoryProperties memory{}; uint32_t family{};
  bool hostImport=false;VkDeviceSize hostAlignment{};VkFormatFeatureFlags linearFeatures{},optimalFeatures{};
+ PFN_vkGetPhysicalDeviceFormatProperties GetPhysicalDeviceFormatProperties{};
  PFN_vkGetMemoryHostPointerPropertiesEXT GetMemoryHostPointerPropertiesEXT{};
  PFN_vkGetPhysicalDeviceImageFormatProperties2 GetPhysicalDeviceImageFormatProperties2{};
  PFN_vkDestroyInstance DestroyInstance{};PFN_vkGetInstanceProcAddr gipa{};
@@ -70,7 +75,7 @@ public:
    DestroyInstance=(PFN_vkDestroyInstance)gipa(instance,"vkDestroyInstance");
    if(!DestroyInstance) throw std::runtime_error("missing vkDestroyInstance");
    INSTANCE(EnumeratePhysicalDevices);INSTANCE(GetPhysicalDeviceMemoryProperties);
-   INSTANCE(GetPhysicalDeviceProperties);INSTANCE(GetPhysicalDeviceQueueFamilyProperties);INSTANCE(GetPhysicalDeviceFormatProperties);
+   INSTANCE(GetPhysicalDeviceProperties);INSTANCE(GetPhysicalDeviceQueueFamilyProperties);GetPhysicalDeviceFormatProperties=(PFN_vkGetPhysicalDeviceFormatProperties)gipa(instance,"vkGetPhysicalDeviceFormatProperties");if(!GetPhysicalDeviceFormatProperties)throw std::runtime_error("missing format query");
    INSTANCE(CreateDevice);INSTANCE(GetDeviceProcAddr);INSTANCE(EnumerateDeviceExtensionProperties);INSTANCE(GetPhysicalDeviceProperties2);
    GetPhysicalDeviceImageFormatProperties2=(PFN_vkGetPhysicalDeviceImageFormatProperties2)gipa(instance,"vkGetPhysicalDeviceImageFormatProperties2");
    uint32_t n=0;check(EnumeratePhysicalDevices(instance,&n,nullptr));
@@ -128,15 +133,15 @@ public:
   if(!length || length>maxBufferLength) throw std::runtime_error("buffer length outside 1..16 MiB");
   auto *b=new Buffer{};b->length=length;
   try {
-   VkBufferCreateInfo ci{};ci.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;ci.size=length;
-   ci.usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+   VkBufferCreateInfo ci{};ci.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;ci.size=(length+15)&~size_t(15);
+   ci.usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT|VK_BUFFER_USAGE_VERTEX_BUFFER_BIT|VK_BUFFER_USAGE_INDEX_BUFFER_BIT|VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT|VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
    check(CreateBuffer(device,&ci,nullptr,&b->buffer));
    VkMemoryRequirements req{};GetBufferMemoryRequirements(device,b->buffer,&req);b->allocated=req.size;
    uint32_t type=0;while(type<memory.memoryTypeCount && (!(req.memoryTypeBits&(1u<<type)) || !(memory.memoryTypes[type].propertyFlags&VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))) ++type;
    if(type==memory.memoryTypeCount) throw std::runtime_error("no host-visible memory");
    VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.allocationSize=req.size;ai.memoryTypeIndex=type;
    check(AllocateMemory(device,&ai,nullptr,&b->memory));check(BindBufferMemory(device,b->buffer,b->memory,0));
-   check(MapMemory(device,b->memory,0,VK_WHOLE_SIZE,0,&b->contents));memset(b->contents,0,length);return b;
+   check(MapMemory(device,b->memory,0,VK_WHOLE_SIZE,0,&b->contents));memset(b->contents,0,(length+15)&~size_t(15));return b;
   } catch(...) {destroyUnlocked(b);throw;}
  }
  void destroyUnlocked(Buffer *b) {
@@ -156,7 +161,7 @@ public:
  bool supportsHostImport() const {return hostImport && hostAlignment && GetMemoryHostPointerPropertiesEXT && GetPhysicalDeviceImageFormatProperties2;}
  void destroy(Sampler *s) {std::lock_guard<std::mutex> guard(mutex);if(s){if(!poisoned && s->sampler)DestroySampler(device,s->sampler,nullptr);delete s;}}
  Sampler *allocateSampler(bool minLinear,bool magLinear) {
-  std::lock_guard<std::mutex> guard(mutex);requireLive();auto *s=new Sampler{};
+  std::lock_guard<std::mutex> guard(mutex);requireLive();auto *s=new Sampler{};s->filters=1|(minLinear?2:0)|(magLinear?4:0);
   VkSamplerCreateInfo ci{};ci.sType=VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;ci.minFilter=minLinear?VK_FILTER_LINEAR:VK_FILTER_NEAREST;
   ci.magFilter=magLinear?VK_FILTER_LINEAR:VK_FILTER_NEAREST;ci.mipmapMode=VK_SAMPLER_MIPMAP_MODE_NEAREST;
   ci.addressModeU=ci.addressModeV=ci.addressModeW=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;ci.maxLod=VK_LOD_CLAMP_NONE;
@@ -205,16 +210,23 @@ public:
    vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};check(CreateImageView(device,&vi,nullptr,&t->view));return t;
   }catch(...) {guard.unlock();destroy(t);throw;}
  }
- Texture *allocateTexture() {
+ static size_t texelBytes(uint32_t f){switch(f){case 1:case 10:return 1;case 30:return 2;case 115:return 8;case 70:case 80:case 81:return 4;default:throw std::runtime_error("unsupported pixel format");}}
+ static VkFormat pixelFormat(uint32_t f) {
+  switch(f){case 80:return VK_FORMAT_B8G8R8A8_UNORM;case 81:return VK_FORMAT_B8G8R8A8_SRGB;case 70:return VK_FORMAT_R8G8B8A8_UNORM;case 115:return VK_FORMAT_R16G16B16A16_SFLOAT;case 10:case 1:return VK_FORMAT_R8_UNORM;case 30:return VK_FORMAT_R8G8_UNORM;default:throw std::runtime_error("unsupported pixel format");}
+ }
+ Texture *allocateTexture(uint32_t format=80,uint32_t usage=5) {
   std::unique_lock<std::mutex> guard(mutex);requireLive();
-  constexpr VkFormatFeatureFlags required=VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT|VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT|
-   VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT|VK_FORMAT_FEATURE_TRANSFER_SRC_BIT|VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-  if((optimalFeatures&required)!=required)throw std::runtime_error("BGRA8 texture format features unavailable");
-  auto *t=new Texture{};
+  if(!usage || (usage&~5u) || format==81 || (format==1 && (usage&4)))throw std::runtime_error("unsupported texture usage/sRGB/A8 attachment");
+  VkFormatProperties features{};GetPhysicalDeviceFormatProperties(physical,pixelFormat(format),&features);
+  VkFormatFeatureFlags needed=VK_FORMAT_FEATURE_TRANSFER_SRC_BIT|VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+  if(usage&1)needed|=VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT|VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+  if(usage&4)needed|=VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+  if((features.optimalTilingFeatures&needed)!=needed)throw std::runtime_error("texture format features unavailable");
+  auto *t=new Texture{};t->format=format;t->vkFormat=pixelFormat(format);
   try {
-   VkImageCreateInfo ii{};ii.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;ii.imageType=VK_IMAGE_TYPE_2D;ii.format=VK_FORMAT_B8G8R8A8_UNORM;
+   VkImageCreateInfo ii{};ii.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;ii.imageType=VK_IMAGE_TYPE_2D;ii.format=t->vkFormat;
    ii.extent={256,256,1};ii.mipLevels=1;ii.arrayLayers=1;ii.samples=VK_SAMPLE_COUNT_1_BIT;ii.tiling=VK_IMAGE_TILING_OPTIMAL;
-   ii.usage=VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT;
+   ii.usage=VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT|(usage&4?VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT:0)|(usage&1?VK_IMAGE_USAGE_SAMPLED_BIT:0);
    check(CreateImage(device,&ii,nullptr,&t->image));VkMemoryRequirements req{};GetImageMemoryRequirements(device,t->image,&req);t->allocated=req.size;
    uint32_t type=0;while(type<memory.memoryTypeCount && (!(req.memoryTypeBits&(1u<<type)) || !(memory.memoryTypes[type].propertyFlags&VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)))++type;
    if(type==memory.memoryTypeCount)throw std::runtime_error("no device-local texture memory");
@@ -224,42 +236,56 @@ public:
    vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};check(CreateImageView(device,&vi,nullptr,&t->view));return t;
   }catch(...) {guard.unlock();destroy(t);throw;}
  }
- void destroy(Pipeline *p) {
-  std::lock_guard<std::mutex> guard(mutex);if(!p)return;
-  if(!poisoned) {if(p->setLayout)DestroyDescriptorSetLayout(device,p->setLayout,nullptr);if(p->pipeline)DestroyPipeline(device,p->pipeline,nullptr);if(p->layout)DestroyPipelineLayout(device,p->layout,nullptr);if(p->render)DestroyRenderPass(device,p->render,nullptr);}delete p;
+ void destroyPipelineUnlocked(Pipeline *p) {
+  if(!p)return;for(auto &v:p->variants)destroyPipelineUnlocked(v.second);
+  if(!poisoned) {if(p->setLayout)DestroyDescriptorSetLayout(device,p->setLayout,nullptr);if(p->pipeline)DestroyPipeline(device,p->pipeline,nullptr);if(p->stripPipeline)DestroyPipeline(device,p->stripPipeline,nullptr);if(p->layout)DestroyPipelineLayout(device,p->layout,nullptr);for(auto &row:p->renders)for(auto render:row)if(render)DestroyRenderPass(device,render,nullptr);}if(p->translation)Translator::get().free(p->translation);delete p;
  }
- bool requiresSampling(const Pipeline *p) const {return !p->descriptors.empty();}
- Pipeline *compilePipeline(void *v,const char *vn,void *f,const char *fn) {
+ void destroy(Pipeline *p){std::lock_guard<std::mutex> guard(mutex);destroyPipelineUnlocked(p);}
+
+ bool requiresSampling(const Pipeline *p) const {return std::any_of(p->descriptors.begin(),p->descriptors.end(),[](const Descriptor &d){return d.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;});}
+ Pipeline *compilePipeline(void *v,const char *vn,void *f,const char *fn,const CompileOptions &options=CompileOptions{}) {
   std::unique_lock<std::mutex> guard(mutex);requireLive();Translation translated{};auto &tr=Translator::get();char error[2048]{};
   auto start=std::chrono::steady_clock::now();
-  int ok=tr.compile(v,vn,f,fn,(void *)gipa,(uint64_t)instance,(uint64_t)physical,&translated,error,sizeof(error));
+  int ok=tr.compile(v,vn,f,fn,(void *)gipa,(uint64_t)instance,(uint64_t)physical,&options,&translated,error,sizeof(error));
   double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
   if(ok)fprintf(stderr,"FUXI MTL: translation PASS %.3f ms (bounded translator cache)\n",ms);
   else fprintf(stderr,"FUXI MTL: translation FAIL %.160s\n",error);
   if(!ok)throw std::runtime_error(error[0]?error:"translation failed");
-  auto *p=new Pipeline{};VkShaderModule modules[2]{};
-  auto cleanup=[&]{for(auto m:modules)if(m)DestroyShaderModule(device,m,nullptr);tr.free(translated.handle);};
+  return createPipeline(translated,options);
+ }
+ Pipeline *createPipeline(Translation translated,const CompileOptions &options) {
+  auto &tr=Translator::get();auto *p=new Pipeline{};p->options=options;VkShaderModule modules[2]{};
+  auto cleanup=[&]{for(auto m:modules)if(m)DestroyShaderModule(device,m,nullptr);if(translated.handle)tr.free(translated.handle);};
   try {
-   VkAttachmentDescription attachment{};attachment.format=VK_FORMAT_B8G8R8A8_UNORM;attachment.samples=VK_SAMPLE_COUNT_1_BIT;
+   VkFormatProperties features{};GetPhysicalDeviceFormatProperties(physical,pixelFormat(options.format),&features);
+   auto needed=VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT|(translated.blend?VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT:0);
+   if((features.optimalTilingFeatures&needed)!=(uint32_t)needed)throw std::runtime_error("attachment format/blend unavailable");
+   VkAttachmentDescription attachment{};attachment.format=pixelFormat(options.format);attachment.samples=VK_SAMPLE_COUNT_1_BIT;
    attachment.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR;attachment.storeOp=VK_ATTACHMENT_STORE_OP_STORE;
    attachment.stencilLoadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE;attachment.stencilStoreOp=VK_ATTACHMENT_STORE_OP_DONT_CARE;
    attachment.initialLayout=VK_IMAGE_LAYOUT_GENERAL;attachment.finalLayout=VK_IMAGE_LAYOUT_GENERAL;
    VkAttachmentReference ref{0,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};VkSubpassDescription sub{};sub.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS;sub.colorAttachmentCount=1;sub.pColorAttachments=&ref;
    VkSubpassDependency deps[2]{};deps[0].srcSubpass=VK_SUBPASS_EXTERNAL;deps[0].dstSubpass=0;
    deps[0].srcStageMask=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;deps[0].dstStageMask=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-   deps[0].srcAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;deps[0].dstAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+   deps[0].srcAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;deps[0].dstAccessMask=VK_ACCESS_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
    deps[1].srcSubpass=0;deps[1].dstSubpass=VK_SUBPASS_EXTERNAL;deps[1].srcStageMask=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
    deps[1].dstStageMask=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;deps[1].srcAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;deps[1].dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
    VkRenderPassCreateInfo ri{};ri.sType=VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;ri.attachmentCount=1;ri.pAttachments=&attachment;ri.subpassCount=1;ri.pSubpasses=&sub;ri.dependencyCount=2;ri.pDependencies=deps;
-   check(CreateRenderPass(device,&ri,nullptr,&p->render));
-   if(!translated.pushSize || translated.pushOffset>128 || translated.pushSize>128-translated.pushOffset || (translated.pushOffset&3) || (translated.pushSize&3) || translated.pushStages!=VK_SHADER_STAGE_FRAGMENT_BIT)throw std::runtime_error("invalid translator push constant range");
-   p->pushOffset=translated.pushOffset;p->pushSize=translated.pushSize;p->pushStages=translated.pushStages;memcpy(p->pushBytes,translated.pushBytes,p->pushSize);
-   VkPushConstantRange range{p->pushStages,p->pushOffset,p->pushSize};
-   if(translated.descriptorCount>1)throw std::runtime_error("descriptor count>1");
+   for(unsigned load=0;load<3;++load)for(unsigned store=0;store<2;++store) {
+    attachment.loadOp=load==2?VK_ATTACHMENT_LOAD_OP_CLEAR:load==1?VK_ATTACHMENT_LOAD_OP_LOAD:VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachment.storeOp=store?VK_ATTACHMENT_STORE_OP_STORE:VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    check(CreateRenderPass(device,&ri,nullptr,&p->renders[load][store]));
+   }
+   p->render=p->renders[2][1];
+   p->pushOffset=translated.pushOffset;p->pushSize=translated.pushSize;p->pushStages=translated.pushStages;memcpy(p->pushBytes,translated.pushBytes,128);
+   // ABI 3 exposes both stage ranges. The translator limits each to the 128-byte Vulkan minimum.
+   VkPushConstantRange ranges[2]{};if(translated.rangeCount>2)throw std::runtime_error("push ranges");
+   for(unsigned i=0;i<translated.rangeCount;++i){auto r=translated.ranges[i];ranges[i]={r.stages,r.offset,r.size};}
+   if(translated.descriptorCount>16)throw std::runtime_error("descriptor count>16");
    std::vector<VkDescriptorSetLayoutBinding> bindings;
    for(uint32_t i=0;i<translated.descriptorCount;++i) {
     auto d=translated.descriptors[i];
-    if(d.binding!=i || d.type!=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || d.stages!=VK_SHADER_STAGE_FRAGMENT_BIT)
+    if((d.type!=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && d.type!=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && d.type!=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) || !d.stages || (d.stages&~17u))
      throw std::runtime_error("unsupported translator descriptor");
     bindings.push_back({d.binding,(VkDescriptorType)d.type,1,d.stages,nullptr});p->descriptors.push_back(d);
    }
@@ -267,7 +293,7 @@ public:
     VkDescriptorSetLayoutCreateInfo si{};si.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;si.bindingCount=bindings.size();si.pBindings=bindings.data();
     check(CreateDescriptorSetLayout(device,&si,nullptr,&p->setLayout));
    }
-   VkPipelineLayoutCreateInfo li{};li.setLayoutCount=p->setLayout?1:0;li.pSetLayouts=&p->setLayout;li.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;li.pushConstantRangeCount=1;li.pPushConstantRanges=&range;check(CreatePipelineLayout(device,&li,nullptr,&p->layout));
+   VkPipelineLayoutCreateInfo li{};li.setLayoutCount=p->setLayout?1:0;li.pSetLayouts=&p->setLayout;li.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;li.pushConstantRangeCount=translated.rangeCount;li.pPushConstantRanges=ranges;check(CreatePipelineLayout(device,&li,nullptr,&p->layout));
    const uint32_t *words[]={translated.vertex,translated.fragment};size_t counts[]={translated.vertexCount,translated.fragmentCount};
    for(unsigned i=0;i<2;++i) {
     if(!words[i] || counts[i]<5 || counts[i]>1024*1024 || words[i][0]!=0x07230203)throw std::runtime_error("invalid translator SPIR-V");
@@ -284,33 +310,78 @@ public:
    for(unsigned i=0;i<2;++i) {stages[i].sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;stages[i].module=modules[i];stages[i].pSpecializationInfo=&specialization;}
    stages[0].stage=VK_SHADER_STAGE_VERTEX_BIT;stages[0].pName=translated.vertexEntry;stages[1].stage=VK_SHADER_STAGE_FRAGMENT_BIT;stages[1].pName=translated.fragmentEntry;
    VkPipelineVertexInputStateCreateInfo vertex{};vertex.sType=VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+   std::vector<VkVertexInputBindingDescription> vbindings;std::vector<VkVertexInputAttributeDescription> vattrs;
+   if(translated.bindingCount>4 || translated.attributeCount>8)throw std::runtime_error("vertex input bounds");
+   for(unsigned i=0;i<translated.bindingCount;++i){auto b=translated.bindings[i];vbindings.push_back({b.binding,b.stride,VK_VERTEX_INPUT_RATE_VERTEX});}
+   for(unsigned i=0;i<translated.attributeCount;++i){auto a=translated.attributes[i];vattrs.push_back({a.location,a.binding,(VkFormat)a.format,a.offset});}
+   vertex.vertexBindingDescriptionCount=vbindings.size();vertex.pVertexBindingDescriptions=vbindings.data();vertex.vertexAttributeDescriptionCount=vattrs.size();vertex.pVertexAttributeDescriptions=vattrs.data();
    VkPipelineInputAssemblyStateCreateInfo assembly{};assembly.sType=VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;assembly.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
    // Metal's viewport has a top-left origin. Vulkan 1.2 supports negative height.
    VkViewport viewport{0,256,256,-256,0,1};VkRect2D scissor{{0,0},{256,256}};
    VkPipelineViewportStateCreateInfo vp{};vp.sType=VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;vp.viewportCount=1;vp.pViewports=&viewport;vp.scissorCount=1;vp.pScissors=&scissor;
    VkPipelineRasterizationStateCreateInfo raster{};raster.sType=VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;raster.polygonMode=VK_POLYGON_MODE_FILL;raster.cullMode=VK_CULL_MODE_NONE;raster.lineWidth=1;
    VkPipelineMultisampleStateCreateInfo ms{};ms.sType=VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;ms.rasterizationSamples=VK_SAMPLE_COUNT_1_BIT;
-   VkPipelineColorBlendAttachmentState blend{};blend.colorWriteMask=15;VkPipelineColorBlendStateCreateInfo bs{};bs.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;bs.attachmentCount=1;bs.pAttachments=&blend;
+   VkPipelineColorBlendAttachmentState blend{};blend.colorWriteMask=translated.mask;blend.blendEnable=translated.blend;
+   blend.srcColorBlendFactor=(VkBlendFactor)translated.factors[0];blend.dstColorBlendFactor=(VkBlendFactor)translated.factors[1];blend.colorBlendOp=(VkBlendOp)translated.factors[2];blend.srcAlphaBlendFactor=(VkBlendFactor)translated.factors[3];blend.dstAlphaBlendFactor=(VkBlendFactor)translated.factors[4];blend.alphaBlendOp=(VkBlendOp)translated.factors[5];VkPipelineColorBlendStateCreateInfo bs{};bs.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;bs.attachmentCount=1;bs.pAttachments=&blend;
    VkGraphicsPipelineCreateInfo gi{};gi.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;gi.stageCount=2;gi.pStages=stages;gi.pVertexInputState=&vertex;gi.pInputAssemblyState=&assembly;
    gi.pViewportState=&vp;gi.pRasterizationState=&raster;gi.pMultisampleState=&ms;gi.pColorBlendState=&bs;gi.layout=p->layout;gi.renderPass=p->render;
-   check(CreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gi,nullptr,&p->pipeline));cleanup();return p;
-  }catch(...) {cleanup();guard.unlock();destroy(p);throw;}
+   VkDynamicState dynamicStates[]={VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR};VkPipelineDynamicStateCreateInfo dynamic{};dynamic.sType=VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;dynamic.dynamicStateCount=2;dynamic.pDynamicStates=dynamicStates;gi.pDynamicState=&dynamic;
+   check(CreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gi,nullptr,&p->pipeline));assembly.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;assembly.primitiveRestartEnable=VK_TRUE;
+   check(CreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gi,nullptr,&p->stripPipeline));p->translation=translated.handle;translated.handle=nullptr;cleanup();return p;
+  }catch(...) {cleanup();destroyPipelineUnlocked(p);throw;}
  }
- void submit(const std::vector<Operation>& ops) {
+ void submit(std::vector<Operation> ops) {
   std::lock_guard<std::mutex> guard(mutex);requireLive();
-  VkCommandPool pool{};VkFence fence{};bool submitted=false,completed=false;std::vector<VkFramebuffer> frames;std::vector<VkDescriptorPool> descriptorPools;std::vector<Texture *> textures;std::vector<VkImageLayout> oldLayouts;std::vector<bool> oldDefined;
-  auto cleanup=[&] {for(auto dp:descriptorPools)DestroyDescriptorPool(device,dp,nullptr);for(auto frame:frames)DestroyFramebuffer(device,frame,nullptr);if(fence) DestroyFence(device,fence,nullptr);if(pool) DestroyCommandPool(device,pool,nullptr);};
+  VkCommandPool pool{};VkFence fence{};bool submitted=false,completed=false;std::vector<VkImageView> sampleViews;std::vector<VkFramebuffer> frames;std::vector<VkDescriptorPool> descriptorPools;std::vector<Texture *> textures;std::vector<VkImageLayout> oldLayouts;std::vector<bool> oldDefined;
+  auto cleanup=[&] {for(auto v:sampleViews)DestroyImageView(device,v,nullptr);for(auto dp:descriptorPools)DestroyDescriptorPool(device,dp,nullptr);for(auto frame:frames)DestroyFramebuffer(device,frame,nullptr);if(fence) DestroyFence(device,fence,nullptr);if(pool) DestroyCommandPool(device,pool,nullptr);};
   try {
-   // Validate before recording any transitions (especially attachment feedback).
-   for(const auto &op:ops)if(op.pipeline) {
-    if(!op.texture || (op.vertices!=3 && op.vertices!=6))throw std::runtime_error("invalid bounded draw");
-    if(!op.pipeline->descriptors.empty() && (!op.sourceTexture || !op.sampler || op.sourceTexture==op.texture
-        || (op.sourceTexture->imported && op.texture->imported && op.sourceTexture->mapped==op.texture->mapped)))
-     throw std::runtime_error("missing sampled texture/sampler or attachment feedback");
-   }
+   std::vector<DrawOutput> draws(ops.size());
    std::vector<Buffer *> buffers;
-   for(const auto &op:ops) for(auto *b:{op.src,op.dst}) if(b && std::find(buffers.begin(),buffers.end(),b)==buffers.end()) buffers.push_back(b);
-   for(const auto &op:ops)for(auto *t:{op.texture,op.sourceTexture})if(t && std::find(textures.begin(),textures.end(),t)==textures.end())textures.push_back(t);
+   auto addBuffer=[&](Buffer *b){if(b && std::find(buffers.begin(),buffers.end(),b)==buffers.end())buffers.push_back(b);};
+   auto addTexture=[&](Texture *t){if(t && std::find(textures.begin(),textures.end(),t)==textures.end())textures.push_back(t);};
+   for(size_t n=0;n<ops.size();++n){auto &op=ops[n];addBuffer(op.src);addBuffer(op.dst);addBuffer(op.indices);addTexture(op.texture);addTexture(op.sourceTexture);
+    if(!op.pipeline && op.texture){size_t bytes=65536*texelBytes(op.texture->format);
+     if(op.sourceTexture && op.sourceTexture->format!=op.texture->format)throw std::runtime_error("texture copy format mismatch");
+     if(op.upload && (!op.src || op.from>op.src->length || bytes>op.src->length-op.from))throw std::runtime_error("upload bounds");
+     if(!op.upload && !op.sourceTexture && (!op.dst || op.to>op.dst->length || bytes>op.dst->length-op.to))throw std::runtime_error("readback bounds");
+    }
+    if(!op.pipeline)continue;
+    if(op.vertices<3 || op.vertices>65536 || op.first>65536-op.vertices || (!op.strip && op.vertices%3))throw std::runtime_error("invalid primitive count/start");
+    if(!op.texture || op.texture->format!=op.pipeline->options.format || op.load>2 || op.store>1)throw std::runtime_error("invalid bounded draw target/actions");
+    if(op.texture->imported && op.pipeline->options.blend && !(linearFeatures&VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT))throw std::runtime_error("imported attachment blending unavailable");
+    DrawInput input{};input.count=op.vertices;input.start=op.first;input.strip=op.strip;input.indexed=op.indices!=nullptr;input.indexLength=op.indices?op.indices->length:0;input.indexOffset=op.indexOffset;
+    for(unsigned stage=0;stage<2;++stage)for(unsigned i=0;i<4;++i){auto b=op.buffers[stage][i];if(b.buffer){addBuffer(b.buffer);input.buffers[stage][i]={b.buffer->length,b.offset,b.bytes?1u:0u};}}
+    for(unsigned i=0;i<4;++i){auto *t=i==0 && !op.samples[i]?op.sourceTexture:op.samples[i];auto *sam=i==0 && !op.samplers[i]?op.sampler:op.samplers[i];
+     if(t){if(t==op.texture || (t->imported && op.texture->imported && t->mapped==op.texture->mapped))throw std::runtime_error("attachment feedback");addTexture(t);input.formats[i]=t->format;}
+     if(sam)input.filters[i]=sam->filters;
+    }
+    char why[512]{};auto &translator=Translator::get();
+    if(!translator.draw(op.pipeline->translation,&input,&draws[n],why,sizeof(why))){
+     if(strcmp(why,"draw requires runtime variant") && strcmp(why,"draw requires different specialization"))throw std::runtime_error(why);
+     std::string key;for(unsigned i=0;i<4;++i){key+=std::to_string(input.formats[i])+","+std::to_string(input.filters[i])+",";for(auto &stage:input.buffers)key+=std::to_string(stage[i].length!=0)+":"+std::to_string(stage[i].bytes)+",";}
+     auto *original=op.pipeline;auto found=std::find_if(original->variants.begin(),original->variants.end(),[&](const auto &v){return v.first==key;});
+     if(found!=original->variants.end())op.pipeline=found->second;
+     else {if(original->variants.size()>=8)throw std::runtime_error("runtime variant bound");Translation variant{};
+      if(!translator.variant(original->translation,&input,&variant,why,sizeof(why)))throw std::runtime_error(why);
+      auto *pipeline=createPipeline(variant,original->options);original->variants.push_back({key,pipeline});op.pipeline=pipeline;
+     }
+     if(!translator.draw(op.pipeline->translation,&input,&draws[n],why,sizeof(why)))throw std::runtime_error(why);
+    }
+    // CPU bounds check the fixed-function vertex fetches, including every index.
+    uint32_t last=op.first+op.vertices-1;
+    if(op.indices){last=0;for(unsigned i=0;i<op.vertices;++i){uint16_t index;memcpy(&index,(uint8_t *)op.indices->contents+op.indexOffset+2*i,2);if(op.strip && index==65535)continue;last=std::max(last,uint32_t(index));}}
+    for(auto &a:op.pipeline->options.attributes)if(a.format){auto slot=a.buffer;
+     if(slot>=4 || !op.buffers[0][slot].buffer)throw std::runtime_error("unbound vertex buffer");
+     auto bound=op.buffers[0][slot];uint64_t end=bound.offset+uint64_t(last)*op.pipeline->options.strides[slot]+a.offset+(a.format==9?4:a.format==29?8:16);
+     if(end>bound.buffer->length)throw std::runtime_error("vertex fetch bounds");
+    }
+    // CPU index bounds are valid only for quiescent host input. A preceding GPU
+    // write in this command needs readback before its values can be checked.
+    for(size_t previous=0;previous<n;++previous)if(ops[previous].dst){
+     if(ops[previous].dst==op.indices)throw std::runtime_error("GPU-written index input requires separate submission");
+     for(auto &stage:op.buffers)for(auto &bound:stage)if(bound.buffer==ops[previous].dst)throw std::runtime_error("GPU-written draw buffer requires separate submission");
+    }
+   }
    for(auto *t:textures){oldLayouts.push_back(t->layout);oldDefined.push_back(t->defined);}
    for(auto *t:textures)if(t->mapped) {VkMappedMemoryRange r{};r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;r.memory=t->memory;r.size=VK_WHOLE_SIZE;check(FlushMappedMemoryRanges(device,1,&r));}
    for(auto *b:buffers) {VkMappedMemoryRange r{};r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;r.memory=b->memory;r.size=VK_WHOLE_SIZE;check(FlushMappedMemoryRanges(device,1,&r));}
@@ -318,8 +389,8 @@ public:
    VkCommandBufferAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;ai.commandPool=pool;ai.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;ai.commandBufferCount=1;
    VkCommandBuffer cmd{};check(AllocateCommandBuffers(device,&ai,&cmd));
    VkCommandBufferBeginInfo bi{};bi.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;bi.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;check(BeginCommandBuffer(cmd,&bi));
-   VkMemoryBarrier barrier{};barrier.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;barrier.srcAccessMask=VK_ACCESS_HOST_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT|VK_ACCESS_TRANSFER_WRITE_BIT;
-   CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_HOST_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&barrier,0,nullptr,0,nullptr);
+   VkMemoryBarrier barrier{};barrier.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;barrier.srcAccessMask=VK_ACCESS_HOST_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
+   CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_HOST_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&barrier,0,nullptr,0,nullptr);
    auto transition=[&](Texture *t,VkImageLayout next) {
     VkImageMemoryBarrier ib{};ib.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;ib.oldLayout=t->layout;ib.newLayout=next;
     ib.srcAccessMask=t->layout==VK_IMAGE_LAYOUT_UNDEFINED?0:VK_ACCESS_MEMORY_WRITE_BIT|VK_ACCESS_HOST_WRITE_BIT;
@@ -328,34 +399,45 @@ public:
     CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT|VK_PIPELINE_STAGE_HOST_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,1,&ib);t->layout=next;
    };
    // Layouts are committed only on successful completion; restore on pre-submit errors.
-   for(const auto &op:ops) {
+   for(size_t opIndex=0;opIndex<ops.size();++opIndex) {const auto &op=ops[opIndex];const auto &draw=draws[opIndex];
+    for(auto *t:op.samples)if(t){if(!t->defined)throw std::runtime_error("undefined sampled texture");transition(t,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);}
     if(op.sourceTexture && !op.sourceTexture->defined)throw std::runtime_error("undefined source texture");
     if(op.sourceTexture)transition(op.sourceTexture,op.pipeline?VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:VK_IMAGE_LAYOUT_GENERAL);
     if(op.texture)transition(op.texture,VK_IMAGE_LAYOUT_GENERAL);
     if(op.texture && op.pipeline) {
-     op.texture->defined=true;
-     VkFramebufferCreateInfo fi{};fi.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;fi.renderPass=op.pipeline->render;
+     if(op.load==1 && !op.texture->defined)throw std::runtime_error("load undefined attachment");
+     op.texture->defined=op.store && (op.load==2 || (op.load==1 && op.texture->defined));
+     auto render=op.pipeline->renders[op.load][op.store];
+     VkFramebufferCreateInfo fi{};fi.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;fi.renderPass=render;
      fi.attachmentCount=1;fi.pAttachments=&op.texture->view;fi.width=256;fi.height=256;fi.layers=1;VkFramebuffer frame{};
      check(CreateFramebuffer(device,&fi,nullptr,&frame));frames.push_back(frame);
      VkClearValue clear{};memcpy(clear.color.float32,op.clear,sizeof(op.clear));
-     VkRenderPassBeginInfo ri{};ri.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;ri.renderPass=op.pipeline->render;ri.framebuffer=frame;
+     VkRenderPassBeginInfo ri{};ri.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;ri.renderPass=render;ri.framebuffer=frame;
      ri.renderArea={{0,0},{256,256}};ri.clearValueCount=1;ri.pClearValues=&clear;
-     CmdBeginRenderPass(cmd,&ri,VK_SUBPASS_CONTENTS_INLINE);CmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,op.pipeline->pipeline);
-     if(!op.pipeline->descriptors.empty()) {
-      VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,(uint32_t)op.pipeline->descriptors.size()};
-      VkDescriptorPoolCreateInfo pci{};pci.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;pci.maxSets=1;pci.poolSizeCount=1;pci.pPoolSizes=&ps;
+     CmdBeginRenderPass(cmd,&ri,VK_SUBPASS_CONTENTS_INLINE);CmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,op.strip?op.pipeline->stripPipeline:op.pipeline->pipeline);
+     CmdSetViewport(cmd,0,1,&op.viewport);CmdSetScissor(cmd,0,1,&op.scissor);
+     if(draw.descriptorCount) {
+      std::vector<VkDescriptorPoolSize> sizes;
+      for(unsigned i=0;i<draw.descriptorCount;++i){auto ty=(VkDescriptorType)draw.descriptors[i].type;auto it=std::find_if(sizes.begin(),sizes.end(),[&](const VkDescriptorPoolSize &s){return s.type==ty;});if(it==sizes.end())sizes.push_back({ty,1});else ++it->descriptorCount;}
+      VkDescriptorPoolCreateInfo pci{};pci.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;pci.maxSets=1;pci.poolSizeCount=sizes.size();pci.pPoolSizes=sizes.data();
       VkDescriptorPool poolForDraw{};check(CreateDescriptorPool(device,&pci,nullptr,&poolForDraw));descriptorPools.push_back(poolForDraw);
       VkDescriptorSetAllocateInfo sai{};sai.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;sai.descriptorPool=poolForDraw;sai.descriptorSetCount=1;sai.pSetLayouts=&op.pipeline->setLayout;
       VkDescriptorSet set{};check(AllocateDescriptorSets(device,&sai,&set));
-      VkDescriptorImageInfo image{op.sampler->sampler,op.sourceTexture->view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-      for(const auto &d:op.pipeline->descriptors) {
-       VkWriteDescriptorSet write{};write.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;write.dstSet=set;write.dstBinding=d.binding;
-       write.descriptorCount=1;write.descriptorType=(VkDescriptorType)d.type;write.pImageInfo=&image;UpdateDescriptorSets(device,1,&write,0,nullptr);
-      }
-      CmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,op.pipeline->layout,0,1,&set,0,nullptr);
+      for(unsigned i=0;i<draw.descriptorCount;++i){const auto &d=draw.descriptors[i];
+       VkWriteDescriptorSet write{};write.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;write.dstSet=set;write.dstBinding=d.binding;write.descriptorCount=1;write.descriptorType=(VkDescriptorType)d.type;
+       VkDescriptorImageInfo image{};VkDescriptorBufferInfo buffer{};
+       if(d.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER){auto *t=d.slot==0 && !op.samples[0]?op.sourceTexture:op.samples[d.slot];auto *sam=d.sampler==0 && !op.samplers[0]?op.sampler:op.samplers[d.sampler];
+        if(!t || !sam || d.format!=(uint32_t)t->vkFormat)throw std::runtime_error("planned texture format mismatch");
+        VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=t->image;vi.viewType=VK_IMAGE_VIEW_TYPE_2D;vi.format=(VkFormat)d.format;vi.components={(VkComponentSwizzle)d.components[0],(VkComponentSwizzle)d.components[1],(VkComponentSwizzle)d.components[2],(VkComponentSwizzle)d.components[3]};vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+        VkImageView view{};check(CreateImageView(device,&vi,nullptr,&view));sampleViews.push_back(view);image={sam->sampler,view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};write.pImageInfo=&image;
+       }else {auto b=op.buffers[d.stages==1?0:1][d.slot];if(!b.buffer || !d.range || d.offset>((b.buffer->length+15)&~size_t(15)) || d.range>((b.buffer->length+15)&~size_t(15))-d.offset)throw std::runtime_error("planned buffer range mismatch");buffer={b.buffer->buffer,d.offset,d.range};write.pBufferInfo=&buffer;}
+       UpdateDescriptorSets(device,1,&write,0,nullptr);
+      }CmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,op.pipeline->layout,0,1,&set,0,nullptr);
      }
-     CmdPushConstants(cmd,op.pipeline->layout,op.pipeline->pushStages,op.pipeline->pushOffset,op.pipeline->pushSize,op.pipeline->pushBytes);
-     CmdDraw(cmd,op.vertices,1,0,0);CmdEndRenderPass(cmd);
+     for(unsigned i=0;i<draw.pushCount;++i){auto &w=draw.pushes[i];CmdPushConstants(cmd,op.pipeline->layout,w.stages,w.offset,w.size,w.bytes);}
+     for(unsigned i=0;i<draw.vertexCount;++i){auto b=op.buffers[0][draw.vertexSlots[i]].buffer;VkDeviceSize offset=draw.vertexOffsets[i];CmdBindVertexBuffers(cmd,draw.vertexBindings[i],1,&b->buffer,&offset);}
+     if(draw.indexed){CmdBindIndexBuffer(cmd,op.indices->buffer,draw.indexOffset,VK_INDEX_TYPE_UINT16);CmdDrawIndexed(cmd,draw.count,1,draw.first,0,0);}else CmdDraw(cmd,draw.count,1,draw.first,0);
+     CmdEndRenderPass(cmd);
     } else if(op.texture && op.sourceTexture) {
      op.texture->defined=true;
      VkImageCopy region{};region.srcSubresource=region.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};region.extent={256,256,1};

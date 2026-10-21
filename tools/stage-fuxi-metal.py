@@ -46,8 +46,8 @@ def stage(root,icd,bundle,smoke,conf,clients=Path(__file__).with_name('metal-cli
     if os.geteuid()!=0:raise PermissionError('run as root to set root:wheel 0:0')
     root=root.resolve()
     if not (root/'System/Library').is_dir():raise ValueError('expected mounted iOS root')
-    if not re.fullmatch(rb'[ \t\r\n]*[0-5][ \t\r\n]*',conf.read_bytes()) or conf.stat().st_size>31:
-        raise ValueError('config must contain max stage 0..5')
+    if not re.fullmatch(rb'[ \t\r\n]*[0-6][ \t\r\n]*',conf.read_bytes()) or conf.stat().st_size>31:
+        raise ValueError('config must contain max stage 0..6')
     if translator is None:translator=smoke.parent/'libmetal2vulkan.dylib'
     if metallib is None:metallib=smoke.parent/'metal-smoke.metallib'
     if source is None:source=smoke.parent/'metal2vulkan-source.tar.gz'

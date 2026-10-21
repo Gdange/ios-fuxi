@@ -10,7 +10,7 @@ ROOT=Path(__file__).resolve().parents[1]
 
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--translator',type=Path,required=True,help='native host ABI-v2 dylib at the pinned revision')
+    ap.add_argument('--translator',type=Path,required=True,help='native host ABI-v3 dylib at the pinned revision')
     ap.add_argument('--metallib',type=Path,required=True)
     a=ap.parse_args()
     if os.uname().sysname!='Darwin':raise SystemExit('requires Mac Foundation/Metal')
@@ -28,7 +28,7 @@ def main():
         assert 'FUXI MTL: function fuxi_fragment class=FuxiFunction stage=2 device=1' in p.stderr,p.stderr
         assert p.stderr.count('texture FAIL M4 CPU model has no rendering')==2,p.stderr
         assert 'translation PASS' not in p.stderr,p.stderr
-        for field,value in [('vertexDescriptor.attributes[30].format',31),('rasterSampleCount',4),('colorAttachments[0].blendingEnabled',1)]:
+        for field,value in [('rasterSampleCount',4),('colorAttachments[0].writeMask',32)]:
             assert 'FUXI MTL: pipeline reject %s %s\n'%(field,value) in p.stderr,p.stderr
         print(p.stdout,end='');print(p.stderr,end='')
 

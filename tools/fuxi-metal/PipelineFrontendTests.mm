@@ -31,7 +31,7 @@ int main() {@autoreleasepool {
  MTLRenderPassDescriptor *pass=ios16PassDefaults();pass.colorAttachments[0].texture=(id)t;
  pass.colorAttachments[0].loadAction=MTLLoadActionClear;pass.colorAttachments[0].storeAction=MTLStoreActionStore;
  FuxiCommandBuffer *c=(id)queue.commandBuffer;
- pass.colorAttachments[0].loadAction=MTLLoadActionLoad;
+ pass.colorAttachments[0].loadAction=(MTLLoadAction)3;
  refuses(c,^{[c renderCommandEncoderWithDescriptor:pass];});pass.colorAttachments[0].loadAction=MTLLoadActionClear;
  pass.defaultRasterSampleCount=4;refuses(c,^{[c renderCommandEncoderWithDescriptor:pass];});pass.defaultRasterSampleCount=0;
  pass.renderTargetArrayLength=2;refuses(c,^{[c renderCommandEncoderWithDescriptor:pass];});pass.renderTargetArrayLength=0;
@@ -45,23 +45,36 @@ int main() {@autoreleasepool {
  refuses(c,^{[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];});
  refuses(c,^{[r setRenderPipelineState:(id)t];});[r setRenderPipelineState:(id)p];
  refuses(c,^{[r drawPrimitives:MTLPrimitiveTypeLine vertexStart:0 vertexCount:3];});
- refuses(c,^{[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:1 vertexCount:3];});
- p->_pipeline->sampled=true;
- refuses(c,^{[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];});
- p->_pipeline->sampled=false;
+ refuses(c,^{[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:65535 vertexCount:3];});
+
  [r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
- refuses(c,^{[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];});
+ [r drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
  [r endEncoding];refuses(c,^{[r endEncoding];});
  FuxiBuffer *b=[device newBufferWithLength:262656 options:0];FuxiBlit *blit=[c blitCommandEncoder];
  refuses(c,^{[blit copyFromTexture:(id)t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(256,256,1)
  toBuffer:(id)b destinationOffset:0 destinationBytesPerRow:1000 destinationBytesPerImage:262144];});
  [blit copyFromTexture:(id)t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(256,256,1)
  toBuffer:(id)b destinationOffset:256 destinationBytesPerRow:1024 destinationBytesPerImage:262144];[blit endEncoding];
- assert(c->_ops.size()==2 && c->_ops[0].texture==t->_texture && c->_ops[0].pipeline==p->_pipeline && c->_ops[1].dst==b->_buffer);
- assert(c->_resources.count==4);
+ assert(c->_ops.size()==3 && c->_ops[0].texture==t->_texture && c->_ops[0].pipeline==p->_pipeline && c->_ops[2].dst==b->_buffer);
+ assert(c->_resources.count==6);
+ // Recording snapshots the byte data and state; all bound buffers survive callers.
+ FuxiBuffer *input=[device newBufferWithLength:128 options:0];
+ pass.colorAttachments[0].loadAction=MTLLoadActionLoad;pass.colorAttachments[0].storeAction=MTLStoreActionDontCare;
+ r=[c renderCommandEncoderWithDescriptor:pass];assert(r);[r setRenderPipelineState:(id)p];
+ [r setVertexBuffer:input offset:16 atIndex:0];[r setFragmentBuffer:input offset:32 atIndex:3];
+ float uniform[4]={1,0.5,0.25,1};[r setFragmentBytes:uniform length:sizeof(uniform) atIndex:1];memset(uniform,0,sizeof(uniform));
+ [r setViewport:(MTLViewport){16,24,128,96,0,1}];[r setScissorRect:(MTLScissorRect){24,32,64,64}];
+ refuses(c,^{[r setVertexBuffer:input offset:0 atIndex:4];});
+ refuses(c,^{[r setFragmentBytes:uniform length:4097 atIndex:1];});
+ refuses(c,^{[r drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:3 indexType:MTLIndexTypeUInt32 indexBuffer:input indexBufferOffset:0];});
+ [r drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:6 indexType:MTLIndexTypeUInt16 indexBuffer:input indexBufferOffset:4];[r endEncoding];
+ const auto &recorded=c->_ops.back();assert(recorded.load==1 && !recorded.store && recorded.indices==input->_buffer && recorded.indexOffset==4);
+ assert(recorded.buffers[0][0].offset==16 && recorded.buffers[1][3].offset==32 && recorded.buffers[1][1].bytes);
+ assert(((float *)recorded.buffers[1][1].buffer->contents)[1]==0.5f && recorded.viewport.y==120 && recorded.scissor.offset.x==24);
+ [input release];
  [t release];[p release];[b release]; // Encoder and command references keep resources alive.
  assert([c->_resources[0] device]==device && [c->_resources[1] device]==device);
  // Never submit modeled render operations; translation/pixels are tested on real Vulkan.
  [queue release];[device release];
  }assert(fuxi::Backend::live==0);
- puts("PASS: pipeline frontend CPU-model descriptor refusals, one-draw state, readback bounds, retained resource ownership (no submit)");}
+ puts("PASS: pipeline frontend CPU-model descriptor refusals, multiple-draw state, readback bounds, retained resource ownership (no submit)");}

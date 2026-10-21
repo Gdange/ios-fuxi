@@ -16,6 +16,7 @@ if [[ -n ${FUXI_METAL_TOOLS:-} ]]; then
 else
  metal=$(xcrun --sdk iphoneos --find metal);metallib=$(xcrun --sdk iphoneos --find metallib)
 fi
+# Compile the whole original source, including the opt-in stage-6 layer controls.
 "$metal" -isysroot "$sdk" -std=ios-metal2.4 -mios-version-min=16.0 -fno-fast-math -c tools/shaders/metal-smoke.metal -o "$out/metal-smoke.air"
 "$metallib" "$out/metal-smoke.air" -o "$out/metal-smoke.metallib"
 bundle=$out/FuxiMetal.bundle

@@ -33,17 +33,22 @@ static std::vector<uint32_t> shader(const char *name) {
  std::vector<uint32_t> words(bytes.size()/4);memcpy(words.data(),bytes.data(),bytes.size());return words;
 }
 struct Product {std::vector<uint32_t> v,f;};
-extern "C" uint32_t fuxi_m2v_abi(){return 2;}
+extern "C" uint32_t fuxi_m2v_abi(){return 3;}
 extern "C" void *fuxi_m2v_open(const uint8_t *,size_t,char *,size_t){return nullptr;}
 extern "C" void fuxi_m2v_close(void *){}
 extern "C" int fuxi_m2v_function(void *,const char *,char *,size_t){return 0;}
 extern "C" void fuxi_m2v_free(void *p){delete (Product *)p;}
-extern "C" int fuxi_m2v_compile(void *,const char *,void *,const char *,void *,uint64_t,uint64_t,fuxi::Translation *out,char *,size_t) {
+extern "C" int fuxi_m2v_compile(void *,const char *,void *,const char *,void *,uint64_t,uint64_t,const fuxi::CompileOptions *,fuxi::Translation *out,char *,size_t) {
  auto *p=new Product{shader("CONTROL_VERTEX"),shader("CONTROL_FRAGMENT")};
  *out={};out->handle=p;out->vertex=p->v.data();out->vertexCount=p->v.size();out->vertexEntry="main";
  out->fragment=p->f.data();out->fragmentCount=p->f.size();out->fragmentEntry="main";
- out->pushSize=4;out->pushStages=16;out->descriptorCount=1;out->descriptors[0]={0,1,16};return 1;
+ out->mask=15;out->rangeCount=1;out->ranges[0]={0,4,16};out->pushSize=4;out->pushStages=16;out->descriptorCount=1;out->descriptors[0]={0,1,16};return 1;
 }
+extern "C" int fuxi_m2v_draw(void *,const fuxi::DrawInput *in,fuxi::DrawOutput *out,char *,size_t){
+ if(!in->formats[0] || !in->filters[0])return 0;*out={};out->count=in->count;out->first=in->start;out->descriptorCount=1;out->descriptors[0]={0,1,16,0,0,44};out->pushCount=1;out->pushes[0].size=4;out->pushes[0].stages=16;return 1;
+}
+extern "C" int fuxi_m2v_variant(void *,const fuxi::DrawInput *,fuxi::Translation *,char *,size_t){return 0;}
+
 '''
 
 

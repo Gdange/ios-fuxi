@@ -4,6 +4,7 @@
 #import <IOSurface/IOSurfaceRef.h>
 #import <objc/runtime.h>
 #include <errno.h>
+#include "fuxi-metal/M7Reference.h"
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -31,7 +32,7 @@ static unsigned configuration(void) {
  char raw[32];size_t n=fread(raw,1,sizeof(raw),f);BOOL bad=ferror(f);fclose(f);
  if(bad || n==sizeof(raw))fail("config read/length");
  size_t i=0;while(i<n && strchr(" \t\r\n",raw[i]) && raw[i])++i;
- if(i==n || raw[i]<'0' || raw[i]>'5')fail("config expected max stage 0..5");
+ if(i==n || raw[i]<'0' || raw[i]>'6')fail("config expected max stage 0..6");
  unsigned result=(unsigned)(raw[i++]-'0');while(i<n && raw[i] && strchr(" \t\r\n",raw[i]))++i;
  if(i!=n)fail("config trailing data");return result;
 }
@@ -166,6 +167,59 @@ static void composition(id<MTLDevice>device,id<MTLCommandQueue>q) {
  puts("FUXI MTL: stage 5 composition PASS IOSurface BGRA8 256x256 textured quad 65536 pixels + same-memory target + sentinel edges");
  [readback release];[sampler release];[sd release];[p release];[pd release];[v release];[f release];[lib release];CFRelease(src);CFRelease(dst);
 }
+static void layers(id<MTLDevice>device,id<MTLCommandQueue>q) {
+ IOSurfaceRef surfaces[3]={surface(),surface(),surface()};id<MTLTexture>textures[3]={nil,nil,nil};
+ MTLTextureDescriptor *td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:256 height:256 mipmapped:NO];
+ td.storageMode=MTLStorageModeShared;td.usage=MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget;
+ for(unsigned i=0;i<3;++i){if(IOSurfaceLock(surfaces[i],0,NULL))fail("layer surface lock");
+  uint8_t *base=IOSurfaceGetBaseAddress(surfaces[i]);size_t row=IOSurfaceGetBytesPerRow(surfaces[i]);if(!base || row<1024)fail("layer mapping");
+  for(unsigned y=0;y<256;++y)for(unsigned x=0;x<256;++x){if(i<2)fuxiM7Texel(i,x,y,base+y*row+x*4);else memset(base+y*row+x*4,0x39,4);}
+  if(IOSurfaceUnlock(surfaces[i],0,NULL))fail("layer surface unlock");
+  textures[i]=[device newTextureWithDescriptor:td iosurface:surfaces[i] plane:0];if(!textures[i])fail("layer same-memory import");
+ }
+ NSError *error=nil;id<MTLLibrary>lib=[device newLibraryWithURL:[NSURL fileURLWithPath:@FUXI_MTL_METALLIB] error:&error];if(!lib || error)fail("layer library");
+ MTLFunctionConstantValues *values=[MTLFunctionConstantValues new];BOOL enabled=YES;[values setConstantValue:&enabled type:MTLDataTypeBool atIndex:0];
+ id<MTLFunction>v=[lib newFunctionWithName:@"fuxi_layer_vertex"],f=[lib newFunctionWithName:@"fuxi_layer_fragment" constantValues:values error:&error];
+ if(!v || !f || error)fail("layer function constants %s",error.description.UTF8String);
+ MTLRenderPipelineDescriptor *pd=[MTLRenderPipelineDescriptor new];pd.vertexFunction=v;pd.fragmentFunction=f;
+ MTLVertexDescriptor *vd=[MTLVertexDescriptor vertexDescriptor];
+ vd.attributes[0].format=MTLVertexFormatFloat2;vd.attributes[0].bufferIndex=0;
+ vd.attributes[1].format=MTLVertexFormatFloat2;vd.attributes[1].offset=8;vd.attributes[1].bufferIndex=0;
+ vd.attributes[2].format=MTLVertexFormatUChar4Normalized;vd.attributes[2].offset=16;vd.attributes[2].bufferIndex=0;vd.layouts[0].stride=sizeof(struct FuxiM7VertexData);pd.vertexDescriptor=vd;
+ MTLRenderPipelineColorAttachmentDescriptor *color=pd.colorAttachments[0];color.pixelFormat=MTLPixelFormatBGRA8Unorm;color.blendingEnabled=YES;
+ color.sourceRGBBlendFactor=color.sourceAlphaBlendFactor=MTLBlendFactorOne;
+ color.destinationRGBBlendFactor=color.destinationAlphaBlendFactor=MTLBlendFactorOneMinusSourceAlpha;
+ id<MTLRenderPipelineState>p=[device newRenderPipelineStateWithDescriptor:pd error:&error];if(!p || error)fail("layer pipeline %s",error.description.UTF8String);
+ id<MTLRenderPipelineState>cached=[device newRenderPipelineStateWithDescriptor:pd error:&error];if(!cached || error)fail("layer cache");[cached release];
+ id<MTLBuffer>vertices=[device newBufferWithBytes:fuxiM7Vertices length:sizeof(fuxiM7Vertices) options:MTLResourceStorageModeShared];
+ id<MTLBuffer>indices=[device newBufferWithBytes:fuxiM7Indices length:sizeof(fuxiM7Indices) options:MTLResourceStorageModeShared];
+ id<MTLBuffer>readback=[device newBufferWithLength:262656 options:MTLResourceStorageModeShared];
+ MTLSamplerDescriptor *sd=[MTLSamplerDescriptor new];id<MTLSamplerState>sampler=[device newSamplerStateWithDescriptor:sd];
+ if(!vertices || !indices || !readback || !sampler)fail("layer buffers/sampler");memset(readback.contents,0x39,readback.length);
+ @autoreleasepool {id<MTLCommandBuffer>command=q.commandBuffer;
+  for(unsigned i=0;i<2;++i){MTLRenderPassDescriptor *pass=[MTLRenderPassDescriptor renderPassDescriptor];pass.colorAttachments[0].texture=textures[2];
+   pass.colorAttachments[0].loadAction=i?MTLLoadActionLoad:MTLLoadActionClear;pass.colorAttachments[0].storeAction=MTLStoreActionStore;pass.colorAttachments[0].clearColor=MTLClearColorMake(0,0,0,1);
+   id<MTLRenderCommandEncoder>r=[command renderCommandEncoderWithDescriptor:pass];if(!r)fail("layer pass");
+   [r setRenderPipelineState:p];[r setVertexBuffer:vertices offset:0 atIndex:0];[r setFragmentTexture:textures[i] atIndex:0];[r setFragmentSamplerState:sampler atIndex:0];
+   float geometry[4]={1,1,1,1};[r setVertexBytes:geometry length:sizeof(geometry) atIndex:2];memset(geometry,0,sizeof(geometry));
+   float tint[4]={i?0.5f:1.0f,i?0.5f:1.0f,i?0.5f:1.0f,i?0.5f:1.0f};[r setFragmentBytes:tint length:sizeof(tint) atIndex:1];memset(tint,0,sizeof(tint));
+   [r setViewport:(MTLViewport){0,0,256,256,0,1}];if(i)[r setScissorRect:(MTLScissorRect){16,24,224,208}];
+   [r drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:6 indexType:MTLIndexTypeUInt16 indexBuffer:indices indexBufferOffset:0];[r endEncoding];
+  }
+  id<MTLBlitCommandEncoder>b=command.blitCommandEncoder;if(!b)fail("layer readback");
+  [b copyFromTexture:textures[2] sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(256,256,1)
+   toBuffer:readback destinationOffset:256 destinationBytesPerRow:1024 destinationBytesPerImage:262144];[b endEncoding];finish(command);
+ }
+ verify(readback,0,256,0x39);verify(readback,262400,256,0x39);const uint8_t *pixels=(const uint8_t *)readback.contents+256;
+ for(unsigned y=0;y<256;++y)for(unsigned x=0;x<256;++x){uint8_t want[4];fuxiM7Reference(x,y,want);if(memcmp(pixels+4*(y*256+x),want,4))fail("layer pixel %u,%u",x,y);}
+ for(unsigned i=0;i<3;++i)[textures[i] release];
+ if(IOSurfaceLock(surfaces[2],kIOSurfaceLockReadOnly,NULL))fail("layer consumer lock");
+ const uint8_t *base=IOSurfaceGetBaseAddress(surfaces[2]);size_t row=IOSurfaceGetBytesPerRow(surfaces[2]);
+ for(unsigned y=0;y<256;++y)if(memcmp(base+y*row,pixels+y*1024,1024))fail("layer same-memory row %u",y);
+ if(IOSurfaceUnlock(surfaces[2],kIOSurfaceLockReadOnly,NULL))fail("layer consumer unlock");
+ puts("FUXI MTL: stage 6 layers PASS IOSurface BGRA8 source-over + vertex/index buffers + function constant + fragment bytes + two passes + scissor 65536 pixels + same-memory target + sentinel edges");
+ [sampler release];[sd release];[readback release];[indices release];[vertices release];[p release];[pd release];[v release];[f release];[values release];[lib release];for(unsigned i=0;i<3;++i)CFRelease(surfaces[i]);
+}
 int main(int argc,char **argv) {
  (void)argc;(void)argv;setvbuf(stdout,NULL,_IONBF,0);setvbuf(stderr,NULL,_IONBF,0);signal(SIGALRM,expired);arm(30);
  @autoreleasepool { @try {
@@ -192,6 +246,7 @@ int main(int argc,char **argv) {
    }
    if(maximum>=4) {stage=4;name="pipeline";arm(60);@autoreleasepool {pipeline(device,q);}}
    if(maximum>=5) {stage=5;name="composition";arm(60);@autoreleasepool {composition(device,q);}}
+   if(maximum>=6) {stage=6;name="layers";arm(60);@autoreleasepool {layers(device,q);}}
    arm(10);[a release];[q release];
   }
   [device release];alarm(0);puts("FUXI MTL: done PASS");

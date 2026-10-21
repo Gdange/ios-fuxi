@@ -20,3 +20,24 @@ fragment float4 fuxi_sample(float4 position [[position]],
                             sampler filtering [[sampler(0)]]) {
     return image.sample(filtering, position.xy / 256.0f);
 }
+
+// M7: original premultiplied layer renderer. CI's existing recipe compiles this
+// file with Xcode metal; Linux AIR controls do not replace this qualification.
+constant bool fuxi_m7_uniform [[function_constant(0)]];
+struct FuxiM7Vertex {float2 position [[attribute(0)]];float2 uv [[attribute(1)]];float4 color [[attribute(2)]];};
+struct FuxiM7Varying {float4 position [[position]];float2 uv;float4 color;};
+vertex FuxiM7Varying fuxi_layer_vertex(FuxiM7Vertex v [[stage_in]],constant float4 &geometry [[buffer(2)]]) {
+    return {float4(v.position,0.0f,1.0f)*geometry,v.uv,v.color};
+}
+fragment float4 fuxi_layer_fragment(FuxiM7Varying v [[stage_in]],
+    texture2d<float> layer [[texture(0)]],sampler filtering [[sampler(0)]],
+    constant float4 &tint [[buffer(1)]]) {
+    return layer.sample(filtering,v.uv)*v.color*(fuxi_m7_uniform?tint:float4(1.0f,0.0f,0.0f,1.0f));
+}
+// Extra original CI control for the four small fragment slots.
+fragment float4 fuxi_four_fragment(FuxiM7Varying v [[stage_in]],
+ texture2d<float> a [[texture(0)]],texture2d<float> b [[texture(1)]],
+ texture2d<float> c [[texture(2)]],texture2d<float> d [[texture(3)]],
+ sampler s0 [[sampler(0)]],sampler s1 [[sampler(1)]],sampler s2 [[sampler(2)]],sampler s3 [[sampler(3)]]) {
+ return (a.sample(s0,v.uv)+b.sample(s1,v.uv)+c.sample(s2,v.uv)+d.sample(s3,v.uv))*0.25f;
+}
