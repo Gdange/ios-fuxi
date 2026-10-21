@@ -34,7 +34,7 @@ BASE = (
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--variant", choices=("metal4", "wlan6f"), required=True)
+    ap.add_argument("--variant", choices=("metal4", "wlan6g"), required=True)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--local-adt", type=Path,
                     help="LOCAL ONLY: preserve this integration ADT, including root extents")
@@ -63,7 +63,8 @@ def main():
         cmdlines = {"cmdline.txt": line}
     else:
         cmdlines = {"cmdline.txt": BASE + " fuxiwlan=1",
-                    "cmdline-s22.txt": BASE + " fuxiwlan=22"}
+                    "cmdline-s22.txt": BASE + " fuxiwlan=22",
+                    "cmdline-s22-oldiova.txt": BASE + " fuxiwlan=22 fuxiwlanoldiova=1"}
     for name, line in cmdlines.items():
         if len(line.encode()) >= 608:
             ap.error(f"{name} exceeds the payload command-line limit")

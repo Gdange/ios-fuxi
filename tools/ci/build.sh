@@ -5,9 +5,9 @@ root=$(cd "$(dirname "$0")/../.." && pwd)
 usage() {
     cat <<'HELP'
 Usage: tools/ci/build.sh TARGET [--dry-run]
-Targets: kernel-metal4, kernel-wlan6f, metal, mesa, tools
+Targets: kernel-metal4, kernel-wlan6g, metal, mesa, tools
        tools/ci/build.sh --plan KERNEL METAL MESA TOOLS
-KERNEL: none|metal4|wlan6f|all; remaining plan arguments: true|false
+KERNEL: none|metal4|wlan6g|all; remaining plan arguments: true|false
 Outputs: tools/out/ci/TARGET/ (explicit allowlist, logs, SHA256SUMS)
 Caches: deps/ci-downloads/; isolated build directories: deps/ci-work-TARGET/
 Requires a Mac with preinstalled Xcode 15.4 (kernel) or a selected full Xcode
@@ -21,14 +21,14 @@ case "$1" in
     -h|--help) [[ $# == 1 ]] || die 'unexpected help arguments'; usage; exit 0 ;;
     --plan)
         [[ $# == 5 ]] || die '--plan needs KERNEL METAL MESA TOOLS'
-        case "$2" in none|metal4|wlan6f|all) ;; *) die 'invalid kernel selection' ;; esac
+        case "$2" in none|metal4|wlan6g|all) ;; *) die 'invalid kernel selection' ;; esac
         for flag in "$3" "$4" "$5"; do
             [[ $flag == true || $flag == false ]] || die 'plan flags must be true or false'
         done
         python3 - "$2" "$3" "$4" "$5" <<'PY'
 import json, sys
 kernel, *flags = sys.argv[1:]
-targets = ["kernel-" + v for v in ("metal4", "wlan6f") if kernel in (v, "all")]
+targets = ["kernel-" + v for v in ("metal4", "wlan6g") if kernel in (v, "all")]
 targets += [t for t, f in zip(("metal", "mesa", "tools"), flags) if f == "true"]
 if not targets:
     raise SystemExit("Select at least one target")
@@ -38,7 +38,7 @@ PY
 esac
 target=$1
 shift
-case "$target" in kernel-metal4|kernel-wlan6f|metal|mesa|tools) ;; *) die "unknown target: $target" ;; esac
+case "$target" in kernel-metal4|kernel-wlan6g|metal|mesa|tools) ;; *) die "unknown target: $target" ;; esac
 dry=false
 if [[ $# == 1 && $1 == --dry-run ]]; then dry=true; shift; fi
 [[ $# == 0 ]] || die 'unexpected arguments'

@@ -11,7 +11,7 @@ Built on macOS (Apple silicon) with
 ## Manual hosted builds
 
 `.github/workflows/fuxi-build.yml` runs only on `workflow_dispatch`. It needs no
-repository secrets. Select `kernel=none|metal4|wlan6f|all` (default `metal4`),
+repository secrets. Select `kernel=none|metal4|wlan6g|all` (default `metal4`),
 and independent boolean inputs `metal`, `mesa`, `tools` (default `false`).
 `all` builds both kernel profiles; selecting nothing fails before allocating a
 Mac. Each target runs independently, with a 120-minute limit and one artifact
@@ -19,7 +19,7 @@ retained for **7 days**. Failed builds upload logs and their checksum manifest;
 check the job result before treating an artifact as complete.
 
 The Mac entry point is `bash tools/ci/build.sh TARGET`, where TARGET is
-`kernel-metal4`, `kernel-wlan6f`, `metal`, `mesa` or `tools`. It installs Homebrew
+`kernel-metal4`, `kernel-wlan6g`, `metal`, `mesa` or `tools`. It installs Homebrew
 dependencies, requires a full preinstalled Xcode, and uses ignored `deps/` and
 `tools/out/` directories. Existing target work/output directories must be moved
 aside before another build. `--dry-run` and `--plan` work on Linux without
@@ -42,7 +42,7 @@ See [the runner image inventory](https://github.com/actions/runner-images/blob/m
 | Artifact | Contents in addition to `SHA256SUMS` and `logs/build.log` | Estimated cold runtime |
 | --- | --- | --- |
 | `fuxi-kernel-metal4` | `kernel.development.fuxi`, `kernel.development.fuxi.unstripped`, public `fuxi.adt`, `cmdline.txt` for the Metal smoke host | 15–35 min |
-| `fuxi-kernel-wlan6f` | Same kernel pair and public ADT, M6f `cmdline.txt` (full) and `cmdline-s22.txt` (stop at BHI completion) | 15–35 min |
+| `fuxi-kernel-wlan6g` | Same kernel pair and public ADT, M6g `cmdline.txt` (full) and `cmdline-s22.txt` (stop at BHI completion) and `cmdline-s22-oldiova.txt` (same, old IOVA pool) | 15–35 min |
 | `fuxi-metal` | Complete ad-hoc signed `FuxiMetal.bundle`, `fuxi-metal-smoke`, our compiled `metal-smoke.metallib`, separately signed `libmetal2vulkan.dylib`, `metal2vulkan-source.tar.gz` with licences and vendored crate sources, `metal-clients.conf`, `metal-smoke.conf` | 10–25 min |
 | `fuxi-mesa` | Signed `libvulkan_freedreno.dylib`, `patches/`, `tools/` build/audit recipes, `mesa-licenses/` | 15–35 min |
 | `fuxi-tools` | Signed `fuxi-vk-probe`, `fuxi-vk-smoke`, `fuxi-gpu-abi-test`, `vk-smoke.conf`, import-audit sidecars | 5–15 min |
@@ -68,7 +68,7 @@ examples assume the reviewed change has been integrated into `main`:
 ```sh
 # Run each target separately; all flags are explicit to avoid the kernel default.
 gh workflow run fuxi-build.yml -R bangprovn/ios-fuxi --ref main -f kernel=metal4 -f metal=false -f mesa=false -f tools=false
-gh workflow run fuxi-build.yml -R bangprovn/ios-fuxi --ref main -f kernel=wlan6f -f metal=false -f mesa=false -f tools=false
+gh workflow run fuxi-build.yml -R bangprovn/ios-fuxi --ref main -f kernel=wlan6g -f metal=false -f mesa=false -f tools=false
 gh workflow run fuxi-build.yml -R bangprovn/ios-fuxi --ref main -f kernel=none -f metal=true -f mesa=false -f tools=false
 gh workflow run fuxi-build.yml -R bangprovn/ios-fuxi --ref main -f kernel=none -f metal=false -f mesa=true -f tools=false
 gh workflow run fuxi-build.yml -R bangprovn/ios-fuxi --ref main -f kernel=none -f metal=false -f mesa=false -f tools=true
@@ -79,7 +79,7 @@ gh run list -R bangprovn/ios-fuxi --workflow fuxi-build.yml --limit 10
 # Set RUN_ID to the chosen run's numeric ID, and verify it succeeded.
 gh run watch "$RUN_ID" -R bangprovn/ios-fuxi --exit-status
 gh run download "$RUN_ID" -R bangprovn/ios-fuxi -n fuxi-kernel-metal4 -D xnu/out-ci-metal4
-gh run download "$RUN_ID" -R bangprovn/ios-fuxi -n fuxi-kernel-wlan6f -D xnu/out-ci-wlan6f
+gh run download "$RUN_ID" -R bangprovn/ios-fuxi -n fuxi-kernel-wlan6g -D xnu/out-ci-wlan6g
 gh run download "$RUN_ID" -R bangprovn/ios-fuxi -n fuxi-metal -D tools/out/download-metal
 gh run download "$RUN_ID" -R bangprovn/ios-fuxi -n fuxi-mesa -D tools/out/download-mesa
 gh run download "$RUN_ID" -R bangprovn/ios-fuxi -n fuxi-tools -D tools/out/download-tools
@@ -122,11 +122,11 @@ python3 tools/mkpayload.py xnu/out-ci-metal4/kernel.development.fuxi \
 bash shim/fuxi-loader/build.sh shim/out/fuxi-ci-metal4-payload.bin
 
 # WLAN: same locally preserved integration ADT, with full or stop-at-22 cmdline.
-python3 tools/ci/kernel-inputs.py --variant wlan6f --local-adt "$BASE_ADT" --out xnu/out-local-wlan6f
-python3 tools/mkpayload.py xnu/out-ci-wlan6f/kernel.development.fuxi \
-  xnu/out-local-wlan6f/fuxi.adt shim/out/fuxi-ci-wlan6f-s22-payload.bin \
-  --cmdline "$(cat xnu/out-ci-wlan6f/cmdline-s22.txt)"
-bash shim/fuxi-loader/build.sh shim/out/fuxi-ci-wlan6f-s22-payload.bin
+python3 tools/ci/kernel-inputs.py --variant wlan6g --local-adt "$BASE_ADT" --out xnu/out-local-wlan6g
+python3 tools/mkpayload.py xnu/out-ci-wlan6g/kernel.development.fuxi \
+  xnu/out-local-wlan6g/fuxi.adt shim/out/fuxi-ci-wlan6g-s22-payload.bin \
+  --cmdline "$(cat xnu/out-ci-wlan6g/cmdline-s22.txt)"
+bash shim/fuxi-loader/build.sh shim/out/fuxi-ci-wlan6g-s22-payload.bin
 ```
 
 The loader's output is `shim/out/fuxi-loader/fuxi-xnu-boot.img`; save/rename it

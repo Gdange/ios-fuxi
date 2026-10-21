@@ -6,7 +6,7 @@ on:
       kernel:
         description: Kernel/boot-argument profiles (current source, WLAN opt-in)
         type: choice
-        options: [none, metal4, wlan6f, all]
+        options: [none, metal4, wlan6g, all]
         default: metal4
       metal:
         description: Signed FuxiMetal, smoke, own metallib and pinned metal2vulkan
