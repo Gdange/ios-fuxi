@@ -812,13 +812,20 @@ static thread_local FuxiCommandBuffer *completionCommand;
  if(indices && (![indices isKindOfClass:[FuxiBuffer class]] || [indices device]!=_command->_queue->_device || (offset&1) || offset>[indices length] || count*2>[indices length]-offset))invalid(@"index bounds/device");
  fuxi::Operation op=_state;op.texture=_target->_texture;op.pipeline=_pipeline->_pipeline;op.vertices=(uint32_t)count;op.first=(uint32_t)start;op.strip=t==MTLPrimitiveTypeTriangleStrip;
  op.indices=indices?((FuxiBuffer *)indices)->_buffer:nullptr;op.indexOffset=offset;
- // CA smoke diagnostic: a textured draw's CA stage-0 vertices (buffer 1, stride 48: float4 position, float2 @16, float2 @24).
- if(caTrace() && _samples[0] && _buffers[0][1].buffer && !_buffers[0][1].bytes) {
-  const fuxi::BufferBind &v=_buffers[0][1];
-  for(NSUInteger k=start;k<start+count && k<start+4;++k) {
-   uint64_t at=v.offset+k*48;if(at+32>v.buffer->length)break;const float *f=(const float *)((const uint8_t *)v.buffer->contents+at);
-   fprintf(stderr,"FUXI MTL: trace textured vertex %lu pos %.3f,%.3f,%.3f,%.3f a1 %.4f,%.4f a2 %.4f,%.4f tex %lux%lu\n",(unsigned long)k,f[0],f[1],f[2],f[3],f[4],f[5],f[6],f[7],
-    (unsigned long)[_samples[0] width],(unsigned long)[_samples[0] height]);
+ // CA smoke diagnostic: for a textured draw, every vertex binding and its first vertices (stride 48 floats).
+ bool textured=false;for(size_t i=0;i<fuxi::resourceSlots;++i)textured|=_samples[i]!=nil;
+ static std::atomic<unsigned> texturedTraces{0};
+ if(caTrace() && textured && texturedTraces.fetch_add(1)<8) {
+  fprintf(stderr,"FUXI MTL: trace textured draw start %lu count %lu indexed %d\n",(unsigned long)start,(unsigned long)count,indices!=nil);
+  for(size_t i=0;i<fuxi::resourceSlots;++i)if(_samples[i])fprintf(stderr,"FUXI MTL: trace textured slot %zu tex %lux%lu\n",i,(unsigned long)[_samples[i] width],(unsigned long)[_samples[i] height]);
+  for(size_t i=0;i<fuxi::resourceSlots;++i) {const fuxi::BufferBind &v=_buffers[0][i];if(!v.buffer)continue;
+   fprintf(stderr,"FUXI MTL: trace textured vbuf %zu offset %llu length %llu bytes %d\n",i,(unsigned long long)v.offset,(unsigned long long)v.buffer->length,v.bytes);
+   for(unsigned k=0;k<4;++k) {uint64_t at=v.offset+k*48;if(at+32>v.buffer->length)break;const float *f=(const float *)((const uint8_t *)v.buffer->contents+at);
+    fprintf(stderr,"FUXI MTL: trace textured vbuf %zu v%u %.3f %.3f %.3f %.3f | %.4f %.4f | %.4f %.4f\n",i,k,f[0],f[1],f[2],f[3],f[4],f[5],f[6],f[7]);}
+  }
+  for(unsigned stage=0;stage<2;++stage)for(size_t i=0;i<fuxi::resourceSlots;++i) {const fuxi::BufferBind &v=_buffers[stage][i];
+   if(!v.buffer || v.offset+64>v.buffer->length)continue;const float *f=(const float *)((const uint8_t *)v.buffer->contents+v.offset);
+   fprintf(stderr,"FUXI MTL: trace textured %s buf %zu raw",stage?"frag":"vert",i);for(unsigned k=0;k<16;++k)fprintf(stderr," %.4g",f[k]);fputc('\n',stderr);
   }
  }
  op.load=_drawn?1:_load;op.store=1;
