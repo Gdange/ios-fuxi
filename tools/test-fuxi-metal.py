@@ -362,6 +362,8 @@ def main():
             path=tree/'bsd/dev'/name; path.parent.mkdir(parents=True,exist_ok=True);path.write_text(sync.baseline(name))
         conf=tree/'iokit/conf/files.arm64';conf.parent.mkdir(parents=True,exist_ok=True)
         conf.write_text(sync.CONFIG_BASE)
+        conf=tree/'osfmk/conf/files.arm64';conf.parent.mkdir(parents=True,exist_ok=True)
+        conf.write_text(sync.OSFMK_CONFIG_BASE)
         subprocess.run(['patch','-s','-p1','--fuzz=0','-i', str(ROOT/'xnu/patches/0098-fuxi-native-adreno-abi.patch')],cwd=tree,check=True)
         delta=(ROOT/'xnu/patches/0100-sweet-execswap-gpu-abi-trace.patch').read_text()
         delta=delta[delta.index('--- a/bsd/kern/sweet_execswap.h'):]

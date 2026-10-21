@@ -16,6 +16,7 @@ BASE = ROOT / 'xnu/fuxi-adreno'
 FILES = {
     'iokit/Kernel/arm/FuxiAdrenoUserClient.cpp': 'FuxiAdrenoUserClient.cpp',
     'bsd/dev/fuxi_gpu_abi_backend.inc': 'fuxi_gpu_abi_backend.inc',
+    'osfmk/arm/fuxi_adreno_host.c': 'fuxi_adreno_host.c',
 }
 for folder in ('bsd/dev', 'iokit/Kernel/arm'):
     for name in ('NativeAdrenoABI.h', 'fuxi_abi_wire.h', 'fuxi_gpu_abi.h', 'LICENSE.NativeAdreno'):
@@ -33,6 +34,9 @@ def baseline(name):
 CONFIG_BASE = '\n'*13 + 'iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp\niokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp\niokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp\niokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp\niokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp\niokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp\niokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp\n'
 
 
+OSFMK_CONFIG_BASE = 'OPTIONS/fb\t\t\toptional fb\n\nOPTIONS/debug\t\t\toptional debug\n\nosfmk/vm/vm_apple_protect.c\t standard\nosfmk/vm/vm_fourk_pager.c\t standard\n\nosfmk/arm64/hi_res_clock_map.c \toptional hi_res_clock\n\n'
+
+
 def metal1_client():
     patch = (ROOT/'xnu/patches/0098-fuxi-native-adreno-abi.patch').read_text()
     block = next(p for p in re.split(r'(?=^--- a/)', patch, flags=re.M)
@@ -46,6 +50,10 @@ def content():
     changed = CONFIG_BASE.replace(line, line+'iokit/Kernel/arm/FuxiAdrenoUserClient.cpp                         optional iokitcpp\n')
     patch = ''.join(difflib.unified_diff(CONFIG_BASE.splitlines(True), changed.splitlines(True),
         fromfile='a/iokit/conf/files.arm64', tofile='b/iokit/conf/files.arm64'))
+    line = 'osfmk/vm/vm_apple_protect.c\t standard\n'
+    changed = OSFMK_CONFIG_BASE.replace(line, line+'osfmk/arm/fuxi_adreno_host.c\tstandard\n')
+    patch += ''.join(difflib.unified_diff(OSFMK_CONFIG_BASE.splitlines(True), changed.splitlines(True),
+        fromfile='a/osfmk/conf/files.arm64', tofile='b/osfmk/conf/files.arm64', n=1))
     for name in ('gpu.c', 'gpu-a740.h', 'gpu-zap.h', 'gpu-handoff.h', 'fuxi_adreno.c', 'fuxi_adreno.h'):
         folder = BASE if name.startswith('fuxi_') else ROOT/'shim/fuxi-probe'
         patch += ''.join(difflib.unified_diff(baseline(name).splitlines(True),

@@ -47,7 +47,8 @@ static void IOLog(const char *,...){}
 static void abiTrace(const char *,int,int){}
 static bool pmap_valid_page(ppnum_t p) {return p!=0x12345;}
 constexpr unsigned VM_WIMG_MASK=255,VM_WIMG_DEFAULT=2,VM_WIMG_WCOMB=6;
-static unsigned pmap_cache_attributes(ppnum_t) {return fail==12?7:VM_WIMG_DEFAULT;}
+static unsigned hostCache=VM_WIMG_DEFAULT;
+static unsigned pmap_cache_attributes(ppnum_t) {return fail==12?7:hostCache;}
 struct IOMemoryMap;
 struct IOMemoryDescriptor {
  unsigned refs=1,wired=0;uint64_t length=0;
@@ -107,6 +108,12 @@ int main() {
  static_assert(NativeAdrenoAbiVersion==2);
  static_assert(NativeAdrenoAbiHostPageBytes==16384);
  static_assert(sizeof(NativeAdrenoAbiBoImport)==16);
+ assert(!fuxi_adreno_host_page_ok(0x12345ULL<<14));
+ for(hostCache=0;hostCache<512;hostCache++) {
+  unsigned cache=hostCache&VM_WIMG_MASK;
+  assert(fuxi_adreno_host_page_ok(0x10000000)==(cache==VM_WIMG_DEFAULT || cache==VM_WIMG_WCOMB));
+ }
+ hostCache=VM_WIMG_DEFAULT;
  assert(!fg_abi_import_valid(0,16384));
  assert(!fg_abi_import_valid(0x100000,0));
  assert(!fg_abi_import_valid(UINT64_MAX-16383,32768));
@@ -158,9 +165,11 @@ int main() {
 
 def main():
     source = (ROOT/'xnu/fuxi-adreno/FuxiAdrenoUserClient.cpp').read_text()
+    helper = (ROOT/'xnu/fuxi-adreno/fuxi_adreno_host.c').read_text()
+    helper = helper[helper.index('bool fuxi_adreno_host_page_ok('):helper.index('#endif')]
     bo = source[source.index(' struct Bo {'):source.index(' task_t task_')]
     close = method(source, 'clientClose').replace(' override', '').replace('openLock);', '&openLock);')
-    model = PREFIX + 'struct Client {\n enum {MaxBos=64};\n' + bo + r'''
+    model = PREFIX + helper + 'struct Client {\n enum {MaxBos=64};\n' + bo + r'''
  task_t task_=7;uint64_t nextHandle_=1,wired_=0,lastFence_=1;
  int *lock_=&clientLock;bool live_=true;int pid_=0;
  void terminate(){}

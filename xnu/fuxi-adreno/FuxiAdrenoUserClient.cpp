@@ -13,7 +13,6 @@
 #include <IOKit/IOLocks.h>
 #include <kern/clock.h>
 #include <kern/task.h>
-#include <vm/pmap.h>
 #include <sys/proc.h>
 #include <pexpert/pexpert.h>
 #include "fuxi_gpu_abi.h"
@@ -205,11 +204,7 @@ class FuxiAdrenoUserClient : public IOUserClient {
    IOByteCount length=0;
    uint64_t pa=memory->getPhysicalSegment(off,&length,kIOMemoryMapperNone);
    valid=pa && !(pa&(NativeAdrenoAbiHostPageBytes-1)) && length>=NativeAdrenoAbiHostPageBytes &&
-       pa<(UINT64_C(1)<<FG_ABI_PA_BITS) && pmap_valid_page((ppnum_t)(pa>>14));
-   if (valid) {
-    unsigned cache=pmap_cache_attributes((ppnum_t)(pa>>14))&VM_WIMG_MASK;
-    valid=cache==VM_WIMG_DEFAULT || cache==VM_WIMG_WCOMB; // Normal WB or NC only
-   }
+       pa<(UINT64_C(1)<<FG_ABI_PA_BITS) && fuxi_adreno_host_page_ok(pa);
   }
   // DefaultCache inherits the memory entry's actual policy (WB or Normal NC).
   IOMemoryMap *mapping=valid ? memory->createMappingInTask(kernel_task,0,kIOMapAnywhere|kIOMapDefaultCache) : nullptr;

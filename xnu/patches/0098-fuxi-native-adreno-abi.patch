@@ -8,6 +8,12 @@
  iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
  iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
  iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -5,2 +5,3 @@
+ osfmk/vm/vm_apple_protect.c	 standard
++osfmk/arm/fuxi_adreno_host.c	standard
+ osfmk/vm/vm_fourk_pager.c	 standard
 --- a/bsd/dev/gpu.c
 +++ b/bsd/dev/gpu.c
 @@ -21,6 +21,9 @@
@@ -312,7 +318,7 @@
  int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,
 --- a/iokit/Kernel/arm/FuxiAdrenoUserClient.cpp
 +++ b/iokit/Kernel/arm/FuxiAdrenoUserClient.cpp
-@@ -0,0 +1,373 @@
+@@ -0,0 +1,368 @@
 +/* NativeAdrenoABI v2 userspace lane. No Apple accelerator/Metal impersonation.
 + * ABI and framing credit: UniXNU NativeAdreno contributors (MIT).
 + * See NativeAdrenoABI.h and LICENSE.NativeAdreno for copied material.
@@ -327,7 +333,6 @@
 +#include <IOKit/IOLocks.h>
 +#include <kern/clock.h>
 +#include <kern/task.h>
-+#include <vm/pmap.h>
 +#include "fuxi_gpu_abi.h"
 +#include "fuxi_abi_wire.h"
 +
@@ -475,11 +480,7 @@
 +   IOByteCount length=0;
 +   uint64_t pa=memory->getPhysicalSegment(off,&length,kIOMemoryMapperNone);
 +   valid=pa && !(pa&(NativeAdrenoAbiHostPageBytes-1)) && length>=NativeAdrenoAbiHostPageBytes &&
-+       pa<(UINT64_C(1)<<FG_ABI_PA_BITS) && pmap_valid_page((ppnum_t)(pa>>14));
-+   if (valid) {
-+    unsigned cache=pmap_cache_attributes((ppnum_t)(pa>>14))&VM_WIMG_MASK;
-+    valid=cache==VM_WIMG_DEFAULT || cache==VM_WIMG_WCOMB; // Normal WB or NC only
-+   }
++       pa<(UINT64_C(1)<<FG_ABI_PA_BITS) && fuxi_adreno_host_page_ok(pa);
 +  }
 +  // DefaultCache inherits the memory entry's actual policy (WB or Normal NC).
 +  IOMemoryMap *mapping=valid ? memory->createMappingInTask(kernel_task,0,kIOMapAnywhere|kIOMapDefaultCache) : nullptr;
@@ -1012,6 +1013,24 @@
 + if (err<0) return err;
 + return fence<=fg_abi_completed ? 0 : 1;
 +}
+--- a/osfmk/arm/fuxi_adreno_host.c
++++ b/osfmk/arm/fuxi_adreno_host.c
+@@ -0,0 +1,15 @@
++/* HostImport's private pmap queries belong to Mach, not IOKit or BSD. */
++#include <pexpert/arm64/board_config.h>
++#if defined(FUXI)
++#include <stdbool.h>
++#include <vm/pmap.h>
++#include "../../bsd/dev/fuxi_gpu_abi.h"
++
++bool fuxi_adreno_host_page_ok(uint64_t pa)
++{
++ ppnum_t page=(ppnum_t)(pa>>14); /* NativeAdrenoABI's fixed 16K host page. */
++ if (!pmap_valid_page(page)) return false;
++ unsigned cache=pmap_cache_attributes(page)&VM_WIMG_MASK;
++ return cache==VM_WIMG_DEFAULT || cache==VM_WIMG_WCOMB;
++}
++#endif
 --- a/bsd/dev/NativeAdrenoABI.h
 +++ b/bsd/dev/NativeAdrenoABI.h
 @@ -0,0 +1,171 @@
@@ -1284,14 +1303,17 @@
 +#endif
 --- a/bsd/dev/fuxi_gpu_abi.h
 +++ b/bsd/dev/fuxi_gpu_abi.h
-@@ -0,0 +1,23 @@
+@@ -0,0 +1,26 @@
 +/* NativeAdrenoABI platform bridge. All operations serialize with presents. */
 +#ifndef FUXI_GPU_ABI_H
 +#define FUXI_GPU_ABI_H
 +#include <stdint.h>
++#include <stdbool.h>
 +#ifdef __cplusplus
 +extern "C" {
 +#endif
++/* Managed 16K host page with Normal WB or NC cache policy; osfmk owns pmap APIs. */
++bool fuxi_adreno_host_page_ok(uint64_t pa);
 +/* 0 success, 1 ring busy, -1 disabled/drained, -2 failed DMA drain.
 + * poll also returns -3 on watchdog timeout/drained, -4 timeout/quarantined. */
 +int fuxi_gpu_abi_map(uint64_t iova, uintptr_t source, uint64_t bytes,
@@ -1604,14 +1626,17 @@
 +#endif
 --- a/iokit/Kernel/arm/fuxi_gpu_abi.h
 +++ b/iokit/Kernel/arm/fuxi_gpu_abi.h
-@@ -0,0 +1,23 @@
+@@ -0,0 +1,26 @@
 +/* NativeAdrenoABI platform bridge. All operations serialize with presents. */
 +#ifndef FUXI_GPU_ABI_H
 +#define FUXI_GPU_ABI_H
 +#include <stdint.h>
++#include <stdbool.h>
 +#ifdef __cplusplus
 +extern "C" {
 +#endif
++/* Managed 16K host page with Normal WB or NC cache policy; osfmk owns pmap APIs. */
++bool fuxi_adreno_host_page_ok(uint64_t pa);
 +/* 0 success, 1 ring busy, -1 disabled/drained, -2 failed DMA drain.
 + * poll also returns -3 on watchdog timeout/drained, -4 timeout/quarantined. */
 +int fuxi_gpu_abi_map(uint64_t iova, uintptr_t source, uint64_t bytes,

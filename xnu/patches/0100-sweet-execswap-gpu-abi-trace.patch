@@ -120,7 +120,7 @@
   * ABI and framing credit: UniXNU NativeAdreno contributors (MIT).
   * See NativeAdrenoABI.h and LICENSE.NativeAdreno for copied material.
   */
-@@ -8,39 +8,67 @@
+@@ -8,38 +8,66 @@
  #include <IOKit/IOPlatformExpert.h>
  #include <IOKit/IOUserClient.h>
  #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -129,7 +129,6 @@
  #include <IOKit/IOLocks.h>
  #include <kern/clock.h>
  #include <kern/task.h>
- #include <vm/pmap.h>
 +#include <sys/proc.h>
 +#include <pexpert/pexpert.h>
  #include "fuxi_gpu_abi.h"
@@ -200,7 +199,7 @@
  class FuxiAdrenoUserClient : public IOUserClient {
   OSDeclareDefaultStructors(FuxiAdrenoUserClient)
   enum {MaxBos=64};
-@@ -55,7 +83,29 @@
+@@ -54,7 +82,29 @@
   } bos_[MaxBos] = {};
   task_t task_ = TASK_NULL;
   IOLock *lock_ = nullptr;
@@ -231,7 +230,7 @@
   uint64_t nextHandle_ = 1, wired_ = 0, lastFence_ = 0, firstFence_ = 0;
   uint32_t nextToken_ = 1;
   bool queues_[8] = {true};
-@@ -112,10 +162,8 @@
+@@ -111,10 +161,8 @@
    if (!memory && !r.contiguous) memory=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,options,allocated,mask);
    if (!memory) return kIOReturnNoMemory;
    if (memory->prepare()!=kIOReturnSuccess) { memory->release(); return kIOReturnNoMemory; }
@@ -243,7 +242,7 @@
    uint64_t first=0;
    for (uint64_t off=0;valid && off<allocated;off+=16384) {
     IOByteCount length=0;
-@@ -124,14 +172,11 @@
+@@ -123,14 +171,11 @@
         (!off ? !(pa&((UINT64_C(1)<<r.align_log2)-1)) : !r.contiguous || pa==first+off);
     if (!valid) break;
     if (!off) first=pa;
@@ -260,7 +259,7 @@
    if (!valid) {
     if (view) view->release();
     memory->complete(); memory->release(); return kIOReturnNoMemory;
-@@ -282,24 +327,34 @@
+@@ -277,24 +322,34 @@
   bool initWithTask(task_t task, void *securityID, UInt32 type) override {
    if (!IOUserClient::initWithTask(task,securityID,type)) return false;
    task_=task; task_reference(task_);
@@ -298,7 +297,7 @@
    IOLockUnlock(lock_); return s;
   }
   IOReturn clientMemoryForType(UInt32 token, IOOptionBits *options, IOMemoryDescriptor **memory) override {
-@@ -309,7 +364,9 @@
+@@ -304,7 +359,9 @@
    if (live_) for (auto &b:bos_) if (b.handle && b.token==token && b.leases) {
     b.view->retain(); *memory=b.view; *options=kIOMapAnywhere|kIOMapWriteCombineCache; break;
    }
@@ -309,7 +308,7 @@
   }
   IOReturn clientClose() override {
    if (!lock_) return kIOReturnSuccess;
-@@ -326,7 +383,8 @@
+@@ -321,7 +378,8 @@
     IOLockLock(openLock); connected=false; IOLockUnlock(openLock);
    }
    IOLockUnlock(lock_);
@@ -319,7 +318,7 @@
   }
   void free() override {
    (void)clientClose();
-@@ -336,14 +394,26 @@
+@@ -331,14 +389,26 @@
   }
  };
  OSDefineMetaClassAndStructors(FuxiAdrenoUserClient,IOUserClient)
@@ -348,7 +347,7 @@
    if (!handler) return kIOReturnBadArgument;
    *handler=nullptr;
    if (type!=0x4147 && type!=0) return kIOReturnUnsupported;
-@@ -356,9 +426,12 @@
+@@ -351,9 +421,12 @@
    *handler=uc; return kIOReturnSuccess;
   }
  };
@@ -362,7 +361,7 @@
   openLock=IOLockAlloc();
   auto *service=new NativeAdrenoGpuPublished;
   if (!openLock || !service) { if (service) service->release(); return; }
-@@ -367,6 +440,16 @@
+@@ -362,6 +435,16 @@
   }
   service->setName("NativeAdrenoGpu");
   service->setProperty("NativeAdrenoABI",(uint64_t)NativeAdrenoAbiVersion,32);
