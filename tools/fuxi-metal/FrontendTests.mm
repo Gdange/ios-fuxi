@@ -62,7 +62,7 @@ int main() {
    // A missing encoder entry must name the selector, return without throwing,
    // retain prior resources, and never send even the valid prefix to the GPU.
    id<MTLBuffer>b=[device newBufferWithLength:64 options:0];[e fillBuffer:b range:NSMakeRange(0,64) value:7];
-   unsigned before=fuxi::Backend::submissions;[e generateMipmapsForTexture:nil];[e endEncoding];
+   unsigned before=fuxi::Backend::submissions;id<MTLTexture> none=nil;[e generateMipmapsForTexture:none];[e endEncoding];
    [c commit];assert(c.status==MTLCommandBufferStatusError && c.error && fuxi::Backend::submissions==(int)before);
    for(unsigned i=0;i<64;++i)assert(!((uint8_t *)b.contents)[i]);[b release];
   }

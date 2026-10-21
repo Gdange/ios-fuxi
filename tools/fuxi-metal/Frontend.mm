@@ -843,7 +843,7 @@ static void rejectProtocol(Class cls,Protocol *proto) {
  for(unsigned i=0;i<n;++i)rejectProtocol(cls,parents[i]);free(parents);
 }
 // A constructor runs during NSBundle load, before principalClass lookup.
-static Class makeDeviceClass(Class base) {
+__attribute__((unused)) static Class makeDeviceClass(Class base) {
  if(!base || class_getInstanceSize(base)!=528) {
   failureLog("FUXI MTL: _MTLDevice size guard FAIL got %zu expected 528\n",base?class_getInstanceSize(base):0);return Nil;
  }

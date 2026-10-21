@@ -65,7 +65,7 @@ int main() {@autoreleasepool {
  float uniform[4]={1,0.5,0.25,1};[r setFragmentBytes:uniform length:sizeof(uniform) atIndex:1];memset(uniform,0,sizeof(uniform));
  [r setViewport:(MTLViewport){16,24,128,96,0,1}];[r setScissorRect:(MTLScissorRect){24,32,64,64}];
  refuses(c,^{[r setVertexBuffer:input offset:0 atIndex:4];});
- refuses(c,^{[r setFragmentBytes:uniform length:4097 atIndex:1];});
+ {float *u=uniform;refuses(c,^{[r setFragmentBytes:u length:4097 atIndex:1];});}
  refuses(c,^{[r drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:3 indexType:MTLIndexTypeUInt32 indexBuffer:input indexBufferOffset:0];});
  [r drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:6 indexType:MTLIndexTypeUInt16 indexBuffer:input indexBufferOffset:4];[r endEncoding];
  const auto &recorded=c->_ops.back();assert(recorded.load==1 && !recorded.store && recorded.indices==input->_buffer && recorded.indexOffset==4);
