@@ -39,6 +39,7 @@
 #include <sys/fcntl.h>
 #include <sys/vnode.h>
 #include <sys/uio.h>
+#include <sys/random.h>
 #include <string.h>
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -73,7 +74,7 @@ static struct fw_window fw_windows[] = {
 	{0x01c00000, 0x8000, 0},    /* PCIe0 PARF 0x1c00000 + QMP PHY 0x1c06000 */
 	{0x01fd4000, 0x4000, 0},    /* TCSR clkref 0x1fd5100 */
 	{0x15000000, 0x100000, 0},  /* apps SMMU: GR0/GR1 + runtime-bounded CBs */
-	{0x60480000, 0x4000, 0},    /* EP internal register window (TCSR version) */
+	{0x60480000, 0x80000, 0},   /* EP sliding 512-KiB window: version + bounded BL logs */
 	{0x0f14c000, 0x18000, 0},   /* TLMM tiles gpio76..96 */
 	{0x17a20000, 0x4000, 0},    /* apps RSC DRV2 + TCS */
 	{0x60000000, 0x4000, 0},    /* PCIe0 DBI, ELBI 0xf20, iATU 0x1000 */
@@ -518,6 +519,63 @@ wl_mwr64(uint32_t off, uint64_t v)
 	wl_mwr(off, (uint32_t)v);
 }
 
+/* The only caller is the dedicated bring-up thread. Save/restore the dynamic
+ * window for every access, including fault paths; never leave a log window set.
+ * CNSS pci.c/reg.h: WINDOW_SHIFT=19, mask=0x3f, start=0x80000. */
+static int
+wl_soc_read(uint32_t off, uint32_t *val)
+{
+	*val = ~0u;
+	if (fw_faults || (off & 3) || off >= 0x02000000) { return 1; }
+	uint32_t saved = wl_mrd(0x310c), win = (saved & ~0x3fu) | 0x40000000 | (off >> 19);
+	if (saved == ~0u || fw_faults) { return 1; }
+	wl_mwr(0x310c, win);
+	int e = wl_mrd(0x310c) != win || fw_faults;
+	if (!e) { *val = wl_prd(WL_BAR0 + 0x80000ull + (off & 0x7ffff)); }
+	/* Containment writes remain possible after a latched synchronous fault. */
+	if (wl_contain_wr(WL_BAR0 + 0x310c, saved) || wl_mrd(0x310c) != saved) { e = 1; }
+	return e || fw_faults;
+}
+
+/* CNSS KIWI bootloader diagnostics only, <=27 words, no arbitrary SRAM dump.
+ * In PBL the DBG tuple may still be the input DMA address/size, not an SBL log. */
+static void
+wl_boot_logs(void)
+{
+	uint32_t ee = wl_mrd(wl_bhi + 0x28);
+	if (fw_faults || (ee != 0 && ee != 1)) {
+		printf("FUXI WLAN: M6f boot logs skipped EE %#x faults %u\n", ee, fw_faults); return;
+	}
+	const uint32_t regs[] = {0x01b000f8, 0x01e22b34, 0x01a10008, 0x01e0e238, 0x01e0e23c};
+	const char *names[] = {"TCSR_PBL_LOGGING", "PBL_WLAN_BOOT_CFG", "KIWI_PBL_BOOTSTRAP_STATUS",
+	    "PCIE_BHI_ERRDBG2", "PCIE_BHI_ERRDBG3"};
+	uint32_t v[5];
+	for (unsigned i = 0; i < 5; i++) {
+		if (wl_soc_read(regs[i], &v[i])) {
+			printf("FUXI WLAN: M6f boot log access failed reg %#x; window restored/containment attempted\n", regs[i]); return;
+		}
+		printf("FUXI WLAN: M6f %s [%#x] %#x\n", names[i], regs[i], v[i]);
+	}
+	for (unsigned i = 0; i < 10; i++) {
+		uint32_t value, addr = 0x01403d98 + 4 * i;
+		if (wl_soc_read(addr, &value)) { return; }
+		printf("FUXI WLAN: M6f PBL log [%#x] %#x\n", addr, value);
+	}
+	uint32_t start = v[3], size = v[4];
+	/* Clamp like CNSS, but require word alignment and subtraction-safe bounds. */
+	if (size > 48) { size = 48; }
+	if (start < 0x01400000 || start >= 0x01800000 || (start & 3) ||
+	    !size || (size & 3) || size > 0x01800000 - start) {
+		printf("FUXI WLAN: M6f SBL log skipped invalid SRAM tuple %#x/%#x (runtime DBG %#x/%#x)\n",
+		    start, v[4], wl_mrd(wl_bhi + 0x38), wl_mrd(wl_bhi + 0x3c)); return;
+	}
+	for (unsigned i = 0; i < size; i += 4) {
+		uint32_t value;
+		if (wl_soc_read(start + i, &value)) { return; }
+		printf("FUXI WLAN: M6f SBL log [%#x] %#x\n", start + i, value);
+	}
+}
+
 static void
 wl5_status(unsigned step)
 {
@@ -930,6 +988,66 @@ wl_pt_pa(unsigned table)
 	return wl_phys(wl_tables.va + table * 4096);
 }
 
+/* Reverse PA lookup is restricted to our wired allocations. Never dereference
+ * an untrusted table PA via phystokv or invent physical contiguity at 16 KiB. */
+static vm_offset_t
+wl_owned_alias(uint64_t pa, unsigned bytes, bool tables_only)
+{
+	struct wl_dma *bufs[] = { &wl_tables, &wl_image, &wl_vectors, &wl_contexts };
+	for (unsigned i = 0; i < (tables_only ? 1u : 4u); i++) {
+		struct wl_dma *d = bufs[i];
+		for (vm_size_t off = 0; d->va && off < d->size; off += PAGE_SIZE) {
+			uint64_t base = wl_phys(d->va + off);
+			if (pa >= base && pa - base < PAGE_SIZE && bytes <= PAGE_SIZE - (pa - base)) {
+				return d->va + off + (vm_offset_t)(pa - base);
+			}
+		}
+	}
+	return 0;
+}
+
+static uint64_t
+wl_hash_bytes(uint64_t h, const uint8_t *p, unsigned bytes)
+{
+	for (unsigned i = 0; i < bytes; i++) { h = (h ^ p[i]) * 0x100000001b3ull; }
+	return h;
+}
+
+static int
+wl_bhi_mapping_check(void)
+{
+	const uint64_t mask = 0x0000000ffffff000ull, seed = 0xcbf29ce484222325ull;
+	uint64_t source = wl_hash_bytes(seed, (const uint8_t *)wl_image.va, WL_CHUNK), mapped = seed;
+	/* flush_dcache64 is clean+invalidate to PoC on this ARM64 target.
+	 * Force the physical-page hash to reload after the source hash. */
+	wl_dma_clean(&wl_image); wl_dma_clean(&wl_tables);
+	uint64_t root = ((uint64_t)wl_prd(wl_cb_addr(wl_cb) + 0x24) << 32) | wl_prd(wl_cb_addr(wl_cb) + 0x20);
+	unsigned pages = 0, bad = 0;
+	/* Walk the live CB TTBR, not fixed virtual indexes used by the builder. */
+	if ((root & mask) != wl_pt_pa(0) || fw_faults) { bad = 1; }
+	for (unsigned off = 0; !bad && off < WL_CHUNK; off += 4096) {
+		uint64_t iova = wl_image.iova + off, table = root & mask, leaf = 0;
+		const unsigned shifts[] = {30, 21, 12};
+		for (unsigned level = 0; level < 3; level++) {
+			vm_offset_t alias = wl_owned_alias(table, 4096, true);
+			if (!alias) { bad = 2; break; }
+			uint64_t desc = ((const uint64_t *)alias)[(iova >> shifts[level]) & 511];
+			if ((desc & 3) != 3) { bad = 3; break; }
+			table = desc & mask;
+			if (level == 2) { leaf = table; }
+		}
+		if (bad) { break; }
+		vm_offset_t alias = wl_owned_alias(leaf, 4096, false);
+		if (!alias) { bad = 4; break; }
+		mapped = wl_hash_bytes(mapped, (const uint8_t *)alias, 4096); pages++;
+		if (leaf != wl_phys(wl_image.va + off)) { bad = 5; }
+	}
+	int e = bad || pages != WL_CHUNK / 4096 || source != mapped;
+	printf("FUXI WLAN: M6f CB %u BHI IOVA %#llx+%#x FNV1a64 source %016llx walk %016llx pages %u/128 %s reason %u (CPU view)\n",
+	    wl_cb, wl_image.iova, WL_CHUNK, source, mapped, pages, e ? "FAIL" : "MATCH", bad);
+	return e;
+}
+
 static int
 wl_smmu_enable(void)
 {
@@ -1128,7 +1246,27 @@ wl_read_firmware(void)
 		memcpy(&ehsize, b + 52, 2); memcpy(&phsize, b + 54, 2); memcpy(&phnum, b + 56, 2);
 	}
 	if (ehsize != (b[4] == 1 ? 52 : 64) || !phnum || phsize != (b[4] == 1 ? 32 : 56) ||
-	    phoff < ehsize || phoff > wl_fw_size || (uint64_t)phsize * phnum > wl_fw_size - phoff) { e = 6; goto close; }
+	    phoff < ehsize || phoff > WL_CHUNK || (uint64_t)phsize * phnum > WL_CHUNK - phoff) { e = 6; goto close; }
+	/* FBC prefix must contain ELF metadata and any Qualcomm hash segment.
+	 * Other PT_LOAD ranges may be in the later BHIe transfer. No extraction. */
+	unsigned hashes = 0;
+	uint64_t hash_off = 0, hash_size = 0;
+	for (unsigned i = 0; i < phnum; i++) {
+		const uint8_t *ph = b + phoff + (uint64_t)i * phsize;
+		uint32_t flags;
+		memcpy(&flags, ph + (b[4] == 1 ? 24 : 4), 4);
+		if ((flags & 0x07000000) != 0x02000000) { continue; }
+		if (b[4] == 1) {
+			uint32_t off, size;
+			memcpy(&off, ph + 4, 4); memcpy(&size, ph + 16, 4);
+			hash_off = off; hash_size = size;
+		} else {
+			memcpy(&hash_off, ph + 8, 8); memcpy(&hash_size, ph + 32, 8);
+		}
+		if (++hashes > 1 || !hash_size || hash_off > WL_CHUNK || hash_size > WL_CHUNK - hash_off) { e = 6; goto close; }
+	}
+	printf("FUXI WLAN: M6f FBC metadata fits prefix phend %#llx hash segments %u offset %#llx size %#llx\n",
+	    phoff + (uint64_t)phsize * phnum, hashes, hash_off, hash_size);
 	wl_dma_clean(&wl_image);
 	wl5_report[17] = wl_fw_size; wl5_report[18] = (uint32_t)wl_image.iova;
 	printf("FUXI WLAN: firmware %s bytes %u ELF%u DMA %#llx cache-clean\n", wl_fw_path, wl_fw_size, b[4] == 1 ? 32 : 64, wl_image.iova);
@@ -1222,10 +1360,18 @@ wl5_step(unsigned s)
 		    wl_smmu_verify("CB_SCTLR pre-DMA", wl_cb_addr(wl_cb), 0x1027,
 		    wl_prd(wl_cb_addr(wl_cb)), 0x1027, WL_CB_SCTLR_MASK) ||
 		    (wl_prd(WL_PARF + 0x2c00) & 1) || wl_prd(WL_PARF + 0x234)) { return 6; }
-		for (unsigned o = 0x60; o <= 0x70; o += 4) { wl_mwr(wl_bhie + o, 0); }
+		/* ath12k_mhi_clear_vector: undefined reset status is not a result.
+		 * Only doorbells/status, no RDDM buffers and no retry. */
+		const unsigned clear[] = {0x3c, 0x44, 0x70, 0x78};
+		for (unsigned i = 0; i < 4; i++) { wl_mwr(wl_bhie + clear[i], 0); }
+		for (unsigned i = 0; i < 4; i++) {
+			if (wl_mrd(wl_bhie + clear[i]) || fw_faults) { return 9; }
+		}
+		printf("FUXI WLAN: M6f BHIe TX/RX doorbells/status cleared; no RX buffers\n");
 		wl_mwr(wl_bhi + 0x20, 0); wl_mwr(wl_bhi + 0x2c, 0);
 		wl_mwr64(wl_bhi + 8, wl_image.iova); wl_mwr(wl_bhi + 0x10, WL_CHUNK);
 		wl_dma_clean(&wl_image);
+		if (wl_bhi_mapping_check()) { return 8; }
 		/* Flush posted setup writes and verify the exact Linux BHI tuple before
 		 * enabling bus mastering. No MMIO write to MHICTRL before BHI. */
 		uint32_t hi = wl_mrd(wl_bhi + 0x0c), lo = wl_mrd(wl_bhi + 8);
@@ -1240,9 +1386,11 @@ wl5_step(unsigned s)
 		 * Disable legacy INTx; MSI/MSI-X remain unconfigured/disabled. */
 		wl_pwr(WL_EPCFG + 4, (wl_prd(WL_EPCFG + 4) & 0xffff) | 0x404);
 		if ((wl_prd(WL_EPCFG + 4) & 0x406) != 0x406 || fw_faults) { return 2; }
-		wl_seq = ((uint32_t)mach_absolute_time() & WL_SEQ_MASK) | 1;
+		read_random(&wl_seq, sizeof(wl_seq));
+		wl_seq &= WL_SEQ_MASK;
+		if (!wl_seq) { wl_seq = 1; } /* bounded nonzero fallback */
 		wl_mwr(wl_bhi + 0x18, wl_seq);
-		printf("FUXI WLAN: BHI doorbell seq %#x bytes %#x bus master on\n", wl_seq, WL_CHUNK);
+		printf("FUXI WLAN: M6f BHI doorbell random seq %#x mask %#x bytes %#x bus master on\n", wl_seq, WL_SEQ_MASK, WL_CHUNK);
 		return fw_faults ? 3 : 0;
 	}
 	case 22: {
@@ -1252,6 +1400,11 @@ wl5_step(unsigned s)
 		wl5_report[126] = first; wl5_report[127] = (uint32_t)e;
 		wl_sleep(10); /* diagnostic repeat only; never retry a failed transfer */
 		uint32_t again = wl_bhi_diag(1);
+		if (e || ((first | again) & WL_DIAG_PBL_ERROR)) {
+			if (!((first | again) & WL_DIAG_TRANSPORT)) { wl_boot_logs(); }
+			else { printf("FUXI WLAN: M6f boot logs skipped transport flags %#x\n", first | again); }
+		}
+		if (fw_faults) { return e == 3 ? e : 5; }
 		if ((first | again) & WL_DIAG_TRANSPORT) { return e == 3 ? e : 5; }
 		/* A late error/EE loss in the repeat must not turn into step-22 OK. */
 		if (!e && ((wl5_report[67] >> 30) == 3 || wl5_report[64] == 3 || wl5_report[64] == 6 ||

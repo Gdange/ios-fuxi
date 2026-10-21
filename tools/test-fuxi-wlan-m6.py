@@ -93,6 +93,10 @@ static uint32_t wl_prd(uint64_t pa) {
     if (read_fault_pa && pa==read_fault_pa) {fw_faults++; return ~0u;}
     uint32_t v=0;
     for (unsigned i=0;i<nr;i++) if(regs[i].pa==pa) {v=regs[i].v; break;}
+    if (pa>=WL_BAR0+0x80000 && pa<WL_BAR0+0x100000) {
+        uint64_t key=0x200000000ull+((wl_prd(WL_BAR0+0x310c)&63)<<19)+(pa-WL_BAR0-0x80000);
+        for(unsigned i=0;i<nr;i++) if(regs[i].pa==key) {v=regs[i].v; break;}
+    }
     for (unsigned i=0;i<nread_masks;i++) if(read_masks[i].pa==pa)
         v=(v | read_masks[i].rao) & ~read_masks[i].raz;
     return (tlb_busy && (pa & 0xfff)==0x7f4) ? 1 : v;
@@ -128,7 +132,7 @@ static void raw_pwr(uint64_t pa, uint32_t v) {
     if (pa==WL_BAR0+0x38 && v==0x200) {
         setreg(WL_BAR0+0x128,1); setreg(WL_BAR0+0x48,0x200);
     }
-    if (pa==WL_BAR0+0x260) {
+    if (pa==WL_BAR0+0x260 && v) {
         setreg(WL_BAR0+0x268,(2u<<30)|(v & 0x3fffffff));
         setreg(WL_BAR0+0x128,2);
     }
@@ -150,6 +154,8 @@ static void assert_wait_timeout(event_t e, int intr, unsigned ms, unsigned ns) {
     }
 }
 static void thread_block(int cont) { }
+static uint32_t random_value = 0x12345;
+static void read_random(void *p, unsigned bytes) { assert(bytes==4); memcpy(p,&random_value,4); }
 static uint64_t mach_absolute_time(void) { return 0x12345; }
 static int kmem_alloc(int map, uintptr_t *va, size_t size, int flags, int tag) {
     assert(flags & KMA_NOPAGEWAIT);
@@ -162,7 +168,7 @@ static int kmem_alloc(int map, uintptr_t *va, size_t size, int flags, int tag) {
 }
 static ppnum_t pmap_find_phys(int pmap, uintptr_t va) {
     for(unsigned i=0;i<allocations;i++) if(va>=allocs[i].va && va<allocs[i].va+allocs[i].size)
-        return (allocs[i].pa+(va-allocs[i].va)+(noncontig ? (va-allocs[i].va) : 0)) >> PAGE_SHIFT;
+        return (allocs[i].pa+((va-allocs[i].va)&~(uintptr_t)PAGE_MASK)*(noncontig?2:1)) >> PAGE_SHIFT;
     return 0;
 }
 static void kmem_free(int map, uintptr_t va, size_t size) {
@@ -191,7 +197,7 @@ static int vnode_close(vnode_t v, int mode, vfs_context_t c) { return 0; }
 '''
 TESTS = r'''
 static void init(void) {
-    nr=ne=sleeps=frees=allocations=0; next_pa=0x8c0000000ull;
+    nr=ne=sleeps=frees=allocations=0; random_value=0x12345; next_pa=0x8c0000000ull;
     progress=true; fail_bm=fail_perst=no_root=false;
     mismatch_pa=0x15001004ull; read_fault_pa=0;
     high_memory=noncontig=fail_alloc=tlb_busy=mismatch=inject_fault=false; open_error=read_resid=0;
@@ -304,12 +310,65 @@ int main(void) {
     assert(!wl_image.va && fw_faults==1);
     for(unsigned i=start;i<ne;i++) if(events[i].kind=='F') assert(i>(unsigned)perst);
 
+    /* M6f: the live TTBR walk must see the same 128 physical 4-KiB pages,
+       including noncontiguous 16-KiB XNU pages. Corruption never enables DMA. */
+    for(unsigned nc=0;nc<2;nc++) {
+        init(); noncontig=nc;
+        for(unsigned s=17;s<=20;s++) assert(wl5_step(s)==0);
+        for(unsigned i=0;i<WL_CHUNK;i++) ((uint8_t *)wl_image.va)[i]=(uint8_t)(i*31+(i>>12));
+        assert(wl_bhi_mapping_check()==0 && strstr(logbuf,"pages 128/128 MATCH"));
+        uint64_t *l3=(void *)(wl_tables.va+8192), saved=l3[0];
+        l3[0]=l3[1]; assert(wl5_step(21)==8 && !(wl_prd(WL_EPCFG+4)&4));
+        assert(strstr(logbuf,"FAIL reason 5")); l3[0]=saved;
+        l3[0]=0; assert(wl_bhi_mapping_check()==1); l3[0]=saved;
+        uint64_t *root=(void *)wl_tables.va, oldroot=root[0];
+        root[0]=0x12345003; assert(wl_bhi_mapping_check()==1); root[0]=oldroot;
+        setreg(wl_cb_addr(wl_cb)+0x20,0x1000); assert(wl_bhi_mapping_check()==1);
+        setreg(wl_cb_addr(wl_cb)+0x20,(uint32_t)wl_pt_pa(0)); release();
+    }
+    assert(wl_hash_bytes(0xcbf29ce484222325ull,(const uint8_t *)"hello",5)==0xa430d84680aabd0bull);
+    for(unsigned i=0;i<2;i++) {
+        init(); random_value=i?~0u:0;
+        for(unsigned s=17;s<=21;s++) assert(wl5_step(s)==0);
+        assert(wl_seq==(i?WL_SEQ_MASK:1) && wl_mrd(wl_bhi+0x18)==wl_seq); release();
+    }
+    /* Every clear is checked before BME; stale TX status cannot pass. */
+    init(); for(unsigned s=17;s<=20;s++) assert(wl5_step(s)==0);
+    corrupt_write_pa=WL_BAR0+wl_bhie+0x44;
+    assert(wl5_step(21)==9 && !(wl_prd(WL_EPCFG+4)&4));
+    corrupt_write_pa=0; release();
+    /* Sliding window restore on mismatch/fault; no arbitrary address reads. */
+    init(); uint32_t value;
+    setreg(WL_BAR0+0x310c,0x12340000);
+    assert(!wl_soc_read(0x1b000f8,&value) && wl_mrd(0x310c)==0x12340000);
+    unsigned window_start=ne;
+    assert(wl_soc_read(0x2000000,&value) && ne==window_start);
+    assert(wl_soc_read(0x1b000f9,&value) && ne==window_start);
+    read_fault_pa=WL_BAR0+0x800f8;
+    assert(wl_soc_read(0x1b000f8,&value) && fw_faults && wl_mrd(0x310c)==0x12340000);
+    assert(events[ne-1].pa==WL_BAR0+0x310c && events[ne-1].v==0x12340000);
+    read_fault_pa=0;
+    init(); wl_bhi=0x100;
+    setreg(0x200000000ull+0x1e0e238,0x1400100);
+    setreg(0x200000000ull+0x1e0e23c,0xffffffff);
+    window_start=ne; wl_boot_logs();
+    assert(strstr(logbuf,"SBL log [0x140012c]") && !strstr(logbuf,"SBL log [0x1400130]"));
+    for(unsigned i=window_start;i<ne;i++) assert(events[i].pa==WL_BAR0+0x310c);
+    assert(wl_mrd(0x310c)==0);
+    loglen=0; logbuf[0]=0;
+    setreg(0x200000000ull+0x1e0e238,0xfffffff0);
+    wl_boot_logs(); assert(strstr(logbuf,"SBL log skipped invalid SRAM"));
+    setreg(WL_BAR0+0x128,2); window_start=ne;
+    wl_boot_logs(); assert(ne==window_start && strstr(logbuf,"boot logs skipped EE"));
+
     /* M6e: all-ones STATUS is not enough to diagnose a lost endpoint. */
     init(); for(unsigned s=17;s<=21;s++) assert(wl5_step(s)==0);
     setreg(WL_BAR0+0x12c,~0u); setreg(WL_BAR0+0x130,0xef0e0003);
     setreg(WL_BAR0+0x128,0);
     unsigned diag_start=ne, diag_sleeps=sleeps;
-    assert(wl5_step(22)==1 && sleeps==diag_sleeps+10 && ne==diag_start);
+    assert(wl5_step(22)==1 && sleeps==diag_sleeps+10);
+    for(unsigned i=diag_start;i<ne;i++) assert(events[i].kind=='W' && events[i].pa==WL_BAR0+0x310c);
+    assert(wl_mrd(0x310c)==0 && strstr(logbuf,"TCSR_PBL_LOGGING") && strstr(logbuf,"PBL log"));
     assert(wl5_report[109]==129 && wl5_report[126]==129 && wl5_report[124]==~0u);
     assert(wl5_report[125]==0xef0e0003 && wl5_report[127]==1);
     assert(strstr(logbuf,"PBL error evidence") && strstr(logbuf,"BHI sample 1"));
@@ -696,6 +755,16 @@ int main(void) {
     fail_alloc=false; setreg(WL_BAR0+0x80000,0x101); assert(wl5_step(18)==0);
     assert(strstr(wl_fw_path,"/amss.bin"));
     assert(wl5_step(19)==0); release();
+    /* FBC metadata must fit the prefix even when the whole file is larger. */
+    init(); assert(wl5_step(17)==0 && wl5_step(18)==0);
+    uint32_t hash_flags=0x02200000, hash_offset=0x1000, hash_size=0x308;
+    memcpy(fixture+52+24,&hash_flags,4); memcpy(fixture+52+4,&hash_offset,4);
+    memcpy(fixture+52+16,&hash_size,4);
+    assert(wl5_step(19)==0 && strstr(logbuf,"hash segments 1 offset 0x1000 size 0x308")); release();
+    hash_offset=WL_CHUNK-4; memcpy(fixture+52+4,&hash_offset,4);
+    assert(wl5_step(19)==6); release();
+    hash_offset=WL_CHUNK-16; memcpy(fixture+28,&hash_offset,4);
+    assert(wl5_step(19)==6); release();
 
     /* Both PCI interrupt mechanisms are disabled, malformed cycles bounded. */
     init(); setreg(WL_EPCFG+0x34,0x40);

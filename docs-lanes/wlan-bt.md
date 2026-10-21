@@ -1430,3 +1430,171 @@ Native kernel build, native-Mac host tests, final image packing and artifact
 hashes are pending access to the dedicated Mac build host. The implementation
 and Linux host verification above are complete; no M6e boot image is claimed
 as built or device-validated yet.
+
+## M6f: live BHI mapping verification and KIWI bootloader logs
+
+M6e's result establishes that PBL processed the doorbell and copied the BHI
+address/length into its error registers. It does **not** establish that a PCIe
+memory read reached the intended DDR bytes, or identify an authentication
+failure. All-ones STATUS remains ambiguous in isolation; the independent
+transport checks and error code establish the narrower PBL-error hypothesis.
+M6f does not label the private error as a bad signature or invalid ELF.
+
+### Reference audit
+
+The pinned sources used for this comparison are
+[upstream MHI boot.c](https://github.com/torvalds/linux/blob/v6.6/drivers/bus/mhi/host/boot.c),
+[MHI pm.c](https://github.com/torvalds/linux/blob/v6.6/drivers/bus/mhi/host/pm.c),
+[ath12k mhi.c](https://github.com/torvalds/linux/blob/v6.6/drivers/net/wireless/ath/ath12k/mhi.c),
+[ath12k pci.c](https://github.com/torvalds/linux/blob/v6.6/drivers/net/wireless/ath/ath12k/pci.c),
+[Xiaomi CNSS pci.c](https://github.com/LineageOS/android_kernel_xiaomi_sm8550-modules/blob/92a9fde479d3262da080cfd28bab0775b0da500a/qcom/opensource/wlan/platform/cnss2/pci.c),
+[CNSS register definitions](https://github.com/LineageOS/android_kernel_xiaomi_sm8550-modules/blob/92a9fde479d3262da080cfd28bab0775b0da500a/qcom/opensource/wlan/platform/cnss2/reg.h),
+and the [Xiaomi MHI boot handler](https://github.com/LineageOS/android_kernel_xiaomi_sm8550/blob/2cac706017fd8fd44a1d6a27855ef1b685ce4ea2/drivers/bus/mhi/host/boot.c).
+These are reference implementations, not evidence of a successful M6f boot.
+
+| Operation | Reference behavior and M6f decision |
+|---|---|
+| BHI INTVEC | Power-up writes zero before the firmware handler. Zero selects vector zero; it does not disable MSI. Retained. |
+| BHI programming | STATUS=0; IMGADDR_HIGH=0; IMGADDR_LOW=IOVA; IMGSIZE=0x80000; IMGTXDB=session. HIGH precedes LOW. Retained. |
+| Sequence | Random nonzero bits [29:0], mask 0x3fffffff. Replaced the timer-derived odd value with kernel random bytes, masked; zero becomes 1 without an unbounded retry. |
+| MHI state before BHI | A load-capable EE, not a forced READY/M0. PBL with RESET state and READY=0 is permitted. RESET state (MHISTATUS state field zero) differs from asserting MHICTRL.RESET bit 1. M6f retains PBL-only admission, reset request clear, no SYSERR, and no MHICTRL state write before BHI. |
+| After BHI | Reset-clear/READY precedes context installation and M0. SBL precedes the BHIe transfer. Retained. |
+| BHIe reset state | ath12k clears TXVECDB, TXVECSTATUS, RXVECDB, RXVECSTATUS. M6f clears and checks those four actual offsets, replacing M6e's RX-address/size/doorbell-only loop. No RX buffers are exposed. |
+| Firmware | KIWI major 2 selects kiwi/amss20.bin. CNSS and ath12k enable FBC with sbl_size and seg_len both 512 KiB. The initial buffer is a copy from file offset zero; no separate SBL or PT_LOAD extraction. Retained. |
+| QRTR instance | cnss_pci_store_qrtr_node_id only handles QCA6390/QCA6490, and only writes a nonzero configured instance. KIWI skips it. No KIWI scratch write added. |
+| Wake | CNSS force-wake uses MHI device get operations for accesses/runtime PM; it is not a prerequisite to the PBL firmware handler. ath12k writes local wake at BAR0+0x3004 during power-down. No pre-PBL wake/M0 handshake added. |
+| Global reset | ath12k software reset toggles local BAR0+0x3008 bit 0, waits 10 ms on each edge, then requests MHICTRL.RESET to clear possible SYSERR. It also clears warm-entry/debug and hot-reset state. CNSS's KIWI cold power-up does not replicate that software-reset sequence. M6f retains the current PERST/power sequence; no speculative global reset is mixed into a live image transfer. |
+| Timeouts / image type | The audited CNSS/MHI KIWI path uses host software timeouts, not an extra BHI image-type or endpoint timeout-register write. CNSS config defaults to 10 s and scales power-up to 30/60 s; ath12k controller config is 2 s and its start path uses 90 s. M6f retains its bounded 5 s polls, since the observed failure is an immediate explicit error. |
+| PBL/SBL logging | The CNSS diagnostic registers are read on failure; they are not pre-load configuration. M6f implements the bounded KIWI subset below. |
+
+The public files do not supply an enum or decoder for `0xef0e0003`; public
+exact-code searches also found none. Only the BHI status-field error meaning
+is defined. BHIe TXVECSTATUS `0xeab00c75`, interpreted structurally, has status
+3 and sequence bits `0x2ab00c75`. Before a host TXVECDB transaction it is not a
+correlated BHIe result. M6f explicitly clears this stale/undefined state; the
+value cannot identify a firmware error by itself.
+
+The existing ELF metadata and Qualcomm hash segment fit inside the selected
+prefix (ELF32 program-table end 0x314; hash offset 0x1000, length 0x308).
+M6f now enforces program-table and hash-segment prefix bounds before DMA.
+Other program segments extend beyond the prefix; FBC transfers those later
+firmware stages through BHIe. Linux's DMA allocator supplies the
+BHI buffer; neither audited loader specifies an additional ELF-segment
+alignment constraint. Our initial IOVA is aligned to 512 KiB, 16 KiB and 4 KiB.
+Internal hash consistency, already checked in M6e, does not prove ROM trust,
+anti-rollback acceptance or the identity of bytes delivered by PCIe DMA.
+
+### Checks and bounded changes
+
+Immediately before BME, M6f hashes the 512-KiB source with FNV-1a-64, then
+cleans/invalidates image and table pages to PoC with flush_dcache64 and dsb sy.
+It reads the selected live CB's TTBR0 and walks L1/L2/L3 for all 128 4-KiB
+IOVA pages. Table pointers can resolve only into the owned table allocation;
+leaf pointers can resolve only into owned wired allocations. Reverse lookup
+uses each actual XNU physical page, including noncontiguous 16-KiB backing.
+No untrusted PA goes through phystokv, and no physical contiguity is assumed.
+The CPU hashes bytes through the aliases of the resolved physical pages,
+checks every leaf against its intended source page, and prints both hashes
+and the page count in **one console line**. A bad pointer, descriptor, physical
+page, count or hash fails step 21 reason 8 before bus mastering.
+
+This catches a wrong/stale software mapping and forces a post-clean CPU reload.
+It cannot independently prove the endpoint used that CB/SID, invalidate a
+hypothetical endpoint address cache, or prove PCIe inbound translation and
+coherency. The existing CB TLB synchronization, RC route readbacks and SMMU
+fault checks remain required. FNV is a diagnostic checksum, not an
+authentication check; the output artifacts use SHA-256.
+
+Step 21 also checks the four cleared BHIe registers before BME (reason 9 on
+failure). It retains the Linux BHI tuple/readbacks (reason 7), then uses the
+random session ID and rings exactly one BHI doorbell. No automatic firmware
+retry is added. Limits 20 and 22 remain usable for staged runs; 22 initiates
+DMA and stops only after a successful BHI completion.
+
+On step-22 failure with readable transport, M6f reads these endpoint-internal
+registers through the sliding BAR window, with selector readback and restore
+on every access, including contained fault paths:
+
+| Register | Endpoint address |
+|---|---|
+| TCSR_PBL_LOGGING | 0x01b000f8 |
+| PBL_WLAN_BOOT_CFG | 0x01e22b34 |
+| KIWI_PBL_BOOTSTRAP_STATUS | 0x01a10008 |
+| CNSS PCIE_BHI_ERRDBG2 / ERRDBG3 aliases | 0x01e0e238 / 0x01e0e23c |
+| KIWI PBL log | Ten words starting at 0x01403d98 |
+
+The aliases are printed alongside the existing dynamically located BHI debug
+registers; they must not silently be assumed identical on every revision.
+CNSS's SBL-log pointer/length aliases are validated as word-aligned SRAM in
+0x01400000..0x01800000 and clamped to 48 bytes before reading. A DMA address or
+zero echoed in DBG2 is not a valid log pointer and is explicitly skipped. The
+maximum is 27 data words including register metadata. Reads stop at the first
+access fault and are skipped outside PBL/SBL or on transport loss. The BAR
+mapping covers the 512-KiB sliding aperture; addresses are still explicitly
+bounded. No arbitrary SRAM, serial, key, firmware or calibration dump is added.
+The audited CNSS KIWI dump names TCSR_PBL_LOGGING; it defines no separate
+KIWI TCSR_PBL_ERROR register or private-code decoder. PEACH-only reset-cause
+and BHI-debug dumps are not copied into the KIWI path.
+
+All prior abort paths remain: reset request, BME off, PERST assertion, disable
+and invalidate only the owned SMMU bank/route, TLB synchronization, then free.
+Buffers remain retained when safe containment cannot be established. A log
+access fault cannot override an earlier SMMU failure or allow later DMA.
+
+### Hypotheses and validation
+
+Ranked by the current evidence, with no claimed device validation of M6f:
+
+1. PBL rejects its BHI transfer at an unidentified internal stage. Image
+   acceptance/authentication and a failed target-side DMA read remain possible;
+   the public error value does not distinguish them. The boot logs should
+   identify how far it got before assigning a more specific cause.
+2. Incorrect/stale DMA mapping or backing bytes. Register echoes do not exclude
+   this. The new live-CB walk and post-clean hashes test the CPU-visible half;
+   a MATCH lowers this hypothesis without proving endpoint DMA delivery.
+3. Residual endpoint/BHIe boot state or the timer-derived session value.
+   These are concrete differences from the reference, now normalized, but the
+   evidence does not prove either caused the BHI error. A reset/READY ordering
+   change, a different image size, or a QRTR write has weaker source support.
+
+Linux ASan/UBSan host tests cover successful progression, noncontiguous
+physical pages, altered leaf/table/root pointers, known FNV output, zero/full
+random values, failed vector clears, bounded ELF/hash metadata, log bounds,
+mission-mode skips, fault-time selector restore, transport loss and all existing
+containment paths. The fake pmap model now returns a physical **XNU page** for
+subpage VAs, so noncontiguous tests no longer accidentally move within one
+16-KiB page. Embedded patch sources must match the standalone files byte for
+byte. Native-Mac host tests and artifact verification are also required.
+
+`tools/build-fuxi-wlan6f-images.sh` emits full and stop-at-22 variants.
+`tools/test-fuxi-wlan-m6-artifacts.py --milestone m6f` verifies packed kernels,
+ADT/cmdlines, GPU sections, headers and every SHA-256 manifest entry. Outputs
+and machine-specific build records stay ignored.
+
+Expected additional console templates (not captured device logs):
+
+```text
+FUXI WLAN: M6f FBC metadata fits prefix phend 0x314 hash segments 1 offset 0x1000 size 0x308
+FUXI WLAN: M6f BHIe TX/RX doorbells/status cleared; no RX buffers
+FUXI WLAN: M6f CB <bank> BHI IOVA 0x10000000+0x80000 FNV1a64 source <16 hex> walk <same 16 hex> pages 128/128 MATCH reason 0 (CPU view)
+FUXI WLAN: M6f BHI doorbell random seq <nonzero> mask 0x3fffffff bytes 0x80000 bus master on
+FUXI WLAN: M6f TCSR_PBL_LOGGING [0x1b000f8] <value>
+FUXI WLAN: M6f PBL_WLAN_BOOT_CFG [0x1e22b34] <value>
+FUXI WLAN: M6f KIWI_PBL_BOOTSTRAP_STATUS [0x1a10008] <value>
+FUXI WLAN: M6f PCIE_BHI_ERRDBG2 [0x1e0e238] <value>
+FUXI WLAN: M6f PCIE_BHI_ERRDBG3 [0x1e0e23c] <value>
+FUXI WLAN: M6f PBL log [<one of ten fixed addresses>] <value>
+FUXI WLAN: M6f SBL log skipped invalid SRAM tuple <start>/<size> (runtime DBG <start>/<size>)
+```
+
+The existing M6e transport samples still print twice. Boot-log lines appear
+only on a failed/unusable BHI result; a successful BHI goes on to bounded
+READY/SBL/BHIe/M0 steps. Failure still prints the existing containment/undo
+lines, including buffer retention if containment fails.
+
+M6f native kernel compilation, native-Mac and Linux ASan/UBSan suites, and both
+Mac-packed artifact variants passed. Full image SHA-256:
+`dbc931785517a3f9831bac1a2e83d03e341727540550ee29caf8c544bd0ced1b`.
+Stop-at-22 SHA-256:
+`576c77855ef7708955bc154e06cd5858e55d838f68d8cb9db23eb52dbfb602e2`.
+These are build/host results only; no M6f phone test was performed.
