@@ -21,6 +21,30 @@ pub struct Constant {index:u32,ty:u32,size:u32,bytes:[u8;16],name:[u8;128]}
 #[repr(C)]
 #[derive(Clone,Copy,Debug,Default)]
 pub struct Attribute {format:u32,offset:u32,buffer:u32}
+// Same public-ordinal profile as VertexProfile.hpp. Exact byte widths, including
+// three-component formats; RGB9E5 is not a Turnip vertex-buffer format.
+fn vertex_format_bytes(format:u32)->u32 {
+    match format {
+        1..=12=>[2,3,4][((format-1)%3) as usize],
+        13..=27=>[4,6,8][((format-13)%3) as usize],
+        28..=39=>[4,8,12,16][((format-28)%4) as usize],
+        40..=42|54=>4,45..=48=>1,49..=53=>2,_=>0,
+    }
+}
+fn validate_vertex_descriptor(options:&CompileOptions)->Result<(),String> {
+    for (i,a) in options.attributes.iter().enumerate().filter(|(_,a)|a.format!=0) {
+        let size=vertex_format_bytes(a.format);
+        if size==0 || a.buffer>=4 || a.offset>256-size {
+            return Err(format!("vertex attribute[{i}] format={} bufferIndex={} offset={} outside bounded profile",a.format,a.buffer,a.offset));
+        }
+        let stride=options.strides[a.buffer as usize];
+        if stride==0 || stride>256 {return Err(format!("vertex layout[{}] stride={stride} outside 1..256",a.buffer));}
+    }
+    if let Some((i,stride))=options.strides.iter().enumerate().find(|(_,s)|**s>256) {
+        return Err(format!("vertex layout[{i}] stride={stride} outside 0..256"));
+    }
+    Ok(())
+}
 #[repr(C)]
 #[derive(Clone,Copy,Debug)]
 pub struct CompileOptions {format:u32,blend:u32,src_rgb:u32,dst_rgb:u32,rgb_op:u32,src_alpha:u32,dst_alpha:u32,alpha_op:u32,mask:u32,strip:u32,
@@ -149,6 +173,7 @@ unsafe fn name<'a>(p:*const c_char)->Result<&'a str,String> {
     attempt(err,cap,|| {
         if v.is_null() || f.is_null() || gipa.is_null() || out.is_null(){return Err("nil compile argument".into());}
         if options.is_null(){return Err("nil compile options".into());}let options=&*options;
+        validate_vertex_descriptor(options)?;
         if options.format==81 || options.format==1{return Err("M7 sRGB/A8 attachment deferred".into());}
         let entry=ash::Entry::from_static_fn(ash::StaticFn{get_instance_proc_addr:std::mem::transmute(gipa)});
         let inst=ash::Instance::load(entry.static_fn(),vk::Instance::from_raw(instance));
@@ -195,7 +220,6 @@ unsafe fn name<'a>(p:*const c_char)->Result<&'a str,String> {
         descriptor.color_attachments[0]=Some(color);
         let mut vd=metal2vulkan::pipeline::VertexDescriptor::new();
         for (i,a) in options.attributes.iter().enumerate().filter(|(_,a)|a.format!=0) {
-            if a.buffer>=4 || !matches!(a.format,9|29|31) || options.strides[a.buffer as usize]==0 || options.strides[a.buffer as usize]>256 {return Err("bounded vertex descriptor".into());}
             vd.attributes.insert(i as u32,metal2vulkan::pipeline::VertexAttributeDescriptor::new(metal2vulkan::metal::VertexFormat::try_from(a.format).map_err(|e|e.to_string())?,a.offset,a.buffer));
             vd.layouts.insert(a.buffer,metal2vulkan::pipeline::VertexBufferLayoutDescriptor::new(Some(options.strides[a.buffer as usize])));
         }
@@ -215,6 +239,33 @@ unsafe fn name<'a>(p:*const c_char)->Result<&'a str,String> {
 mod tests {
     use super::*;
     use metal2vulkan::pipeline::SlotRef;
+    #[test]
+    fn vertex_profile_exact_widths_and_bounds() {
+        use metal2vulkan::metal::{VertexFormat,vertex::vk_vertex_format};
+        let mut options:CompileOptions=unsafe{std::mem::zeroed()};
+        for format in 0..256 {
+            let size=vertex_format_bytes(format);
+            assert_eq!(size!=0,(1..=42).contains(&format) || (45..=54).contains(&format));
+            options.attributes[7]=Attribute{format,offset:0,buffer:3};options.strides[3]=256;
+            if size==0 {
+                if format!=0 {assert!(validate_vertex_descriptor(&options).is_err());}
+                continue;
+            }
+            // Cross-check our widths against the pinned translator's Vulkan
+            // mapping, rather than trusting the C++/Rust tables agree.
+            let mapped=vk_vertex_format(VertexFormat::try_from(format).unwrap()).unwrap();
+            assert_eq!(mapped.block().unwrap().size,size);
+            options.attributes[7].offset=256-size;assert!(validate_vertex_descriptor(&options).is_ok());
+            options.attributes[7].offset+=1;assert!(validate_vertex_descriptor(&options).is_err());
+            options.attributes[7].offset=0;options.attributes[7].buffer=4;
+            assert!(validate_vertex_descriptor(&options).is_err());
+        }
+        options.attributes[7]=Attribute{format:27,offset:8,buffer:1};
+        options.strides[1]=16;assert!(validate_vertex_descriptor(&options).is_ok());
+        options.strides[1]=0;assert!(validate_vertex_descriptor(&options).unwrap_err().contains("layout[1]"));
+        options.strides[1]=257;assert!(validate_vertex_descriptor(&options).is_err());
+        options.strides[1]=16;options.strides[2]=257;assert!(validate_vertex_descriptor(&options).is_err());
+    }
     #[test]
     fn constant_abi4_layout_and_vectors() {
         assert_eq!(fuxi_m2v_abi(),4);
@@ -300,7 +351,7 @@ fn make_product(device:Device,descriptor:RenderPipelineDescriptor,options:&Compi
         let mut bindings=Vec::new();let mut attributes=Vec::new();
         for b in &pipeline.vertex_input.bindings {
             let stride=match b.stride {metal2vulkan::pipeline::VertexStride::Static(s)=>s,_=>return Err("dynamic stride".into())};
-            if b.buffer_index>=4 || b.divisor!=1 || b.input_rate.as_raw()!=0{return Err("vertex step".into());}
+            if b.buffer_index>=4 || b.divisor!=1 || b.input_rate.as_raw()!=0{return Err(format!("vertex binding[{}] slot={} stride={} inputRate={} divisor={}: ABI4 requires per-vertex rate 1",b.binding,b.buffer_index,stride,b.input_rate.as_raw(),b.divisor));}
             bindings.push(VertexBinding{binding:b.binding,slot:b.buffer_index,stride});
         }
         for a in &pipeline.vertex_input.attributes {attributes.push(VertexAttribute{location:a.location,binding:a.binding,format:a.format.as_raw() as u32,offset:a.offset});}

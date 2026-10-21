@@ -5,13 +5,14 @@
 #include "Frontend.mm"
 #include "IOS16Defaults.hpp"
 #include <cassert>
+#include "VertexFrontendTests.hpp"
 @interface FuxiDefaultsTestBase : NSObject {uint8_t bytes[520];}
 @end
 @implementation FuxiDefaultsTestBase
 @end
 static void rejects(MTLRenderPipelineDescriptor *d,id device,NSString *field,void (^change)(MTLRenderPipelineDescriptor *)) {
  MTLRenderPipelineDescriptor *copy=[[d copy] autorelease];change(copy);NSString *actual=pipelineRejection(copy,device);
- assert([actual isEqualToString:field]);
+ assert([field hasPrefix:@"vertexDescriptor "]?[actual hasPrefix:field]:[actual isEqualToString:field]);
 }
 int main(int argc,char **argv) {assert(argc==2);@autoreleasepool {
  Class cls=makeDeviceClass([FuxiDefaultsTestBase class]);assert(cls);
@@ -31,6 +32,7 @@ int main(int argc,char **argv) {assert(argc==2);@autoreleasepool {
  assert(!pipelineRejection(d,device));
  assert(![device newRenderPipelineStateWithDescriptor:d error:&error]);
  assert([error.localizedDescription isEqualToString:@"M4 CPU model has no translation"]); // Reached backend.
+ checkVertexDescriptors(device,v,f);
  rejects(d,device,@"vertexFunction.stage",^(MTLRenderPipelineDescriptor *x){x.vertexFunction=(id)f;});
  rejects(d,device,@"fragmentFunction.stage",^(MTLRenderPipelineDescriptor *x){x.fragmentFunction=(id)v;});
  rejects(d,device,@"vertexFunction.class",^(MTLRenderPipelineDescriptor *x){x.vertexFunction=nil;});

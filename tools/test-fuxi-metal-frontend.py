@@ -18,6 +18,10 @@ def main():
                         '-fsanitize=address,undefined','-pthread',
                         str(ROOT/'tools/fuxi-metal/ConstantHooksTests.cpp'),'-o',str(d/'constant-hooks')],check=True)
         subprocess.run([str(d/'constant-hooks')],check=True,timeout=15)
+        subprocess.run([*compiler,'-std=c++17','-Wall','-Wextra','-Werror',
+                        '-fsanitize=address,undefined',str(ROOT/'tools/fuxi-metal/VertexProfileTests.cpp'),
+                        '-o',str(d/'vertex-profile')],check=True)
+        subprocess.run([str(d/'vertex-profile')],check=True,timeout=15)
         if os.uname().sysname!='Darwin':
             print('SKIP: native Objective-C frontend/smoke tests require Mac Foundation/Metal')
             return

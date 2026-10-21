@@ -11,6 +11,7 @@
 #include <vector>
 #include "Translator.hpp"
 #include "PipelineCache.hpp"
+#include "VertexProfile.hpp"
 #include "../../xnu/fuxi-adreno/NativeAdrenoABI.h"
 static_assert(NativeAdrenoAbiVersion==2,"FuxiMetal HostImport requires NativeAdreno ABI 2");
 #ifndef FUXI_MTL_ICD
@@ -318,7 +319,10 @@ public:
    std::vector<VkVertexInputBindingDescription> vbindings;std::vector<VkVertexInputAttributeDescription> vattrs;
    if(translated.bindingCount>4 || translated.attributeCount>8)throw std::runtime_error("vertex input bounds");
    for(unsigned i=0;i<translated.bindingCount;++i){auto b=translated.bindings[i];vbindings.push_back({b.binding,b.stride,VK_VERTEX_INPUT_RATE_VERTEX});}
-   for(unsigned i=0;i<translated.attributeCount;++i){auto a=translated.attributes[i];vattrs.push_back({a.location,a.binding,(VkFormat)a.format,a.offset});}
+   for(unsigned i=0;i<translated.attributeCount;++i){auto a=translated.attributes[i];
+    VkFormatProperties support{};GetPhysicalDeviceFormatProperties(physical,(VkFormat)a.format,&support);
+    if(!(support.bufferFeatures&VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT))throw std::runtime_error("vertex attribute["+std::to_string(a.location)+"] Vulkan format="+std::to_string(a.format)+" lacks VERTEX_BUFFER");
+    vattrs.push_back({a.location,a.binding,(VkFormat)a.format,a.offset});}
    vertex.vertexBindingDescriptionCount=vbindings.size();vertex.pVertexBindingDescriptions=vbindings.data();vertex.vertexAttributeDescriptionCount=vattrs.size();vertex.pVertexAttributeDescriptions=vattrs.data();
    VkPipelineInputAssemblyStateCreateInfo assembly{};assembly.sType=VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;assembly.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
    // Metal's viewport has a top-left origin. Vulkan 1.2 supports negative height.
@@ -384,8 +388,8 @@ public:
     if(op.indices){last=0;for(unsigned i=0;i<op.vertices;++i){uint16_t index;memcpy(&index,(uint8_t *)op.indices->contents+op.indexOffset+2*i,2);if(op.strip && index==65535)continue;last=std::max(last,uint32_t(index));}}
     for(auto &a:op.pipeline->options.attributes)if(a.format){auto slot=a.buffer;
      if(slot>=4 || !op.buffers[0][slot].buffer)throw std::runtime_error("unbound vertex buffer");
-     auto bound=op.buffers[0][slot];uint64_t end=bound.offset+uint64_t(last)*op.pipeline->options.strides[slot]+a.offset+(a.format==9?4:a.format==29?8:16);
-     if(end>bound.buffer->length)throw std::runtime_error("vertex fetch bounds");
+     auto bound=op.buffers[0][slot];
+     if(!vertexFetchFits(bound.buffer->length,bound.offset,last,op.pipeline->options.strides[slot],a.offset,a.format))throw std::runtime_error("vertex fetch bounds");
     }
     // CPU index bounds are valid only for quiescent host input. A preceding GPU
     // write in this command needs readback before its values can be checked.

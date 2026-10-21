@@ -127,6 +127,31 @@ int main(int argc,char **argv){try {
  draw=base;draw.pipeline=floatPipeline;draw.strip=0;draw.vertices=6;draw.buffers[0][0]={floatBuffer,0,false};b.submit({draw,read});
  for(unsigned y=0;y<256;++y)for(unsigned x=0;x<256;++x){uint8_t want[4];fuxiM7Texel(0,x,y,want);require(!memcmp((uint8_t *)readback->contents+256+4*(y*256+x),want,4),"float4 attribute");}
  b.destroy(floatPipeline);b.destroy(floatBuffer);puts("PASS: Float4 vertex color fetch");
+ // M9d: exact-width half coordinates plus a separate tightly sized color
+ // binding. Red exposes BGRA swizzles and normalization/packed conversion.
+ const uint16_t halfCoordinates[4][4]={{0xbc00,0x3c00,0,0},{0x3c00,0x3c00,0x3c00,0},
+  {0xbc00,0xbc00,0,0x3c00},{0x3c00,0xbc00,0x3c00,0x3c00}};
+ auto *coordinates=b.allocate(sizeof(halfCoordinates));memcpy(coordinates->contents,halfCoordinates,sizeof(halfCoordinates));
+ for(uint32_t format:{27u,30u,21u,42u,40u,41u,54u}) {
+  uint8_t color[16]{};uint32_t word=0;
+  if(format==27){const uint16_t rgba[4]={0x3c00,0,0,0x3c00};memcpy(color,rgba,8);}
+  else if(format==30){const float rgb[3]={1,0,0};memcpy(color,rgb,12);}
+  else if(format==21){const uint16_t rgba[4]={65535,0,0,65535};memcpy(color,rgba,8);}
+  else if(format==42){color[2]=255;color[3]=255;}
+  else {word=format==40?0x400001ffu:format==41?0xc00003ffu:0x3c0u;memcpy(color,&word,4);}
+  uint32_t size=fuxi::vertexFormatInfo(format).bytes;auto *colors=b.allocate(4*size);
+  for(unsigned i=0;i<4;++i)memcpy((uint8_t *)colors->contents+i*size,color,size);
+  auto widened=unblended;widened.attributes[0]={25,0,0};widened.attributes[1]={25,4,0};
+  widened.attributes[2]={format,0,1};widened.strides[0]=8;widened.strides[1]=size;
+  auto *pipeline=b.compilePipeline(lib,"fuxi_layer_vertex",lib,"fuxi_layer_fragment",widened);
+  draw=base;draw.pipeline=pipeline;draw.buffers[0][0]={coordinates,0,false};draw.buffers[0][1]={colors,0,false};
+  b.submit({draw,read});
+  for(unsigned y=0;y<256;++y)for(unsigned x=0;x<256;++x){uint8_t want[4];fuxiM7Texel(0,x,y,want);want[0]=want[1]=0;
+   require(!memcmp((uint8_t *)readback->contents+256+4*(y*256+x),want,4),"M9d half/multiple-buffer vertex pixels");}
+  auto shortDraw=draw;shortDraw.buffers[0][1].offset=1;refused({shortDraw});
+  b.destroy(pipeline);b.destroy(colors);
+ }
+ b.destroy(coordinates);puts("PASS: Half2 + Half4/Float3/UShort4Normalized/BGRA/packed vertex fetch, independent bindings and exact buffer bounds");
  for(auto *buffer:{vertices,indices,readback,full,half})b.destroy(buffer);b.destroy(sam);for(unsigned i=0;i<3;++i){b.destroy(t[i]);free(pages[i]);}b.destroy(p);b.destroy(cached);tr.close(lib);
  puts("PASS: M7 AIR control source-over, float2/uchar4norm vertices with offset16, uint16 indices offset4, strips, function constant, inline uniform, two passes/load/scissor, 65536 exact pixels + same-memory + sentinels + refusals");
  }catch(const std::exception &e){fprintf(stderr,"FAIL: %s\n",e.what());return 1;}}

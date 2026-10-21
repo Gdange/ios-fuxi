@@ -8,6 +8,7 @@ static int testFunctionLookup(void *,const char *,char *,size_t);
 #include <cassert>
 #include "LabelFrontendTests.hpp"
 #include "IOS16Defaults.hpp"
+#include "VertexFrontendTests.hpp"
 // Only the dynamic translator boundary is modeled; actual Objective-C lookup,
 // NSError propagation and specialization wrappers are exercised below.
 static int testFunctionLookup(void *,const char *name,char *why,size_t size) {
@@ -29,6 +30,13 @@ int main() {@autoreleasepool {
  FuxiOwner *state=[FuxiOwner new];state->backend=new fuxi::Backend;state->registry=123;
  id device=[cls alloc];objc_setAssociatedObject(device,&ownerKey,state,OBJC_ASSOCIATION_RETAIN_NONATOMIC);[state release];
  id<MTLCommandQueue>queue=[device newCommandQueue];
+ {
+  FuxiLibrary *library=[FuxiLibrary new];library->_device=[device retain];
+  FuxiFunction *vertex=[FuxiFunction new],*fragment=[FuxiFunction new];
+  vertex->_library=[library retain];vertex->_name=[@"fixture_vertex" copy];vertex->_stage=1;
+  fragment->_library=[library retain];fragment->_name=[@"fixture_fragment" copy];fragment->_stage=2;
+  checkVertexDescriptors(device,vertex,fragment);[vertex release];[fragment release];[library release];
+ }
  { // A modeled missing entry exercises real nil/error wrappers exactly once.
   FuxiLibrary *library=[FuxiLibrary new];library->_device=[device retain];checkLabel(library);
   NSError *lookupError=nil;uint64_t failures=fuxi_metal_failure_count();
@@ -81,8 +89,19 @@ int main() {@autoreleasepool {
  refuses(c,^{[r setRenderPipelineState:(id)t];});[r setRenderPipelineState:(id)p];
  refuses(c,^{[r drawPrimitives:MTLPrimitiveTypeLine vertexStart:0 vertexCount:3];});
  refuses(c,^{[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:65535 vertexCount:3];});
+ [r setFrontFacingWinding:MTLWindingClockwise];[r setCullMode:MTLCullModeNone];[r setTriangleFillMode:MTLTriangleFillModeFill];
+ [r setDepthBias:0 slopeScale:1 clamp:0];[r setBlendColorRed:0 green:0 blue:0 alpha:0];
+ [r setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];assert(!c->_rejected);
+ refuses(c,^{[r setFrontFacingWinding:MTLWindingCounterClockwise];});
+ refuses(c,^{[r setCullMode:MTLCullModeBack];});
+ refuses(c,^{[r setTriangleFillMode:MTLTriangleFillModeLines];});
+ refuses(c,^{[r setDepthBias:1 slopeScale:1 clamp:0];});
+ refuses(c,^{[r setDepthBias:0 slopeScale:NAN clamp:0];});
+ refuses(c,^{[r setBlendColorRed:NAN green:0 blue:0 alpha:0];});
+ refuses(c,^{[r setVisibilityResultMode:MTLVisibilityResultModeBoolean offset:0];});
+ refuses(c,^{[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3 instanceCount:2];});
 
- [r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+ [r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3 instanceCount:1];
  [r drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
  [r endEncoding];refuses(c,^{[r endEncoding];});
  checkLabel(r);checkLabel(c);assert(!c->_rejected && !c.error);

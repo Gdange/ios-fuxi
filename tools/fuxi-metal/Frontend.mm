@@ -21,6 +21,7 @@
 #include "ClientGate.hpp"
 #include "Translator.hpp"
 #include "CAState.hpp"
+#include "VertexProfile.hpp"
 #ifndef FUXI_MTL_BACKEND_HEADER
 #define FUXI_MTL_BACKEND_HEADER "Backend.hpp"
 #endif
@@ -145,7 +146,7 @@ static FuxiOwner *owner(id obj) {return (FuxiOwner *)objc_getAssociatedObject(ob
 - (NSUInteger)allocatedSize {CENSUS();return _buffer->allocated;}
 @end
 static id metalError(NSError **error,const char *why) {
- failureLog("FUXI MTL: pipeline/library FAIL %.256s\n",why);
+ failureLog("FUXI MTL: pipeline/library FAIL %.768s\n",why);
  if(error)*error=[NSError errorWithDomain:@"org.fuxi.metal" code:1 userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithUTF8String:why]}];return nil;
 }
 // Track only public calls. Allocation provenance and method-coverage epochs
@@ -341,6 +342,49 @@ static bool stage4Class(const char *scope,const char *field,id object,Class expe
 static void stage4Require(const char *scope,const char *field,uint64_t value,bool accepted) {
  if(!stage4Value(scope,field,value,accepted))invalid([NSString stringWithFormat:@"%s %s",scope,field]);
 }
+static NSString *vertexAttributeText(MTLVertexDescriptor *vd,unsigned index) {
+ auto a=vd.attributes[index];
+ // Invalid buffer indices must never become an indexed SDK access.
+ MTLVertexBufferLayoutDescriptor *l=a.bufferIndex<31?vd.layouts[a.bufferIndex]:nil;
+ return [NSString stringWithFormat:@"attribute[%u] format=%lu(%s) bufferIndex=%lu offset=%lu stride=%lu stepFunction=%lu stepRate=%lu layoutPresent=%u",index,
+  (unsigned long)a.format,fuxi::vertexFormatInfo(a.format).name,(unsigned long)a.bufferIndex,(unsigned long)a.offset,
+  (unsigned long)l.stride,(unsigned long)l.stepFunction,(unsigned long)l.stepRate,l!=nil];
+}
+static NSString *vertexDescriptorText(MTLVertexDescriptor *vd) {
+ // At most 31 public attributes/layouts; only configured entries, including
+ // nondefault unused state, are emitted. No object descriptions or pointers.
+ NSMutableString *text=[NSMutableString stringWithString:@"attributes={"];
+ bool referenced[31]{};bool first=true;
+ if(vd)for(unsigned i=0;i<31;++i){auto a=vd.attributes[i];
+  if(a.format!=MTLVertexFormatInvalid && a.bufferIndex<31)referenced[a.bufferIndex]=true;
+  if(a.format==MTLVertexFormatInvalid && !a.offset && !a.bufferIndex)continue;
+  [text appendFormat:@"%s%@",first?"":";",vertexAttributeText(vd,i)];first=false;
+ }
+ [text appendString:@"} layouts={"];first=true;
+ if(vd)for(unsigned i=0;i<31;++i){auto l=vd.layouts[i];
+  if(!referenced[i] && !l.stride && l.stepFunction==MTLVertexStepFunctionPerVertex && l.stepRate==1)continue;
+  [text appendFormat:@"%s%u:stride=%lu/stepFunction=%lu/stepRate=%lu",first?"":";",i,(unsigned long)l.stride,(unsigned long)l.stepFunction,(unsigned long)l.stepRate];first=false;
+ }
+ [text appendString:@"}"];return text;
+}
+static NSString *vertexDescriptorRejection(MTLVertexDescriptor *vd) {
+ bool referenced[31]{};
+ if(vd)for(unsigned i=0;i<31;++i){auto a=vd.attributes[i];
+  if(a.format==MTLVertexFormatInvalid)continue;
+  if(const char *why=fuxi::vertexAttributeRejection(i,a.format,a.bufferIndex,a.offset))
+   return [NSString stringWithFormat:@"vertexDescriptor %@ reason=%s",vertexAttributeText(vd,i),why];
+  referenced[a.bufferIndex]=true;
+ }
+ if(vd)for(unsigned i=0;i<31;++i){auto l=vd.layouts[i];
+  if(!referenced[i] && !l.stride && l.stepFunction==MTLVertexStepFunctionPerVertex && l.stepRate==1)continue;
+  if(const char *why=fuxi::vertexLayoutRejection(i,l.stride,l.stepFunction,l.stepRate,referenced[i])) {
+   NSString *attribute=@"attribute=none";
+   for(unsigned j=0;j<31;++j)if(vd.attributes[j].format!=MTLVertexFormatInvalid && vd.attributes[j].bufferIndex==i){attribute=vertexAttributeText(vd,j);break;}
+   return [NSString stringWithFormat:@"vertexDescriptor layout[%u] stride=%lu stepFunction=%lu stepRate=%lu %@ reason=%s",i,(unsigned long)l.stride,(unsigned long)l.stepFunction,(unsigned long)l.stepRate,attribute,why];
+  }
+ }
+ return nil;
+}
 static NSString *pipelineRejection(MTLRenderPipelineDescriptor *d,id device) {
  id v=d.vertexFunction,f=d.fragmentFunction;MTLVertexDescriptor *vd=d.vertexDescriptor;
  bool vertex=[v isKindOfClass:[FuxiFunction class]],fragment=[f isKindOfClass:[FuxiFunction class]];
@@ -348,12 +392,13 @@ static NSString *pipelineRejection(MTLRenderPipelineDescriptor *d,id device) {
  auto vl=d.vertexLinkedFunctions,fl=d.fragmentLinkedFunctions;
  char colors[640]{};size_t used=0;
  for(unsigned i=0;i<8;++i) {auto a=d.colorAttachments[i];used+=(size_t)snprintf(colors+used,sizeof(colors)-used,"%s%u:%lu/%u/%lu",i?",":"",i,(unsigned long)a.pixelFormat,a.blendingEnabled,(unsigned long)a.writeMask);}
- fprintf(stderr,"FUXI MTL: pipeline descriptor present=%u vertex=%s/stage%d/device%u fragment=%s/stage%d/device%u vertexDescriptor=%u samples=%lu alphaCoverage=%u alphaOne=%u raster=%u depth=%lu stencil=%lu topology=%lu tessFormat=%lu tessMax=%lu indirect=%u amplification=%lu vertexLinked=%u/%lu/%lu/%lu/%lu fragmentLinked=%u/%lu/%lu/%lu/%lu colors(format/blend/mask)=%s\n",
+ static std::atomic<unsigned> descriptorLogs{0};
+ if(descriptorLogs.fetch_add(1)<64)fprintf(stderr,"FUXI MTL: pipeline descriptor present=%u vertex=%s/stage%d/device%u fragment=%s/stage%d/device%u vertexDescriptor=%u samples=%lu alphaCoverage=%u alphaOne=%u raster=%u depth=%lu stencil=%lu topology=%lu tessFormat=%lu tessMax=%lu indirect=%u amplification=%lu vertexLinked=%u/%lu/%lu/%lu/%lu fragmentLinked=%u/%lu/%lu/%lu/%lu colors(format/blend/mask)=%s %s\n",
   d!=nil,v?object_getClassName(v):"nil",vs,vertex && [v device]==device,f?object_getClassName(f):"nil",fs,fragment && [f device]==device,vd!=nil,
   (unsigned long)d.rasterSampleCount,d.alphaToCoverageEnabled,d.alphaToOneEnabled,d.rasterizationEnabled,(unsigned long)d.depthAttachmentPixelFormat,(unsigned long)d.stencilAttachmentPixelFormat,
   (unsigned long)d.inputPrimitiveTopology,(unsigned long)d.tessellationFactorFormat,(unsigned long)d.maxTessellationFactor,d.supportIndirectCommandBuffers,(unsigned long)d.maxVertexAmplificationCount,
   vl!=nil,(unsigned long)vl.functions.count,(unsigned long)vl.binaryFunctions.count,(unsigned long)vl.privateFunctions.count,(unsigned long)vl.groups.count,
-  fl!=nil,(unsigned long)fl.functions.count,(unsigned long)fl.binaryFunctions.count,(unsigned long)fl.privateFunctions.count,(unsigned long)fl.groups.count,colors);
+  fl!=nil,(unsigned long)fl.functions.count,(unsigned long)fl.binaryFunctions.count,(unsigned long)fl.privateFunctions.count,(unsigned long)fl.groups.count,colors,vertexDescriptorText(vd).UTF8String);
 #define CHECK(field,value,accepted) do {__typeof__(value) actual=(value);if(!stage4Value("pipeline",field,(uint64_t)actual,(accepted)))return [NSString stringWithUTF8String:field];}while(0)
  CHECK("descriptor",d,d!=nil);
  if(!stage4Class("pipeline","vertexFunction.class",v,[FuxiFunction class]))return @"vertexFunction.class";
@@ -364,12 +409,8 @@ static NSString *pipelineRejection(MTLRenderPipelineDescriptor *d,id device) {
  CHECK("fragmentFunction.stage",fs,actual==2);
  // 20H392's getter lazily creates an empty descriptor. Presence alone cannot
  // distinguish the untouched default from an explicitly supplied empty object.
- // Validate configured attributes and per-vertex layouts against our small profile.
- if(vd)for(unsigned i=0;i<31;++i) {
-  auto a=vd.attributes[i];auto l=vd.layouts[i];
-  if(a.format!=MTLVertexFormatInvalid && (i>=8 || (a.format!=MTLVertexFormatFloat2 && a.format!=MTLVertexFormatFloat4 && a.format!=MTLVertexFormatUChar4Normalized) || a.bufferIndex>=4 || a.offset>252))return @"vertexDescriptor attribute";
-  if(l.stride && (i>=4 || l.stride>256 || l.stepFunction!=MTLVertexStepFunctionPerVertex || l.stepRate!=1))return @"vertexDescriptor layout";
- }
+ // ABI 4 transmits exact formats/offsets/buffer slots/strides, per-vertex only.
+ if(NSString *why=vertexDescriptorRejection(vd))return why;
  CHECK("rasterSampleCount",d.rasterSampleCount,actual==1);
  CHECK("alphaToCoverageEnabled",d.alphaToCoverageEnabled,!actual);
  CHECK("alphaToOneEnabled",d.alphaToOneEnabled,!actual);
@@ -521,6 +562,27 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
 - (void)setDepthStencilState:(id)s {@try {CENSUS();[self active];
  if(s && (![s isKindOfClass:[FuxiDepthStencil class]] || [s device]!=[self device]))invalid(@"depth/stencil state device/class");
 } @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
+// CA's update_encoder_state restores these defaults when its dirty bits are
+// set. With our sole color target and restricted blend factors they are inert.
+// Refuse other raster/query state instead of silently accepting a real effect.
+- (void)setFrontFacingWinding:(MTLWinding)w {@try {CENSUS();[self active];
+ stage4Require("raster","winding",w,w==MTLWindingClockwise);
+} @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
+- (void)setCullMode:(MTLCullMode)m {@try {CENSUS();[self active];
+ stage4Require("raster","cullMode",m,m==MTLCullModeNone);
+} @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
+- (void)setTriangleFillMode:(MTLTriangleFillMode)m {@try {CENSUS();[self active];
+ stage4Require("raster","fillMode",m,m==MTLTriangleFillModeFill);
+} @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
+- (void)setDepthBias:(float)bias slopeScale:(float)slope clamp:(float)clamp {@try {CENSUS();[self active];
+ if(bias!=0 || (slope!=0 && slope!=1) || clamp!=0)invalid(@"neutral depth bias only (0,0/1,0)");
+} @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
+- (void)setBlendColorRed:(float)red green:(float)green blue:(float)blue alpha:(float)alpha {@try {CENSUS();[self active];
+ for(float value:{red,green,blue,alpha})if(!std::isfinite(value) || value<0 || value>1)invalid(@"blend color outside 0..1");
+} @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
+- (void)setVisibilityResultMode:(MTLVisibilityResultMode)mode offset:(NSUInteger)offset {@try {CENSUS();[self active];
+ if(mode!=MTLVisibilityResultModeDisabled || offset)invalid(@"visibility queries deferred");
+} @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
 - (id)device {CENSUS();return _command->_queue->_device;}
 - (void)setBytes:(const void *)bytes length:(NSUInteger)n index:(NSUInteger)i stage:(unsigned)stage {
  [self active];if(!bytes || !n || n>4096 || i>=4)invalid(@"inline bytes bound");
@@ -551,6 +613,9 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
  [_command->_resources addObject:_target];[_command->_resources addObject:_pipeline];_lastOp=_command->_ops.size();_command->_ops.push_back(op);_drawn=YES;
 }
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count {@try {CENSUS();[self record:t start:start count:count indices:nil offset:0];} @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
+- (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count instanceCount:(NSUInteger)instances {@try {CENSUS();[self active];
+ stage4Require("draw","instanceCount",instances,instances==1);[self record:t start:start count:count indices:nil offset:0];
+} @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)count indexType:(MTLIndexType)type indexBuffer:(id)b indexBufferOffset:(NSUInteger)offset {@try {CENSUS();if(type!=MTLIndexTypeUInt16 || !b)invalid(@"index type/buffer");[self record:t start:0 count:count indices:b offset:offset];} @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
 - (void)endEncoding {@try {CENSUS();[self active];stage4Require("renderEncoder","drawn",_drawn,_drawn);_command->_ops[_lastOp].store=_store;_ended=YES;_command->_encoding=NO;} @catch(NSException *e) {(void)e;[self rejectSelector:_cmd];}}
 
