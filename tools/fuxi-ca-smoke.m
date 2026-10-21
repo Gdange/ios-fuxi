@@ -176,6 +176,20 @@ int main(int argc,char **argv) {
    printf("FUXI CA: stage %u orientation top-left bad=%u unflipped bad=%u probe(96,60)=%02x%02x%02x%02x probe(96,196)=%02x%02x%02x%02x\n",
     stage,m.bad_pixels,u.bad_pixels,top[2],top[1],top[0],top[3],bottom[2],bottom[1],bottom[0],bottom[3]);
    if(IOSurfaceUnlock(surface,kIOSurfaceLockReadOnly,NULL))fail("consumer unlock");
+   if(!fuxiCAAccept(m)) {
+    // Locate the mismatch: bounding box of bad pixels and a 4x4 grid of GPU/CPU samples in it (ARGB hex).
+    unsigned x0=256,y0=256,x1=0,y1=0;
+    for(unsigned y=0;y<256;++y)for(unsigned x=0;x<256;++x)for(unsigned c=0;c<4;++c) {
+     int d=(int)base[y*row+x*4+c]-(int)reference[(y*256+x)*4+c];
+     if(d>8 || d<-8){if(x<x0)x0=x;if(x>x1)x1=x;if(y<y0)y0=y;if(y>y1)y1=y;break;}
+    }
+    printf("FUXI CA: stage %u bad box x=%u..%u y=%u..%u\n",stage,x0,x1,y0,y1);
+    for(unsigned j=0;x0<=x1 && j<4;++j) {printf("FUXI CA: stage %u row",stage);
+     for(unsigned i=0;i<4;++i) {unsigned x=x0+(x1-x0)*(2*i+1)/8,y=y0+(y1-y0)*(2*j+1)/8;
+      const uint8_t *g=base+y*row+x*4,*c=reference+(y*256+x)*4;
+      printf(" (%u,%u) gpu=%02x%02x%02x%02x cpu=%02x%02x%02x%02x",x,y,g[3],g[2],g[1],g[0],c[3],c[2],c[1],c[0]);}
+     putchar('\n');}
+   }
    if(!fuxiCAAccept(m))fail("pixels=65536 max=%u mean=%.4f bad=%u tol=8/64/256/1",m.max_error,m.mean_error,m.bad_pixels);
    if(failures())fail("frontend_errors=%llu",(unsigned long long)failures());
    printf("FUXI CA: stage %u %s PASS pixels=65536 max=%u mean=%.4f bad=%u gpu_draws=%llu total_draws=%llu\n",stage,names[stage],m.max_error,m.mean_error,m.bad_pixels,(unsigned long long)rendered,(unsigned long long)(draws()-startDraws));
