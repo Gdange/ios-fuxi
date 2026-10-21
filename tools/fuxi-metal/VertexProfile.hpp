@@ -40,7 +40,7 @@ inline const char *vertexAttributeRejection(uint64_t index,uint64_t format,uint6
 inline const char *vertexLayoutRejection(uint64_t index,uint64_t stride,uint64_t step,uint64_t rate,bool referenced) {
  if(index>=4)return "layout index >= 4";
  if(stride>256 || (referenced && !stride))return "stride outside 1..256";
- // ABI 4 carries strides, not step state. Never silently turn instance/constant
+ // ABI 5 carries strides, not step state. Never silently turn instance/constant
  // input into per-vertex input, even when the configured stride is zero.
  if(step!=1)return "stepFunction requires PerVertex (instance/constant deferred)";
  if(rate!=1)return "stepRate requires 1 (vertex attribute divisor deferred)";

@@ -33,6 +33,50 @@ int main(int argc,char **argv){try {
   for(unsigned y=0;y<256;++y)for(unsigned x=0;x<256;++x){uint8_t want[4];fuxiM7Reference(x,y,want);auto got=raw+256+4*(y*256+x);if(memcmp(got,want,4)){fprintf(stderr,"pixel %u,%u got %u,%u,%u,%u want %u,%u,%u,%u\n",x,y,got[0],got[1],got[2],got[3],want[0],want[1],want[2],want[3]);throw std::runtime_error("CPU reference");}}
   require(!memcmp(raw+256,pages[2],262144),"same memory");
  }
+ // Ordered destination reads within one draw AND across draw/pass boundaries.
+ // CI MSL predates this authored entry; test it only when present in the input.
+ if(tr.function(lib,"fuxi_fetch_fragment",error,sizeof(error))) {
+  require(b.supportsOrderedColorAccess(),"authored fetch test requires ordered color access");
+  auto fetchOptions=options;fetchOptions.blend=0;fetchOptions.constantCount[1]=0;
+  auto *fetch=b.compilePipeline(lib,"fuxi_layer_vertex",lib,"fuxi_fetch_fragment",fetchOptions);
+  require(fetch->fetchMask==1 && fetch->orderedColorAccess,"fetch plan not consumed");
+  uint16_t overlapIndices[12];memcpy(overlapIndices,fuxiM7Indices,12);memcpy(overlapIndices+6,fuxiM7Indices,12);
+  auto *overlap=b.allocate(sizeof(overlapIndices));memcpy(overlap->contents,overlapIndices,sizeof(overlapIndices));
+  auto twice=base;twice.pipeline=fetch;twice.indices=overlap;twice.indexOffset=0;twice.vertices=12;
+  twice.buffers[1][1]={};for(float &c:twice.clear)c=0;
+  auto again=twice;again.load=1;
+  b.submit({twice,again,read});
+  const uint8_t want[]={30,60,120,120};
+  for(unsigned i=0;i<65536;++i)require(!memcmp((uint8_t *)readback->contents+256+4*i,want,4),"ordered fetch within/across draw pixels");
+  require(!memcmp((uint8_t *)readback->contents+256,pages[2],262144),"fetch CPU ownership/same memory");
+  auto undefined=twice;undefined.load=0;refused({undefined});
+  // Reuse the translation and driver caches with the same ordered contract.
+  auto *fetchCached=b.compilePipeline(lib,"fuxi_layer_vertex",lib,"fuxi_fetch_fragment",fetchOptions);
+  twice.pipeline=again.pipeline=fetchCached;b.submit({twice,again,read});
+  for(unsigned i=0;i<65536;++i)require(!memcmp((uint8_t *)readback->contents+256+4*i,want,4),"cached fetch pixels");
+  b.destroy(fetchCached);b.destroy(fetch);b.destroy(overlap);
+  puts("PASS: ordered framebuffer fetch plan, overlapping fragments within one draw/across passes, cache, 65536 exact BGRA pixels and same-memory ownership");
+ }
+ // Clear-only, load-only, DontCare store, and a smaller private image.
+ auto *small=b.allocateTexture(80,5,32,24);auto *smallRead=b.allocate(32*24*4);
+ fuxi::Operation clear{};clear.texture=small;clear.clearOnly=true;clear.clear[0]=1;clear.clear[3]=1;
+ fuxi::Operation getSmall{};getSmall.texture=small;getSmall.dst=smallRead;b.submit({clear,getSmall});
+ for(unsigned i=0;i<32*24;++i){const uint8_t red[]={0,0,255,255};require(!memcmp((uint8_t *)smallRead->contents+4*i,red,4),"small clear-only pixels");}
+ clear.load=1;b.submit({clear,getSmall});
+ auto *padded=b.allocate(256);memset(padded->contents,0x39,256);
+ // Four 8-pixel rows with 16-byte padding, copied to an interior rectangle.
+ for(unsigned y=0;y<4;++y)for(unsigned x=0;x<8;++x){const uint8_t green[]={0,255,0,255};memcpy((uint8_t *)padded->contents+16+y*48+x*4,green,4);}
+ fuxi::Operation uploadPatch{};uploadPatch.texture=small;uploadPatch.src=padded;uploadPatch.upload=true;uploadPatch.from=16;uploadPatch.dstX=3;uploadPatch.dstY=5;uploadPatch.width=8;uploadPatch.height=4;uploadPatch.rowBytes=48;
+ b.submit({uploadPatch,getSmall});
+ for(unsigned y=0;y<24;++y)for(unsigned x=0;x<32;++x){const uint8_t red[]={0,0,255,255},green[]={0,255,0,255};require(!memcmp((uint8_t *)smallRead->contents+4*(y*32+x),(x>=3 && x<11 && y>=5 && y<9)?green:red,4),"partial upload pixels");}
+ memset(padded->contents,0x39,256);fuxi::Operation getPatch{};getPatch.texture=small;getPatch.dst=padded;getPatch.to=16;getPatch.srcX=3;getPatch.srcY=5;getPatch.width=8;getPatch.height=4;getPatch.rowBytes=48;b.submit({getPatch});
+ for(unsigned i=0;i<256;++i){bool pixel=i>=16 && i<16+3*48+32 && (i-16)%48<32;require(((uint8_t *)padded->contents)[i]==(pixel?((i-16)%4==1 || (i-16)%4==3?255:0):0x39),"partial readback/padding pixels");}
+ auto *smallCopy=b.allocateTexture(80,5,16,12);fuxi::Operation patchCopy{};patchCopy.texture=smallCopy;patchCopy.sourceTexture=small;patchCopy.srcX=3;patchCopy.srcY=5;patchCopy.dstX=2;patchCopy.dstY=3;patchCopy.width=8;patchCopy.height=4;
+ fuxi::Operation getCopy{};getCopy.texture=smallCopy;getCopy.dst=smallRead;b.submit({patchCopy,getCopy});
+ for(unsigned y=0;y<12;++y)for(unsigned x=0;x<16;++x){const uint8_t zero[]={0,0,0,0},green[]={0,255,0,255};require(!memcmp((uint8_t *)smallRead->contents+4*(y*16+x),(x>=2 && x<10 && y>=3 && y<7)?green:zero,4),"partial image copy/initialization pixels");}
+ b.destroy(smallCopy);b.destroy(padded);clear.store=0;b.submit({clear});
+ try{b.submit({getSmall});throw std::logic_error("read discarded empty pass accepted");}catch(const std::runtime_error&){}
+ b.destroy(smallRead);b.destroy(small);
  // DontCare store makes later load/read fail, with all state restored.
  bad=base;bad.store=0;refused({bad,read});
  bad=base;bad.load=0;refused({bad,read}); // Conservatively undefined after DontCare load.

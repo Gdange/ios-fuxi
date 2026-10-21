@@ -2,6 +2,7 @@
 #define VK_NO_PROTOTYPES
 #include "fuxi-metal/PipelineCache.hpp"
 #include "fuxi-metal/CAState.hpp"
+#include "fuxi-metal/FramebufferFetch.hpp"
 #include <cassert>
 #include <cstdio>
 #include <limits>
@@ -20,6 +21,10 @@ static VkResult VKAPI_CALL size(VkDevice,VkPipelineCache c,size_t *n,void *bytes
  assert(live.count(c) && !bytes);*n=blobSize;return failSize?VK_ERROR_DEVICE_LOST:VK_SUCCESS;
 }
 int main() {
+ assert(fuxi::validFetchContract(false,0,0) && fuxi::validFetchContract(true,1,0) && fuxi::validFetchContract(true,1,1));
+ assert(!fuxi::validFetchContract(false,0,1) && !fuxi::validFetchContract(false,1,1));
+ assert(!fuxi::validFetchContract(true,0,1) && !fuxi::validFetchContract(true,1,2));
+ assert(!fuxi::validFetchContract(true,2,1) && !fuxi::validFetchContract(true,1,UINT32_MAX));
  assert(fuxi::bindingRange(0,4) && fuxi::bindingRange(4,0));
  assert(!fuxi::bindingRange(4,1) && !fuxi::bindingRange(std::numeric_limits<size_t>::max(),2));
  assert(fuxi::bindingOffset(true,false,128,127));

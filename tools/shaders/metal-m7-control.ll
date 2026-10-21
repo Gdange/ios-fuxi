@@ -31,7 +31,7 @@ declare {<4 x float>,i8} @air.sample_texture_2d.v4f32(ptr addrspace(1),ptr addrs
 !air.version = !{!0}
 !air.language_version = !{!1}
 !air.vertex = !{!2}
-!air.fragment = !{!10,!30}
+!air.fragment = !{!10,!30,!40}
 !air.function_constants = !{!21}
 !0 = !{i32 2,i32 4,i32 0}
 !1 = !{!"Metal",i32 2,i32 4,i32 0}
@@ -82,3 +82,14 @@ define <4 x float> @fuxi_four_fragment(<2 x float> %uv,ptr addrspace(1) %a,ptr a
 !37 = !{i32 6,!"air.sampler",!"air.location_index",i32 1,i32 1,!"air.arg_type_name",!"sampler"}
 !38 = !{i32 7,!"air.sampler",!"air.location_index",i32 2,i32 1,!"air.arg_type_name",!"sampler"}
 !39 = !{i32 8,!"air.sampler",!"air.location_index",i32 3,i32 1,!"air.arg_type_name",!"sampler"}
+
+; M9e original programmable source-over: destination is a color input, never a
+; sampled snapshot. Duplicate overlapping quads in ONE draw must see each other.
+define <4 x float> @fuxi_fetch_fragment(<4 x float> %destination) {
+ %attenuated = fmul <4 x float> %destination,<float 0.5,float 0.5,float 0.5,float 0.5>
+ %result = fadd <4 x float> %attenuated,<float 0.25,float 0.125,float 0.0625,float 0.25>
+ ret <4 x float> %result
+}
+!40 = !{ptr @fuxi_fetch_fragment,!11,!41}
+!41 = !{!42}
+!42 = !{i32 0,!"air.render_target",i32 0,!"air.arg_type_name",!"float4"}

@@ -8,7 +8,7 @@
 #include <iterator>
 #include <vector>
 static_assert(sizeof(fuxi::Constant)==156 && offsetof(fuxi::CompileOptions,constants)==160);
-static_assert(sizeof(fuxi::CompileOptions)==40096);
+static_assert(sizeof(fuxi::CompileOptions)==40100);
 int main(int argc,char **argv) {
  assert(argc==3);
  for(auto base:{3u,16u,29u,33u,37u,41u,45u,49u,53u}) {
@@ -67,5 +67,5 @@ int main(int argc,char **argv) {
  }
  tr.close(library);
  auto destroy=(PFN_vkDestroyInstance)gipa(instance,"vkDestroyInstance");destroy(instance,nullptr);dlclose(icd);
- puts("PASS: ABI4 58 named/indexed bool/uchar/uchar3 constants, linked specialization, cache hit/change, overflow/type/size refusal; no GPU submits");
+ puts("PASS: ABI5 58 named/indexed bool/uchar/uchar3 constants, linked specialization, cache hit/change, overflow/type/size refusal; no GPU submits");
 }

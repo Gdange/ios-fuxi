@@ -1,9 +1,9 @@
 // Original Fuxi adapter, compiled only into the separate external LGPL library.
-// No translator code is copied here. ABI v4: synchronous, owned handles, bounded input.
+// No translator code is copied here. ABI v5: synchronous, owned handles, bounded input.
 use std::{ffi::{c_char,c_void,CStr,CString}, panic::{catch_unwind,AssertUnwindSafe}};
 use std::{collections::VecDeque, sync::{Mutex,OnceLock}};
 use ash::vk::{self,Handle};
-use metal2vulkan::{library::Library, device::{Device,DeviceDescription,DevicePolicy,EnableSet,ApiVersion},
+use metal2vulkan::{library::Library, device::{Device,DeviceDescription,DevicePolicy,EnableSet,ApiVersion,VkFeature,VkExtension},
     pipeline::{RenderPipelineDescriptor,StageSource,FunctionDescriptor,ColorAttachmentDescriptor},
     metal::{PixelFormat,TextureType,SamplerMinMagFilter,sampler::OpaqueBlackBorder},
     pipeline::{Stage,SlotClass,RuntimeDependency,RuntimeFact,Mechanism},
@@ -48,7 +48,7 @@ fn validate_vertex_descriptor(options:&CompileOptions)->Result<(),String> {
 #[repr(C)]
 #[derive(Clone,Copy,Debug)]
 pub struct CompileOptions {format:u32,blend:u32,src_rgb:u32,dst_rgb:u32,rgb_op:u32,src_alpha:u32,dst_alpha:u32,alpha_op:u32,mask:u32,strip:u32,
- attributes:[Attribute;8],strides:[u32;4],constant_count:[u32;2],constants:[[Constant;128];2]}
+ attributes:[Attribute;8],strides:[u32;4],constant_count:[u32;2],constants:[[Constant;128];2],ordered_color_access:u32}
 #[repr(C)]
 #[derive(Clone,Copy,Debug,Default)]
 pub struct Descriptor {binding:u32,ty:u32,stages:u32,slot:u32,sampler:u32,format:u32,components:[u32;4],offset:u64,range:u64}
@@ -80,7 +80,7 @@ pub struct Range {offset:u32,size:u32,stages:u32}
 pub struct Translation {
  handle:*mut c_void,vertex:*const u32,vertex_count:usize,vertex_entry:*const c_char,fragment:*const u32,fragment_count:usize,fragment_entry:*const c_char,
  push_offset:u32,push_size:u32,push_stages:u32,push_bytes:[u8;128],descriptor_count:u32,descriptors:[Descriptor;16],spec_count:u32,spec_size:u32,specs:[Specialization;32],spec_data:[u8;256],
- binding_count:u32,attribute_count:u32,bindings:[VertexBinding;4],attributes:[VertexAttribute;8],format:u32,blend:u32,mask:u32,factors:[u32;6],range_count:u32,ranges:[Range;2],
+ binding_count:u32,attribute_count:u32,bindings:[VertexBinding;4],attributes:[VertexAttribute;8],format:u32,blend:u32,mask:u32,factors:[u32;6],range_count:u32,ranges:[Range;2],fetch_mask:u32,ordered_color_access:u32,
 }
 #[derive(Clone)]
 struct Product {vertex:Vec<u32>,fragment:Vec<u32>,vname:CString,fname:CString,
@@ -99,12 +99,16 @@ fn sampling_dependency(d:&RuntimeDependency)->bool {
         (RuntimeFact::SamplerCoordinates{slot},Mechanism::Specialization)
         | (RuntimeFact::SamplerReduction{slot},Mechanism::PlanTimeCheck)
         | (RuntimeFact::CubicSampler{slot},Mechanism::Variant) => slot.stage==Stage::Fragment && slot.class==SlotClass::Sampler && slot.index<4,
-        (RuntimeFact::SrgbDeviceDecode{slot},Mechanism::PlanTimeCheck)
+        (RuntimeFact::OutOfBoundsAlpha{slot},Mechanism::Specialization)
+        | (RuntimeFact::SrgbDeviceDecode{slot},Mechanism::PlanTimeCheck)
         | (RuntimeFact::SrgbTexture{slot},Mechanism::Variant)
         | (RuntimeFact::YCbCrTexture{slot},Mechanism::Variant)
         | (RuntimeFact::CrossClassReads{slot},Mechanism::Variant) => slot.stage==Stage::Fragment && slot.class==SlotClass::Texture && slot.index<4,
         _=>false,
     }
+}
+fn fetch_dependency(d:&RuntimeDependency,enabled:u32)->bool {
+ enabled==1 && matches!((d.fact,d.mechanism),(RuntimeFact::FramebufferFetch{color:0},Mechanism::RenderPassContract))
 }
 fn dependency_error(d:&RuntimeDependency)->String {
     // Debug dumps can be much larger than the console's line limit. Keep the
@@ -131,7 +135,7 @@ unsafe fn output(out:*mut Translation,product:Product) {
     *out=Translation{handle:std::ptr::null_mut(),vertex:product.vertex.as_ptr(),vertex_count:product.vertex.len(),vertex_entry:product.vname.as_ptr(),
         fragment:product.fragment.as_ptr(),fragment_count:product.fragment.len(),fragment_entry:product.fname.as_ptr(),
         push_offset:product.push_offset,push_size:product.push_size,push_stages:product.push_stages,push_bytes:product.push_bytes,
-        descriptor_count:product.descriptors.len() as u32,descriptors,spec_count:product.specs.len() as u32,spec_size:product.spec_data.len() as u32,specs,spec_data,binding_count:product.bindings.len() as u32,attribute_count:product.attributes.len() as u32,bindings,attributes,format:product.format,blend:product.blend,mask:product.mask,factors:product.factors,range_count:product.pipeline.layout.push_constants.len() as u32,ranges};
+        descriptor_count:product.descriptors.len() as u32,descriptors,spec_count:product.specs.len() as u32,spec_size:product.spec_data.len() as u32,specs,spec_data,binding_count:product.bindings.len() as u32,attribute_count:product.attributes.len() as u32,bindings,attributes,format:product.format,blend:product.blend,mask:product.mask,factors:product.factors,range_count:product.pipeline.layout.push_constants.len() as u32,ranges,fetch_mask:product.pipeline.graphics.input_attachments.iter().fold(0,|mask,a|mask|(1<<a.color_index)),ordered_color_access:product.options.ordered_color_access};
     (*out).handle=Box::into_raw(product).cast();
 }
 unsafe fn error(dst:*mut c_char,cap:usize,text:&str) {
@@ -150,7 +154,7 @@ unsafe fn name<'a>(p:*const c_char)->Result<&'a str,String> {
     if bytes.is_empty() || bytes.len()>127{return Err("function name length".into());}
     std::str::from_utf8(bytes).map_err(|e|e.to_string())
 }
-#[no_mangle] pub extern "C" fn fuxi_m2v_abi()->u32 {4}
+#[no_mangle] pub extern "C" fn fuxi_m2v_abi()->u32 {5}
 #[no_mangle] pub unsafe extern "C" fn fuxi_m2v_open(p:*const u8,n:usize,err:*mut c_char,cap:usize)->*mut c_void {
     attempt(err,cap,|| {
         if p.is_null() || n==0 || n>4*1024*1024{return Err("library outside 1..4 MiB".into());}
@@ -189,8 +193,14 @@ unsafe fn name<'a>(p:*const c_char)->Result<&'a str,String> {
             eprintln!("FUXI MTL: translation cache HIT");output(out,product);return Ok(1);
         }
         eprintln!("FUXI MTL: translation cache MISS");
+        if options.ordered_color_access>1 {return Err("unknown device enables".into());}
+        let mut enabled=EnableSet::new();
+        if options.ordered_color_access!=0 {
+            enabled.features.insert(VkFeature::RasterizationOrderColorAttachmentAccess);
+            enabled.extensions.insert(VkExtension::ExtRasterizationOrderAttachmentAccess);
+        }
         let desc=DeviceDescription::query(&inst,vk::PhysicalDevice::from_raw(physical),ApiVersion::V1_2)
-            .map_err(|e|e.to_string())?.with_enabled(&EnableSet::new()).map_err(|e|e.to_string())?;
+            .map_err(|e|e.to_string())?.with_enabled(&enabled).map_err(|e|e.to_string())?;
         let device=Device::new(desc,DevicePolicy::default()).map_err(|e|e.to_string())?;
         let mut vertex=FunctionDescriptor::new(vf);
         let mut fragment=FunctionDescriptor::new(ff);
@@ -267,10 +277,10 @@ mod tests {
         options.strides[1]=16;options.strides[2]=257;assert!(validate_vertex_descriptor(&options).is_err());
     }
     #[test]
-    fn constant_abi4_layout_and_vectors() {
-        assert_eq!(fuxi_m2v_abi(),4);
+    fn constant_abi5_layout_and_vectors() {
+        assert_eq!(fuxi_m2v_abi(),5);
         assert_eq!(std::mem::size_of::<Constant>(),156);
-        assert_eq!(std::mem::size_of::<CompileOptions>(),40096);
+        assert_eq!(std::mem::size_of::<CompileOptions>(),40100);
         assert_eq!(std::mem::offset_of!(CompileOptions,constants),160);
         for (base,width) in [(3,4),(16,2),(29,4),(33,4),(37,2),(41,2),(45,1),(49,1),(53,1)] {
             for lane in 0..4 {assert_eq!(constant_payload_size(base+lane),width*(lane+1));}
@@ -283,6 +293,7 @@ mod tests {
         let sampler=SlotRef{stage:Stage::Fragment,class:SlotClass::Sampler,index:0};
         let texture=SlotRef{class:SlotClass::Texture,..sampler};
         let supported=[
+            (RuntimeFact::OutOfBoundsAlpha{slot:texture},Mechanism::Specialization),
             (RuntimeFact::SamplerCoordinates{slot:sampler},Mechanism::Specialization),
             (RuntimeFact::SamplerReduction{slot:sampler},Mechanism::PlanTimeCheck),
             (RuntimeFact::CubicSampler{slot:sampler},Mechanism::Variant),
@@ -303,6 +314,14 @@ mod tests {
         let buffer=SlotRef{stage:Stage::Vertex,class:SlotClass::Buffer,index:3};
         assert!(sampling_dependency(&RuntimeDependency::new(RuntimeFact::BufferRangeLimit{slot:buffer},Mechanism::PlanTimeCheck)));
         assert!(!sampling_dependency(&RuntimeDependency::new(RuntimeFact::BufferRangeLimit{slot:texture},Mechanism::PlanTimeCheck)));
+    }
+    #[test]
+    fn ordered_fetch_dependency_is_exactly_color_zero_and_enabled() {
+        let d=RuntimeDependency::new(RuntimeFact::FramebufferFetch{color:0},Mechanism::RenderPassContract);
+        assert!(fetch_dependency(&d,1));assert!(!fetch_dependency(&d,0));assert!(!fetch_dependency(&d,2));
+        assert!(!fetch_dependency(&RuntimeDependency::new(RuntimeFact::FramebufferFetch{color:1},Mechanism::RenderPassContract),1));
+        assert!(!fetch_dependency(&RuntimeDependency::new(RuntimeFact::FramebufferFetch{color:0},Mechanism::Specialization),1));
+        assert!(!sampling_dependency(&d));
     }
     #[test]
     fn rejection_is_one_short_specific_line() {
@@ -351,12 +370,12 @@ fn make_product(device:Device,descriptor:RenderPipelineDescriptor,options:&Compi
         let mut bindings=Vec::new();let mut attributes=Vec::new();
         for b in &pipeline.vertex_input.bindings {
             let stride=match b.stride {metal2vulkan::pipeline::VertexStride::Static(s)=>s,_=>return Err("dynamic stride".into())};
-            if b.buffer_index>=4 || b.divisor!=1 || b.input_rate.as_raw()!=0{return Err(format!("vertex binding[{}] slot={} stride={} inputRate={} divisor={}: ABI4 requires per-vertex rate 1",b.binding,b.buffer_index,stride,b.input_rate.as_raw(),b.divisor));}
+            if b.buffer_index>=4 || b.divisor!=1 || b.input_rate.as_raw()!=0{return Err(format!("vertex binding[{}] slot={} stride={} inputRate={} divisor={}: ABI5 requires per-vertex rate 1",b.binding,b.buffer_index,stride,b.input_rate.as_raw(),b.divisor));}
             bindings.push(VertexBinding{binding:b.binding,slot:b.buffer_index,stride});
         }
         for a in &pipeline.vertex_input.attributes {attributes.push(VertexAttribute{location:a.location,binding:a.binding,format:a.format.as_raw() as u32,offset:a.offset});}
         for d in &pipeline.dependencies {
-            if !sampling_dependency(d) {return Err(dependency_error(d));}
+            if !sampling_dependency(d) && !fetch_dependency(d,options.ordered_color_access) {return Err(dependency_error(d));}
         }
         let g=&pipeline.graphics;
         let blend=g.color_blend_attachments();
@@ -373,8 +392,12 @@ fn make_product(device:Device,descriptor:RenderPipelineDescriptor,options:&Compi
         reject_graphics!(g.alpha_to_coverage);
         reject_graphics!(g.alpha_to_one);
         reject_graphics!(g.rasterizer_discard);
-        reject_graphics!(!g.input_attachments.is_empty());
-        reject_graphics!(g.rasterization_order_attachment_access);
+        // Consume only the ordered, single-color input-attachment form. Storage
+        // interlock, multisample and other attachment indices remain explicit errors.
+        reject_graphics!(g.input_attachments.len()>1);
+        reject_graphics!(g.input_attachments.iter().any(|a|a.color_index!=0 || a.input_attachment_index!=0));
+        reject_graphics!(!g.input_attachments.is_empty() && (!g.rasterization_order_attachment_access || options.ordered_color_access!=1));
+        reject_graphics!(g.rasterization_order_attachment_access && options.ordered_color_access!=1);
         reject_graphics!(g.declares_layer);
         reject_graphics!(g.tessellation.is_some());
         reject_graphics!(g.fragment_imageblock.is_some());
@@ -395,7 +418,7 @@ fn make_product(device:Device,descriptor:RenderPipelineDescriptor,options:&Compi
         let specs=plan.specialization.entries.iter().map(|e|Specialization{id:e.constant_id,offset:e.offset,size:e.size as u32}).collect();
         let mut descriptors=Vec::new();
         for set in &pipeline.layout.sets {for b in &set.bindings {
-            if b.count!=1 || b.flags.as_raw()!=0 || b.immutable_sampler.is_some() || !matches!(b.ty.as_raw() as u32,1|6|7) || b.stages.as_raw()&!17!=0 {return Err("unsupported descriptor layout".into());}
+            if b.count!=1 || b.flags.as_raw()!=0 || b.immutable_sampler.is_some() || !matches!(b.ty.as_raw() as u32,1|6|7|10) || b.stages.as_raw()&!17!=0 {return Err("unsupported descriptor layout".into());}
             descriptors.push(Descriptor{binding:b.binding,ty:b.ty.as_raw() as u32,stages:b.stages.as_raw(),..Descriptor::default()});
         }}
         let mut push_bytes=[0u8;128];let(mut push_offset,mut push_size,mut push_stages)=(0,0,0);
@@ -441,6 +464,8 @@ fn check_plan(p:&metal2vulkan::bind::BindingPlan,expected:&metal2vulkan::cache::
    let layout=p.descriptors.iter().find(|d|d.binding==w.binding && d.ty==w.ty.as_raw() as u32).ok_or("draw layout mismatch")?;
    if w.set!=0 || w.array_element!=0{return Err("descriptor set/array".into());}let mut d=*layout;
    match &w.source {
+    WriteSource::Attachment{color_index:0} if d.ty==10 && d.stages==16 && p.options.ordered_color_access==1
+        && p.pipeline.graphics.input_attachments.iter().any(|a|a.color_index==0 && a.input_attachment_index==0)=>{d.slot=0;d.format=p.pipeline.graphics.color_attachments[0].as_ref().ok_or("missing fetch target")?.format.as_raw() as u32;},
     WriteSource::Buffer{slot}|WriteSource::InlineBytes{slot}=>{if slot.index>=4 || slot.class!=SlotClass::Buffer || !matches!(slot.stage,Stage::Vertex|Stage::Fragment){return Err("buffer slot".into());}
      let n=if slot.stage==Stage::Vertex{0}else{1};if i.buffers[n][slot.index as usize].length==0{return Err("unbound buffer".into());}
      if d.stages!=if n==0{1}else{16}{return Err("buffer stage".into());}d.slot=slot.index;

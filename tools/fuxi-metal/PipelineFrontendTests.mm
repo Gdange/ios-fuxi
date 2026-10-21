@@ -57,6 +57,8 @@ int main() {@autoreleasepool {
   FuxiFunction *function=[library newFunctionWithName:@"fixture_fragment" constantValues:nil error:&lookupError];
   assert(function && !lookupError && function.functionType==MTLFunctionTypeFragment);
   checkLabel(function);assert(fuxi_metal_failure_count()==failures);
+  MTLFunctionDescriptor *roundtrip=[function functionDescriptor];assert([roundtrip.name isEqualToString:@"fixture_fragment"] && !roundtrip.constantValues && ![function options]);
+  __block bool called=false;[library newFunctionWithName:@"fixture_fragment" constantValues:nil completionHandler:^(id<MTLFunction> f,NSError *e){called=true;assert(f && !e && [f.name isEqualToString:@"fixture_fragment"]);}];assert(called);
   [function release];[library release];
  }
  MTLSamplerDescriptor *sd=[MTLSamplerDescriptor new];id<MTLSamplerState>sampler=[device newSamplerStateWithDescriptor:sd];

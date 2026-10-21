@@ -4,6 +4,7 @@
 Synthetic 528-byte base/root/registry ID and CPU transfers; no iOS discovery or
 GPU execution is qualified by these tests. Production backend tested separately.
 """
+import argparse
 import os
 from pathlib import Path
 import subprocess
@@ -11,23 +12,37 @@ import tempfile
 ROOT=Path(__file__).resolve().parents[1]
 
 def main():
+    ap=argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--compile-only',action='store_true',help='build all applicable tests without running executables')
+    a=ap.parse_args()
     with tempfile.TemporaryDirectory() as tmp:
         d=Path(tmp);conf=d/'smoke.conf'
         compiler=['xcrun','clang++'] if os.uname().sysname=='Darwin' else ['clang++']
         subprocess.run([*compiler,'-std=c++17','-O1','-g','-Wall','-Wextra','-Werror',
                         '-fsanitize=address,undefined','-pthread',
                         str(ROOT/'tools/fuxi-metal/ConstantHooksTests.cpp'),'-o',str(d/'constant-hooks')],check=True)
-        subprocess.run([str(d/'constant-hooks')],check=True,timeout=15)
+        if not a.compile_only:subprocess.run([str(d/'constant-hooks')],check=True,timeout=15)
         subprocess.run([*compiler,'-std=c++17','-Wall','-Wextra','-Werror',
                         '-fsanitize=address,undefined',str(ROOT/'tools/fuxi-metal/VertexProfileTests.cpp'),
                         '-o',str(d/'vertex-profile')],check=True)
-        subprocess.run([str(d/'vertex-profile')],check=True,timeout=15)
+        if not a.compile_only:subprocess.run([str(d/'vertex-profile')],check=True,timeout=15)
+        subprocess.run([*compiler,'-std=c++17','-Wall','-Wextra','-Werror','-pthread',
+                        '-fsanitize=address,undefined',str(ROOT/'tools/fuxi-metal/TimelineTests.cpp'),
+                        '-o',str(d/'timeline')],check=True)
+        if not a.compile_only:subprocess.run([str(d/'timeline')],check=True,timeout=15)
         if os.uname().sysname!='Darwin':
             print('SKIP: native Objective-C frontend/smoke tests require Mac Foundation/Metal')
             return
         flags=['-O1','-g','-Wall','-Wextra','-Werror','-fno-objc-arc','-fblocks','-fsanitize=address,undefined']
         frameworks=['-framework','Foundation','-framework','Metal','-framework','IOSurface']
         def call(command):subprocess.run(command,check=True)
+        if a.compile_only:
+            for name in ['ConstantFrontendTests','FrontendTests','PipelineFrontendTests','CAFrontendTests','GateFrontendTests','CensusTests']:
+                call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal'/(name+'.mm')),*frameworks,'-o',str(d/name)])
+            print('PASS: compile-only frontend tests; no test executables run')
+            return
+        call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/CAFrontendTests.mm'),*frameworks,'-o',str(d/'ca-frontend')])
+        subprocess.run([str(d/'ca-frontend')],env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0'),check=True,timeout=15)
         call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/ConstantFrontendTests.mm'),*frameworks,'-o',str(d/'constant-frontend')])
         constants=subprocess.run([str(d/'constant-frontend')],env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0'),text=True,capture_output=True,check=True,timeout=15)
         failures=[line for line in constants.stderr.splitlines() if 'constants snapshot FAIL' in line]
