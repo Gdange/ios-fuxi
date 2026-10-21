@@ -66,6 +66,7 @@ typedef void *event_t;
 #define WL_PARF 0x1c00000ull
 #define TS_TLMM 0xf100000ull
 static uint32_t wl4_report[64], fw_faults;
+static unsigned wl_icc_acks;
 struct reg { uint64_t pa; uint32_t v; };
 struct ev { char kind; uint64_t pa; uint32_t v; };
 static struct reg regs[4096];
@@ -307,7 +308,7 @@ int main(void) {
     assert(strstr(logbuf,"hash 0x15 entry 0x1000100 BDF 0x100 SIDoff 0x1 NEXT 0 root 0 nonzero 1 mismatch 0"));
     assert(strstr(logbuf,"slots 0..7 enabled 0x80") && strstr(logbuf,"fixture iATU IB7"));
     assert(strstr(logbuf,"OFF 0x3 OFF_no_HWCG 0x2"));
-    assert(strstr(logbuf,"ICC XNU_votes=none Linux pcie-mem init 0/250000 link 0/1000000 kBps cpu-pcie 0/1 kBps Gen2 x2"));
+    assert(strstr(logbuf,"ICC XNU_batches=0 Linux pcie-mem init 0/250000 link 0/1000000 kBps cpu-pcie 0/1 kBps Gen2 x2"));
     for(unsigned i=0;i<256;i++) {
         bool found=false;
         for(unsigned j=0;j<nreads;j++) if(reads[j]==WL_PARF+0x2000+4*i) found=true;

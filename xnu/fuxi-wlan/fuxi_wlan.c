@@ -6,6 +6,8 @@
  *   fuxiwlan=2..28  stop after that step (bisecting a hang or reset)
  *   fuxiwlanoldiova=1  use M6f's IOVA pool, retaining the M6g SMMU profile
  *   fuxiwlanclk=1  add missing PCIe fabric clock votes (default: observe)
+ *   fuxiwlanicc=0  disable M6i BCM votes (default 1 = enabled)
+ *   fuxiwlaniccbw=0..8  optional KIWI CNSS bandwidth row (default 0)
  *   fuxiwlaniboff=1  disable stale inbound iATU windows before BHI (opt-in)
  * Steps 17..28 probe DMA safety and load rootfs firmware through BHI/BHIe.
  * No interrupts, channels or QMI are enabled; see docs-lanes/wlan-bt.md M6.
@@ -216,10 +218,10 @@ ts_gpio(unsigned n, unsigned func, unsigned pull, unsigned ma, int out)
 	    (out >= 0 ? 0x200u : 0u));
 }
 
-/* One write-with-response command in ACTIVE TCS t (RSC v3 layout,
- * rpmh_rsc_reg_offset_ver_3_0); identical to probe.c rh_send. No other XNU
- * code drives the fuxi apps RSC. 0 on proven completion; on timeout the TCS
- * is left quarantined and wlan.c stops at that step. */
+/* ACTIVE TCS transport shared by the existing WLAN regulator votes and M6i.
+ * RSC v3: TCS stride 672, command stride 24 (rpmh-rsc.c). No other XNU
+ * code drives the fuxi apps RSC. Never touch inherited busy TCS state; an
+ * uncertain transaction is quarantined for the session. */
 #define RH_STRIDE 0x2a0u
 #define RH_WAIT   0x20u
 #define RH_CTRL   0x24u
@@ -236,46 +238,267 @@ rh_wr(uint32_t off, uint32_t v)
 	ts_wr(RH_TCS_PA, off, v);
 	__asm__ volatile("dsb osh" ::: "memory");
 }
+struct wl_rh_cmd { uint32_t addr, data, wait; };
+static bool rh_poisoned;
 static uint32_t
-rh_send(unsigned t, uint32_t addr, uint32_t data)
+rh_send_batch(unsigned t, const struct wl_rh_cmd *cmd, unsigned n)
 {
+	/* DRV2 has three ACTIVE TCSs; preserve all sleep/wake/other slots. */
+	if (t >= 3 || !n || n > 16 || rh_poisoned || fw_faults) { return 1; }
 	uint32_t b = t * RH_STRIDE, bit = 1u << t;
-	if (rh_rd(b + RH_IDLE) == 0 || rh_rd(b + RH_CTRL) || rh_rd(b + RH_EN) ||
-	    rh_rd(b + RH_WAIT) || (rh_rd(4) & bit) || fw_faults) {
-		return 1;
-	}
-	uint32_t irq_en = rh_rd(0);
+	uint32_t cfg = usb_rd(RH_DRV_PA, 0xc);
+	if (((usb_rd(RH_DRV_PA, 0) >> 16) & 255) != 3 ||
+	    ((cfg >> 12) & 63) < 3 || ((cfg >> 27) & 31) < n ||
+	    rh_rd(b + RH_IDLE) == 0 || rh_rd(b + RH_CTRL) || rh_rd(b + RH_EN) ||
+	    rh_rd(b + RH_WAIT) || (rh_rd(4) & bit) || fw_faults) { return 1; }
+	uint32_t irq_en = rh_rd(0), wait = 0;
+	if (fw_faults) { return 1; }
+	rh_poisoned = true;
 	rh_wr(0, irq_en & ~bit);
-	rh_wr(b + RH_MSGID, 8u | (1u << 8) | (1u << 16));
-	rh_wr(b + RH_ADDR, addr);
-	rh_wr(b + RH_DATA, data);
-	rh_wr(b + RH_WAIT, 1);
-	rh_wr(b + RH_EN, 1);
+	for (unsigned i = 0; i < n; i++) {
+		uint32_t c = b + i * 24;
+		rh_wr(c + RH_MSGID, 8u | (1u << 16) | (cmd[i].wait ? 1u << 8 : 0));
+		rh_wr(c + RH_ADDR, cmd[i].addr);
+		rh_wr(c + RH_DATA, cmd[i].data);
+		if (cmd[i].wait) { wait |= 1u << i; }
+	}
+	rh_wr(b + RH_WAIT, wait);
+	rh_wr(b + RH_EN, (1u << n) - 1);
+	bool programmed = !(rh_rd(0) & bit) && rh_rd(b + RH_WAIT) == wait && rh_rd(b + RH_EN) == (1u << n) - 1;
+	for (unsigned i = 0; i < n; i++) {
+		uint32_t c = b + i * 24;
+		if (rh_rd(c + RH_ADDR) != cmd[i].addr || rh_rd(c + RH_DATA) != cmd[i].data ||
+		    rh_rd(c + RH_MSGID) != (8u | (1u << 16) | (cmd[i].wait ? 1u << 8 : 0))) { programmed = false; }
+	}
+	if (!programmed || fw_faults) { return 2; }
 	rh_wr(b + RH_CTRL, 0);
 	rh_wr(b + RH_CTRL, 1u << 16);
+	if (rh_rd(b + RH_CTRL) != (1u << 16) || fw_faults) { return 2; }
 	rh_wr(b + RH_CTRL, (1u << 16) | (1u << 24));
-	uint32_t st = 0;
-	for (unsigned us = 0; us < 100000; us++) {
-		st = rh_rd(b + RH_CSTAT);
-		if (rh_rd(b + RH_IDLE) && (st & 0x10100) == 0x10100) {
-			break;
+	bool done = false;
+	for (unsigned us = 0; us < 100000 && !fw_faults; us++) {
+		done = (rh_rd(4) & bit) && rh_rd(b + RH_IDLE) != 0;
+		for (unsigned i = 0; i < n; i++) {
+			uint32_t mask = 0x100u | (cmd[i].wait ? 0x10000u : 0);
+			if ((rh_rd(b + i * 24 + RH_CSTAT) & mask) != mask) { done = false; }
 		}
+		if (done) { break; }
 		fw_delay(1);
 	}
-	if ((st & 0x10100) != 0x10100) {
-		return 2 | (st << 12);
-	}
+	if (!done || fw_faults) { return 2; }
 	rh_wr(b + RH_CTRL, 1u << 16);
 	rh_wr(b + RH_CTRL, 0);
 	rh_wr(b + RH_EN, 0);
 	rh_wr(b + RH_WAIT, 0);
 	rh_wr(8, bit);
 	rh_wr(0, (rh_rd(0) & ~bit) | (irq_en & bit));
+	if (fw_faults || rh_rd(b + RH_CTRL) || rh_rd(b + RH_EN) ||
+	    rh_rd(b + RH_WAIT) || (rh_rd(4) & bit) || !rh_rd(b + RH_IDLE) || fw_faults) { return 3; }
+	rh_poisoned = false;
 	return 0;
+}
+static uint32_t
+rh_send(unsigned t, uint32_t addr, uint32_t data)
+{
+	const struct wl_rh_cmd cmd = {addr, data, 1};
+	return rh_send_batch(t, &cmd, 1);
 }
 
 #define FUXI_WLAN_XNU 1
 #include "wlan.c"
+
+/* ---- milestone 6i: fixed SM8550 PCIe0 ICC clients, ACTIVE session votes ----
+ * Graph, aggregation and packet format: Linux v6.18 sm8550.c, bcm-voter.c,
+ * icc-rpmh.c, cmd-db.c and tcs.h; derivation / CNSS audit: docs/wlan-m6i.md.
+ * No BCM address is MMIO and no address/unit/width/VCD is hardcoded here.
+ * This is the WLAN client's vote only, not an aggregate of other XNU clients.
+ */
+#define WL_ICC_N 6u
+struct wl_bcm {
+	const char *name;
+	uint32_t addr, unit, width, vcd, version, x, y, data;
+};
+static struct wl_bcm wl_bcms[WL_ICC_N] = {
+	{.name = "SN7"}, {.name = "SH1"}, {.name = "SH0"},
+	{.name = "MC0"}, {.name = "ACV"}, {.name = "CN0"}
+};
+static unsigned wl_icc_acks;
+static bool wl_icc_ready, wl_icc_failed, wl_icc_configured;
+static int wl_icc_enabled = 1, wl_icc_bw;
+
+static bool
+wl_cdb_range(uint32_t at, uint32_t n)
+{
+	return at <= WL_CMDDB_BYTES && n <= WL_CMDDB_BYTES - at;
+}
+static uint32_t
+wl_cdb32(uint32_t off)
+{
+	return wl_cdb16(off) | wl_cdb16(off + 2) << 16;
+}
+static int
+wl_bcm_lookup(struct wl_bcm *bcm)
+{
+	/* Same existing reserved-DDR mapping and byte accessors as WLAN rails.
+	 * Header v1, 8 slave headers, 24-byte entries; all offsets relative to
+	 * byte 144. Validate complete extents before fetching entry/aux bytes. */
+	if (fw_faults || wl_cdb32(0) != 1 || wl_cdb32(4) != 0x0c0330db ||
+	    (wl_cdb32(140) & 1)) { return 1; }
+	unsigned matches = 0;
+	for (unsigned h = 8; h < 136; h += 16) {
+		unsigned slave = wl_cdb16(h);
+		if (!slave) { break; }
+		uint32_t at = 144 + wl_cdb16(h + 2), aux = 144 + wl_cdb16(h + 4);
+		unsigned n = wl_cdb16(h + 6);
+		if (slave < 3 || slave > 5 || !wl_cdb_range(at, n * 24) || !wl_cdb_range(aux, 0)) { return 2; }
+		for (unsigned i = 0; i < n; i++) {
+			uint32_t e = at + i * 24;
+			unsigned j = 0;
+			for (; j < 8 && bcm->name[j]; j++) {
+				if (wl_cdb8(e + j) != (uint8_t)bcm->name[j]) { break; }
+			}
+			if (j < 8 && bcm->name[j]) { continue; }
+			/* Compare the entire zero-padded key, not just a prefix. */
+			for (; j < 8 && !wl_cdb8(e + j); j++) { }
+			if (j != 8) { continue; }
+			uint32_t addr = wl_cdb32(e + 16), len = wl_cdb16(e + 20);
+			uint32_t data = aux + wl_cdb16(e + 22);
+			if (slave != 5 || (addr >> 16) != 5 || (addr & 3) || len < 8 ||
+			    !wl_cdb_range(data, len)) { return 3; }
+			bcm->addr = addr; bcm->unit = wl_cdb32(data);
+			bcm->width = wl_cdb16(data + 4); bcm->vcd = wl_cdb8(data + 6);
+			bcm->version = wl_cdb16(h + 8);
+			if (!bcm->unit || !bcm->width || bcm->vcd >= 10) { return 4; }
+			matches++;
+		}
+	}
+	return fw_faults || matches != 1 ? 5 : 0;
+}
+
+/* Linux bcm_div floors except a nonzero value below the divisor becomes 1.
+ * Do not substitute DIV_ROUND_UP: both normalization stages matter. */
+static uint64_t
+wl_bcm_div(uint64_t value, uint32_t divisor)
+{
+	return value && value < divisor ? 1 : value / divisor;
+}
+static uint32_t
+wl_bcm_encode(uint64_t x, uint64_t y, bool commit)
+{
+	uint32_t valid = !!(x || y);
+	if (x > 0x3fff) { x = 0x3fff; }
+	if (y > 0x3fff) { y = 0x3fff; }
+	return (commit ? 1u << 30 : 0) | valid << 29 | (uint32_t)x << 14 | (uint32_t)y;
+}
+static void
+wl_bcm_bandwidth(struct wl_bcm *b, uint32_t avg, uint32_t peak, unsigned buswidth, unsigned channels)
+{
+	uint64_t x = wl_bcm_div((uint64_t)avg * b->width, buswidth * channels);
+	uint64_t y = wl_bcm_div((uint64_t)peak * b->width, buswidth);
+	x = wl_bcm_div(x * 1000, b->unit); y = wl_bcm_div(y * 1000, b->unit);
+	b->x = (uint32_t)MIN(x, 0x3fff); b->y = (uint32_t)MIN(y, 0x3fff);
+}
+static void
+wl_icc_configure(void)
+{
+	if (wl_icc_configured) { return; }
+	wl_icc_configured = true;
+	(void)PE_parse_boot_argn("fuxiwlanicc", &wl_icc_enabled, sizeof(wl_icc_enabled));
+	(void)PE_parse_boot_argn("fuxiwlaniccbw", &wl_icc_bw, sizeof(wl_icc_bw));
+	if ((wl_icc_enabled != 0 && wl_icc_enabled != 1) || wl_icc_bw < 0 || wl_icc_bw > 8) {
+		wl_icc_failed = true;
+	}
+	printf("FUXI WLAN: M6i ICC fuxiwlanicc=%d fuxiwlaniccbw=%d default=1 retained ACTIVE session votes; CNSS download auto-vote=none\n",
+	    wl_icc_enabled, wl_icc_bw);
+}
+static int
+wl_icc_vote(uint32_t peak, bool download)
+{
+	/* KIWI (0x1107), two paths / nine rows, kB/s: path1 PCIe->GEM,
+	 * path2 GEM->EBI. Optional experiment; CNSS2 does not automatically
+	 * select a nonzero row during PBL download in the audited revision. */
+	static const uint32_t cnss[][3] = {
+		{0, 0, 0}, {2250, 1600000, 2188800}, {7500, 1600000, 2188800},
+		{30000, 1600000, 2188800}, {100000, 1600000, 2188800},
+		{175000, 6448000, 6220800}, {312500, 6448000, 8368000},
+		{587500, 8528000, 12800000}, {7500, 3200000, 2188800}
+	};
+	wl_icc_configure();
+	if (wl_icc_failed || fw_faults) { return 1; }
+	if (!wl_icc_enabled) { return 0; }
+	/* Resolve every dependency before the first vote. Missing or malformed
+	 * metadata never leads to guessed addresses or partial lookup votes. */
+	if (!wl_icc_ready) {
+		for (unsigned i = 0; i < WL_ICC_N; i++) {
+			struct wl_bcm *b = &wl_bcms[i];
+			int e = wl_bcm_lookup(b);
+			printf("FUXI WLAN: M6i ICC %s cmd-db addr %#x unit %u width %u VCD %u aux-version %#x lookup %d\n",
+			    b->name, b->addr, b->unit, b->width, b->vcd, b->version, e);
+			if (e) { wl_icc_failed = true; return 2; }
+			for (unsigned j = 0; j < i; j++) {
+				if (b->addr == wl_bcms[j].addr) { wl_icc_failed = true; return 2; }
+			}
+		}
+		wl_icc_ready = true;
+	}
+	unsigned row = download ? (unsigned)wl_icc_bw : 0;
+	uint32_t avg = cnss[row][0], p1 = cnss[row][1], p2 = cnss[row][2];
+	if (p1 < peak) { p1 = peak; }
+	if (p2 < peak) { p2 = peak; }
+	printf("FUXI WLAN: M6i ICC %s pcie-mem 0/%u cpu-pcie 0/1 CNSS row %u path1 %u/%u path2 %u/%u kBps\n",
+	    download ? "link/download" : "pretrain", peak, row, avg, cnss[row][1], avg, cnss[row][2]);
+	wl_bcm_bandwidth(&wl_bcms[0], avg, p1, 16, 1); /* SN7 qns_pcie_mem_noc */
+	wl_bcms[1].x = 0; wl_bcms[1].y = 1;          /* SH1 mask, both paths */
+	wl_bcm_bandwidth(&wl_bcms[2], avg, p2, 16, 4); /* SH0 qns_llcc */
+	wl_bcm_bandwidth(&wl_bcms[3], avg, p2, 4, 4);  /* MC0 ebi */
+	wl_bcms[4].x = 0; wl_bcms[4].y = 8;          /* ACV mask */
+	wl_bcms[5].x = 1; wl_bcms[5].y = 1;          /* CN0 mask + keepalive */
+	unsigned order[WL_ICC_N];
+	for (unsigned i = 0; i < WL_ICC_N; i++) {
+		unsigned j = i;
+		while (j && wl_bcms[order[j - 1]].vcd > wl_bcms[i].vcd) {
+			order[j] = order[j - 1]; j--;
+		}
+		order[j] = i;
+	}
+	/* A whole VCD stays in one payload; commit/response/wait only its last
+	 * command. All six fit in a v3 TCS; geometry is checked by transport. */
+	struct wl_rh_cmd cmd[WL_ICC_N];
+	for (unsigned i = 0; i < WL_ICC_N; i++) {
+		struct wl_bcm *b = &wl_bcms[order[i]];
+		bool commit = i + 1 == WL_ICC_N || b->vcd != wl_bcms[order[i + 1]].vcd;
+		b->data = wl_bcm_encode(b->x, b->y, commit);
+		cmd[i] = (struct wl_rh_cmd){b->addr, b->data, commit};
+	}
+	uint32_t e = rh_send_batch(0, cmd, WL_ICC_N);
+	for (unsigned i = 0; i < WL_ICC_N; i++) {
+		struct wl_bcm *b = &wl_bcms[order[i]];
+		printf("FUXI WLAN: M6i ICC %s addr %#x vote %u/%u data %#x VCD %u commit %u ack %s error %#x\n",
+		    b->name, b->addr, b->x, b->y, b->data, b->vcd, cmd[i].wait, e ? "unconfirmed" : "yes", e);
+	}
+	if (e) { wl_icc_failed = true; return 3; }
+	wl_icc_acks++;
+	return 0;
+}
+static int
+wl_icc_step(unsigned step)
+{
+	if (step == 2) { return wl_icc_vote(250000, false); }
+	if (step != 12) { return 0; }
+	wl_icc_configure();
+	if (wl_icc_failed) { return 1; }
+	if (!wl_icc_enabled) { return 0; }
+	/* Step 11's capability walk / link read has succeeded. Validate it
+	 * again before accepting a negotiated rate; never lower to zero. */
+	uint32_t link = usb_rd(WL_DBI, wl3_report[67] + 0x10);
+	unsigned speed = (link >> 16) & 15, width = (link >> 20) & 63;
+	static const uint32_t rate[] = {0, 250000, 500000, 984500};
+	if (fw_faults || !(link & (1u << 29)) || !width || width > 2 || speed < 1 || speed > 3) {
+		wl_icc_failed = true; return 4;
+	}
+	return wl_icc_vote(rate[speed] * width, true);
+}
+/* ---- end milestone 6i ---- */
 
 /* ---- milestone 4 ---- */
 #define WL4_MAGIC   0x574c0004u
@@ -808,8 +1031,8 @@ wl_host_diag(const char *phase)
 	unsigned peak = speed == 1 ? 250000 : speed == 2 ? 500000 : speed == 3 ? 984500 : 0;
 	/* No BCM register reads: cmd-db gives RPMh command addresses, not MMIO.
 	 * Firmware/other clients' aggregated votes cannot be inferred from GCC. */
-	printf("FUXI WLAN: M6h %s ICC XNU_votes=none Linux pcie-mem init 0/250000 link 0/%u kBps cpu-pcie 0/1 kBps Gen%u x%u BCM SN7/SH1/SH0/MC0/ACV/CN0 firmware_votes=unknown faults %u\n",
-	    phase, peak * width, speed, width, fw_faults);
+	printf("FUXI WLAN: M6h %s ICC XNU_batches=%u Linux pcie-mem init 0/250000 link 0/%u kBps cpu-pcie 0/1 kBps Gen%u x%u BCM SN7/SH1/SH0/MC0/ACV/CN0 firmware_votes=unknown faults %u\n",
+	    phase, wl_icc_acks, peak * width, speed, width, fw_faults);
 }
 
 /* SM8550 gcc clock drivers: existing M3 votes cover master/slave/Q2A,
@@ -1728,10 +1951,11 @@ fw_run(unsigned limit)
 		unsigned faults0 = fw_faults;
 		int e;
 		if (s <= WL3_STEPS) {
-			wlan_m3(s);    /* runs only step s: earlier ones are in wl3_done */
-			e = (int)(wl3_report[3] & 0xffu);
-			if (wl3_report[3]) {
-				e = e ? e : 0xfe;
+			e = wl_icc_step(s); /* failure blocks link training / BHI */
+			if (!e) {
+				wlan_m3(s); /* runs only step s: earlier ones are in wl3_done */
+				e = (int)(wl3_report[3] & 0xffu);
+				if (wl3_report[3]) { e = e ? e : 0xfe; }
 			}
 		} else {
 			wl_mark(s);
