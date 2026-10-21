@@ -33,6 +33,7 @@ PREAMBLE = r'''
 static uint8_t db[WL_CMDDB_BYTES];
 static uint32_t rsc[1024], cfg, revision, fw_faults, fw_fault_esr, wl3_faults;
 static uint64_t fw_fault_far;
+static uint64_t wl_perst_done, wl_link_done;
 static uint32_t wl3_report[128], wl4_report[64], wl5_report[128], link;
 static unsigned writes, triggers, delays, stages[32], nstages, bhi, aborts;
 static unsigned fail_irq, fail_trigger, idle_busy, bad_cleanup, fail_cstat;

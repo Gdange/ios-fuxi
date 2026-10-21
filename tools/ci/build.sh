@@ -190,10 +190,11 @@ setup() {
 kernel() {
     local dxb=$work/dxb variant=${target#kernel-}
     if [[ $target == kernel-wlan6g ]]; then
-        # M6i keeps the existing artifact/target and cmdlines. Exercise the
+        # WLAN source keeps the existing artifact/target and cmdlines. Exercise the
         # exact C carried by patch 0099 before spending a hosted kernel build.
         python3 tools/test-fuxi-wlan-m6.py
         python3 tools/test-fuxi-wlan-m6i.py
+        python3 tools/test-fuxi-wlan-m6k.py
         shasum -a 256 xnu/fuxi-wlan/fuxi_wlan.c xnu/patches/0099-fuxi-wlan.patch \
             shim/fuxi-probe/wlan.c > "$out/wlan-source-SHA256SUMS.txt"
     fi

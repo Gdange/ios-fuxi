@@ -50,6 +50,8 @@ typedef void *event_t;
 #define KMA_ZERO 2
 #define KMA_NOPAGEWAIT 4
 #define VM_KERN_MEMORY_IOKIT 0
+#define VM_WIMG_DEFAULT 0
+#define VM_WIMG_WCOMB 1
 #define TRUE 1
 #define THREAD_UNINT 0
 #define THREAD_CONTINUE_NULL 0
@@ -75,13 +77,22 @@ static unsigned nr, ne, sleeps, frees, allocations;
 static int old_iova_arg;
 static bool old_iova_present;
 static int clock_arg, iboff_arg;
+static int aspm_arg;
+static const char *probe_arg;
+static unsigned cache_attrs[32][1024];
+static bool cache_drop;
 static unsigned clock_delays;
 static bool track_reads;
 static uint64_t reads[4096];
 static unsigned nreads;
 static void fw_delay(unsigned us) { clock_delays+=us; }
 static bool PE_parse_boot_argn(const char *name, void *out, int size) {
+    if(!strcmp(name,"fuxiwlanprobe")) {
+        if(probe_arg) { strncpy(out,probe_arg,size); return true; }
+        return false;
+    }
     assert(size==sizeof(int));
+    if(!strcmp(name,"fuxiwlanaspm")) { memcpy(out,&aspm_arg,size); return true; }
     if(!strcmp(name,"fuxiwlanclk")) { memcpy(out,&clock_arg,size); return true; }
     if(!strcmp(name,"fuxiwlaniboff")) { memcpy(out,&iboff_arg,size); return true; }
     assert(!strcmp(name,"fuxiwlanoldiova"));
@@ -175,6 +186,7 @@ static void thread_block(int cont) { }
 static uint32_t random_value = 0x12345;
 static void read_random(void *p, unsigned bytes) { assert(bytes==4); memcpy(p,&random_value,4); }
 static uint64_t mach_absolute_time(void) { return 0x12345; }
+static void absolutetime_to_nanoseconds(uint64_t t, uint64_t *ns) { *ns=t; }
 static int kmem_alloc(int map, uintptr_t *va, size_t size, int flags, int tag) {
     assert(flags & KMA_NOPAGEWAIT);
     if(fail_alloc) return 1;
@@ -188,6 +200,16 @@ static ppnum_t pmap_find_phys(int pmap, uintptr_t va) {
     for(unsigned i=0;i<allocations;i++) if(va>=allocs[i].va && va<allocs[i].va+allocs[i].size)
         return (allocs[i].pa+((va-allocs[i].va)&~(uintptr_t)PAGE_MASK)*(noncontig?2:1)) >> PAGE_SHIFT;
     return 0;
+}
+static unsigned *cache_slot(ppnum_t pn) {
+    for(unsigned i=0;i<allocations;i++)
+        for(size_t off=0;off<allocs[i].size;off+=PAGE_SIZE)
+            if(pmap_find_phys(0,allocs[i].va+off)==pn) return &cache_attrs[i][off/PAGE_SIZE];
+    assert(0); return NULL;
+}
+static unsigned pmap_cache_attributes(ppnum_t pn) { return *cache_slot(pn); }
+static void pmap_set_cache_attributes(ppnum_t pn, unsigned attr) {
+    record('A',pn,attr); if(!cache_drop || attr==VM_WIMG_DEFAULT) *cache_slot(pn)=attr;
 }
 static void kmem_free(int map, uintptr_t va, size_t size) {
     record('F',va,0); frees++; free((void *)va);
@@ -225,7 +247,8 @@ static void init(void) {
     probe_steal=probe_change_next=false; corrupt_write_pa=0; corrupt_write_mask=1; nread_masks=0;
     memset(&wl_image,0,sizeof(wl_image)); memset(&wl_vectors,0,sizeof(wl_vectors));
     memset(&wl_tables,0,sizeof(wl_tables)); wl_owned=wl_enabled=wl_route_owned=wl_route_installed=false;
-    old_iova_arg=0; old_iova_present=false; wl_iova_configure();
+    old_iova_arg=0; old_iova_present=false; probe_arg=NULL; aspm_arg=0;
+    cache_drop=false; memset(cache_attrs,0,sizeof(cache_attrs)); wl_iova_configure();
     clock_arg=iboff_arg=0; clock_delays=nreads=0; track_reads=false;
     memset(&wl_contexts,0,sizeof(wl_contexts)); memset(wl5_report,0,sizeof(wl5_report));
     memset(fixture,0,sizeof(fixture)); file_size=sizeof(fixture);
@@ -236,6 +259,7 @@ static void init(void) {
     setreg(WL_SMMU+0x28,0x1000|0x22);
     for(unsigned i=0;i<4;i++) setreg(WL_SMMU+0xc00+4*i,0x20000);
     setreg(WL_DBI+0x34,0x70); setreg(WL_DBI+0x70,0x10);
+    setreg(WL_EPCFG+0x34,0x70); setreg(WL_EPCFG+0x70,0x10);
     setreg(WL_DBI+4,0x107); /* step 14 RC IO|MEM|MASTER|SERR */
     setreg(WL_DBI+0x80,1u<<29); setreg(WL_DBI+0xf28,0x400); setreg(WL_PARF+0x1b0,0x111);
     setreg(WL_EPCFG,0x110717cb); setreg(WL_EPCFG+0x10,WL_BAR0|4);

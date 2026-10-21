@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,2083 @@
+@@ -0,0 +1,2242 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -41,6 +41,8 @@
 + *   fuxiwlanicc=0  disable M6i BCM votes (default 1 = enabled)
 + *   fuxiwlaniccbw=0..8  optional KIWI CNSS bandwidth row (default 0)
 + *   fuxiwlaniboff=1  disable stale inbound iATU windows before BHI (opt-in)
++ *   fuxiwlanprobe=unmapped|pattern|civac|nc  one BHI experiment, then contain
++ *   fuxiwlanaspm=1  retain inherited ASPM (revert download safeguard)
 + * Steps 17..28 probe DMA safety and load rootfs firmware through BHI/BHIe.
 + * No interrupts, channels or QMI are enabled; see docs-lanes/wlan-bt.md M6.
 + *
@@ -714,8 +716,29 @@
 +static uint32_t wl_bhi, wl_bhie, wl_fw_size, wl_seq;
 +static const char *wl_fw_path;
 +static bool wl_mhi_valid;
-+struct wl_dma { vm_offset_t va; vm_size_t size; uint64_t pa, iova; };
++struct wl_dma { vm_offset_t va; vm_size_t size; uint64_t pa, iova; bool nc; };
 +static struct wl_dma wl_image, wl_vectors, wl_contexts, wl_tables;
++enum wl_probe_mode { WL_PROBE_OFF, WL_PROBE_UNMAPPED, WL_PROBE_PATTERN,
++    WL_PROBE_CIVAC, WL_PROBE_NC, WL_PROBE_INVALID };
++static enum wl_probe_mode wl_probe;
++static bool wl_probe_fired;
++static uint64_t wl_perst_done, wl_link_done;
++static const char *const wl_probe_names[] = {"off", "unmapped", "pattern", "civac", "nc", "invalid"};
++
++static void
++wl_probe_configure(void)
++{
++	char arg[16] = {0};
++	wl_probe = WL_PROBE_OFF; wl_probe_fired = false;
++	if (PE_parse_boot_argn("fuxiwlanprobe", arg, sizeof(arg))) {
++		arg[sizeof(arg) - 1] = 0;
++		wl_probe = WL_PROBE_INVALID;
++		for (unsigned i = 0; i < WL_PROBE_INVALID; i++) {
++			if (!strcmp(arg, wl_probe_names[i])) { wl_probe = (enum wl_probe_mode)i; break; }
++		}
++	}
++	printf("FUXI WLAN: M6k probe=%s (one BHI doorbell; diagnostic modes stop at 22)\n", wl_probe_names[wl_probe]);
++}
 +#define WL_CNSS_IOVA 0xa0000000ull
 +#define WL_CNSS_IOVA_END 0xb0000000ull
 +#define WL_LEGACY_IOVA 0x10000000ull
@@ -770,6 +793,7 @@
 +static void
 +wl_iova_configure(void)
 +{
++	wl_probe_configure();
 +	int legacy = 0;
 +	(void)PE_parse_boot_argn("fuxiwlanoldiova", &legacy, sizeof(legacy));
 +	wl_iova_base = legacy == 1 ? WL_LEGACY_IOVA : WL_CNSS_IOVA;
@@ -808,6 +832,20 @@
 +	for (vm_size_t off = 0; off < d->size; off += PAGE_SIZE) {
 +		uint64_t pa = wl_phys(d->va + off);
 +		if (!pa || pa >= (1ull << 36)) { return 2; }
++		if (d == &wl_image && wl_probe == WL_PROBE_NC &&
++		    pmap_cache_attributes((ppnum_t)(pa >> PAGE_SHIFT)) != VM_WIMG_DEFAULT) { return 3; }
++	}
++	if (d == &wl_image && wl_probe == WL_PROBE_NC) {
++		/* Change ALL CPU aliases through pmap, including the physical aperture.
++		 * WCOMB is Normal NC (MAIR 0x44); Device mappings can fault memcpy.
++		 * Do this before VFS writes the image, restore only after containment. */
++		d->nc = true;
++		for (vm_size_t off = 0; off < d->size; off += PAGE_SIZE) {
++			ppnum_t pn = (ppnum_t)(wl_phys(d->va + off) >> PAGE_SHIFT);
++			pmap_set_cache_attributes(pn, VM_WIMG_WCOMB);
++			if (pmap_cache_attributes(pn) != VM_WIMG_WCOMB) { return 3; }
++		}
++		printf("FUXI WLAN: M6k image CPU mapping Normal-NC WCOMB all aliases bytes %#llx\n", (uint64_t)d->size);
 +	}
 +	d->pa = wl_phys(d->va);
 +	d->iova = wl_iova_next; wl_iova_next += d->size;
@@ -823,10 +861,39 @@
 +	__asm__ volatile("dsb sy" ::: "memory");
 +}
 +
++/* Explicit architectural clean+invalidate to PoC, regardless of CB attributes.
++ * CTR_EL0.DminLine is log2(words); never assume an Apple cache-line size. */
++static void
++wl_dma_civac(struct wl_dma *d)
++{
++	uint64_t ctr = 0;
++	__asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
++	vm_size_t line = (vm_size_t)4 << ((ctr >> 16) & 15);
++	for (vm_size_t off = 0; off < d->size; off += line) {
++		vm_offset_t va = d->va + off;
++		__asm__ volatile("dc civac, %0" :: "r"(va) : "memory");
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static void
++wl_probe_publish(void)
++{
++	if (wl_probe != WL_PROBE_CIVAC) { return; }
++	wl_dma_civac(&wl_image); wl_dma_civac(&wl_vectors);
++	wl_dma_civac(&wl_contexts); wl_dma_civac(&wl_tables);
++	printf("FUXI WLAN: M6k DC CIVAC + DSB SY image/vectors/contexts/tables before BHI doorbell\n");
++}
++
 +static void
 +wl_dma_free(struct wl_dma *d)
 +{
 +	if (d->va) {
++		if (d->nc) {
++			for (vm_size_t off = 0; off < d->size; off += PAGE_SIZE) {
++				pmap_set_cache_attributes((ppnum_t)(wl_phys(d->va + off) >> PAGE_SHIFT), VM_WIMG_DEFAULT);
++			}
++		}
 +		kmem_free(kernel_map, d->va, d->size);
 +		bzero(d, sizeof(*d));
 +	}
@@ -998,6 +1065,31 @@
 +	printf("FUXI WLAN: M6e AER sample %u RC uncor/cor/root %#x/%#x/%#x EP uncor/cor %#x/%#x (absent/unreadable = all-ones)\n",
 +	    sample, r[118], r[119], r[120], r[121], r[122]);
 +	return f;
++}
++
++/* ath12k_pci_power_up disables ASPM during download. Preserve Link Status
++ * W1C bits by writing only the low control half. L1SS is observed, not enabled;
++ * with ASPM L1 off and both functions D0 it cannot initiate an ASPM L1 substate. */
++static int
++wl_download_aspm(void)
++{
++	int retain = 0;
++	(void)PE_parse_boot_argn("fuxiwlanaspm", &retain, sizeof(retain));
++	const uint64_t cfg[] = {WL_EPCFG, WL_DBI};
++	for (unsigned i = 0; i < 2; i++) {
++		uint32_t flags = 0;
++		unsigned cap = wl_diag_cap(cfg[i], 0x10, false, &flags);
++		unsigned l1ss = wl_diag_cap(cfg[i], 0x1e, true, &flags);
++		if (flags || fw_faults || !cap) { return 1; }
++		uint32_t old = wl_prd(cfg[i] + cap + 0x10) & 0xffff;
++		uint32_t want = retain == 1 ? old : old & ~3u;
++		if (old != want) { wl_pwr(cfg[i] + cap + 0x10, want); }
++		uint32_t now = wl_prd(cfg[i] + cap + 0x10) & 0xffff;
++		printf("FUXI WLAN: M6k %s ASPM LNKCTL %#x -> %#x L1SS_CTL1 %#x retained %u\n",
++		    i ? "RC" : "EP", old, now, l1ss ? wl_prd(cfg[i] + l1ss + 8) : 0, retain == 1);
++		if (fw_faults || now != want) { return 2; }
++	}
++	return 0;
 +}
 +
 +/* Linux qcom_pcie_config_sid_1_9_0: CRC8/MSB over big-endian BDF,
@@ -1481,17 +1573,27 @@
 +			vm_offset_t alias = wl_owned_alias(table, 4096, true);
 +			if (!alias) { bad = 2; break; }
 +			uint64_t desc = ((const uint64_t *)alias)[(iova >> shifts[level]) & 511];
++			if (level == 2 && wl_probe == WL_PROBE_UNMAPPED) {
++				if (desc) { bad = 6; }
++				break;
++			}
 +			if ((desc & 3) != 3) { bad = 3; break; }
 +			table = desc & mask;
 +			if (level == 2) { leaf = table; }
 +		}
 +		if (bad) { break; }
++		if (wl_probe == WL_PROBE_UNMAPPED) { pages++; continue; }
 +		vm_offset_t alias = wl_owned_alias(leaf, 4096, false);
 +		if (!alias) { bad = 4; break; }
 +		mapped = wl_hash_bytes(mapped, (const uint8_t *)alias, 4096); pages++;
 +		if (leaf != wl_phys(wl_image.va + off)) { bad = 5; }
 +	}
-+	int e = bad || pages != WL_CHUNK / 4096 || source != mapped;
++	int e = bad || pages != WL_CHUNK / 4096 || (wl_probe != WL_PROBE_UNMAPPED && source != mapped);
++	if (wl_probe == WL_PROBE_UNMAPPED) {
++		printf("FUXI WLAN: M6k hole IOVA %#llx+%#x invalid leaves %u/128 %s reason %u (live CB walk)\n",
++		    wl_image.iova, WL_CHUNK, pages, e ? "FAIL" : "VERIFIED", bad);
++		return e;
++	}
 +	printf("FUXI WLAN: M6f CB %u BHI IOVA %#llx+%#x FNV1a64 source %016llx walk %016llx pages %u/128 %s reason %u (CPU view)\n",
 +	    wl_cb, wl_image.iova, WL_CHUNK, source, mapped, pages, e ? "FAIL" : "MATCH", bad);
 +	return e;
@@ -1512,6 +1614,7 @@
 +	struct wl_dma *bufs[] = { &wl_image, &wl_vectors, &wl_contexts };
 +	for (unsigned i = 0; i < 3; i++) {
 +		struct wl_dma *d = bufs[i];
++		if (d == &wl_image && wl_probe == WL_PROBE_UNMAPPED) { continue; }
 +		for (vm_size_t off = 0; off < d->size; off += 4096) {
 +			uint64_t addr = d->iova + off;
 +			if (addr < wl_iova_base || addr >= wl_iova_end) { return 2; }
@@ -1583,11 +1686,13 @@
 +	uint32_t fsr = wl_prd(cb + 0x58), lo = wl_prd(cb + 0x60), hi = wl_prd(cb + 0x64);
 +	uint32_t syn = wl_prd(cb + 0x68), syn1 = wl_prd(cb + 0x6c);
 +	uint32_t global = wl_prd(WL_SMMU + 0x48), sid = wl_prd(WL_SMMU + 0x54);
++	uint32_t cb_sid = wl_prd(wl_gr1 + 0x400 + 4 * wl_cb); /* CBFRSYNRA */
 +	wl5_report[80] = fsr; wl5_report[81] = lo; wl5_report[82] = hi;
 +	wl5_report[83] = syn; wl5_report[84] = syn1;
 +	wl5_report[85] = global; wl5_report[86] = sid;
 +	if (step >= 17 && step <= 28) { wl5_report[96 + step - 17] = fsr; }
 +	printf("FUXI WLAN: M6 step %u CB %u FSR %#x FAR %#x:%08x FSYNR %#x/%#x GFSR %#x GFSYNR1 %#x\n", step, wl_cb, fsr, hi, lo, syn, syn1, global, sid);
++	printf("FUXI WLAN: M6k step %u CBFRSYNRA %#x SID %#x\n", step, cb_sid, cb_sid & 0xffff);
 +	return fw_faults || !!(fsr & 0xc00001fe) || ((global & 2) && (sid & 0xffff) == 0x1401);
 +}
 +
@@ -1753,11 +1858,52 @@
 +	return 2;
 +}
 +
++static void
++wl_probe_pattern(void)
++{
++	if (wl_probe != WL_PROBE_PATTERN) { return; }
++	uint8_t *p = (uint8_t *)wl_image.va;
++	for (vm_size_t i = 0; i < wl_image.size; i++) { p[i] = (uint8_t)(0xa5u ^ (i & 255)); }
++	bzero(p, 64);
++	memcpy(p, "\177ELF\377\377\0", 7); /* invalid class, endian and version */
++	memcpy(p + 16, "FUXI-M6K-PATTERN", 16);
++	printf("FUXI WLAN: M6k pattern first64 ELF class ff endian ff version 00 marker FUXI-M6K-PATTERN FNV1a64 %016llx\n",
++	    wl_hash_bytes(0xcbf29ce484222325ull, p, WL_CHUNK));
++}
++
++/* Unlike normal wl_poll, continue observing after PBL's first error: a late
++ * SMMU fault is the discriminant. Never clear FSR, retry, or proceed to READY.
++ * The caller's existing abort contains DMA before any allocation is freed. */
++static int
++wl_probe_observe(void)
++{
++	uint32_t flags = wl_bhi_diag(0);
++	for (unsigned i = 0; i < 200 && !fw_faults; i++) { wl_sleep(25); }
++	flags |= wl_bhi_diag(1);
++	(void)wl_smmu_fault(22);
++	uint64_t cb = wl_cb_addr(wl_cb);
++	uint32_t fsr = wl_prd(cb + 0x58);
++	uint64_t far = ((uint64_t)wl_prd(cb + 0x64) << 32) | wl_prd(cb + 0x60);
++	uint32_t sid = wl_prd(wl_gr1 + 0x400 + 4 * wl_cb) & 0xffff;
++	const char *result = "no-CB-translation-fault";
++	if (fsr & 2) {
++		result = far >= wl_image.iova && far - wl_image.iova < WL_CHUNK && sid == 0x1401 ?
++		    "target-translation-fault" : "other-translation-fault";
++	}
++	if (fw_faults || (flags & WL_DIAG_TRANSPORT)) { result = "transport-inconclusive"; }
++	printf("FUXI WLAN: M6k result probe=%s %s FSR %#x FAR %#llx SID %#x observation 5000 ms; stop/contain (not firmware success)\n",
++	    wl_probe_names[wl_probe], result, fsr, far, sid);
++	wl_host_diag("probe-completion");
++	if (!fw_faults && !(flags & WL_DIAG_TRANSPORT)) { wl_boot_logs(); }
++	return 0x6b; /* deliberate diagnostic stop, including unexpected BHI success */
++}
++
 +static int
 +wl5_step(unsigned s)
 +{
 +	switch (s) {
 +	case 17:
++		if (wl_probe == WL_PROBE_INVALID) { return 0x6b; }
 +		/* M4 validated BHIOFF; independently validate all M5 block extents. */
 +		wl_bhi = wl4_report[25]; wl_bhie = wl4_report[26];
 +		if (wl_bhi < 0x40 || wl_bhi > 0x3fc0 || (wl_bhi & 3) ||
@@ -1805,6 +1951,7 @@
 +		return fw_faults ? 3 : wl_smmu_enable();
 +	}
 +	case 21: {
++		if (wl_probe_fired) { return 0x6b; } /* never a second doorbell this boot */
 +		if (!wl_enabled || wl_smmu_fault(21) || wl_rc_check() ||
 +		    wl_prd(WL_SMMU) != wl5_report[4] ||
 +		    wl_prd(WL_SMMU + 0x800 + 4 * wl_slot) != 0x80001401 ||
@@ -1816,6 +1963,7 @@
 +			wl_host_diag("preflight-blocked");
 +			return 10;
 +		}
++		if (wl_download_aspm()) { return 11; }
 +		/* ath12k_mhi_clear_vector: undefined reset status is not a result.
 +		 * Only doorbells/status, no RDDM buffers and no retry. */
 +		const unsigned clear[] = {0x3c, 0x44, 0x70, 0x78};
@@ -1824,6 +1972,7 @@
 +			if (wl_mrd(wl_bhie + clear[i]) || fw_faults) { return 9; }
 +		}
 +		printf("FUXI WLAN: M6f BHIe TX/RX doorbells/status cleared; no RX buffers\n");
++		wl_probe_pattern();
 +		wl_mwr(wl_bhi + 0x20, 0); wl_mwr(wl_bhi + 0x2c, 0);
 +		wl_mwr64(wl_bhi + 8, wl_image.iova); wl_mwr(wl_bhi + 0x10, WL_CHUNK);
 +		wl_dma_clean(&wl_image);
@@ -1849,11 +1998,19 @@
 +		read_random(&wl_seq, sizeof(wl_seq));
 +		wl_seq &= WL_SEQ_MASK;
 +		if (!wl_seq) { wl_seq = 1; } /* bounded nonzero fallback */
++		wl_probe_publish(); /* last CPU buffer operation before the doorbell */
++		uint64_t now = mach_absolute_time(), perst_ns = 0, link_ns = 0;
++		absolutetime_to_nanoseconds(now - wl_perst_done, &perst_ns);
++		absolutetime_to_nanoseconds(now - wl_link_done, &link_ns);
++		printf("FUXI WLAN: M6k BHI timing since PERST-step completion %llu ms since link-step completion %llu ms (PERST sample is 1 ms after deassert)\n",
++		    perst_ns / 1000000ull, link_ns / 1000000ull);
++		wl_probe_fired = true;
 +		wl_mwr(wl_bhi + 0x18, wl_seq);
 +		printf("FUXI WLAN: M6f BHI doorbell random seq %#x mask %#x bytes %#x bus master on\n", wl_seq, WL_SEQ_MASK, WL_CHUNK);
 +		return fw_faults ? 3 : 0;
 +	}
 +	case 22: {
++		if (wl_probe != WL_PROBE_OFF) { return wl_probe_observe(); }
 +		int e = wl_poll(0);
 +		uint32_t first = wl_bhi_diag(0);
 +		wl5_report[124] = wl5_report[67]; wl5_report[125] = wl5_report[68];
@@ -2043,6 +2200,8 @@
 +		printf("FUXI WLAN: step %u %s code %#x (%llu ms, faults %u)\n", s, e ? "FAILED" : "ok",
 +		    code, ns / 1000000ull, fw_faults);
 +		if (!e && s <= WL3_STEPS) {
++			if (s == 10) { wl_perst_done = mach_absolute_time(); }
++			if (s == 11) { wl_link_done = mach_absolute_time(); }
 +			fw_m3_summary(s);
 +		}
 +		if (e) {
