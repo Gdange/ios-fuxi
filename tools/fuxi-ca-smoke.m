@@ -27,6 +27,8 @@
 - (void)addUpdateRect:(CGRect)rect;
 - (void)render;
 - (void)endFrame;
+@optional
+- (CGRect)updateBounds;
 @end
 extern int memorystatus_control(uint32_t,int32_t,uint32_t,void *,size_t);
 struct FuxiMemlimit {int32_t active;uint32_t active_attr;int32_t inactive;uint32_t inactive_attr;};
@@ -138,8 +140,22 @@ int main(int argc,char **argv) {
    if(!cpu)fail("reference context");[root renderInContext:cpu];CGContextRelease(cpu);
    uint64_t beforeRender=draws();
    [renderer beginFrameAtTime:CACurrentMediaTime() timeStamp:NULL];[renderer addUpdateRect:CGRectMake(0,0,256,256)];
+   if([renderer respondsToSelector:@selector(updateBounds)]) {CGRect u=[renderer updateBounds];
+    printf("FUXI CA: stage %u update=%.0f,%.0f %.0fx%.0f\n",stage,u.origin.x,u.origin.y,u.size.width,u.size.height);}
    [renderer render];[renderer endFrame];finish(queue.commandBuffer);
    rendered=draws()-beforeRender;
+   // Diagnose a frame CA declined to draw: retry after a flush, then with a fresh renderer.
+   for(unsigned retry=1;!rendered && retry<=2;++retry) {
+    if(retry==2) {[renderer setLayer:nil];
+     renderer=((id(*)(id,SEL,id,id))objc_msgSend)(rendererClass,factory,texture,@{*queueKey:queue,*spaceKey:(id)space});
+     if(!renderer)fail("nil retry CARenderer");
+     [CATransaction begin];[CATransaction setDisableActions:YES];[renderer setLayer:root];[renderer setBounds:CGRectMake(0,0,256,256)];[CATransaction commit];}
+    [CATransaction flush];uint64_t again=draws();
+    [renderer beginFrameAtTime:CACurrentMediaTime() timeStamp:NULL];[renderer addUpdateRect:CGRectMake(0,0,256,256)];
+    [renderer render];[renderer endFrame];finish(queue.commandBuffer);
+    rendered=draws()-again;
+    printf("FUXI CA: stage %u retry %u (%s) gpu_draws=%llu\n",stage,retry,retry==1?"flush":"new renderer",(unsigned long long)rendered);
+   }
    if(failures() || !rendered)fail("frontend_errors=%llu gpu_draws=%llu",(unsigned long long)failures(),(unsigned long long)rendered);
    // Release CA's imported target before taking CPU ownership. The frontend's
    // current submit is synchronous; the supplied queue also has a completion fence.
