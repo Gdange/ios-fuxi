@@ -11,7 +11,7 @@ KERNEL: none|metal4|wlan6g|all; remaining plan arguments: true|false
 Outputs: tools/out/ci/TARGET/ (explicit allowlist, logs, SHA256SUMS)
 Caches: deps/ci-downloads/; isolated build directories: deps/ci-work-TARGET/
 Requires a Mac with preinstalled Xcode 15.4 (kernel) or a selected full Xcode
-(userspace), Homebrew, and rustup (metal). Kernel setup may install its KDK.
+(userspace), Homebrew (prefix only; nothing is brew-installed), and rustup (metal). Kernel setup may install its KDK.
 --dry-run validates arguments and prints the plan on Linux without side effects.
 HELP
 }
@@ -115,16 +115,58 @@ source_checkout() {
     git -C "$dest" diff --cached --exit-code
 }
 
+# Verified source/binary download into the cache, then unpacked into $work.
+fetch_verified() {
+    local url=$1 name=$2 sum=$3
+    fetch "$url" "$downloads/$name"
+    echo "$sum  $downloads/$name" | shasum -a 256 -c -
+}
+
+install_gum() {
+    fetch_verified "https://github.com/charmbracelet/gum/releases/download/v$GUM_VERSION/gum_${GUM_VERSION}_Darwin_arm64.tar.gz" \
+        "gum-$GUM_VERSION-darwin-arm64.tar.gz" "$GUM_SHA256"
+    mkdir -p "$work/gum"
+    tar -xzf "$downloads/gum-$GUM_VERSION-darwin-arm64.tar.gz" -C "$work/gum"
+    # The pinned builder rebuilds PATH from Xcode, system dirs and the Homebrew
+    # prefix only, so builder-visible tools go into that prefix.
+    install -m 0755 "$(find "$work/gum" -type f -name gum | head -1)" "$(brew --prefix)/bin/gum"
+    gum --version
+}
+
+install_bash() {
+    fetch_verified "https://ftp.gnu.org/gnu/bash/bash-$BASH_VERSION_PIN.tar.gz" \
+        "bash-$BASH_VERSION_PIN.tar.gz" "$BASH_SHA256"
+    tar -xzf "$downloads/bash-$BASH_VERSION_PIN.tar.gz" -C "$work"
+    (cd "$work/bash-$BASH_VERSION_PIN" && ./configure --prefix="$native" --without-bash-malloc >/dev/null && make -j6 >/dev/null && make install >/dev/null)
+    "$native/bin/bash" --version | head -1
+}
+
+install_glslang() {
+    fetch_verified "https://github.com/KhronosGroup/glslang/archive/refs/tags/$GLSLANG_VERSION.tar.gz" \
+        "glslang-$GLSLANG_VERSION.tar.gz" "$GLSLANG_SHA256"
+    tar -xzf "$downloads/glslang-$GLSLANG_VERSION.tar.gz" -C "$work"
+    cmake -S "$work/glslang-$GLSLANG_VERSION" -B "$work/glslang-build" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$native" \
+        -DENABLE_OPT=OFF -DGLSLANG_TESTS=OFF -DBUILD_EXTERNAL=OFF
+    ninja -C "$work/glslang-build" install
+    glslangValidator --version | head -1
+}
+
 setup() {
-    export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1
-    export HOMEBREW_CACHE=$root/deps/ci-brew
-    local packages=(cmake ninja)
+    # macOS 14 is a Homebrew tier-3 platform without bottles, so never run brew
+    # install/upgrade: use the runner's tools and build missing ones from pins.
+    native=$work/native
+    mkdir -p "$native/bin"
+    export PATH="$native/bin:$PATH"
+    local cmd
+    for cmd in cmake ninja; do command -v "$cmd" >/dev/null || die "runner lacks $cmd"; done
     case "$target" in
-        kernel-*) packages+=(jq gum bash) ;;
-        mesa) packages+=(glslang pkgconf) ;;
-        tools) packages+=(glslang) ;;
+        kernel-*) command -v jq >/dev/null || die 'runner lacks jq'
+                  install_gum; install_bash ;;
+        mesa) command -v pkg-config >/dev/null || die 'runner lacks pkg-config'
+              install_glslang ;;
+        tools) install_glslang ;;
     esac
-    brew install "${packages[@]}"
     if [[ $target == kernel-* ]]; then
         export DEVELOPER_DIR=${DEVELOPER_DIR:-/Applications/Xcode_15.4.app/Contents/Developer}
     else
@@ -154,7 +196,7 @@ kernel() {
     (
         cd "$dxb"
         export MACOS_VERSION=13.5 KERNEL_CONFIG=DEVELOPMENT ARCH_CONFIG=ARM64 MACHINE_CONFIG=FUXI
-        "$(brew --prefix)/bin/bash" build.sh
+        "$native/bin/bash" build.sh
     )
     cp "$dxb/fakeroot/System/Library/Kernels/kernel.development.fuxi" "$out/"
     # MakeInc.kernel installs the raw linked kernel into SYMROOT *without* an

@@ -19,8 +19,10 @@ retained for **7 days**. Failed builds upload logs and their checksum manifest;
 check the job result before treating an artifact as complete.
 
 The Mac entry point is `bash tools/ci/build.sh TARGET`, where TARGET is
-`kernel-metal4`, `kernel-wlan6g`, `metal`, `mesa` or `tools`. It installs Homebrew
-dependencies, requires a full preinstalled Xcode, and uses ignored `deps/` and
+`kernel-metal4`, `kernel-wlan6g`, `metal`, `mesa` or `tools`. It uses the runner's
+cmake/ninja/jq/pkg-config, builds or downloads the remaining tools (gum, bash,
+glslang) from checksum-pinned sources in `tools/ci/pins.env` (macOS 14 has no
+Homebrew bottles any more, so nothing is brew-installed), requires a full preinstalled Xcode, and uses ignored `deps/` and
 `tools/out/` directories. Existing target work/output directories must be moved
 aside before another build. `--dry-run` and `--plan` work on Linux without
 downloading anything. Kernel builds require Xcode 15.x; set `DEVELOPER_DIR` for
@@ -49,8 +51,8 @@ See [the runner image inventory](https://github.com/actions/runner-images/blob/m
 
 Estimates are planning ranges, not measurements of this restored workflow.
 Jobs run concurrently subject to the account's runner capacity. Warm caches
-avoid repeated source/bottle/crate downloads; they do not restore build products.
-Source snapshots, isolated Homebrew downloads and Cargo registry caches are keyed
+avoid repeated source/tool/crate downloads; they do not restore build products.
+Source snapshots, pinned tool downloads and Cargo registry caches are keyed
 by pinned revisions and the relevant recipe. No SDK, KDK, Xcode, research tree,
 firmware or boot images are cached or uploaded. The translator checkout uses a
 partial clone and sparse checkout to avoid fetching precompiled AIR/metallib

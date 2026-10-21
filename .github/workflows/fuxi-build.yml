@@ -67,10 +67,6 @@ jobs:
           path: deps/ci-downloads
           key: fuxi-source-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('tools/ci/pins.env', 'tools/ci/build.sh') }}
       - uses: actions/cache@v4
-        with:
-          path: deps/ci-brew
-          key: fuxi-brew-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('tools/ci/pins.env', 'tools/ci/build.sh') }}
-      - uses: actions/cache@v4
         if: matrix.target == 'metal'
         with:
           path: |
