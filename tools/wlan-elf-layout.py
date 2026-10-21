@@ -39,11 +39,28 @@ def inspect(data, prefix=0x80000):
         segments.append(dict(index=i, type=typ, flags=flags, kind=(flags >> 24) & 7,
                              offset=offset, filesz=size, end=end, fits_prefix=end <= prefix))
     hashes = [s for s in segments if s['kind'] == 2]
+    # MBN v5 is a 40-byte header followed by hashes and optional QTI/OEM
+    # signature/certificate material. Report lengths only; never extract it.
+    hash_headers = []
+    for seg in hashes:
+        if seg['filesz'] < 40:
+            hash_headers.append(dict(version=None, parsed=False))
+            continue
+        h = struct.unpack_from('<10I', data, seg['offset'])
+        if h[1] != 5:
+            hash_headers.append(dict(version=h[1], parsed=False))
+            continue
+        used = h[2] + h[3] + h[5] + h[7] + h[9]
+        hash_headers.append(dict(version=5, parsed=True, image_size=h[4], code_size=h[5],
+                                 qti_signature_size=h[2], qti_certificate_size=h[3],
+                                 oem_signature_size=h[7], oem_certificate_size=h[9],
+                                 lengths_fit=used <= seg['filesz'] - 40,
+                                 authentication='unverified'))
     return dict(elf_class=cls * 32, machine=machine, entry=entry, file_size=len(data),
                 prefix=prefix, phoff=phoff, phnum=phnum, phend=phend,
                 metadata_fits=phend <= prefix and bool(hashes) and
                 all(s['filesz'] and s['fits_prefix'] for s in hashes),
-                hash_count=len(hashes), segments=segments)
+                hash_count=len(hashes), hash_headers=hash_headers, segments=segments)
 
 
 def main():

@@ -11,7 +11,8 @@
  *   fuxiwlaniboff=1  disable stale inbound iATU windows before BHI (opt-in)
  *   fuxiwlanprobe=unmapped|pattern|civac|nc  one BHI experiment, then contain
  *   fuxiwlanaspm=1  retain inherited ASPM (revert download safeguard)
- *   fuxiwlanpre=qfprom|warm|reset|wake  M6l pre-BHI experiment
+ *   fuxiwlanpre=qfprom|warm|reset|wake|l1ss  pre-BHI experiment
+ *   fuxiwlanfw=stock  separate caller-supplied stock image, no fallback
  *   fuxiwlanbhi=full  M6l whole-file BHI size experiment
  *   fuxiwlanvec=early|rddm  M6l TX staging or RDDM RX experiment
  * Steps 17..28 probe DMA safety and load rootfs firmware through BHI/BHIe.
@@ -695,9 +696,10 @@ struct wl_dma { vm_offset_t va; vm_size_t size; uint64_t pa, iova; bool nc; };
 static struct wl_dma wl_image, wl_vectors, wl_contexts, wl_tables;
 static struct wl_dma wl_rddm, wl_rxvectors;
 #define WL_RDDM_SIZE 0x780000u /* ath12k WCN7850; crash sink only, never dumped */
-static unsigned wl_pre, wl_full, wl_vec;
+static unsigned wl_pre, wl_full, wl_vec, wl_fw;
 static bool wl_variant_invalid;
-static const char *const wl_pre_names[] = {"off", "qfprom", "warm", "reset", "wake"};
+static const char *const wl_pre_names[] = {"off", "qfprom", "warm", "reset", "wake", "l1ss"};
+static const char *const wl_fw_names[] = {"off", "stock"};
 static const char *const wl_vec_names[] = {"off", "early", "rddm"};
 
 static unsigned
@@ -713,7 +715,7 @@ wl_variant_arg(const char *name, const char *const *names, unsigned count)
 	return 0;
 }
 
-static bool wl_variant_active(void) { return wl_pre || wl_full || wl_vec; }
+static bool wl_variant_active(void) { return wl_pre || wl_full || wl_vec || wl_fw; }
 static unsigned wl_bhi_bytes(void) { return wl_full ? wl_fw_size : WL_CHUNK; }
 enum wl_probe_mode { WL_PROBE_OFF, WL_PROBE_UNMAPPED, WL_PROBE_PATTERN,
     WL_PROBE_CIVAC, WL_PROBE_NC, WL_PROBE_INVALID };
@@ -728,7 +730,8 @@ wl_probe_configure(void)
 	char arg[16] = {0};
 	const char *const sizes[] = {"off", "full"};
 	wl_variant_invalid = false;
-	wl_pre = wl_variant_arg("fuxiwlanpre", wl_pre_names, 5);
+	wl_pre = wl_variant_arg("fuxiwlanpre", wl_pre_names, 6);
+	wl_fw = wl_variant_arg("fuxiwlanfw", wl_fw_names, 2);
 	wl_full = wl_variant_arg("fuxiwlanbhi", sizes, 2);
 	wl_vec = wl_variant_arg("fuxiwlanvec", wl_vec_names, 3);
 	wl_probe = WL_PROBE_OFF; wl_probe_fired = false;
@@ -742,9 +745,14 @@ wl_probe_configure(void)
 	if (wl_variant_active() && (wl_probe == WL_PROBE_UNMAPPED || wl_probe == WL_PROBE_PATTERN)) {
 		wl_variant_invalid = true;
 	}
+	int retain = 0;
+	(void)PE_parse_boot_argn("fuxiwlanaspm", &retain, sizeof(retain));
+	if (wl_pre == 5 && retain == 1) { wl_variant_invalid = true; }
 	printf("FUXI WLAN: M6l pre=%s bhi=%s vec=%s valid=%u (variants stop at 22)\n",
 	    wl_pre_names[wl_pre], sizes[wl_full], wl_vec_names[wl_vec], !wl_variant_invalid);
 	printf("FUXI WLAN: M6k probe=%s (one BHI doorbell; diagnostic modes stop at 22)\n", wl_probe_names[wl_probe]);
+	printf("FUXI WLAN: M6m fw=%s l1ss=%u valid=%u (stock means supplied input, not verified provenance)\n",
+	    wl_fw_names[wl_fw], wl_pre == 5, !wl_variant_invalid);
 }
 #define WL_CNSS_IOVA 0xa0000000ull
 #define WL_CNSS_IOVA_END 0xb0000000ull
@@ -1159,14 +1167,16 @@ wl_bhi_diag(unsigned sample)
 	return f;
 }
 
-/* ath12k_pci_power_up disables ASPM during download. Preserve Link Status
- * W1C bits by writing only the low control half. L1SS is observed, not enabled;
- * with ASPM L1 off and both functions D0 it cannot initiate an ASPM L1 substate. */
+/* ath12k disables ASPM during download. Preserve Link Status W1C bits by
+ * writing only the low control half. M6m additionally tests disabling all
+ * four L1SS enables (PCI-PM as well as ASPM), without PHY workarounds. */
 static int
 wl_download_aspm(void)
 {
 	int retain = 0;
 	(void)PE_parse_boot_argn("fuxiwlanaspm", &retain, sizeof(retain));
+	if (wl_pre == 5 && (retain == 1 || fw_faults ||
+	    wl_prd(WL_EPCFG) != 0x110717cb || (wl_prd(WL_EPCFG + 4) & 4))) { return 3; }
 	const uint64_t cfg[] = {WL_EPCFG, WL_DBI};
 	for (unsigned i = 0; i < 2; i++) {
 		uint32_t flags = 0;
@@ -1180,6 +1190,20 @@ wl_download_aspm(void)
 		printf("FUXI WLAN: M6k %s ASPM LNKCTL %#x -> %#x L1SS_CTL1 %#x retained %u\n",
 		    i ? "RC" : "EP", old, now, l1ss ? wl_prd(cfg[i] + l1ss + 8) : 0, retain == 1);
 		if (fw_faults || now != want) { return 2; }
+		if (wl_pre == 5) {
+			if (!l1ss) {
+				printf("FUXI WLAN: M6m %s L1SS absent\n", i ? "RC" : "EP");
+				continue;
+			}
+			uint32_t before = wl_prd(cfg[i] + l1ss + 8);
+			if (before == ~0u || fw_faults) { return 3; }
+			uint32_t disabled = before & ~0xfu;
+			if (before != disabled) { wl_pwr(cfg[i] + l1ss + 8, disabled); }
+			uint32_t after = wl_prd(cfg[i] + l1ss + 8);
+			printf("FUXI WLAN: M6m %s L1SS_CTL1 %#x -> %#x mask 0xf BME off\n",
+			    i ? "RC" : "EP", before, after);
+			if (after != disabled || fw_faults) { return 3; }
+		}
 	}
 	return 0;
 }
@@ -1918,6 +1942,19 @@ wl_read_firmware(void)
 	}
 	printf("FUXI WLAN: M6f FBC metadata fits prefix phend %#llx hash segments %u offset %#llx size %#llx\n",
 	    phoff + (uint64_t)phsize * phnum, hashes, hash_off, hash_size);
+	/* MBN v5 fields are lengths, not proof of authenticity. Do not print
+	 * certificate contents, keys or device identity, or interpret other versions. */
+	if (hashes && hash_size >= 40) {
+		uint32_t h[10]; memcpy(h, b + hash_off, sizeof(h));
+		if (h[1] == 5) {
+			uint64_t used = (uint64_t)h[2] + h[3] + h[5] + h[7] + h[9];
+			printf("FUXI WLAN: M6m MBNv5 code %#x QTI sig/cert %#x/%#x OEM sig/cert %#x/%#x bounds %s; authentication unverified\n",
+			    h[5], h[2], h[3], h[7], h[9], used <= hash_size - 40 ? "fit" : "INVALID");
+			if (used > hash_size - 40) { e = 6; goto close; }
+		} else {
+			printf("FUXI WLAN: M6m hash header version %u unparsed; authentication unverified\n", h[1]);
+		}
+	}
 	wl_dma_clean(&wl_image);
 	wl5_report[17] = wl_fw_size; wl5_report[18] = (uint32_t)wl_image.iova;
 	printf("FUXI WLAN: firmware %s bytes %u ELF%u DMA %#llx cache-clean\n", wl_fw_path, wl_fw_size, b[4] == 1 ? 32 : 64, wl_image.iova);
@@ -1990,6 +2027,9 @@ wl_probe_observe(void)
 	wl_host_diag("probe-completion");
 	if (!fw_faults && !(flags & WL_DIAG_TRANSPORT)) { wl_boot_logs(); }
 	if (wl_variant_active()) {
+		printf("FUXI WLAN: M6m result fw=%s pre=%s bhi=%s vec=%s EE %#x ERRCODE %#x observation 5000 ms; stop/contain\n",
+		    wl_fw_names[wl_fw], wl_pre_names[wl_pre], wl_full ? "full" : "off", wl_vec_names[wl_vec],
+		    wl_mrd(wl_bhi + 0x28), wl_mrd(wl_bhi + 0x30));
 		printf("FUXI WLAN: M6l result pre=%s bhi=%s vec=%s EE %#x ERRCODE %#x observation 5000 ms; stop/contain\n",
 		    wl_pre_names[wl_pre], wl_full ? "full" : "off", wl_vec_names[wl_vec],
 		    wl_mrd(wl_bhi + 0x28), wl_mrd(wl_bhi + 0x30));
@@ -2021,6 +2061,11 @@ wl5_step(unsigned s)
 		if (!hw || hw == ~0u || fw_faults) { return 2; }
 		wl_fw_path = ((hw >> 8) & 15) == 2 ?
 		    "/usr/local/share/fuxi/wlan/amss20.bin" : "/usr/local/share/fuxi/wlan/amss.bin";
+		if (wl_fw) {
+			if (wl_prd(WL_EPCFG) != 0x110717cb || ((hw >> 8) & 15) != 2) { return 0x6c; }
+			wl_fw_path = "/usr/local/share/fuxi/wlan/stock-amss20.bin";
+			printf("FUXI WLAN: M6m stock input selected major 2; no fallback or provenance claim\n");
+		}
 		printf("FUXI WLAN: TCSR_SOC_HW_VERSION %#x major %u minor %u firmware %s (CNSS kiwi major-version rule)\n", hw, (hw >> 8) & 15, hw & 255, wl_fw_path);
 		return wl_pre_bhi() ? 0x6c : 0;
 	}
