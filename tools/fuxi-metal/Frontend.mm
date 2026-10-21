@@ -1,4 +1,6 @@
-/* Bounded Metal diagnostic. Original implementation; no Apple code. */
+/* Bounded Metal diagnostic. No Apple code. CA binding/depth adapters adapted
+ * from UniXNU NativeMetal, MIT, Copyright (c) 2026 NativeMetal contributors.
+ * See LICENSE.NativeMetal and docs-lanes/metal-m9b.md for source provenance. */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurfaceRef.h>
@@ -18,6 +20,7 @@
 #include <sys/stat.h>
 #include "ClientGate.hpp"
 #include "Translator.hpp"
+#include "CAState.hpp"
 #ifndef FUXI_MTL_BACKEND_HEADER
 #define FUXI_MTL_BACKEND_HEADER "Backend.hpp"
 #endif
@@ -413,6 +416,14 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
 - (id)device {CENSUS();return _device;}
 - (NSString *)label {CENSUS();return _label;}
 @end
+// Only the neutral state is representable by our attachment-free backend.
+@interface FuxiDepthStencil : FuxiObject { @public id _device;NSString *_label; }
+@end
+@implementation FuxiDepthStencil
+- (void)dealloc {[_device release];[_label release];[super dealloc];}
+- (id)device {CENSUS();return _device;}
+- (NSString *)label {CENSUS();return _label;}
+@end
 @class FuxiCommandBuffer;
 @interface FuxiQueue : FuxiObject { @public id _device; NSString *_label; }
 @end
@@ -439,6 +450,7 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
 } @catch(NSException *e) {(void)e;[self rejectSelector:_cmd];}}
 - (void)setFragmentTexture:(id)t atIndex:(NSUInteger)i {@try {CENSUS();[self active];
  stage4Require("sampling","textureIndex",i,i<4);
+ if(!t){[_samples[i] release];_samples[i]=nil;return;}
  if(!stage4Class("sampling","texture.class",t,[FuxiTexture class]))invalid(@"sampling texture.class");
  stage4Require("sampling","texture.device",(uint64_t)[t device],[t device]==_command->_queue->_device);
  stage4Require("sampling","texture.usage",((FuxiTexture *)t)->_usage,((FuxiTexture *)t)->_usage&MTLTextureUsageShaderRead);
@@ -447,6 +459,7 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
 } @catch(NSException *e) {(void)e;[self rejectSelector:_cmd];}}
 - (void)setFragmentSamplerState:(id)s atIndex:(NSUInteger)i {@try {CENSUS();[self active];
  stage4Require("sampling","samplerIndex",i,i<4);
+ if(!s){[_samplers[i] release];_samplers[i]=nil;return;}
  if(!stage4Class("sampling","sampler.class",s,[FuxiSampler class]))invalid(@"sampling sampler.class");
  stage4Require("sampling","sampler.device",(uint64_t)[s device],[s device]==_command->_queue->_device);
  [s retain];[_samplers[i] release];_samplers[i]=s;
@@ -457,6 +470,38 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
 }
 - (void)setVertexBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i {@try {CENSUS();[self setBuffer:b offset:o index:i stage:0 bytes:NO];} @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
 - (void)setFragmentBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i {@try {CENSUS();[self setBuffer:b offset:o index:i stage:1 bytes:NO];} @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
+// NativeMetal's stage adapters, retaining Fuxi's four-slot/device/poison rules.
+- (void)setVertexBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i {@try {CENSUS();[self active];
+ if(i>=4)invalid(@"vertex buffer offset slot");auto &b=_buffers[0][i];
+ if(!fuxi::bindingOffset(b.buffer!=nullptr,b.bytes,b.buffer?b.buffer->length:0,o))invalid(@"vertex buffer offset binding/bounds");b.offset=o;
+} @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
+- (void)setFragmentBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i {@try {CENSUS();[self active];
+ if(i>=4)invalid(@"fragment buffer offset slot");auto &b=_buffers[1][i];
+ if(!fuxi::bindingOffset(b.buffer!=nullptr,b.bytes,b.buffer?b.buffer->length:0,o))invalid(@"fragment buffer offset binding/bounds");b.offset=o;
+} @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
+- (void)setVertexBuffers:(const id<MTLBuffer> __unsafe_unretained [])b offsets:(const NSUInteger [])o withRange:(NSRange)r {@try {CENSUS();[self active];
+ if(!fuxi::bindingRange(r.location,r.length) || (r.length && (!b || !o)))invalid(@"vertex buffers range/pointers");
+ for(NSUInteger k=0;k<r.length;++k)[self setBuffer:b[k] offset:o[k] index:r.location+k stage:0 bytes:NO];
+} @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
+- (void)setFragmentBuffers:(const id<MTLBuffer> __unsafe_unretained [])b offsets:(const NSUInteger [])o withRange:(NSRange)r {@try {CENSUS();[self active];
+ if(!fuxi::bindingRange(r.location,r.length) || (r.length && (!b || !o)))invalid(@"fragment buffers range/pointers");
+ for(NSUInteger k=0;k<r.length;++k)[self setBuffer:b[k] offset:o[k] index:r.location+k stage:1 bytes:NO];
+} @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
+- (void)setFragmentTextures:(const id<MTLTexture> __unsafe_unretained [])t withRange:(NSRange)r {@try {CENSUS();[self active];
+ if(!fuxi::bindingRange(r.location,r.length) || (r.length && !t))invalid(@"fragment textures range/pointer");
+ for(NSUInteger k=0;k<r.length;++k)[self setFragmentTexture:t[k] atIndex:r.location+k];
+} @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
+- (void)setFragmentSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s withRange:(NSRange)r {@try {CENSUS();[self active];
+ if(!fuxi::bindingRange(r.location,r.length) || (r.length && !s))invalid(@"fragment samplers range/pointer");
+ for(NSUInteger k=0;k<r.length;++k)[self setFragmentSamplerState:s[k] atIndex:r.location+k];
+} @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
+- (void)setFragmentTexture:(id<MTLTexture>)t atTextureIndex:(NSUInteger)ti samplerState:(id<MTLSamplerState>)s atSamplerIndex:(NSUInteger)si {
+ CENSUS();[self setFragmentTexture:t atIndex:ti];[self setFragmentSamplerState:s atIndex:si];
+}
+- (void)setDepthStencilState:(id)s {@try {CENSUS();[self active];
+ if(s && (![s isKindOfClass:[FuxiDepthStencil class]] || [s device]!=[self device]))invalid(@"depth/stencil state device/class");
+} @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
+- (id)device {CENSUS();return _command->_queue->_device;}
 - (void)setBytes:(const void *)bytes length:(NSUInteger)n index:(NSUInteger)i stage:(unsigned)stage {
  [self active];if(!bytes || !n || n>4096 || i>=4)invalid(@"inline bytes bound");
  FuxiBuffer *b=[FuxiBuffer new];b->_device=[_command->_queue->_device retain];
@@ -499,6 +544,15 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
  FuxiCommandBuffer *b=[FuxiCommandBuffer new];b->_queue=[self retain];
  b->_resources=[NSMutableArray new];b->_handlers=[NSMutableArray new];return [b autorelease];
 }
+// NativeMetal retains owners even for the unretained entry point. Resources
+// remain alive through synchronous completion; this only strengthens lifetime.
+- (id)commandBufferWithUnretainedReferences {CENSUS();return [self commandBuffer];}
+- (id)commandBufferWithDescriptor:(MTLCommandBufferDescriptor *)d {CENSUS();
+ if(!d || d.errorOptions!=MTLCommandBufferErrorOptionNone){unsupported(self,_cmd);return nil;}return [self commandBuffer];
+}
+- (void)setSubmissionQueue:(dispatch_queue_t)queue {CENSUS();(void)queue;}
+- (BOOL)setGPUPriority:(NSUInteger)priority {CENSUS();(void)priority;return NO;}
+- (BOOL)setBackgroundGPUPriority:(NSUInteger)priority {CENSUS();(void)priority;return NO;}
 @end
 @implementation FuxiCommandBuffer
 - (void)rejectSelector:(SEL)s {
@@ -733,6 +787,13 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
 - (id)newBufferWithBytes:(const void *)bytes length:(NSUInteger)n options:(MTLResourceOptions)o {CENSUS();
  if(!bytes) {unsupported(self,_cmd);return nil;}
  FuxiBuffer *b=[self newBufferWithLength:n options:o];if(b)memcpy([b contents],bytes,n);return b;
+}
+- (id)newDepthStencilStateWithDescriptor:(MTLDepthStencilDescriptor *)d {CENSUS();
+ auto neutral=[](MTLStencilDescriptor *s){return !s || fuxi::neutralStencil(s.stencilCompareFunction,s.stencilFailureOperation,s.depthFailureOperation,s.depthStencilPassOperation);};
+ if(!d || !fuxi::neutralDepth(d.depthCompareFunction,d.depthWriteEnabled) || !neutral(d.frontFaceStencil) || !neutral(d.backFaceStencil)) {
+  unsupported(self,_cmd);return nil;
+ }
+ FuxiDepthStencil *s=[FuxiDepthStencil new];s->_device=[self retain];s->_label=[d.label copy];return s;
 }
 - (id)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {CENSUS();
  if(error)*error=nil;if(clientMode==fuxi::ClientMode::census)return nil;

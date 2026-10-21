@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <vector>
 #include "Translator.hpp"
+#include "PipelineCache.hpp"
 #include "../../xnu/fuxi-adreno/NativeAdrenoABI.h"
 static_assert(NativeAdrenoAbiVersion==2,"FuxiMetal HostImport requires NativeAdreno ABI 2");
 #ifndef FUXI_MTL_ICD
@@ -28,6 +29,7 @@ inline void check(VkResult r) { if(r!=VK_SUCCESS) throw std::runtime_error("Vulk
  X(AllocateDescriptorSets) X(UpdateDescriptorSets) X(CmdBindDescriptorSets) X(CreateImageView) X(DestroyImageView) X(CreateRenderPass) X(DestroyRenderPass) \
  X(CreateFramebuffer) X(DestroyFramebuffer) X(CreateShaderModule) X(DestroyShaderModule) \
  X(CreatePipelineLayout) X(DestroyPipelineLayout) X(CreateGraphicsPipelines) X(DestroyPipeline) \
+ X(CreatePipelineCache) X(DestroyPipelineCache) X(GetPipelineCacheData) \
  X(CmdBindVertexBuffers) X(CmdBindIndexBuffer) X(CmdDrawIndexed) X(CmdSetViewport) X(CmdSetScissor) X(CmdPushConstants) X(CmdBeginRenderPass) X(CmdEndRenderPass) X(CmdBindPipeline) X(CmdDraw) X(CmdCopyImageToBuffer) X(CmdPipelineBarrier) X(CreateFence) X(DestroyFence) X(QueueSubmit) X(WaitForFences)
 struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; void *contents{}; size_t length{}, allocated{}; };
 struct Texture {VkImage image{};VkDeviceMemory memory{};VkImageView view{};size_t allocated{};
@@ -46,6 +48,7 @@ struct Operation {
 class Backend {
  void *library{};
  VkInstance instance{}; VkPhysicalDevice physical{}; VkDevice device{}; VkQueue queue{};
+ PipelineCache pipelineCache;
  VkPhysicalDeviceMemoryProperties memory{}; uint32_t family{};
  bool hostImport=false;VkDeviceSize hostAlignment{};VkFormatFeatureFlags linearFeatures{},optimalFeatures{};
  PFN_vkGetPhysicalDeviceFormatProperties GetPhysicalDeviceFormatProperties{};
@@ -116,11 +119,13 @@ public:
    FUXI_VK_FUNCTIONS(LOAD)
 #undef LOAD
 #undef INSTANCE
+   pipelineCache.open(device,CreatePipelineCache,DestroyPipelineCache,GetPipelineCacheData);
    GetDeviceQueue(device,family,0,&queue);if(!queue) throw std::runtime_error("null queue");
   } catch(...) {close();throw;}
  }
  void close() {
   if(poisoned) return; // Unknown GPU ownership: leave reclamation to process death/KMD containment.
+  pipelineCache.close();
   if(device && DestroyDevice) DestroyDevice(device,nullptr);
   if(instance && DestroyInstance) DestroyInstance(instance,nullptr);
   if(library) dlclose(library);
@@ -326,8 +331,15 @@ public:
    VkGraphicsPipelineCreateInfo gi{};gi.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;gi.stageCount=2;gi.pStages=stages;gi.pVertexInputState=&vertex;gi.pInputAssemblyState=&assembly;
    gi.pViewportState=&vp;gi.pRasterizationState=&raster;gi.pMultisampleState=&ms;gi.pColorBlendState=&bs;gi.layout=p->layout;gi.renderPass=p->render;
    VkDynamicState dynamicStates[]={VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR};VkPipelineDynamicStateCreateInfo dynamic{};dynamic.sType=VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;dynamic.dynamicStateCount=2;dynamic.pDynamicStates=dynamicStates;gi.pDynamicState=&dynamic;
-   check(CreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gi,nullptr,&p->pipeline));assembly.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;assembly.primitiveRestartEnable=VK_TRUE;
-   check(CreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gi,nullptr,&p->stripPipeline));p->translation=translated.handle;translated.handle=nullptr;cleanup();return p;
+   auto cache=pipelineCache.get();
+   auto began=std::chrono::steady_clock::now();
+   try {
+    check(CreateGraphicsPipelines(device,cache,1,&gi,nullptr,&p->pipeline));assembly.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;assembly.primitiveRestartEnable=VK_TRUE;
+    check(CreateGraphicsPipelines(device,cache,1,&gi,nullptr,&p->stripPipeline));
+   }catch(...) {pipelineCache.finishedPair();throw;}
+   pipelineCache.finishedPair();
+   fprintf(stderr,"FUXI MTL: Vulkan pipelines PASS %.3f ms cache=%u\n",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-began).count(),cache!=VK_NULL_HANDLE);
+   p->translation=translated.handle;translated.handle=nullptr;cleanup();return p;
   }catch(...) {cleanup();destroyPipelineUnlocked(p);throw;}
  }
  void submit(std::vector<Operation> ops) {

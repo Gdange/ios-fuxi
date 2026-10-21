@@ -72,7 +72,7 @@ def stage(root,icd,bundle,smoke,conf,clients=Path(__file__).with_name('metal-cli
         (smoke,'usr/local/bin/fuxi-metal-smoke',0o755),
         (ca_smoke,'usr/local/bin/fuxi-ca-smoke',0o755),(ca_conf,'usr/local/share/fuxi/ca-smoke.conf',0o644),
         (clients,'usr/local/share/fuxi/metal-clients.conf',0o644),(conf,'usr/local/share/fuxi/metal-smoke.conf',0o644)]
-    for src in ('FuxiMetal','Info.plist','_CodeSignature/CodeResources'):
+    for src in ('FuxiMetal','Info.plist','LICENSE.NativeMetal','_CodeSignature/CodeResources'):
         source=bundle/src
         if not source.is_file() or source.is_symlink():raise ValueError('missing/linked bundle member')
         artifacts.append((source,'System/Library/Extensions/FuxiMetal.bundle/'+src,0o755 if src=='FuxiMetal' else 0o644))

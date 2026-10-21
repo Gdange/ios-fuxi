@@ -33,9 +33,16 @@ def main():
                 (a.out/'metal2vulkan-source.tar.gz','usr/local/share/fuxi/metal2vulkan-source.tar.gz',0o644),
                 (conf,'usr/local/share/fuxi/metal-smoke.conf',0o644),(clients,'usr/local/share/fuxi/metal-clients.conf',0o644),(bundle/'FuxiMetal','System/Library/Extensions/FuxiMetal.bundle/FuxiMetal',0o755),
                 (bundle/'Info.plist','System/Library/Extensions/FuxiMetal.bundle/Info.plist',0o644),
+                (bundle/'LICENSE.NativeMetal','System/Library/Extensions/FuxiMetal.bundle/LICENSE.NativeMetal',0o644),
                 (bundle/'_CodeSignature/CodeResources','System/Library/Extensions/FuxiMetal.bundle/_CodeSignature/CodeResources',0o644)):
                 p=root/rel;assert p.read_bytes()==src.read_bytes() and p.stat().st_mode&0o777==mode
             assert all(c.args[1:]==(0,0) for c in chown.call_args_list)
+            # A missing third-party notice must fail preflight before any copy.
+            original_is_file=Path.is_file
+            with patch.object(Path,'is_file',lambda p:p.name!='LICENSE.NativeMetal' and original_is_file(p)),patch.object(m.shutil,'copyfile') as copied:
+                try:stage();raise AssertionError('missing NativeMetal notice accepted')
+                except ValueError:pass
+                copied.assert_not_called()
             for raw in (b'',b'7',b'3\0',b'1'*32):
                 conf.write_bytes(raw)
                 try:stage();raise AssertionError('bad config accepted')

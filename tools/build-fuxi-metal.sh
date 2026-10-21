@@ -24,6 +24,7 @@ mkdir -p "$bundle"
 # Audit reports are not bundle resources and must never enter its signature.
 rm -f "$bundle/FuxiMetal.undefined.txt"
 cp tools/fuxi-metal/Info.plist "$bundle/Info.plist"
+cp tools/fuxi-metal/LICENSE.NativeMetal "$bundle/LICENSE.NativeMetal"
 "$cxx" "${flags[@]}" -std=c++17 -I"$headers" -dynamiclib tools/fuxi-metal/Frontend.mm \
  -install_name /System/Library/Extensions/FuxiMetal.bundle/FuxiMetal \
  -framework Foundation -framework Metal -framework IOSurface -o "$bundle/FuxiMetal"
@@ -39,7 +40,7 @@ for binary in "$bundle" "$out/fuxi-metal-smoke" "$out/fuxi-ca-smoke"; do
 done
 python3 tools/audit-fuxi-metal.py "$bundle/FuxiMetal" "$out/fuxi-metal-smoke" "$out/fuxi-ca-smoke" "$out/libmetal2vulkan.dylib"
 codesign --verify --strict "$bundle"
-shasum -a 256 "$bundle/FuxiMetal" "$bundle/Info.plist" "$bundle/_CodeSignature/CodeResources" \
+shasum -a 256 "$bundle/FuxiMetal" "$bundle/Info.plist" "$bundle/LICENSE.NativeMetal" "$bundle/_CodeSignature/CodeResources" \
  "$out/libmetal2vulkan.dylib" "$out/metal-smoke.metallib" "$out/metal2vulkan-source.tar.gz" \
  "$out/fuxi-ca-smoke" "$out/ca-smoke.conf" "$out/fuxi-metal-smoke" "$out/metal-smoke.conf" "$out/metal-clients.conf" > "$out/M5b-SHA256SUMS"
 cat "$out/M5b-SHA256SUMS"

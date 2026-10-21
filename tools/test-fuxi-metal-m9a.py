@@ -81,6 +81,7 @@ def staging():
                                struct.pack('<6I',0x32,24,2,0x100000,0,0) + struct.pack('<4I',0x1d,16,72,1) + b'X')
         bundle = out / 'FuxiMetal.bundle'
         shutil.copyfile(ROOT / 'tools/fuxi-metal/Info.plist', bundle / 'Info.plist')
+        shutil.copyfile(ROOT / 'tools/fuxi-metal/LICENSE.NativeMetal', bundle / 'LICENSE.NativeMetal')
         (bundle / '_CodeSignature').mkdir();(bundle / '_CodeSignature/CodeResources').write_bytes(b'fixture')
         (out / 'metal-smoke.metallib').write_bytes(b'MTLBfixture');(out / 'metal2vulkan-source.tar.gz').write_bytes(b'\x1f\x8bfixture')
         other = importlib.util.spec_from_file_location('stage_tests', ROOT / 'tools/test-fuxi-metal-stage.py')

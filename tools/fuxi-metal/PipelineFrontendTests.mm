@@ -71,6 +71,33 @@ int main() {@autoreleasepool {
  const auto &recorded=c->_ops.back();assert(recorded.load==1 && !recorded.store && recorded.indices==input->_buffer && recorded.indexOffset==4);
  assert(recorded.buffers[0][0].offset==16 && recorded.buffers[1][3].offset==32 && recorded.buffers[1][1].bytes);
  assert(((float *)recorded.buffers[1][1].buffer->contents)[1]==0.5f && recorded.viewport.y==120 && recorded.scissor.offset.x==24);
+ // M9b: the real adapters preserve snapshots, independent slots and ownership.
+ r=[c renderCommandEncoderWithDescriptor:pass];assert(r);[r setRenderPipelineState:(id)p];
+ id<MTLBuffer> bindings[2]={(id)input,(id)input};NSUInteger offsets[2]={8,24};
+ [r setVertexBuffers:bindings offsets:offsets withRange:NSMakeRange(1,2)];
+ [r setFragmentBuffers:bindings offsets:offsets withRange:NSMakeRange(2,2)];
+ [r setVertexBufferOffset:48 atIndex:1];[r setFragmentBufferOffset:64 atIndex:3];
+ refuses(c,^{[r setVertexBufferOffset:128 atIndex:1];});
+ refuses(c,^{[r setVertexBufferOffset:0 atIndex:0];});
+ refuses(c,^{[r setFragmentBuffers:nullptr offsets:nullptr withRange:NSMakeRange(NSUIntegerMax,2)];});
+ [r setFragmentBytes:uniform length:sizeof(uniform) atIndex:0];
+ refuses(c,^{[r setFragmentBufferOffset:4 atIndex:0];});
+ FuxiTexture *sample=[FuxiTexture new];sample->_device=[device retain];sample->_texture=new fuxi::Texture{262144};sample->_usage=MTLTextureUsageShaderRead;
+ sd=[MTLSamplerDescriptor new];sampler=[device newSamplerStateWithDescriptor:sd];[sd release];
+ [r setFragmentTexture:(id)sample atTextureIndex:2 samplerState:sampler atSamplerIndex:3];
+ assert(r->_samples[2]==sample && r->_samplers[3]==(id)sampler);
+ id<MTLTexture> textures[1]={nil};id<MTLSamplerState> samplers[1]={nil};
+ [r setFragmentTextures:textures withRange:NSMakeRange(2,1)];[r setFragmentSamplerStates:samplers withRange:NSMakeRange(3,1)];
+ assert(!r->_samples[2] && !r->_samplers[3]);
+ MTLDepthStencilDescriptor *depth=[MTLDepthStencilDescriptor new];
+ id ds=[device newDepthStencilStateWithDescriptor:depth];assert(ds);[r setDepthStencilState:ds];[r setDepthStencilState:nil];
+ depth.depthWriteEnabled=YES;assert(![device newDepthStencilStateWithDescriptor:depth]);depth.depthWriteEnabled=NO;
+ depth.depthCompareFunction=MTLCompareFunctionLess;assert(![device newDepthStencilStateWithDescriptor:depth]);
+ refuses(c,^{[r setDepthStencilState:(id)input];});
+ [r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+ assert(c->_ops.back().buffers[0][1].offset==48 && c->_ops.back().buffers[1][3].offset==64);
+ [r setVertexBufferOffset:80 atIndex:1];assert(c->_ops.back().buffers[0][1].offset==48);[r endEncoding];
+ [ds release];[depth release];[sampler release];[sample release];
  [input release];
  [t release];[p release];[b release]; // Encoder and command references keep resources alive.
  assert([c->_resources[0] device]==device && [c->_resources[1] device]==device);

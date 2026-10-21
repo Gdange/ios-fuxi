@@ -32,6 +32,11 @@ int main() {
   assert(![device newBufferWithLength:4 options:MTLResourceStorageModePrivate]);
   assert(![device newLibraryWithSource:@"kernel void x(){}" options:nil error:nil]);
   id<MTLCommandQueue>q=[device newCommandQueue];
+  assert([q commandBufferWithUnretainedReferences].retainedReferences);
+  MTLCommandBufferDescriptor *commandDesc=[MTLCommandBufferDescriptor new];
+  assert([q commandBufferWithDescriptor:commandDesc]);
+  commandDesc.errorOptions=MTLCommandBufferErrorOptionEncoderExecutionStatus;
+  assert(![q commandBufferWithDescriptor:commandDesc]);[commandDesc release];
   for(unsigned i=0;i<16;++i) { @autoreleasepool {
    uint8_t initial[64];memset(initial,0x42,sizeof(initial));
    id<MTLBuffer>src=[device newBufferWithBytes:initial length:64 options:0];
