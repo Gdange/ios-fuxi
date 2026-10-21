@@ -16,6 +16,7 @@
 - (NSUInteger)protectionOptions;
 - (void)setProtectionOptions:(NSUInteger)o;
 - (BOOL)supportsYCBCRPackedFormats12;
+- (NSUInteger)deviceLinearReadOnlyTextureAlignmentBytes;
 - (BOOL)supportsNativeHardwareFP16;
 - (BOOL)supportsTileShaders;
 - (BOOL)supportsMemorylessRenderTargets;
@@ -62,6 +63,7 @@ int main() {
   { // CA's optional queries and cache probes: answered without latching failures.
    uint64_t failures=fuxi_metal_failure_count();NSError *libraryError=nil;
    assert(![(id)device supportsYCBCRPackedFormats12]);
+   assert([(id)device deviceLinearReadOnlyTextureAlignmentBytes]==16 && [device minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatBGRA8Unorm]==16);
    assert(![(id)device newPipelineLibraryWithFilePath:@"/nonexistent" error:&libraryError] && libraryError);
    id<MTLCommandBuffer>c=q.commandBuffer;assert(![(id)c protectionOptions]);
    [(id)c setProtectionOptions:0];[c enqueue];[c commit];

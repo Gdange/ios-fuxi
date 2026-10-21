@@ -1104,6 +1104,11 @@ static thread_local FuxiCommandBuffer *completionCommand;
 - (BOOL)supportsMemorylessRenderTargets {CENSUS();return NO;}
 - (BOOL)supportsYCBCRPackedFormats12 {CENSUS();return NO;}
 - (NSUInteger)minConstantBufferAlignmentBytes {CENSUS();return 256;}
+// QuartzCore sizes linear image uploads by these (M9 CA smoke stage 3). 16 bytes is
+// Apple's linear texture alignment and metal2vulkan's DeviceLinearTextureAlignmentBytes.
+- (NSUInteger)deviceLinearReadOnlyTextureAlignmentBytes {CENSUS();return 16;}
+- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)format {CENSUS();(void)format;return 16;}
+- (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(MTLPixelFormat)format {CENSUS();(void)format;return 16;}
 - (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes {CENSUS();return 256;}
 - (NSUInteger)maxFragmentTextures {CENSUS();return fuxi::resourceSlots;}
 - (NSUInteger)maxFragmentSamplers {CENSUS();return fuxi::resourceSlots;}
