@@ -215,8 +215,19 @@ metal() {
     command -v rustup >/dev/null || die 'install rustup before building metal'
     export FUXI_M2V_CACHE=$work/metal2vulkan FUXI_M2V_BRIDGE=$work/metal2vulkan-bridge
     # Use only the selected Xcode's own Metal compiler and SDK.
+    # Xcode 15 splits the Metal toolchain into macos/ and ios/ trees; xcrun can
+    # return the macOS one, which lacks the iOS runtime library the link needs.
+    local rt
+    rt=$(find "$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/metal" -name libmetal_rt_ios.a 2>/dev/null | head -1)
     export FUXI_METAL_TOOLS
-    FUXI_METAL_TOOLS=$(dirname "$(xcrun --sdk iphoneos --find metal)")
+    if [[ -n $rt ]]; then
+        FUXI_METAL_TOOLS=${rt%%/lib/clang/*}/bin
+    else
+        FUXI_METAL_TOOLS=$(dirname "$(xcrun --sdk iphoneos --find metal)")
+    fi
+    echo "Metal tools: $FUXI_METAL_TOOLS"
+    [[ -x $FUXI_METAL_TOOLS/metal ]] || die 'no Metal compiler next to the iOS runtime library'
+
     bash tools/build-fuxi-metal.sh "$work/mesa/include" "$work/outputs"
     # Explicit allowlist preserves the complete ad-hoc signed bundle; no AIR,
     # SDK libraries, intermediate build directories or external fixture blobs.

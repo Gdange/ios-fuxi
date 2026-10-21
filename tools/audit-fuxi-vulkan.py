@@ -59,6 +59,10 @@ def audit(path, required_export="_vk_icdGetInstanceProcAddr"):
         m=re.search(r'\(undefined\) (weak )?external (\S+) \((?:from (.+)|dynamically looked up)\)',line)
         if not m: continue
         if not m[1]:
+            # Xcode 15's linker emits objc_msgSend selector stubs as a flat lookup;
+            # accept only that symbol, and only when libobjc is linked.
+            if not m[3] and m[2]=='_objc_msgSend' and '/usr/lib/libobjc.A.dylib' in loads:
+                strong[m[2]]='libobjc'; continue
             assert m[3], 'strong dynamic lookup: '+line
             strong[m[2]]=m[3]
         elif not m[3]: weak_dynamic+=1
