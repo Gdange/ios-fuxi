@@ -228,12 +228,16 @@ metal() {
     # Xcode 15 splits the Metal toolchain into macos/ and ios/ trees; xcrun can
     # return the macOS one, which lacks the iOS runtime library the link needs.
     local rt
-    rt=$(find "$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/metal" -name libmetal_rt_ios.a 2>/dev/null | head -1)
     export FUXI_METAL_TOOLS
-    if [[ -n $rt ]]; then
-        FUXI_METAL_TOOLS=${rt%%/lib/clang/*}/bin
-    else
-        FUXI_METAL_TOOLS=$(dirname "$(xcrun --sdk iphoneos --find metal)")
+    # A local Mac may preset this to a mounted Metal Toolchain component
+    # (Xcode 26+ ships the Metal compiler as a separate component).
+    if [[ -z ${FUXI_METAL_TOOLS:-} ]]; then
+        rt=$(find "$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/metal" -name libmetal_rt_ios.a 2>/dev/null | head -1 || true)
+        if [[ -n $rt ]]; then
+            FUXI_METAL_TOOLS=${rt%%/lib/clang/*}/bin
+        else
+            FUXI_METAL_TOOLS=$(dirname "$(xcrun --sdk iphoneos --find metal)")
+        fi
     fi
     echo "Metal tools: $FUXI_METAL_TOOLS"
     [[ -x $FUXI_METAL_TOOLS/metal ]] || die 'no Metal compiler next to the iOS runtime library'
