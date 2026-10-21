@@ -15,7 +15,10 @@
 /* Private libsystem_kernel call (kern_memorystatus.h). The smoke runs in place of
  * a daemon whose launchd jetsam limit is too small for a cold shader translation. */
 extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags, void *buffer, size_t size);
-#define FUXI_MEMORYSTATUS_CMD_SET_JETSAM_TASK_LIMIT 6
+/* SET_JETSAM_TASK_LIMIT (6) is CONFIG_JETSAM-only and returns EINVAL on Fuxi. */
+#define FUXI_MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES 7
+#define FUXI_MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES 8
+struct fuxi_memlimit {int32_t active;uint32_t active_attr;int32_t inactive;uint32_t inactive_attr;};
 static unsigned long long footprint(void) {
  task_vm_info_data_t i;mach_msg_type_number_t n=TASK_VM_INFO_COUNT;
  return task_info(mach_task_self(),TASK_VM_INFO,(task_info_t)&i,&n)==KERN_SUCCESS?i.phys_footprint>>10:0;
@@ -233,7 +236,9 @@ int main(int argc,char **argv) {
  (void)argc;(void)argv;setvbuf(stdout,NULL,_IONBF,0);setvbuf(stderr,NULL,_IONBF,0);signal(SIGALRM,expired);arm(30);
  @autoreleasepool { @try {
   if(geteuid()!=0)fail("requires unsandboxed root");unsigned maximum=configuration();
-  {int r=memorystatus_control(FUXI_MEMORYSTATUS_CMD_SET_JETSAM_TASK_LIMIT,getpid(),1024,NULL,0);printf("FUXI MTL: jetsam limit 1024 MB rc %d errno %d footprint %llu KiB\n",r,r?errno:0,footprint());}
+  {struct fuxi_memlimit before={0},limit={1024,0,1024,0};int g=memorystatus_control(FUXI_MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES,getpid(),0,&before,sizeof(before));
+   int r=memorystatus_control(FUXI_MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES,getpid(),0,&limit,sizeof(limit));int e=r?errno:0;
+   printf("FUXI MTL: jetsam limit before %d/%d MB attr %u/%u (rc %d) -> 1024 MB non-fatal rc %d errno %d footprint %llu KiB\n",before.active,before.inactive,before.active_attr,before.inactive_attr,g,r,e,footprint());}
   id<MTLDevice>device=MTLCreateSystemDefaultDevice();if(!device)fail("MTLCreateSystemDefaultDevice returned nil");
   Class base=objc_getClass("_MTLDevice");
   if(!base || class_getInstanceSize(base)!=528 || strcmp(class_getName(object_getClass(device)),"FuxiMTLDevice") || ![(id)device isKindOfClass:base] || !device.registryID)fail("class/size/registryID guard");
