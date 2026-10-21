@@ -37,9 +37,9 @@ static void checkVertexDescriptors(id device,FuxiFunction *vertex,FuxiFunction *
  assert([vertexDescriptorRejection(vd) containsString:@"stepRate requires 1"]);
  vd.layouts[3].stepRate=1;vd.layouts[3].stride=0;
  assert([vertexDescriptorRejection(vd) containsString:@"stride outside 1..256"]);
- vd.layouts[3].stride=256;vd.attributes[7].bufferIndex=31;
- assert([vertexDescriptorRejection(vd) containsString:@"bufferIndex=31"]);
- assert([vertexDescriptorRejection(vd) containsString:@"layoutPresent=0"]);
+ vd.layouts[3].stride=256;vd.attributes[7].bufferIndex=30; // Metal itself asserts on 31
+ assert([vertexDescriptorRejection(vd) containsString:@"bufferIndex=30"]);
+ assert([vertexDescriptorRejection(vd) containsString:@"bufferIndex >= 4"]);
  vd.attributes[7].bufferIndex=3;vd.attributes[7].format=(MTLVertexFormat)55;
  assert([vertexDescriptorRejection(vd) containsString:@"FloatRGB9E5"]);
  vd.attributes[7].format=MTLVertexFormatInvalid;vd.layouts[3].stride=0;
