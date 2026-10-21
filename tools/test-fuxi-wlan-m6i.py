@@ -169,7 +169,9 @@ int main(void) {
     fixture(); put16(8,4); assert(wl_bcm_lookup(&b));
     fixture(); put32(656,0); assert(wl_bcm_lookup(&b));
     fixture(); put16(660,0); assert(wl_bcm_lookup(&b));
-    fixture(); db[662]=10; assert(wl_bcm_lookup(&b));
+    /* Mask BCMs (Linux enable_mask) carry no unit/width; device ACV: width 0, VCD 12. */
+    { struct wl_bcm m={.name="SN7",.mask=true}; fixture(); put16(660,0); db[662]=12;
+      assert(!wl_bcm_lookup(&m) && m.width==0 && m.vcd==12); }
     fixture(); fault_read=WL_CMDDB+656; assert(wl_bcm_lookup(&b)); assert(fw_faults);
     /* A missing LAST dependency causes no partial vote. Same for aliases. */
     fixture(); db[144+5*24]=0; assert(wl_icc_step(2)); assert(!writes && !triggers);

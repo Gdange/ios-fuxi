@@ -347,12 +347,12 @@
 + */
 +#define WL_ICC_N 6u
 +struct wl_bcm {
-+	const char *name;
++	const char *name; bool mask; /* Linux enable_mask BCM: no unit/width use */
 +	uint32_t addr, unit, width, vcd, version, x, y, data;
 +};
 +static struct wl_bcm wl_bcms[WL_ICC_N] = {
-+	{.name = "SN7"}, {.name = "SH1"}, {.name = "SH0"},
-+	{.name = "MC0"}, {.name = "ACV"}, {.name = "CN0"}
++	{.name = "SN7"}, {.name = "SH1", .mask = true}, {.name = "SH0"},
++	{.name = "MC0"}, {.name = "ACV", .mask = true}, {.name = "CN0", .mask = true}
 +};
 +static unsigned wl_icc_acks;
 +static bool wl_icc_ready, wl_icc_failed, wl_icc_configured;
@@ -400,7 +400,7 @@
 +			bcm->addr = addr; bcm->unit = wl_cdb32(data);
 +			bcm->width = wl_cdb16(data + 4); bcm->vcd = wl_cdb8(data + 6);
 +			bcm->version = wl_cdb16(h + 8);
-+			if (!bcm->unit || !bcm->width || bcm->vcd >= 10) { return 4; }
++			if (!bcm->mask && (!bcm->unit || !bcm->width)) { return 4; } /* device: ACV width 0, VCD 12 */
 +			matches++;
 +		}
 +	}
