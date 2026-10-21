@@ -1,7 +1,7 @@
 /* Bounded Metal diagnostic. Original implementation; no Apple code. */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
-#import <IOSurface/IOSurface.h>
+#import <IOSurface/IOSurfaceRef.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #include <unistd.h>
