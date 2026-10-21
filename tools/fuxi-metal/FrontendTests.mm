@@ -10,6 +10,13 @@
 @implementation FuxiTestBase
 - (id)dangerousInheritedSelector {abort();}
 @end
+// Private selectors QuartzCore sends on iOS 16 (observed in the M9 CA smoke).
+@interface NSObject (FuxiCATest)
+- (NSUInteger)protectionOptions;
+- (void)setProtectionOptions:(NSUInteger)o;
+- (BOOL)supportsYCBCRPackedFormats12;
+- (id)newPipelineLibraryWithFilePath:(NSString *)path error:(NSError **)error;
+@end
 static void refuses(id<MTLCommandBuffer>command,void (^body)()) {
  FuxiCommandBuffer *c=(id)command;size_t n=c->_ops.size();body();assert(c->_rejected && c.error && c->_ops.size()==n);
  c->_rejected=NO;[c->_error release];c->_error=nil; // isolate modeled validation cases
@@ -37,6 +44,15 @@ int main() {
   assert([q commandBufferWithDescriptor:commandDesc]);
   commandDesc.errorOptions=MTLCommandBufferErrorOptionEncoderExecutionStatus;
   assert(![q commandBufferWithDescriptor:commandDesc]);[commandDesc release];
+  { // CA's optional queries and cache probes: answered without latching failures.
+   uint64_t failures=fuxi_metal_failure_count();NSError *libraryError=nil;
+   assert(![(id)device supportsYCBCRPackedFormats12]);
+   assert(![(id)device newPipelineLibraryWithFilePath:@"/nonexistent" error:&libraryError] && libraryError);
+   id<MTLCommandBuffer>c=q.commandBuffer;assert(![(id)c protectionOptions]);
+   [(id)c setProtectionOptions:0];[c enqueue];[c commit];
+   assert(c.status==MTLCommandBufferStatusCompleted && !c.error && fuxi_metal_failure_count()==failures);
+   id<MTLCommandBuffer>p=q.commandBuffer;refuses(p,^{[(id)p setProtectionOptions:1];});
+  }
   for(unsigned i=0;i<16;++i) { @autoreleasepool {
    uint8_t initial[64];memset(initial,0x42,sizeof(initial));
    id<MTLBuffer>src=[device newBufferWithBytes:initial length:64 options:0];
@@ -61,7 +77,7 @@ int main() {
    [c commit];assert(c.status==MTLCommandBufferStatusCompleted); // idempotent after completion
    assert(!c.blitCommandEncoder);[dst release];
   }}
-  assert(fuxi::Backend::live==0 && fuxi::Backend::submissions==16);
+  assert(fuxi::Backend::live==0 && fuxi::Backend::submissions==17); // 16 rounds + the enqueue probe
   @autoreleasepool {
    id<MTLCommandBuffer>c=q.commandBuffer;id<MTLBlitCommandEncoder>e=c.blitCommandEncoder;
    // A missing encoder entry must name the selector, return without throwing,

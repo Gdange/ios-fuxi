@@ -390,6 +390,7 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
 - (NSUInteger)height {CENSUS();return 256;}
 - (NSUInteger)depth {CENSUS();return 1;}
 - (NSUInteger)arrayLength {CENSUS();return 1;}
+- (NSUInteger)protectionOptions {CENSUS();return 0;}
 - (NSUInteger)mipmapLevelCount {CENSUS();return 1;}
 - (NSUInteger)sampleCount {CENSUS();return 1;}
 - (MTLTextureType)textureType {CENSUS();return MTLTextureType2D;}
@@ -429,7 +430,7 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
 @end
 @interface FuxiCommandBuffer : FuxiObject {
  @public FuxiQueue *_queue; NSMutableArray *_resources,*_handlers; NSString *_label; NSError *_error;
- std::vector<fuxi::Operation> _ops; MTLCommandBufferStatus _status; BOOL _encoding,_rejected;
+ std::vector<fuxi::Operation> _ops; MTLCommandBufferStatus _status; BOOL _encoding,_rejected,_enqueued;
 }
 @end
 @interface FuxiBlit : FuxiObject { @public FuxiCommandBuffer *_command; BOOL _ended; NSString *_label; }
@@ -627,6 +628,12 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
  [handlers release];[_resources removeAllObjects];_ops.clear();
 }
 - (void)waitUntilCompleted {CENSUS();if(_status<MTLCommandBufferStatusCompleted){[self rejectSelector:_cmd];[self commit];}}
+// The queue is synchronous, so enqueue only reserves nothing; commit order is
+// submission order. A second enqueue or one after commit is a client error.
+- (void)enqueue {CENSUS();if(_enqueued || _status!=MTLCommandBufferStatusNotEnqueued)[self rejectSelector:_cmd];_enqueued=YES;}
+// Protected content is unsupported: only the "none" option is accepted.
+- (NSUInteger)protectionOptions {CENSUS();return 0;}
+- (void)setProtectionOptions:(NSUInteger)o {CENSUS();if(o)[self rejectSelector:_cmd];}
 @end
 @implementation FuxiBlit
 - (void)rejectSelector:(SEL)s {unsupported(self,s);[_command rejectSelector:s];}
@@ -758,6 +765,7 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
 // Private scalar queries established by the repo's QuartzCore call-site notes.
 // These are limits of this bounded path, never an Apple family emulation table.
 - (BOOL)supportsMemorylessRenderTargets {CENSUS();return NO;}
+- (BOOL)supportsYCBCRPackedFormats12 {CENSUS();return NO;}
 - (NSUInteger)minConstantBufferAlignmentBytes {CENSUS();return 256;}
 - (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes {CENSUS();return 256;}
 - (NSUInteger)maxFragmentTextures {CENSUS();return 4;}
@@ -804,6 +812,11 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
  try {lib->_library=fuxi::Translator::get().open((const uint8_t *)bytes,size,why,sizeof(why));}
  catch(const std::exception &e) {dispatch_release(mapped);[lib release];return metalError(error,e.what());}
  dispatch_release(mapped);if(!lib->_library) {[lib release];return metalError(error,why);}return lib;
+}
+// Pipeline libraries are an optional precompiled cache; callers fall back to
+// building pipelines, so report absence without counting a failure.
+- (id)newPipelineLibraryWithFilePath:(NSString *)path error:(NSError **)error {CENSUS();(void)path;
+ if(error)*error=[NSError errorWithDomain:@"org.fuxi.metal" code:2 userInfo:@{NSLocalizedDescriptionKey:@"no pipeline library support"}];return nil;
 }
 - (id)newLibraryWithURL:(NSURL *)url error:(NSError **)error {CENSUS();
  if(error)*error=nil;if(clientMode==fuxi::ClientMode::census)return nil;
