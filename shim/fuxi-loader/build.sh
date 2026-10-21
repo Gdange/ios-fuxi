@@ -21,7 +21,9 @@ python3 - "$payload" <<'PY'
 import struct,sys
 b=open(sys.argv[1],'rb').read()
 assert len(b)>=680 and b[:8]==b'SWEETXNU'
-assert b'DEVELOPMENT_ARM64_FUXI' in b, 'Payload is not a FUXI kernel'
+# Native Mac builds embed their DEVELOPMENT_ARM64_FUXI object path; hosted CI
+# (darwin-xnu-build) builds do not, so accept an xnu-8796 kernel with Fuxi drivers.
+assert b'DEVELOPMENT_ARM64_FUXI' in b or (b'xnu-8796' in b and b'FUXI KEYS:' in b), 'Payload is not a FUXI kernel'
 version,n=struct.unpack_from('<II',b,8)
 assert version==1 and 0<n<=32 and len(b)>=680+32*n
 assert struct.unpack_from('<Q',b,56)[0]==0x8c0000000
