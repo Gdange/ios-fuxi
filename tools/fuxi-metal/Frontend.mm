@@ -158,7 +158,7 @@ static FuxiOwner *owner(id obj) {return (FuxiOwner *)objc_getAssociatedObject(ob
   if(state!=MTLPurgeableStateKeepCurrent)_purgeable=state;return before;}
 }
 @end
-@interface FuxiBuffer : FuxiResource { @public fuxi::Buffer *_buffer;void *_wrapped;NSUInteger _wrappedLength;void (^_deallocator)(void *,NSUInteger); }
+@interface FuxiBuffer : FuxiResource { @public fuxi::Buffer *_buffer;void *_wrapped;NSUInteger _wrappedLength;void (^_deallocator)(void *,NSUInteger);BOOL _shadow; }
 @end
 @implementation FuxiBuffer
 - (void)dealloc {auto *backend=owner(_device)->backend;backend->destroy(_buffer);
@@ -166,7 +166,7 @@ static FuxiOwner *owner(id obj) {return (FuxiOwner *)objc_getAssociatedObject(ob
  // On uncertain ownership retain the no-copy deallocator and its pages.
  [_device release];[super dealloc];}
 - (id)device {CENSUS();return _device;}
-- (void *)contents {CENSUS();return _buffer->contents;}
+- (void *)contents {CENSUS();return _shadow?_wrapped:_buffer->contents;}
 - (NSUInteger)length {CENSUS();return _buffer->length;}
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {CENSUS();
  MTLPurgeableState before=[super setPurgeableState:state];
@@ -926,6 +926,9 @@ static thread_local FuxiCommandBuffer *completionCommand;
  _status=MTLCommandBufferStatusCommitted;
  // Deliberately synchronous M4 queue: no dispatch worker or asynchronous promise.
  try {if(!strcmp(clientProcess,"fuxi-ca-smoke") && failureCount.load())throw std::runtime_error("CA diagnostic failure latched: GPU submission refused");if(_rejected)throw std::runtime_error("unsupported command: GPU submission refused");if(clientMode==fuxi::ClientMode::census)throw std::runtime_error("census: no GPU submission");auto *backend=owner(_queue->_device)->backend;size_t begin=0;
+ for(id r in _resources){FuxiBuffer *s=nil;
+  if([r isKindOfClass:[FuxiBuffer class]])s=r;else if([r isKindOfClass:[FuxiTexture class]])s=[(FuxiTexture *)r buffer];
+  if(s && s->_shadow)memcpy(s->_buffer->contents,s->_wrapped,s->_wrappedLength);}
  for(const auto &point:_events){
   if(point.operation>begin){backend->submit(std::vector<fuxi::Operation>(_ops.begin()+begin,_ops.begin()+point.operation),[&]{_scheduled=YES;});begin=point.operation;}
   if(point.signal)[point.event setSignaledValue:point.value];
@@ -1160,7 +1163,17 @@ static thread_local FuxiCommandBuffer *completionCommand;
  if(options!=MTLResourceStorageModeShared || !pointer || clientMode==fuxi::ClientMode::census){unsupported(self,_cmd);return nil;}
  FuxiBuffer *b=[FuxiBuffer new];b->_device=[self retain];
  try {b->_buffer=owner(self)->backend->importBuffer(pointer,length);}
- catch(const std::exception &e){failureLog("FUXI MTL: no-copy buffer FAIL %s\n",e.what());[b release];return nil;}
+ catch(const std::exception &e){
+  // QuartzCore wraps CGImage bytes, which are often unaligned or read-only
+  // copy-on-write pages the kernel will not wire for GPU access (M9 CA smoke
+  // stage 3). Shadow them: contents stays the client's pointer and every
+  // commit refreshes the GPU copy. GPU writes do not reach the client's pages.
+  static std::atomic<bool> logged{false};
+  if(!logged.exchange(true))fprintf(stderr,"FUXI MTL: no-copy buffer shadowed (%s)\n",e.what());
+  try {b->_buffer=owner(self)->backend->allocate(length);}
+  catch(const std::exception &a){failureLog("FUXI MTL: no-copy buffer FAIL %s\n",a.what());[b release];return nil;}
+  memcpy(b->_buffer->contents,pointer,length);b->_shadow=YES;
+ }
  b->_wrapped=pointer;b->_wrappedLength=length;b->_deallocator=[deallocator copy];return b;
 }
 - (id)newDepthStencilStateWithDescriptor:(MTLDepthStencilDescriptor *)d {CENSUS();

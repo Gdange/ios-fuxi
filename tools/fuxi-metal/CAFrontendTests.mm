@@ -55,7 +55,9 @@ int main(){@autoreleasepool {
  for(unsigned i=0;i<16384;++i)assert(!((uint8_t *)[large contents])[i]);
  assert([large setPurgeableState:MTLPurgeableStateNonVolatile]==MTLPurgeableStateEmpty);[large release];
  __block bool deallocated=false;uint8_t callerBytes[16]{};
- assert(![device newBufferWithBytesNoCopy:callerBytes length:16 options:0 deallocator:^(void *bytes,NSUInteger length){(void)bytes;(void)length;deallocated=true;}]);assert(!deallocated);
+ // Unaligned (unimportable) bytes are shadowed: contents stays the caller's pointer.
+ id<MTLBuffer> wrapped=[device newBufferWithBytesNoCopy:callerBytes length:16 options:0 deallocator:^(void *bytes,NSUInteger length){(void)bytes;(void)length;deallocated=true;}];
+ assert(wrapped && [wrapped contents]==callerBytes && [wrapped length]==16 && !deallocated);[wrapped release];assert(deallocated);
  fuxi::Backend::modelTextures=true;
  MTLTextureDescriptor *td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:8 height:4 mipmapped:NO];
  td.storageMode=MTLStorageModeShared;td.usage=MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget;
