@@ -7,3 +7,129 @@ Built on macOS (Apple silicon) with
 - `patches/*.patch` (and the `*.sh` staging scripts) are copied into the build script's patch dir and applied to the xnu tree with `git apply`, in numeric order.
 - `tools/build-fuxi-native.sh` does the same natively; `tools/xnu-cc.py` compiles single files for quick checks.
 - Output: `kernel.development.<config>` plus the unstripped kernel used for symbolication.
+
+## Manual hosted builds
+
+`.github/workflows/fuxi-build.yml` runs only on `workflow_dispatch`. It needs no
+repository secrets. Select `kernel=none|metal4|wlan6f|all` (default `metal4`),
+and independent boolean inputs `metal`, `mesa`, `tools` (default `false`).
+`all` builds both kernel profiles; selecting nothing fails before allocating a
+Mac. Each target runs independently, with a 120-minute limit and one artifact
+retained for **7 days**. Failed builds upload logs and their checksum manifest;
+check the job result before treating an artifact as complete.
+
+The Mac entry point is `bash tools/ci/build.sh TARGET`, where TARGET is
+`kernel-metal4`, `kernel-wlan6f`, `metal`, `mesa` or `tools`. It installs Homebrew
+dependencies, requires a full preinstalled Xcode, and uses ignored `deps/` and
+`tools/out/` directories. Existing target work/output directories must be moved
+aside before another build. `--dry-run` and `--plan` work on Linux without
+downloading anything. Kernel builds require Xcode 15.x; set `DEVELOPER_DIR` for
+another installed Xcode 15 location. The workflow explicitly selects Xcode 15.4
+on `macos-14`, preserving XNU 8796's compatible **iig**. Xcode 16 iig emits an
+incompatible IORPC ABI. This uses the pinned blacktop builder
+`663906528d1cd5ea8fde7de6f16de73db9511549`, macOS source version 13.5,
+`DEVELOPMENT ARM64 FUXI`, and KDK 13.5 / 22G74 (installed on the runner when
+absent). The shared staging scripts are adapted for FUXI, firehose includes
+plain arm64, and failure to apply any repository patch fails the build.
+The native local builder's IIG cache is unnecessary with this Xcode 15 setup.
+
+**Runner lifetime:** GitHub lists macos-14 as fully unsupported from
+November 2, 2026. This restores the previously working environment while that
+image is available; a later migration needs an explicit compatible iig plan,
+rather than silently changing the runner to macos-latest.
+See [the runner image inventory](https://github.com/actions/runner-images/blob/main/images/macos/macos-14-Readme.md).
+
+| Artifact | Contents in addition to `SHA256SUMS` and `logs/build.log` | Estimated cold runtime |
+| --- | --- | --- |
+| `fuxi-kernel-metal4` | `kernel.development.fuxi`, `kernel.development.fuxi.unstripped`, public `fuxi.adt`, `cmdline.txt` for the Metal smoke host | 15–35 min |
+| `fuxi-kernel-wlan6f` | Same kernel pair and public ADT, M6f `cmdline.txt` (full) and `cmdline-s22.txt` (stop at BHI completion) | 15–35 min |
+| `fuxi-metal` | Complete ad-hoc signed `FuxiMetal.bundle`, `fuxi-metal-smoke`, our compiled `metal-smoke.metallib`, separately signed `libmetal2vulkan.dylib`, `metal2vulkan-source.tar.gz` with licences and vendored crate sources, `metal-clients.conf`, `metal-smoke.conf` | 10–25 min |
+| `fuxi-mesa` | Signed `libvulkan_freedreno.dylib`, `patches/`, `tools/` build/audit recipes, `mesa-licenses/` | 15–35 min |
+| `fuxi-tools` | Signed `fuxi-vk-probe`, `fuxi-vk-smoke`, `fuxi-gpu-abi-test`, `vk-smoke.conf`, import-audit sidecars | 5–15 min |
+
+Estimates are planning ranges, not measurements of this restored workflow.
+Jobs run concurrently subject to the account's runner capacity. Warm caches
+avoid repeated source/bottle/crate downloads; they do not restore build products.
+Source snapshots, isolated Homebrew downloads and Cargo registry caches are keyed
+by pinned revisions and the relevant recipe. No SDK, KDK, Xcode, research tree,
+firmware or boot images are cached or uploaded. The translator checkout uses a
+partial clone and sparse checkout to avoid fetching precompiled AIR/metallib
+fixtures at all. UniXNU contributes only the five hash-verified text patches;
+its full tree is never fetched. Mesa and metal2vulkan revisions remain the ones
+in the existing lane recipes, recorded in `tools/ci/pins.env` and every build log.
+Metal signing and audits use the existing M5b/M5c build scripts unchanged.
+
+### Trigger and download (after reviewing and pushing)
+
+The workflow must first exist on the repository's default branch for GitHub
+to expose manual dispatch. Use `--ref` for the pushed branch to build. These
+examples assume the reviewed change has been integrated into `main`:
+
+```sh
+# Run each target separately; all flags are explicit to avoid the kernel default.
+gh workflow run fuxi-build.yml -R bangprovn/ios-fuxi --ref main -f kernel=metal4 -f metal=false -f mesa=false -f tools=false
+gh workflow run fuxi-build.yml -R bangprovn/ios-fuxi --ref main -f kernel=wlan6f -f metal=false -f mesa=false -f tools=false
+gh workflow run fuxi-build.yml -R bangprovn/ios-fuxi --ref main -f kernel=none -f metal=true -f mesa=false -f tools=false
+gh workflow run fuxi-build.yml -R bangprovn/ios-fuxi --ref main -f kernel=none -f metal=false -f mesa=true -f tools=false
+gh workflow run fuxi-build.yml -R bangprovn/ios-fuxi --ref main -f kernel=none -f metal=false -f mesa=false -f tools=true
+# Or all five artifacts in one run:
+gh workflow run fuxi-build.yml -R bangprovn/ios-fuxi --ref main -f kernel=all -f metal=true -f mesa=true -f tools=true
+
+gh run list -R bangprovn/ios-fuxi --workflow fuxi-build.yml --limit 10
+# Set RUN_ID to the chosen run's numeric ID, and verify it succeeded.
+gh run watch "$RUN_ID" -R bangprovn/ios-fuxi --exit-status
+gh run download "$RUN_ID" -R bangprovn/ios-fuxi -n fuxi-kernel-metal4 -D xnu/out-ci-metal4
+gh run download "$RUN_ID" -R bangprovn/ios-fuxi -n fuxi-kernel-wlan6f -D xnu/out-ci-wlan6f
+gh run download "$RUN_ID" -R bangprovn/ios-fuxi -n fuxi-metal -D tools/out/download-metal
+gh run download "$RUN_ID" -R bangprovn/ios-fuxi -n fuxi-mesa -D tools/out/download-mesa
+gh run download "$RUN_ID" -R bangprovn/ios-fuxi -n fuxi-tools -D tools/out/download-tools
+(cd xnu/out-ci-metal4 && sha256sum -c SHA256SUMS)
+```
+
+For separate runs, use each corresponding RUN_ID and download only that run's
+artifact. On macOS use `shasum -a 256 -c SHA256SUMS`. GitHub artifact extraction
+does not preserve executable modes; restore `chmod +x` on downloaded userspace
+executables and bundle executables before staging. Do not alter bundle resources;
+the complete resource signature is included.
+
+### Pack only on local Linux
+
+Both profiles build the **current commit's complete FUXI patch set**. Profile
+names select boot arguments, not historical binary snapshots: Metal leaves
+WLAN disabled, while M6f opts into the current `0099` driver with limits 1/22.
+The command lines match the existing metal4/M6f image scripts, including their
+different exec-swap hosts. No `build-fuxi-*-images.sh`, `mkpayload.py` or
+`shim/fuxi-loader/build.sh` runs in CI.
+
+The public ADT is generated entirely from our measured hardware recipe: 5088 MiB
+XNU RAM, seven CPUs, UFS and the top-of-bank 32 MiB GPU reservation. It contains
+**no private root-file extents or copied Apple /product node**. Consequently,
+before packing a boot for the existing pinned-file root, preserve the integration
+ADT you already use locally. Set `BASE_ADT` to that existing `fuxi.adt`; the local
+helper validates/preserves its root mapping and identity and refreshes only the
+GPU reservation. No Apple data or device dump needs to enter the public repo or CI.
+
+```sh
+# Run from the repository root on Linux. BASE_ADT is an existing local input.
+python3 tools/ci/kernel-inputs.py --variant metal4 --local-adt "$BASE_ADT" --out xnu/out-local-metal4
+mkdir -p shim/out
+python3 tools/mkpayload.py xnu/out-ci-metal4/kernel.development.fuxi \
+  xnu/out-local-metal4/fuxi.adt shim/out/fuxi-ci-metal4-payload.bin \
+  --cmdline "$(cat xnu/out-ci-metal4/cmdline.txt)"
+# Supply the same private firmware/toolchain environment as existing local packs:
+# FUXI_GMU_FIRMWARE, FUXI_SQE_FIRMWARE, FUXI_GPU_ZAP_MBN, MKBOOTIMG.
+# Also export CLANG, LLD, OBJCOPY and READELF for the AArch64 loader toolchain.
+bash shim/fuxi-loader/build.sh shim/out/fuxi-ci-metal4-payload.bin
+
+# WLAN: same locally preserved integration ADT, with full or stop-at-22 cmdline.
+python3 tools/ci/kernel-inputs.py --variant wlan6f --local-adt "$BASE_ADT" --out xnu/out-local-wlan6f
+python3 tools/mkpayload.py xnu/out-ci-wlan6f/kernel.development.fuxi \
+  xnu/out-local-wlan6f/fuxi.adt shim/out/fuxi-ci-wlan6f-s22-payload.bin \
+  --cmdline "$(cat xnu/out-ci-wlan6f/cmdline-s22.txt)"
+bash shim/fuxi-loader/build.sh shim/out/fuxi-ci-wlan6f-s22-payload.bin
+```
+
+The loader's output is `shim/out/fuxi-loader/fuxi-xnu-boot.img`; save/rename it
+locally before another pack. Firmware provision, root-image edits and device
+testing remain separate local operations. CI never fetches or embeds GPU/WLAN
+firmware and uploads no Apple binaries, SDK headers, support libraries or build trees.

@@ -1,0 +1,249 @@
+#!/bin/bash
+# Shared hosted/local Mac entry point. Never invokes a boot-image packer.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/../.." && pwd)
+usage() {
+    cat <<'HELP'
+Usage: tools/ci/build.sh TARGET [--dry-run]
+Targets: kernel-metal4, kernel-wlan6f, metal, mesa, tools
+       tools/ci/build.sh --plan KERNEL METAL MESA TOOLS
+KERNEL: none|metal4|wlan6f|all; remaining plan arguments: true|false
+Outputs: tools/out/ci/TARGET/ (explicit allowlist, logs, SHA256SUMS)
+Caches: deps/ci-downloads/; isolated build directories: deps/ci-work-TARGET/
+Requires a Mac with preinstalled Xcode 15.4 (kernel) or a selected full Xcode
+(userspace), Homebrew, and rustup (metal). Kernel setup may install its KDK.
+--dry-run validates arguments and prints the plan on Linux without side effects.
+HELP
+}
+die() { echo "fuxi-ci: $*" >&2; exit 2; }
+[[ $# -gt 0 ]] || { usage >&2; exit 2; }
+case "$1" in
+    -h|--help) [[ $# == 1 ]] || die 'unexpected help arguments'; usage; exit 0 ;;
+    --plan)
+        [[ $# == 5 ]] || die '--plan needs KERNEL METAL MESA TOOLS'
+        case "$2" in none|metal4|wlan6f|all) ;; *) die 'invalid kernel selection' ;; esac
+        for flag in "$3" "$4" "$5"; do
+            [[ $flag == true || $flag == false ]] || die 'plan flags must be true or false'
+        done
+        python3 - "$2" "$3" "$4" "$5" <<'PY'
+import json, sys
+kernel, *flags = sys.argv[1:]
+targets = ["kernel-" + v for v in ("metal4", "wlan6f") if kernel in (v, "all")]
+targets += [t for t, f in zip(("metal", "mesa", "tools"), flags) if f == "true"]
+if not targets:
+    raise SystemExit("Select at least one target")
+print(json.dumps({"target": targets}))
+PY
+        exit ;;
+esac
+target=$1
+shift
+case "$target" in kernel-metal4|kernel-wlan6f|metal|mesa|tools) ;; *) die "unknown target: $target" ;; esac
+dry=false
+if [[ $# == 1 && $1 == --dry-run ]]; then dry=true; shift; fi
+[[ $# == 0 ]] || die 'unexpected arguments'
+# shellcheck source=tools/ci/pins.env
+source "$root/tools/ci/pins.env"
+if $dry; then
+    printf 'target=%s\nartifact=fuxi-%s\noutput=tools/out/ci/%s\n' "$target" "$target" "$target"
+    printf 'pins: dxb=%s mesa=%s metal2vulkan=%s rust=%s\n' "$DXB_SHA" "$MESA_SHA" "$M2V_SHA" "$RUST_VERSION"
+    echo 'No downloads, builds, signing or packing in dry-run mode.'
+    exit 0
+fi
+[[ $(uname -s) == Darwin ]] || die 'builds require macOS; use --dry-run on Linux'
+cd "$root"
+out=$root/tools/out/ci/$target
+work=$root/deps/ci-work-$target
+downloads=$root/deps/ci-downloads
+[[ ! -e $out && ! -e $work ]] || die 'output/work directory exists; move it aside for a fresh build'
+mkdir -p "$out/logs" "$work" "$downloads"
+
+# Even a failed build emits only its log + checksum manifest, never a build tree.
+manifest() {
+    python3 - "$out" <<'PY'
+import hashlib
+from pathlib import Path
+import sys
+out = Path(sys.argv[1])
+files = sorted(p for p in out.rglob('*') if p.is_file() and p.name != 'SHA256SUMS')
+if any(p.is_symlink() for p in out.rglob('*')):
+    raise SystemExit('Artifact must not contain symlinks')
+(out/'SHA256SUMS').write_text(''.join(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.relative_to(out).as_posix()+'\n' for p in files))
+PY
+}
+finish() { status=$?; trap - EXIT; manifest; exit "$status"; }
+trap finish EXIT
+
+fetch() {
+    local url=$1 dest=$2
+    if [[ ! -s $dest ]]; then
+        curl --fail --location --retry 3 --connect-timeout 30 "$url" -o "$dest.part"
+        mv "$dest.part" "$dest"
+    fi
+}
+
+# Cache a source-only shallow git snapshot as a tarball, including its revision
+# metadata. No SDKs, KDKs, build products or boot inputs enter these caches.
+source_checkout() {
+    local name=$1 url=$2 pin=$3 dest=$4
+    local archive=$downloads/$name-$pin-source-v1.tar.gz
+    if [[ -f $archive ]]; then
+        mkdir -p "$dest"
+        tar -xzf "$archive" -C "$dest"
+    else
+        git init -q "$dest"
+        git -C "$dest" remote add origin "$url"
+        if [[ $name == metal2vulkan ]]; then
+            # Full clones fetch precompiled Apple AIR fixtures. Partial clone
+            # with sparse checkout avoids downloading those blobs at all.
+            git -C "$dest" config remote.origin.promisor true
+            git -C "$dest" config remote.origin.partialclonefilter blob:none
+            git -C "$dest" sparse-checkout init --no-cone
+            git -C "$dest" sparse-checkout set --no-cone '/*' \
+                '!**/fixtures/' '!**/golden/' '!**/corpus/' \
+                '!**/*.air' '!**/*.metallib' '!**/*.mtlb' '!**/*.spv' '!**/*.bin'
+            git -C "$dest" -c protocol.version=2 fetch --filter=blob:none --no-tags --depth 1 origin "$pin"
+        else
+            git -C "$dest" fetch --no-tags --depth 1 origin "$pin"
+        fi
+        git -C "$dest" checkout --detach FETCH_HEAD
+        tar -czf "$archive.part" -C "$dest" .
+        mv "$archive.part" "$archive"
+    fi
+    [[ $(git -C "$dest" rev-parse HEAD) == "$pin" ]] || die "$name cache revision mismatch"
+    git -C "$dest" diff --exit-code
+    git -C "$dest" diff --cached --exit-code
+}
+
+setup() {
+    export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1
+    export HOMEBREW_CACHE=$root/deps/ci-brew
+    local packages=(cmake ninja)
+    case "$target" in
+        kernel-*) packages+=(jq gum bash) ;;
+        mesa) packages+=(glslang pkgconf) ;;
+        tools) packages+=(glslang) ;;
+    esac
+    brew install "${packages[@]}"
+    if [[ $target == kernel-* ]]; then
+        export DEVELOPER_DIR=${DEVELOPER_DIR:-/Applications/Xcode_15.4.app/Contents/Developer}
+    else
+        export DEVELOPER_DIR=${DEVELOPER_DIR:-$(xcode-select -p)}
+    fi
+    [[ -d $DEVELOPER_DIR ]] || die 'required full Xcode is missing; never download Xcode in CI'
+    xcodebuild -version
+    xcrun --sdk iphoneos --show-sdk-path
+    if [[ $target == kernel-* ]]; then
+        [[ $(xcodebuild -version | head -1) == 'Xcode 15.'* ]] || die 'XNU requires Xcode 15 iig'
+        xcrun --find iig
+        # The pinned builder tests xcodes even with Xcode preinstalled. Its
+        # clean PATH includes this Homebrew prefix; no authentication needed.
+        if ! command -v xcodes >/dev/null; then
+            printf '#!/bin/sh\nexit 0\n' > "$(brew --prefix)/bin/xcodes"
+            chmod +x "$(brew --prefix)/bin/xcodes"
+        fi
+    fi
+}
+
+kernel() {
+    local dxb=$work/dxb variant=${target#kernel-}
+    source_checkout dxb https://github.com/blacktop/darwin-xnu-build.git "$DXB_SHA" "$dxb"
+    python3 tools/ci/prepare-kernel.py "$dxb"
+    # MACOS_VERSION selects xnu-8796.141.3 + KDK 13.5/22G74. The pinned
+    # builder installs that KDK on this runner when absent; never cache/upload it.
+    (
+        cd "$dxb"
+        export MACOS_VERSION=13.5 KERNEL_CONFIG=DEVELOPMENT ARCH_CONFIG=ARM64 MACHINE_CONFIG=FUXI
+        "$(brew --prefix)/bin/bash" build.sh
+    )
+    cp "$dxb/fakeroot/System/Library/Kernels/kernel.development.fuxi" "$out/"
+    # MakeInc.kernel installs the raw linked kernel into SYMROOT *without* an
+    # .unstripped suffix; give it the local packer's conventional output name.
+    cp "$dxb/build/xnu.sym/kernel.development.fuxi" "$out/kernel.development.fuxi.unstripped"
+    python3 tools/ci/kernel-inputs.py --variant "$variant" --out "$out"
+}
+
+mesa_source() {
+    source_checkout mesa https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa "$MESA_SHA" "$work/mesa"
+}
+
+metal() {
+    mesa_source # Vulkan headers from the same pinned Mesa include/ tree.
+    source_checkout metal2vulkan https://github.com/steelbrain/metal2vulkan.git "$M2V_SHA" "$work/metal2vulkan"
+    command -v rustup >/dev/null || die 'install rustup before building metal'
+    export FUXI_M2V_CACHE=$work/metal2vulkan FUXI_M2V_BRIDGE=$work/metal2vulkan-bridge
+    # Use only the selected Xcode's own Metal compiler and SDK.
+    export FUXI_METAL_TOOLS
+    FUXI_METAL_TOOLS=$(dirname "$(xcrun --sdk iphoneos --find metal)")
+    bash tools/build-fuxi-metal.sh "$work/mesa/include" "$work/outputs"
+    # Explicit allowlist preserves the complete ad-hoc signed bundle; no AIR,
+    # SDK libraries, intermediate build directories or external fixture blobs.
+    cp -R "$work/outputs/FuxiMetal.bundle" "$out/"
+    local name
+    for name in fuxi-metal-smoke metal-smoke.metallib libmetal2vulkan.dylib \
+        metal2vulkan-source.tar.gz metal-smoke.conf metal-clients.conf; do
+        cp "$work/outputs/$name" "$out/"
+    done
+}
+
+mesa() {
+    mesa_source
+    mkdir -p "$work/patches" "$out/patches" "$out/tools"
+    # Fetch only five text patches, never the UniXNU tree (which may contain
+    # unrelated firmware or precompiled inputs). Build recipe checks hashes.
+    local name
+    for name in freedreno-tools-nir.patch ir3-darwin-build-id.patch \
+        ir3-portable-asm-roundtrip.patch offline-adreno-compiler-probe.patch turnip-darwin-kmd.patch; do
+        fetch "https://raw.githubusercontent.com/UniXNU/UniXNU/$UNIXNU_SHA/patches/mesa/$name" \
+            "$downloads/$UNIXNU_SHA-$name"
+        cp "$downloads/$UNIXNU_SHA-$name" "$work/patches/$name"
+    done
+    fetch "https://ftp.gnu.org/gnu/bison/bison-$BISON_VERSION.tar.xz" "$downloads/bison-$BISON_VERSION.tar.xz"
+    echo "$BISON_SHA256  $downloads/bison-$BISON_VERSION.tar.xz" | shasum -a 256 -c -
+    tar -xf "$downloads/bison-$BISON_VERSION.tar.xz" -C "$work"
+    (cd "$work/bison-$BISON_VERSION"; ./configure --prefix="$work/native"; make -j6; make install)
+    python3 -m venv "$work/venv"
+    "$work/venv/bin/pip" install meson==1.12.1 mako==1.4.3 MarkupSafe==3.0.4 pyyaml==6.0.3 packaging==26.3
+    export PATH="$work/native/bin:$work/venv/bin:$PATH"
+    python3 tools/build-fuxi-turnip.py --mesa "$work/mesa" --patches "$work/patches" \
+        --build "$work/mesa-build" --out "$work/outputs"
+    cp "$work/outputs/libvulkan_freedreno.dylib" "$out/"
+    cp "$work/patches/"*.patch tools/patches/mesa-fuxi-*.patch "$out/patches/"
+    cp tools/build-fuxi-turnip.py tools/build-fuxi-vk-shaders.py tools/audit-fuxi-vulkan.py "$out/tools/"
+    # Also preserve upstream licence texts, but no prebuilt third-party files.
+    cp -R "$work/mesa/licenses" "$out/mesa-licenses"
+    cp "$work/mesa/docs/license.rst" "$out/mesa-licenses/"
+}
+
+user_tools() {
+    mesa_source
+    local sdk cc name
+    sdk=$(xcrun --sdk iphoneos --show-sdk-path)
+    cc=$(xcrun --sdk iphoneos --find clang++)
+    python3 tools/build-fuxi-vk-shaders.py "$work/vk-smoke-spv.h"
+    for name in probe smoke; do
+        "$cc" -target arm64-apple-ios16.0 -isysroot "$sdk" -fstack-protector-strong \
+            -Werror=unguarded-availability-new -std=c++17 -O2 -Wall -Wextra -Werror \
+            -I"$work/mesa/include" -I"$work" "tools/fuxi-vk-$name.cpp" -o "$out/fuxi-vk-$name"
+        codesign -f -s - "$out/fuxi-vk-$name"
+        codesign --verify --strict "$out/fuxi-vk-$name"
+    done
+    bash tools/build-fuxi-gpu-abi-test.sh
+    cp tools/out/fuxi-gpu-abi-test tools/vk-smoke.conf "$out/"
+    codesign --verify --strict "$out/fuxi-gpu-abi-test"
+    python3 tools/audit-fuxi-vulkan.py "$out/fuxi-vk-probe" "$out/fuxi-vk-smoke"
+    # Audit sidecars describe only our binaries and are useful with the logs.
+}
+
+build() {
+    setup
+    printf 'Repository: %s\nTarget: %s\n' "$(git rev-parse HEAD)" "$target"
+    cat tools/ci/pins.env
+    case "$target" in
+        kernel-*) kernel ;;
+        metal) metal ;;
+        mesa) mesa ;;
+        tools) user_tools ;;
+    esac
+}
+build 2>&1 | tee "$out/logs/build.log"
