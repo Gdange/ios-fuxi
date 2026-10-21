@@ -26,7 +26,13 @@ int main(int argc,char **argv) {
  assert(!fuxiCAAccept(fuxiCACompare(gpu.data(),1088,cpu.data())));
  std::fill(gpu.begin(),gpu.end(),130);assert(!fuxiCAAccept(fuxiCACompare(gpu.data(),1088,cpu.data())));
  std::fill(gpu.begin(),gpu.end(),129);assert(fuxiCAAccept(fuxiCACompare(gpu.data(),1088,cpu.data())));
- puts("PASS: scalar/vector payload and padded stride; pixel max/mean/outlier limits and padded rows");
+ // A one-pixel edge shift passes; the same pattern flipped vertically does not.
+ for(unsigned y=0;y<256;++y)for(unsigned x=0;x<256;++x){uint8_t v=y<100?200:20;cpu[(y*256+x)*4]=v;gpu[y*1088+x*4]=y<101?200:20;}
+ for(unsigned i=0;i<256*256;++i)for(unsigned c=1;c<4;++c){cpu[i*4+c]=128;gpu[(i/256)*1088+(i%256)*4+c]=128;}
+ assert(fuxiCAAccept(fuxiCACompare(gpu.data(),1088,cpu.data())));
+ for(unsigned y=0;y<256;++y)for(unsigned x=0;x<256;++x)gpu[y*1088+x*4]=255-y<100?200:20;
+ assert(!fuxiCAAccept(fuxiCACompare(gpu.data(),1088,cpu.data())));
+ puts("PASS: scalar/vector payload and padded stride; pixel max/mean/outlier limits, padded rows, one-pixel edge tolerance, flip rejection");
  void *icd=dlopen(argv[2],RTLD_NOW|RTLD_LOCAL);assert(icd);
  auto gipa=(PFN_vkGetInstanceProcAddr)dlsym(icd,"vk_icdGetInstanceProcAddr");assert(gipa);
  auto create=(PFN_vkCreateInstance)gipa(nullptr,"vkCreateInstance");assert(create);
