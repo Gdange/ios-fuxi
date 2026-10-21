@@ -153,7 +153,7 @@ int main(int argc,char **argv)
  int errors=line(!kr && c,"open 0x4147",kr);
  if (!errors) {
   NativeAdrenoAbiParams query{}; kr=call(c,1,nullptr,&query);
-  errors+=line(!kr && query.abi_version==1 && query.input_bits==31 && query.output_bits==FG_ABI_PA_BITS,"query ABI v1",kr);
+  errors+=line(!kr && query.abi_version==NativeAdrenoAbiVersion && query.input_bits==31 && query.output_bits==FG_ABI_PA_BITS,"query ABI v2",kr);
   NativeAdrenoAbiDeviceInfo info{}; kr=call(c,15,nullptr,&info);
   errors+=line(!kr && info.chip_id==0x43050a01 && info.gmem_bytes==3u*1024*1024 &&
       info.va_start==FG_ABI_VA_START && info.va_size==FG_ABI_VA_SIZE,"A740 device info",kr);

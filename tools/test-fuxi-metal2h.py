@@ -23,16 +23,17 @@ def main():
 #define OSDefineMetaClassAndStructors(x,y)
 using IOReturn=int;using IOOptionBits=unsigned;using UInt32=unsigned;
 constexpr int kIOReturnSuccess=0,kIOReturnBusy=1,kIOReturnIOError=2,kIOReturnBadArgument=3,kIOReturnNotFound=4;
-constexpr unsigned kIODirectionInOut=3,kIOMapAnywhere=1,kIOMapWriteCombineCache=2;
+constexpr unsigned kIODirectionNone=0,kIODirectionInOut=3,kIOMapAnywhere=1,kIOMapWriteCombineCache=2;
 static unsigned freed,completed,unmaps;static bool failBind,failDrain;
 struct IOMemoryDescriptor {
  unsigned refs=1;virtual ~IOMemoryDescriptor()=default;
  void retain() {++refs;} void release() {assert(refs);if(!--refs){free();delete this;}}
+ virtual void complete() {assert(false);}
  virtual void free() {} virtual uint64_t getLength() {return 65536;}
 };
 struct IOBufferMemoryDescriptor: IOMemoryDescriptor {
  bool prepared=true;
- void complete() {assert(prepared);prepared=false;++completed;}
+ void complete() override {assert(prepared);prepared=false;++completed;}
  void free() override {assert(!prepared);++freed;}
 };
 struct IOSubMemoryDescriptor: IOMemoryDescriptor {
@@ -46,10 +47,12 @@ struct IOSubMemoryDescriptor: IOMemoryDescriptor {
 static void IOLockLock(int) {} static void IOLockUnlock(int) {}
 static void abiTrace(const char *,int,int) {}
 static int fuxi_gpu_abi_unmap(uint64_t,uint64_t) {++unmaps;return failDrain?1:0;}
+struct IOMemoryMap {int wireRange(unsigned,uint64_t,uint64_t){assert(false);return 1;}void release(){assert(false);}};
 '''+view+r'''
 struct Client {
  struct Bo {IOBufferMemoryDescriptor *memory;FuxiAdrenoBoView *view;
- uint64_t handle,bytes,allocated,iova;unsigned token,leases;} bos_[1]={};
+ uint64_t handle,bytes,allocated,iova;unsigned token,leases;
+ IOMemoryDescriptor *importMemory=nullptr;IOMemoryMap *importMap=nullptr;} bos_[1]={};
  bool live_=true;int lock_=0,pid_=78;uint64_t wired_=65536;
 '''+drop+lookup+r'''
 };

@@ -35,8 +35,8 @@ static unsigned packet(const uint32_t *w,unsigned n,unsigned *op,unsigned *len) 
 int main() {
  NativeAdrenoAbiParams query={};NativeAdrenoAbiDeviceInfo info={};
  assert(!deviceQuery(NativeAdrenoMethodQuery,nullptr,&query));
- assert(query.abi_version==1 && query.input_bits==31 && query.output_bits==36 &&
-     query.flags==0 && query.max_bo_bytes==(1u<<28));
+ assert(query.abi_version==NativeAdrenoAbiVersion && query.input_bits==31 && query.output_bits==36 &&
+     query.flags==NativeAdrenoParamsHostImport && query.max_bo_bytes==(1u<<28));
  assert(!deviceQuery(NativeAdrenoMethodGetDeviceInfo,nullptr,&info));
  /* Decode the actual page-granular 2b readback, restoring inclusive end. */
  const uint32_t min=0x1000000,max=0x12ff000;
@@ -145,6 +145,8 @@ static uint64_t ticks;
 static uint64_t counter(const char *name) {return strcmp(name,"cntfrq_el0")?ticks:1000000;}
 #define rsr(r) counter(r)
 static unsigned fg_access_failed,fg_busy,fg_client_busy,g3_wptr,g3_bank=2,g3_asid=3;
+static unsigned cacheClean,cacheInvalidate;
+static void host_cache(uintptr_t p,int complete) { assert(!(p&63)); if(complete) cacheInvalidate++; else cacheClean++; }
 static unsigned state=1,drains,drainGood=1,fault,tlbs,failTlb,doorbells,enqueued;
 static uint32_t regs[0x10000],sregs[0x1000],ring[8192];
 static unsigned readFault,sreadFault,writeFail,writeCount,logLines,dumpLines,hangLines;
@@ -180,7 +182,8 @@ static void seed(void) {
  sregs[SMMU_ID2/4]=0x5511;
  state=drainGood=1;fg_busy=fg_client_busy=fg_access_failed=0;g3_wptr=0;
  fg_abi_live=fg_abi_seq=fg_abi_completed=fg_abi_poisoned=fg_abi_timed_out=0;fg_abi_hang_dumped=0;
- ticks=tlbs=failTlb=doorbells=enqueued=drains=fault=0;
+ ticks=tlbs=failTlb=doorbells=enqueued=drains=fault=cacheClean=cacheInvalidate=0;
+ memset(fg_abi_imports,0,sizeof(fg_abi_imports));fg_abi_host_handoff=0;
  readFault=sreadFault=writeFail=writeCount=logLines=hangLines=0;
 }
 static void reset(void) {
@@ -293,6 +296,35 @@ int main(void) {
  reset();assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence));fault=1;
  assert(fuxi_gpu_abi_poll(fence)==-1 && drains==1 && state==2);
  reset();failTlb=1;assert(fuxi_gpu_abi_submit(addresses,sizes,1,&fence)==-1 && !doorbells && drains==1);
+ // Indirectly referenced imported BOs must participate, even though the IB
+ // itself lives in a different ordinary BO. Watchdog retires without WaitFence.
+ reset();
+ assert(!fuxi_gpu_abi_map_import(va,source,32768,3));
+ assert(!cacheClean && !cacheInvalidate);
+ assert(fuxi_gpu_abi_map_import(va+0x10000,source+1,16384,3)==-1);
+ assert(fuxi_gpu_abi_map_import(va+0x10000,source,4096,3)==-1);
+ assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence));
+ assert(cacheClean==512 && !cacheInvalidate);
+ assert(fuxi_gpu_abi_unmap(va,32768)==1 && fg_abi_imports[0].iova==va);
+ assert(fuxi_gpu_abi_map_import(va+0x10000,source,16384,3)==1);
+ complete(); fg_abi_watch(NULL,NULL);
+ assert(cacheInvalidate==512 && !fuxi_gpu_abi_poll(fence));
+ assert(!fuxi_gpu_abi_unmap(va,32768) && !fg_abi_imports[0].iova);
+ assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence));
+ complete();fg_abi_watch(NULL,NULL);assert(cacheClean==512 && cacheInvalidate==512);
+ for(unsigned good=0;good<2;good++) {
+  reset();drainGood=good;
+  assert(!fuxi_gpu_abi_map_import(va,source,16384,3));
+  assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence));
+  ticks=100001;fg_abi_watch(NULL,NULL);
+  assert(cacheClean==256 && cacheInvalidate==good*256);
+  assert(fuxi_gpu_abi_unmap(va,16384)==(good?0:-2));
+  assert(!!fg_abi_imports[0].iova==!good); // unknown DMA keeps mapping owned
+ }
+ reset();assert(!fuxi_gpu_abi_map_import(va,source,16384,3));
+ failTlb=1;assert(fuxi_gpu_abi_unmap(va,16384)==-1);
+ assert(!cacheClean && !cacheInvalidate); // no submit: preserve dirty CPU data
+ puts("PASS: imported BO cache handoff covers indirect resources, watchdog retirement, drained fault and undrained quarantine");
  puts("PASS: actual backend root isolation, 16K/4K scattered leaves, VA reuse/TLBI, present exclusion, late retirement, independent watchdog/fault/drain/quarantine");
 }
 '''
@@ -309,6 +341,8 @@ def main():
         wire.write_text(WIRE.replace('int main() {', 'static constexpr int kIOReturnSuccess=0;\n'+query+'\nint main() {'))
         backend = (HEADERS/'fuxi_gpu_abi_backend.inc').read_text()
         backend = re.sub(r'__asm__ volatile\("dsb sy" ::: "memory"\);', '(void)0;', backend)
+        backend = backend.replace('__asm__ volatile("dc ivac, %0" :: "r"(p) : "memory");', 'host_cache(p,1);')
+        backend = backend.replace('__asm__ volatile("dc civac, %0" :: "r"(p) : "memory");', 'host_cache(p,0);')
         model = out/'backend.c'
         model.write_text(BACKEND_PREFIX + backend + BACKEND_TEST)
         for compiler, source in [('clang++', wire), ('clang', model)]:

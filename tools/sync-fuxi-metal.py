@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate/check the 0098 NativeAdreno patch; 0096 remains standalone.
 
-0096 remains the baseline. The published 0098 client snapshot stays frozen;
+0096 remains the baseline. 0098 carries the current native ABI client;
 0100 contains its tracing/guard delta, checked by sync-fuxi-metal2.py.
 0098 contains the delta to canonical driver/shared
 sources plus ABI files and IOKit registration; 0097 is orthogonal.

@@ -15,6 +15,25 @@ static unsigned fg_abi_live, fg_abi_seq, fg_abi_completed, fg_abi_poisoned, fg_a
 static int fg_abi_drained = 1;
 static uint64_t fg_client_deadline;
 static thread_call_data_t fg_client_watchdog;
+/* Every mapped import can be referenced indirectly by PM4, not just the IB
+ * list. Serialize cache handoff with the same GPU lock as submit/retirement.
+ * The user client owns these prepared kernel mappings until successful unmap. */
+static struct { uint64_t iova, bytes; uintptr_t source; } fg_abi_imports[64];
+static unsigned fg_abi_host_handoff;
+static void fg_abi_import_cache(int complete)
+{
+ if (complete && !fg_abi_host_handoff) return;
+ __asm__ volatile("dsb sy" ::: "memory");
+ for (unsigned i=0;i<64;i++) if (fg_abi_imports[i].iova) {
+  uintptr_t end=fg_abi_imports[i].source+fg_abi_imports[i].bytes;
+  for (uintptr_t p=fg_abi_imports[i].source;p<end;p+=64) {
+   if (complete) { __asm__ volatile("dc ivac, %0" :: "r"(p) : "memory"); }
+   else { __asm__ volatile("dc civac, %0" :: "r"(p) : "memory"); }
+  }
+ }
+ __asm__ volatile("dsb sy" ::: "memory");
+ fg_abi_host_handoff=!complete;
+}
 static volatile uint64_t *fg_abi_leaf(uint64_t iova)
 {
  unsigned chunk = (unsigned)((iova-FG_ABI_VA_START)>>21);
@@ -65,6 +84,7 @@ static int fg_abi_fault(const char *why)
  fg_abi_poisoned = 1;
  fg_fail(why,0x701);
  fg_abi_drained = fg_isolate();
+ if (fg_abi_drained) fg_abi_import_cache(1);
  fg_client_busy = 0;
  return fg_abi_drained ? -1 : -2;
 }
@@ -78,6 +98,7 @@ static int fg_abi_observe(void)
  if (g3_read(G3_FENCE_PA+FG_ABI_FENCE_OFF+4)==fg_abi_seq &&
      g3_gr(0x806)==g3_wptr && g3_gr(0x807)==g3_wptr && !(g3_gr(0x210)&~1u)) {
   if (!fg_abi_switch(G3_PT)) return fg_abi_fault("client restore TTBR");
+  fg_abi_import_cache(1); /* before fence success, even without a user wait */
   fg_abi_completed = fg_abi_seq;
   fg_client_busy = 0;
   return 0;
@@ -199,10 +220,9 @@ int fuxi_gpu_abi_available(void)
  FG_GUARD;
  return fg_abi_live && fuxi_gpu_ready() && !fg_abi_poisoned;
 }
-int fuxi_gpu_abi_map(uint64_t iova, uintptr_t source, uint64_t bytes,
+static int fg_abi_map_locked(uint64_t iova, uintptr_t source, uint64_t bytes,
     unsigned permissions, unsigned wb, unsigned sh)
 {
- FG_GUARD;
  if (!fg_abi_live || !fuxi_gpu_ready() || fg_abi_poisoned) return -1;
  if (fg_client_busy) return 1;
  if (!fg_abi_map_valid(iova,bytes,permissions,wb,sh,0) || !source || (source&4095)) return -1;
@@ -220,10 +240,38 @@ int fuxi_gpu_abi_map(uint64_t iova, uintptr_t source, uint64_t bytes,
  /* Root is inactive; TLBI is mandatory before its next doorbell. */
  return 0;
 }
+int fuxi_gpu_abi_map(uint64_t iova, uintptr_t source, uint64_t bytes,
+    unsigned permissions, unsigned wb, unsigned sh)
+{
+ FG_GUARD;
+ return fg_abi_map_locked(iova,source,bytes,permissions,wb,sh);
+}
+int fuxi_gpu_abi_map_import(uint64_t iova, uintptr_t source, uint64_t bytes, unsigned permissions)
+{
+ FG_GUARD;
+ if (!source || !bytes || ((source|bytes)&(NativeAdrenoAbiHostPageBytes-1)) ||
+     bytes>FG_ABI_MAX_BYTES || source+bytes<source) return -1;
+ unsigned slot;
+ for (slot=0;slot<64 && fg_abi_imports[slot].iova;slot++) {}
+ if (slot==64) return -1;
+ int s=fg_abi_map_locked(iova,source,bytes,permissions,0,2);
+ if (!s) {
+  fg_abi_imports[slot].source=source; fg_abi_imports[slot].bytes=bytes; fg_abi_imports[slot].iova=iova;
+ }
+ return s;
+}
+static void fg_abi_import_remove(uint64_t iova, uint64_t bytes)
+{
+ for (unsigned i=0;i<64;i++)
+  if (fg_abi_imports[i].iova==iova && fg_abi_imports[i].bytes==bytes) fg_abi_imports[i].iova=0;
+}
 int fuxi_gpu_abi_unmap(uint64_t iova, uint64_t bytes)
 {
  FG_GUARD;
- if (fg_abi_poisoned) return fg_abi_drained ? 0 : -2;
+ if (fg_abi_poisoned) {
+  if (!fg_abi_drained) return -2;
+  fg_abi_import_remove(iova,bytes); return 0;
+ }
  if (!fg_abi_live || !fg_abi_range(iova,bytes)) return -1;
  if (fg_client_busy) return 1;
  for (uint64_t off=0;off<bytes;off+=4096) *fg_abi_leaf(iova+off)=0;
@@ -232,6 +280,7 @@ int fuxi_gpu_abi_unmap(uint64_t iova, uint64_t bytes)
   * Safe with an in-flight present: only the inactive root was changed. */
  uint32_t tlb[128]={0};
  if (g4_tlb(tlb) || fg_access_failed) return fg_abi_fault("client unmap TLB sync");
+ fg_abi_import_remove(iova,bytes);
  return 0;
 }
 int fuxi_gpu_abi_submit(const uint64_t *iovas, const uint64_t *sizes,
@@ -246,8 +295,11 @@ int fuxi_gpu_abi_submit(const uint64_t *iovas, const uint64_t *sizes,
  unsigned n=fg_abi_frame(words,iovas,sizes,count,G3_FENCE_VA+FG_ABI_FENCE_OFF,fg_abi_seq,fg_abi_seq+1,1);
  if (!n) return -1;
  if (!fg_abi_switch(FG_ABI_PT)) return fg_abi_fault("client install TTBR");
- /* NC BO mappings on both CPUs and GPU; this also publishes user stores.
-  * Prologue flush+invalidate handles prior GPU cache contents. */
+ /* Ordinary BOs are NC on both sides. Imports preserve CPU attributes and
+  * need an explicit PoC handoff; IO-coherent XNU helpers may be no-ops here.
+  * No CPU access is allowed until retirement, per external synchronization.
+  * PM4 prologue/epilogue handle GPU cache invalidate/writeback. */
+ fg_abi_import_cache(0);
  __asm__ volatile("dsb sy" ::: "memory");
  for (unsigned i=0;i<n;i++) g3_emit(words[i]);
  g3_wptr &= 8191;

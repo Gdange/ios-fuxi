@@ -22,7 +22,7 @@ int main(int argc,char **argv) {
    for(unsigned i=0;i<256;++i)assert(((uint8_t *)dst->contents)[i]==0x39 && ((uint8_t *)dst->contents)[262400+i]==0x39);
   }
   // The Linux software ICD may support the same standard import path that the
-  // current NativeAdreno kernel cannot. Either import or a precise refusal is valid.
+  // NativeAdreno ABI 2 provides separately. This does not qualify its KMD/cache path.
   void *host=nullptr;assert(!posix_memalign(&host,65536,262144));memcpy(host,src->contents,262144);
   if(backend.supportsHostImport()) {
    try {backend.importTexture((uint8_t *)host+1,262144,1024);assert(false);}catch(const std::runtime_error&) {}

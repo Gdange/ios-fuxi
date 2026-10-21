@@ -115,12 +115,12 @@
 --- a/iokit/Kernel/arm/FuxiAdrenoUserClient.cpp
 +++ b/iokit/Kernel/arm/FuxiAdrenoUserClient.cpp
 @@ -1,4 +1,4 @@
--/* NativeAdrenoABI v1 userspace lane. No Apple accelerator/Metal impersonation.
-+/* NativeAdrenoABI v1 userspace lane. Minimal Metal discovery metaclass only.
+-/* NativeAdrenoABI v2 userspace lane. No Apple accelerator/Metal impersonation.
++/* NativeAdrenoABI v2 userspace lane. Minimal Metal discovery metaclass only.
   * ABI and framing credit: UniXNU NativeAdreno contributors (MIT).
   * See NativeAdrenoABI.h and LICENSE.NativeAdreno for copied material.
   */
-@@ -8,37 +8,65 @@
+@@ -8,39 +8,67 @@
  #include <IOKit/IOPlatformExpert.h>
  #include <IOKit/IOUserClient.h>
  #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -128,6 +128,8 @@
  #include <IOKit/IOLib.h>
  #include <IOKit/IOLocks.h>
  #include <kern/clock.h>
+ #include <kern/task.h>
+ #include <vm/pmap.h>
 +#include <sys/proc.h>
 +#include <pexpert/pexpert.h>
  #include "fuxi_gpu_abi.h"
@@ -198,9 +200,9 @@
  class FuxiAdrenoUserClient : public IOUserClient {
   OSDeclareDefaultStructors(FuxiAdrenoUserClient)
   enum {MaxBos=64};
-@@ -50,7 +78,29 @@
-   char metadata[64];
+@@ -55,7 +83,29 @@
   } bos_[MaxBos] = {};
+  task_t task_ = TASK_NULL;
   IOLock *lock_ = nullptr;
 - bool live_ = false;
 + bool live_ = false, diagnostic_ = false, resultChecked_ = false;
@@ -229,7 +231,7 @@
   uint64_t nextHandle_ = 1, wired_ = 0, lastFence_ = 0, firstFence_ = 0;
   uint32_t nextToken_ = 1;
   bool queues_[8] = {true};
-@@ -99,10 +149,8 @@
+@@ -112,10 +162,8 @@
    if (!memory && !r.contiguous) memory=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,options,allocated,mask);
    if (!memory) return kIOReturnNoMemory;
    if (memory->prepare()!=kIOReturnSuccess) { memory->release(); return kIOReturnNoMemory; }
@@ -241,7 +243,7 @@
    uint64_t first=0;
    for (uint64_t off=0;valid && off<allocated;off+=16384) {
     IOByteCount length=0;
-@@ -111,14 +159,11 @@
+@@ -124,14 +172,11 @@
         (!off ? !(pa&((UINT64_C(1)<<r.align_log2)-1)) : !r.contiguous || pa==first+off);
     if (!valid) break;
     if (!off) first=pa;
@@ -258,10 +260,10 @@
    if (!valid) {
     if (view) view->release();
     memory->complete(); memory->release(); return kIOReturnNoMemory;
-@@ -225,24 +270,34 @@
- public:
+@@ -282,24 +327,34 @@
   bool initWithTask(task_t task, void *securityID, UInt32 type) override {
    if (!IOUserClient::initWithTask(task,securityID,type)) return false;
+   task_=task; task_reference(task_);
 +  pid_=proc_selfpid();
 +  char name[64]={}; proc_name(pid_,name,sizeof(name));
 +  diagnostic_=execswapTest && type==0x4147 && !strncmp(name,"fuxi-gpu-abi-",13);
@@ -296,7 +298,7 @@
    IOLockUnlock(lock_); return s;
   }
   IOReturn clientMemoryForType(UInt32 token, IOOptionBits *options, IOMemoryDescriptor **memory) override {
-@@ -252,7 +307,9 @@
+@@ -309,7 +364,9 @@
    if (live_) for (auto &b:bos_) if (b.handle && b.token==token && b.leases) {
     b.view->retain(); *memory=b.view; *options=kIOMapAnywhere|kIOMapWriteCombineCache; break;
    }
@@ -307,7 +309,7 @@
   }
   IOReturn clientClose() override {
    if (!lock_) return kIOReturnSuccess;
-@@ -269,7 +326,8 @@
+@@ -326,7 +383,8 @@
     IOLockLock(openLock); connected=false; IOLockUnlock(openLock);
    }
    IOLockUnlock(lock_);
@@ -317,7 +319,7 @@
   }
   void free() override {
    (void)clientClose();
-@@ -278,14 +336,26 @@
+@@ -336,14 +394,26 @@
   }
  };
  OSDefineMetaClassAndStructors(FuxiAdrenoUserClient,IOUserClient)
@@ -346,7 +348,7 @@
    if (!handler) return kIOReturnBadArgument;
    *handler=nullptr;
    if (type!=0x4147 && type!=0) return kIOReturnUnsupported;
-@@ -298,9 +368,12 @@
+@@ -356,9 +426,12 @@
    *handler=uc; return kIOReturnSuccess;
   }
  };
@@ -360,10 +362,10 @@
   openLock=IOLockAlloc();
   auto *service=new NativeAdrenoGpuPublished;
   if (!openLock || !service) { if (service) service->release(); return; }
-@@ -309,6 +382,16 @@
+@@ -367,6 +440,16 @@
   }
   service->setName("NativeAdrenoGpu");
-  service->setProperty("NativeAdrenoABI",1ULL,32);
+  service->setProperty("NativeAdrenoABI",(uint64_t)NativeAdrenoAbiVersion,32);
 + service->setProperty("MetalPluginName","FuxiMetal");
 + service->setProperty("MetalPluginClassName","FuxiMTLDevice");
 + // Verify the exact ancestry test used by IOService's matching path before
@@ -375,5 +377,5 @@
 + }
 + IOLog("FUXI MTL: IOAcceleratorES metaclass match PASS plugin FuxiMetal/FuxiMTLDevice\n");
   service->registerService(); /* retained for boot lifetime */
-  IOLog("FUXI GPU ABI: NativeAdrenoGpuPublished v1, open 0x4147, root only, watchdog 100 ms\n");
+  IOLog("FUXI GPU ABI: NativeAdrenoGpuPublished v2 HostImport 16K, open 0x4147, root only, watchdog 100 ms\n");
  }

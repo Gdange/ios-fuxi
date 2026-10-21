@@ -9,6 +9,8 @@ extern "C" {
  * poll also returns -3 on watchdog timeout/drained, -4 timeout/quarantined. */
 int fuxi_gpu_abi_map(uint64_t iova, uintptr_t source, uint64_t bytes,
     unsigned permissions, unsigned writeback, unsigned shareability);
+/* Persistent kernel mapping of a prepared task descriptor; lifetime through unmap. */
+int fuxi_gpu_abi_map_import(uint64_t iova, uintptr_t source, uint64_t bytes, unsigned permissions);
 int fuxi_gpu_abi_unmap(uint64_t iova, uint64_t bytes);
 int fuxi_gpu_abi_submit(const uint64_t *iovas, const uint64_t *sizes,
     unsigned count, uint64_t *fence);

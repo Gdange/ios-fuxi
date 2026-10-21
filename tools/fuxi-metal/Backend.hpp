@@ -10,6 +10,8 @@
 #include <stdexcept>
 #include <vector>
 #include "Translator.hpp"
+#include "../../xnu/fuxi-adreno/NativeAdrenoABI.h"
+static_assert(NativeAdrenoAbiVersion==2,"FuxiMetal HostImport requires NativeAdreno ABI 2");
 #ifndef FUXI_MTL_ICD
 #define FUXI_MTL_ICD "/usr/local/lib/libvulkan_freedreno.dylib"
 #endif
@@ -97,7 +99,11 @@ public:
    if(hostImport) {
     VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp{};hp.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT;
     VkPhysicalDeviceProperties2 p2{};p2.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;p2.pNext=&hp;GetPhysicalDeviceProperties2(physical,&p2);
-    hostAlignment=hp.minImportedHostPointerAlignment;di.enabledExtensionCount=1;di.ppEnabledExtensionNames=&hostExtension;
+    hostAlignment=hp.minImportedHostPointerAlignment;
+#ifndef FUXI_MTL_HOST_TEST
+    if(hostAlignment!=NativeAdrenoAbiHostPageBytes)throw std::runtime_error("NativeAdreno ABI 2 HostImport requires 16K pages");
+#endif
+    di.enabledExtensionCount=1;di.ppEnabledExtensionNames=&hostExtension;
    }
    check(CreateDevice(physical,&di,nullptr,&device));
    GetMemoryHostPointerPropertiesEXT=(PFN_vkGetMemoryHostPointerPropertiesEXT)GetDeviceProcAddr(device,"vkGetMemoryHostPointerPropertiesEXT");
@@ -156,7 +162,8 @@ public:
   ci.addressModeU=ci.addressModeV=ci.addressModeW=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;ci.maxLod=VK_LOD_CLAMP_NONE;
   try {check(CreateSampler(device,&ci,nullptr,&s->sampler));return s;}catch(...) {delete s;throw;}
  }
- // The caller owns and pins/locks the IOSurface until this image is destroyed.
+ // The caller retains/locks the IOSurface; ABI 2 pins its task pages and handles
+ // non-coherent cache handoff inside kernel submit/retirement.
  // No staging copy: only an external host allocation with exactly matching linear layout.
  Texture *importTexture(void *base,size_t bytes,size_t row) {
   std::unique_lock<std::mutex> guard(mutex);requireLive();

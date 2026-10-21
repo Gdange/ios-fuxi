@@ -41,7 +41,7 @@ def main():
     ap.add_argument('--meson', default='meson')
     ap.add_argument('--verify-inputs-only', action='store_true')
     args = ap.parse_args()
-    if os.uname().sysname != 'Darwin':
+    if not args.verify_inputs_only and os.uname().sysname != 'Darwin':
         ap.error('requires native Mac, iPhoneOS SDK, Meson, Ninja, glslangValidator and Python mako/yaml/packaging')
     source, build, out = (p.resolve() for p in (args.mesa, args.build, args.out))
     for p in (source, build):
@@ -57,7 +57,8 @@ def main():
         if hashlib.sha256(patch.read_bytes()).hexdigest() != digest:
             ap.error('patch hash mismatch: '+name)
         ordered.append(patch)
-    ordered += [ROOT/'tools/patches/mesa-fuxi-ios16.patch', ROOT/'tools/patches/mesa-fuxi-smoke.patch']
+    ordered += [ROOT/'tools/patches/mesa-fuxi-ios16.patch', ROOT/'tools/patches/mesa-fuxi-smoke.patch',
+                ROOT/'tools/patches/mesa-fuxi-hostimport.patch']
     # Accept only an exact known prefix, including a previously completed M3
     # cache. Reverse-checking an upstream added file fails after a local overlay.
     with tempfile.TemporaryDirectory() as tmp:

@@ -312,8 +312,8 @@
  int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,
 --- a/iokit/Kernel/arm/FuxiAdrenoUserClient.cpp
 +++ b/iokit/Kernel/arm/FuxiAdrenoUserClient.cpp
-@@ -0,0 +1,315 @@
-+/* NativeAdrenoABI v1 userspace lane. No Apple accelerator/Metal impersonation.
+@@ -0,0 +1,373 @@
++/* NativeAdrenoABI v2 userspace lane. No Apple accelerator/Metal impersonation.
 + * ABI and framing credit: UniXNU NativeAdreno contributors (MIT).
 + * See NativeAdrenoABI.h and LICENSE.NativeAdreno for copied material.
 + */
@@ -326,6 +326,8 @@
 +#include <IOKit/IOLib.h>
 +#include <IOKit/IOLocks.h>
 +#include <kern/clock.h>
++#include <kern/task.h>
++#include <vm/pmap.h>
 +#include "fuxi_gpu_abi.h"
 +#include "fuxi_abi_wire.h"
 +
@@ -359,11 +361,14 @@
 + enum {MaxBos=64};
 + struct Bo {
 +  IOBufferMemoryDescriptor *memory;
++  IOMemoryDescriptor *importMemory;
++  IOMemoryMap *importMap;
 +  FuxiAdrenoBoView *view;
 +  uint64_t handle, bytes, allocated, iova;
 +  uint32_t token, leases, metadataBytes;
 +  char metadata[64];
 + } bos_[MaxBos] = {};
++ task_t task_ = TASK_NULL;
 + IOLock *lock_ = nullptr;
 + bool live_ = false;
 + uint64_t nextHandle_ = 1, wired_ = 0, lastFence_ = 0, firstFence_ = 0;
@@ -392,10 +397,18 @@
 +  if (b.iova) {
 +   int s=fuxi_gpu_abi_unmap(b.iova,b.bytes);
 +   if (s) return s==1 ? kIOReturnBusy : kIOReturnIOError;
++   b.iova=0;
 +  }
++  if (b.importMemory && b.importMap->wireRange(kIODirectionNone,0,b.bytes)!=kIOReturnSuccess)
++   return kIOReturnIOError;
 +  wired_-=b.allocated;
-+  b.view->release(); /* view owns the matched prepare + backing retain */
-+  b.memory->release();
++  if (b.importMemory) {
++   b.importMap->release();
++   b.importMemory->complete(); b.importMemory->release();
++  } else {
++   b.view->release(); /* view owns the matched prepare + backing retain */
++   b.memory->release();
++  }
 +  bzero(&b,sizeof(b));
 +  return kIOReturnSuccess;
 + }
@@ -443,9 +456,49 @@
 +  out.handle=b->handle;
 +  return kIOReturnSuccess;
 + }
++ /* The persistent memory entry captures the caller's VM object, including
++  * COW resolution, before wiring. Never translate a user VA with kernel_pmap,
++  * change its WIMG/cache mode, or manufacture a physical descriptor alias. */
++ IOReturn importHost(const NativeAdrenoAbiBoImport &r, NativeAdrenoAbiBoAllocReply &out) {
++  if (current_task()!=task_ || task_==kernel_task || !fg_abi_import_valid(r.address,r.bytes))
++   return kIOReturnBadArgument;
++  if (r.bytes>FG_ABI_MAX_BYTES-wired_) return kIOReturnNoResources;
++  Bo *b=nullptr;
++  for (auto &candidate:bos_) if (!candidate.handle) { b=&candidate; break; }
++  if (!b) return kIOReturnNoResources;
++  IOMemoryDescriptor *memory=IOMemoryDescriptor::withAddressRange(r.address,r.bytes,
++      kIODirectionInOut|kIOMemoryMapperNone|kIOMemoryPersistent,task_);
++  if (!memory) return kIOReturnNoMemory;
++  if (memory->prepare()!=kIOReturnSuccess) { memory->release(); return kIOReturnBadArgument; }
++  bool valid=memory->getLength()==r.bytes;
++  for (uint64_t off=0;valid && off<r.bytes;off+=NativeAdrenoAbiHostPageBytes) {
++   IOByteCount length=0;
++   uint64_t pa=memory->getPhysicalSegment(off,&length,kIOMemoryMapperNone);
++   valid=pa && !(pa&(NativeAdrenoAbiHostPageBytes-1)) && length>=NativeAdrenoAbiHostPageBytes &&
++       pa<(UINT64_C(1)<<FG_ABI_PA_BITS) && pmap_valid_page((ppnum_t)(pa>>14));
++   if (valid) {
++    unsigned cache=pmap_cache_attributes((ppnum_t)(pa>>14))&VM_WIMG_MASK;
++    valid=cache==VM_WIMG_DEFAULT || cache==VM_WIMG_WCOMB; // Normal WB or NC only
++   }
++  }
++  // DefaultCache inherits the memory entry's actual policy (WB or Normal NC).
++  IOMemoryMap *mapping=valid ? memory->createMappingInTask(kernel_task,0,kIOMapAnywhere|kIOMapDefaultCache) : nullptr;
++  if (!mapping || !mapping->getVirtualAddress() || mapping->getLength()!=r.bytes) {
++   if (mapping) mapping->release();
++   memory->complete(); memory->release(); return kIOReturnBadArgument;
++  }
++  // Fault/wire the kernel alias as well: pmap lookup and watchdog cache
++  // maintenance must never depend on a pageable/demand-faulted KVA mapping.
++  if (mapping->wireRange(kIODirectionInOut,0,r.bytes)!=kIOReturnSuccess) {
++   mapping->release(); memory->complete(); memory->release(); return kIOReturnNoMemory;
++  }
++  b->importMemory=memory; b->importMap=mapping; b->bytes=b->allocated=r.bytes;
++  b->handle=nextHandle_++; wired_+=r.bytes; out.handle=b->handle;
++  return kIOReturnSuccess;
++ }
 + IOReturn run(unsigned method, const void *in, void *out) {
 +  if (method==NativeAdrenoMethodQuery) {
-+   *static_cast<NativeAdrenoAbiParams *>(out)={1,31,FG_ABI_PA_BITS,0,FG_ABI_MAX_BYTES}; return kIOReturnSuccess;
++   *static_cast<NativeAdrenoAbiParams *>(out)={NativeAdrenoAbiVersion,31,FG_ABI_PA_BITS,NativeAdrenoParamsHostImport,FG_ABI_MAX_BYTES}; return kIOReturnSuccess;
 +  }
 +  if (method==NativeAdrenoMethodGetDeviceInfo) {
 +   /* A740 C510v2, SM8550 UBWC4; programmed UCHE ranges are checked at
@@ -470,17 +523,20 @@
 +   return drop(*b);
 +  }
 +  if (!fuxi_gpu_abi_available()) return kIOReturnNotReady;
++  if (method==NativeAdrenoMethodBoImport)
++   return importHost(*static_cast<const NativeAdrenoAbiBoImport *>(in),*static_cast<NativeAdrenoAbiBoAllocReply *>(out));
 +  if (method==NativeAdrenoMethodBoAlloc)
 +   return allocate(*static_cast<const NativeAdrenoAbiBoAlloc *>(in),*static_cast<NativeAdrenoAbiBoAllocReply *>(out));
 +  if (method==NativeAdrenoMethodBoMap) {
 +   const auto &r=*static_cast<const NativeAdrenoAbiBoMap *>(in);
 +   Bo *b=find(r.handle);
-+   if (!b || b->iova || !fg_abi_map_valid(r.iova,b->bytes,r.permissions,r.writeback,r.shareability,r.reserved))
++   if (!b || b->iova || (b->importMemory && (r.writeback || r.shareability!=2)) || !fg_abi_map_valid(r.iova,b->bytes,r.permissions,r.writeback,r.shareability,r.reserved))
 +    return kIOReturnBadArgument;
 +   uint64_t deadline; clock_interval_to_deadline(150,NSEC_PER_MSEC,&deadline);
 +   int s;
 +   do {
-+    s=fuxi_gpu_abi_map(r.iova,(uintptr_t)b->memory->getBytesNoCopy(),b->bytes,r.permissions,r.writeback,r.shareability);
++    s=b->importMemory ? fuxi_gpu_abi_map_import(r.iova,b->importMap->getVirtualAddress(),b->bytes,r.permissions) :
++        fuxi_gpu_abi_map(r.iova,(uintptr_t)b->memory->getBytesNoCopy(),b->bytes,r.permissions,r.writeback,r.shareability);
 +    if (s!=1 || mach_absolute_time()>=deadline) break;
 +    IOSleep(1);
 +   } while (true);
@@ -489,7 +545,7 @@
 +  }
 +  if (method==NativeAdrenoMethodBoCpuMap) {
 +   Bo *b=find(static_cast<const NativeAdrenoAbiBoCpuMap *>(in)->handle);
-+   if (!b || b->leases==UINT32_MAX) return kIOReturnBadArgument;
++   if (!b || b->importMemory || b->leases==UINT32_MAX) return kIOReturnBadArgument;
 +   ++b->leases;
 +   *static_cast<NativeAdrenoAbiBoCpuMapReply *>(out)={b->token,0,b->allocated}; return kIOReturnSuccess;
 +  }
@@ -540,6 +596,7 @@
 +public:
 + bool initWithTask(task_t task, void *securityID, UInt32 type) override {
 +  if (!IOUserClient::initWithTask(task,securityID,type)) return false;
++  task_=task; task_reference(task_);
 +  lock_=IOLockAlloc(); return lock_!=nullptr;
 + }
 + bool mount() {
@@ -589,6 +646,7 @@
 + void free() override {
 +  (void)clientClose();
 +  if (lock_) IOLockFree(lock_);
++  if (task_!=TASK_NULL) { task_deallocate(task_); task_=TASK_NULL; }
 +  IOUserClient::free();
 + }
 +};
@@ -623,14 +681,14 @@
 +  service->release(); return;
 + }
 + service->setName("NativeAdrenoGpu");
-+ service->setProperty("NativeAdrenoABI",1ULL,32);
++ service->setProperty("NativeAdrenoABI",(uint64_t)NativeAdrenoAbiVersion,32);
 + service->registerService(); /* retained for boot lifetime */
-+ IOLog("FUXI GPU ABI: NativeAdrenoGpuPublished v1, open 0x4147, root only, watchdog 100 ms\n");
++ IOLog("FUXI GPU ABI: NativeAdrenoGpuPublished v2 HostImport 16K, open 0x4147, root only, watchdog 100 ms\n");
 +}
 +#endif
 --- a/bsd/dev/fuxi_gpu_abi_backend.inc
 +++ b/bsd/dev/fuxi_gpu_abi_backend.inc
-@@ -0,0 +1,271 @@
+@@ -0,0 +1,323 @@
 +/* Built into fuxi_adreno.c, with access to its proven SMMU/ring helpers.
 + * Single privileged diagnostic client, not a security boundary for PM4.
 + * Its root has no scanout or surface-cache mappings. The kernel-only runtime
@@ -648,6 +706,25 @@
 +static int fg_abi_drained = 1;
 +static uint64_t fg_client_deadline;
 +static thread_call_data_t fg_client_watchdog;
++/* Every mapped import can be referenced indirectly by PM4, not just the IB
++ * list. Serialize cache handoff with the same GPU lock as submit/retirement.
++ * The user client owns these prepared kernel mappings until successful unmap. */
++static struct { uint64_t iova, bytes; uintptr_t source; } fg_abi_imports[64];
++static unsigned fg_abi_host_handoff;
++static void fg_abi_import_cache(int complete)
++{
++ if (complete && !fg_abi_host_handoff) return;
++ __asm__ volatile("dsb sy" ::: "memory");
++ for (unsigned i=0;i<64;i++) if (fg_abi_imports[i].iova) {
++  uintptr_t end=fg_abi_imports[i].source+fg_abi_imports[i].bytes;
++  for (uintptr_t p=fg_abi_imports[i].source;p<end;p+=64) {
++   if (complete) { __asm__ volatile("dc ivac, %0" :: "r"(p) : "memory"); }
++   else { __asm__ volatile("dc civac, %0" :: "r"(p) : "memory"); }
++  }
++ }
++ __asm__ volatile("dsb sy" ::: "memory");
++ fg_abi_host_handoff=!complete;
++}
 +static volatile uint64_t *fg_abi_leaf(uint64_t iova)
 +{
 + unsigned chunk = (unsigned)((iova-FG_ABI_VA_START)>>21);
@@ -698,6 +775,7 @@
 + fg_abi_poisoned = 1;
 + fg_fail(why,0x701);
 + fg_abi_drained = fg_isolate();
++ if (fg_abi_drained) fg_abi_import_cache(1);
 + fg_client_busy = 0;
 + return fg_abi_drained ? -1 : -2;
 +}
@@ -711,6 +789,7 @@
 + if (g3_read(G3_FENCE_PA+FG_ABI_FENCE_OFF+4)==fg_abi_seq &&
 +     g3_gr(0x806)==g3_wptr && g3_gr(0x807)==g3_wptr && !(g3_gr(0x210)&~1u)) {
 +  if (!fg_abi_switch(G3_PT)) return fg_abi_fault("client restore TTBR");
++  fg_abi_import_cache(1); /* before fence success, even without a user wait */
 +  fg_abi_completed = fg_abi_seq;
 +  fg_client_busy = 0;
 +  return 0;
@@ -832,10 +911,9 @@
 + FG_GUARD;
 + return fg_abi_live && fuxi_gpu_ready() && !fg_abi_poisoned;
 +}
-+int fuxi_gpu_abi_map(uint64_t iova, uintptr_t source, uint64_t bytes,
++static int fg_abi_map_locked(uint64_t iova, uintptr_t source, uint64_t bytes,
 +    unsigned permissions, unsigned wb, unsigned sh)
 +{
-+ FG_GUARD;
 + if (!fg_abi_live || !fuxi_gpu_ready() || fg_abi_poisoned) return -1;
 + if (fg_client_busy) return 1;
 + if (!fg_abi_map_valid(iova,bytes,permissions,wb,sh,0) || !source || (source&4095)) return -1;
@@ -853,10 +931,38 @@
 + /* Root is inactive; TLBI is mandatory before its next doorbell. */
 + return 0;
 +}
++int fuxi_gpu_abi_map(uint64_t iova, uintptr_t source, uint64_t bytes,
++    unsigned permissions, unsigned wb, unsigned sh)
++{
++ FG_GUARD;
++ return fg_abi_map_locked(iova,source,bytes,permissions,wb,sh);
++}
++int fuxi_gpu_abi_map_import(uint64_t iova, uintptr_t source, uint64_t bytes, unsigned permissions)
++{
++ FG_GUARD;
++ if (!source || !bytes || ((source|bytes)&(NativeAdrenoAbiHostPageBytes-1)) ||
++     bytes>FG_ABI_MAX_BYTES || source+bytes<source) return -1;
++ unsigned slot;
++ for (slot=0;slot<64 && fg_abi_imports[slot].iova;slot++) {}
++ if (slot==64) return -1;
++ int s=fg_abi_map_locked(iova,source,bytes,permissions,0,2);
++ if (!s) {
++  fg_abi_imports[slot].source=source; fg_abi_imports[slot].bytes=bytes; fg_abi_imports[slot].iova=iova;
++ }
++ return s;
++}
++static void fg_abi_import_remove(uint64_t iova, uint64_t bytes)
++{
++ for (unsigned i=0;i<64;i++)
++  if (fg_abi_imports[i].iova==iova && fg_abi_imports[i].bytes==bytes) fg_abi_imports[i].iova=0;
++}
 +int fuxi_gpu_abi_unmap(uint64_t iova, uint64_t bytes)
 +{
 + FG_GUARD;
-+ if (fg_abi_poisoned) return fg_abi_drained ? 0 : -2;
++ if (fg_abi_poisoned) {
++  if (!fg_abi_drained) return -2;
++  fg_abi_import_remove(iova,bytes); return 0;
++ }
 + if (!fg_abi_live || !fg_abi_range(iova,bytes)) return -1;
 + if (fg_client_busy) return 1;
 + for (uint64_t off=0;off<bytes;off+=4096) *fg_abi_leaf(iova+off)=0;
@@ -865,6 +971,7 @@
 +  * Safe with an in-flight present: only the inactive root was changed. */
 + uint32_t tlb[128]={0};
 + if (g4_tlb(tlb) || fg_access_failed) return fg_abi_fault("client unmap TLB sync");
++ fg_abi_import_remove(iova,bytes);
 + return 0;
 +}
 +int fuxi_gpu_abi_submit(const uint64_t *iovas, const uint64_t *sizes,
@@ -879,8 +986,11 @@
 + unsigned n=fg_abi_frame(words,iovas,sizes,count,G3_FENCE_VA+FG_ABI_FENCE_OFF,fg_abi_seq,fg_abi_seq+1,1);
 + if (!n) return -1;
 + if (!fg_abi_switch(FG_ABI_PT)) return fg_abi_fault("client install TTBR");
-+ /* NC BO mappings on both CPUs and GPU; this also publishes user stores.
-+  * Prologue flush+invalidate handles prior GPU cache contents. */
++ /* Ordinary BOs are NC on both sides. Imports preserve CPU attributes and
++  * need an explicit PoC handoff; IO-coherent XNU helpers may be no-ops here.
++  * No CPU access is allowed until retirement, per external synchronization.
++  * PM4 prologue/epilogue handle GPU cache invalidate/writeback. */
++ fg_abi_import_cache(0);
 + __asm__ volatile("dsb sy" ::: "memory");
 + for (unsigned i=0;i<n;i++) g3_emit(words[i]);
 + g3_wptr &= 8191;
@@ -904,7 +1014,7 @@
 +}
 --- a/bsd/dev/NativeAdrenoABI.h
 +++ b/bsd/dev/NativeAdrenoABI.h
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,171 @@
 +/* SPDX-License-Identifier: MIT */
 +#ifndef NATIVE_ADRENO_ABI_H
 +#define NATIVE_ADRENO_ABI_H
@@ -918,8 +1028,9 @@
 + * disagrees with the storage. Unknown versions, methods and flags are refused
 + * rather than ignored. */
 +enum {
-+    NativeAdrenoAbiVersion = 1,
++    NativeAdrenoAbiVersion = 2,
 +    NativeAdrenoAbiMaxBuffers = 16,
++    NativeAdrenoAbiHostPageBytes = 16384,
 +    NativeAdrenoAbiMaxBoBytesShift = 28, /* 256MiB per object */
 +    NativeAdrenoMethodQuery = 1,
 +    NativeAdrenoMethodBoAlloc = 2,
@@ -958,12 +1069,17 @@
 +struct NativeAdrenoAbiBoAllocReply {
 +    uint64_t handle;              /* opaque to userspace, nonzero */
 +};
-+/* Pins [address, address + bytes) of the CALLING task and makes it a BO (reply: NativeAdrenoAbiBoAllocReply). The pages stay wired
-+ * until BoFree; they keep the caller's own CPU mapping and cache mode, so the caller cleans its caches before GPU use and invalidates
-+ * them after GPU writes (the GPU maps them non-cacheable). An imported BO has no CPU-map token. */
++/* ABI v2: pins a writable range in the opening task (and only that task may
++ * call BoImport). Reply is NativeAdrenoAbiBoAllocReply. The original CPU cache
++ * policy is preserved; no CPU-map token is issued. Kernel cleans/invalidates
++ * imported mappings before submit and invalidates after retirement/drain.
++ * GPU access uses Normal NC, outer-shareable SMMU leaves. Caller must keep the
++ * original allocation alive and externally synchronize CPU/other GPU access.
++ * BoFree/task death unmaps and unwires after DMA retirement, or quarantines on
++ * an unconfirmed drain. No foreign-device/MMIO or surface-ID import. */
 +struct NativeAdrenoAbiBoImport {
-+    uint64_t address;             /* 4KiB aligned */
-+    uint64_t bytes;               /* 4KiB multiple, <= max_bo_bytes */
++    uint64_t address;             /* nonzero, 16KiB aligned task VA */
++    uint64_t bytes;               /* 16KiB multiple, <= max_bo_bytes */
 +};
 +struct NativeAdrenoAbiBoMap {
 +    uint64_t handle;
@@ -1072,7 +1188,7 @@
 +#endif
 --- a/bsd/dev/fuxi_abi_wire.h
 +++ b/bsd/dev/fuxi_abi_wire.h
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,93 @@
 +/* SPDX-License-Identifier: MIT
 + * A7xx framing adapted from UniXNU NativeAdrenoRing.cpp.
 + * Copyright (c) 2026 NativeAdreno contributors. See LICENSE.NativeAdreno.
@@ -1103,6 +1219,11 @@
 +static inline int fg_abi_alloc_valid(uint64_t bytes, unsigned align, unsigned contiguous)
 +{
 + return bytes && !(bytes&4095) && bytes <= FG_ABI_MAX_BYTES && align >= 12 && align <= 24 && contiguous <= 1;
++}
++static inline int fg_abi_import_valid(uint64_t address, uint64_t bytes)
++{
++ return address && bytes && !((address|bytes)&(NativeAdrenoAbiHostPageBytes-1)) &&
++     bytes<=FG_ABI_MAX_BYTES && address<(UINT64_C(1)<<47) && bytes<=(UINT64_C(1)<<47)-address;
 +}
 +static inline int fg_abi_map_valid(uint64_t iova, uint64_t bytes, unsigned perms,
 +    unsigned wb, unsigned sh, unsigned reserved)
@@ -1163,7 +1284,7 @@
 +#endif
 --- a/bsd/dev/fuxi_gpu_abi.h
 +++ b/bsd/dev/fuxi_gpu_abi.h
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,23 @@
 +/* NativeAdrenoABI platform bridge. All operations serialize with presents. */
 +#ifndef FUXI_GPU_ABI_H
 +#define FUXI_GPU_ABI_H
@@ -1175,6 +1296,8 @@
 + * poll also returns -3 on watchdog timeout/drained, -4 timeout/quarantined. */
 +int fuxi_gpu_abi_map(uint64_t iova, uintptr_t source, uint64_t bytes,
 +    unsigned permissions, unsigned writeback, unsigned shareability);
++/* Persistent kernel mapping of a prepared task descriptor; lifetime through unmap. */
++int fuxi_gpu_abi_map_import(uint64_t iova, uintptr_t source, uint64_t bytes, unsigned permissions);
 +int fuxi_gpu_abi_unmap(uint64_t iova, uint64_t bytes);
 +int fuxi_gpu_abi_submit(const uint64_t *iovas, const uint64_t *sizes,
 +    unsigned count, uint64_t *fence);
@@ -1211,7 +1334,7 @@
 +SOFTWARE.
 --- a/iokit/Kernel/arm/NativeAdrenoABI.h
 +++ b/iokit/Kernel/arm/NativeAdrenoABI.h
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,171 @@
 +/* SPDX-License-Identifier: MIT */
 +#ifndef NATIVE_ADRENO_ABI_H
 +#define NATIVE_ADRENO_ABI_H
@@ -1225,8 +1348,9 @@
 + * disagrees with the storage. Unknown versions, methods and flags are refused
 + * rather than ignored. */
 +enum {
-+    NativeAdrenoAbiVersion = 1,
++    NativeAdrenoAbiVersion = 2,
 +    NativeAdrenoAbiMaxBuffers = 16,
++    NativeAdrenoAbiHostPageBytes = 16384,
 +    NativeAdrenoAbiMaxBoBytesShift = 28, /* 256MiB per object */
 +    NativeAdrenoMethodQuery = 1,
 +    NativeAdrenoMethodBoAlloc = 2,
@@ -1265,12 +1389,17 @@
 +struct NativeAdrenoAbiBoAllocReply {
 +    uint64_t handle;              /* opaque to userspace, nonzero */
 +};
-+/* Pins [address, address + bytes) of the CALLING task and makes it a BO (reply: NativeAdrenoAbiBoAllocReply). The pages stay wired
-+ * until BoFree; they keep the caller's own CPU mapping and cache mode, so the caller cleans its caches before GPU use and invalidates
-+ * them after GPU writes (the GPU maps them non-cacheable). An imported BO has no CPU-map token. */
++/* ABI v2: pins a writable range in the opening task (and only that task may
++ * call BoImport). Reply is NativeAdrenoAbiBoAllocReply. The original CPU cache
++ * policy is preserved; no CPU-map token is issued. Kernel cleans/invalidates
++ * imported mappings before submit and invalidates after retirement/drain.
++ * GPU access uses Normal NC, outer-shareable SMMU leaves. Caller must keep the
++ * original allocation alive and externally synchronize CPU/other GPU access.
++ * BoFree/task death unmaps and unwires after DMA retirement, or quarantines on
++ * an unconfirmed drain. No foreign-device/MMIO or surface-ID import. */
 +struct NativeAdrenoAbiBoImport {
-+    uint64_t address;             /* 4KiB aligned */
-+    uint64_t bytes;               /* 4KiB multiple, <= max_bo_bytes */
++    uint64_t address;             /* nonzero, 16KiB aligned task VA */
++    uint64_t bytes;               /* 16KiB multiple, <= max_bo_bytes */
 +};
 +struct NativeAdrenoAbiBoMap {
 +    uint64_t handle;
@@ -1379,7 +1508,7 @@
 +#endif
 --- a/iokit/Kernel/arm/fuxi_abi_wire.h
 +++ b/iokit/Kernel/arm/fuxi_abi_wire.h
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,93 @@
 +/* SPDX-License-Identifier: MIT
 + * A7xx framing adapted from UniXNU NativeAdrenoRing.cpp.
 + * Copyright (c) 2026 NativeAdreno contributors. See LICENSE.NativeAdreno.
@@ -1410,6 +1539,11 @@
 +static inline int fg_abi_alloc_valid(uint64_t bytes, unsigned align, unsigned contiguous)
 +{
 + return bytes && !(bytes&4095) && bytes <= FG_ABI_MAX_BYTES && align >= 12 && align <= 24 && contiguous <= 1;
++}
++static inline int fg_abi_import_valid(uint64_t address, uint64_t bytes)
++{
++ return address && bytes && !((address|bytes)&(NativeAdrenoAbiHostPageBytes-1)) &&
++     bytes<=FG_ABI_MAX_BYTES && address<(UINT64_C(1)<<47) && bytes<=(UINT64_C(1)<<47)-address;
 +}
 +static inline int fg_abi_map_valid(uint64_t iova, uint64_t bytes, unsigned perms,
 +    unsigned wb, unsigned sh, unsigned reserved)
@@ -1470,7 +1604,7 @@
 +#endif
 --- a/iokit/Kernel/arm/fuxi_gpu_abi.h
 +++ b/iokit/Kernel/arm/fuxi_gpu_abi.h
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,23 @@
 +/* NativeAdrenoABI platform bridge. All operations serialize with presents. */
 +#ifndef FUXI_GPU_ABI_H
 +#define FUXI_GPU_ABI_H
@@ -1482,6 +1616,8 @@
 + * poll also returns -3 on watchdog timeout/drained, -4 timeout/quarantined. */
 +int fuxi_gpu_abi_map(uint64_t iova, uintptr_t source, uint64_t bytes,
 +    unsigned permissions, unsigned writeback, unsigned shareability);
++/* Persistent kernel mapping of a prepared task descriptor; lifetime through unmap. */
++int fuxi_gpu_abi_map_import(uint64_t iova, uintptr_t source, uint64_t bytes, unsigned permissions);
 +int fuxi_gpu_abi_unmap(uint64_t iova, uint64_t bytes);
 +int fuxi_gpu_abi_submit(const uint64_t *iovas, const uint64_t *sizes,
 +    unsigned count, uint64_t *fence);

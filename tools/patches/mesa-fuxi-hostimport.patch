@@ -1,0 +1,107 @@
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -1164,8 +1164,8 @@
+          : pdevice->info->props.max_storage_buffer_range_bytes;
+    props->maxPushConstantsSize = MAX_PUSH_CONSTANTS_SIZE;
+    props->maxMemoryAllocationCount = UINT32_MAX;
+-   /* VK_EXT_external_memory_host: the kernel pins whole 4 KiB pages. */
+-   props->minImportedHostPointerAlignment = 4096;
++   /* NativeAdreno ABI 2 wires whole 16 KiB XNU task pages. */
++   props->minImportedHostPointerAlignment = 16384;
+    props->maxSamplerAllocationCount = 64 * 1024;
+    props->bufferImageGranularity = 64;          /* A cache line */
+    props->sparseAddressSpaceSize = pdevice->va_size;
+@@ -3706,8 +3706,11 @@
+       vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_HOST_POINTER_INFO_EXT);
+ 
+    if (host_info && host_info->handleType) {
+-      if (host_info->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT ||
+-          ((uintptr_t) host_info->pHostPointer | pAllocateInfo->allocationSize) & 4095) {
++      if (!device->physical_device->has_host_import || !host_info->pHostPointer ||
++          (fd_info && fd_info->handleType) || pAllocateInfo->memoryTypeIndex != 0 ||
++          host_info->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT ||
++          !pAllocateInfo->allocationSize ||
++          ((uintptr_t) host_info->pHostPointer | pAllocateInfo->allocationSize) & 16383) {
+          result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+       } else {
+          result = tu_bo_init_host(device, &mem->bo, host_info->pHostPointer,
+@@ -3844,11 +3847,14 @@
+                                      VkMemoryHostPointerPropertiesEXT *pMemoryHostPointerProperties)
+ {
+    VK_FROM_HANDLE(tu_device, device, _device);
++   pMemoryHostPointerProperties->memoryTypeBits = 0;
+    if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT ||
+-       !device->physical_device->has_host_import || ((uintptr_t) pHostPointer & 4095))
++       !device->physical_device->has_host_import || !pHostPointer || ((uintptr_t) pHostPointer & 16383))
+       return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+-   /* Imported pages keep the owner's CPU mapping; they are offered as the plain (host-coherent) type. On Darwin the importer cleans
+-    * and invalidates its own CPU caches around GPU use (NativeAdrenoAbiBoImport), as an IOSurface's owner does. */
++   /* Type 0 is host visible/coherent. ABI 2 keeps the original CPU mapping
++    * and performs non-coherent PoC handoff in kernel submit/retirement (also
++    * watchdog retirement). No user cache instructions or IOSurface sync are
++    * required for this queue. Other producers still require external sync. */
+    pMemoryHostPointerProperties->memoryTypeBits = 1u;
+    return VK_SUCCESS;
+ }
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -1,5 +1,5 @@
+ /*
+- * Native Darwin kernel backend for Turnip: talks to the NativeAdreno IOKit user client (NativeAdrenoABI.h, version 1).
++ * Native Darwin kernel backend for Turnip: talks to the NativeAdreno IOKit user client (NativeAdrenoABI.h, version 2).
+  * Modelled on tu_knl_kgsl.cc (no libdrm) and tu_knl_drm_msm.cc (the client chooses GPU addresses).
+  * SPDX-License-Identifier: MIT
+  */
+@@ -14,6 +14,8 @@
+ #include <mach/mach.h>
+ 
+ #include "NativeAdrenoABI.h"
++static_assert(NativeAdrenoAbiVersion == 2, "Fuxi HostImport requires ABI 2");
++static_assert(NativeAdrenoAbiHostPageBytes == 16384, "Fuxi host page size");
+ 
+ #include "util/os_time.h"
+ #include "util/timespec.h"
+@@ -308,7 +310,11 @@
+ static VkResult
+ darwin_bo_init_host(struct tu_device *dev, struct tu_bo **out_bo, void *pointer, uint64_t size)
+ {
+-   if (!(dw.params.flags & NativeAdrenoParamsHostImport))
++   *out_bo = NULL;
++   if (!(dw.params.flags & NativeAdrenoParamsHostImport) || !pointer || !size ||
++       size > (UINT64_C(1) << NativeAdrenoAbiMaxBoBytesShift) ||
++       (((uintptr_t)pointer | size) & (NativeAdrenoAbiHostPageBytes - 1)) ||
++       (uintptr_t)pointer > UINTPTR_MAX - size)
+       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+    uint64_t iova;
+    VkResult result = darwin_allocate_iova(dev, size, 0, TU_BO_ALLOC_NO_FLAGS, &iova);
+--- a/src/freedreno/vulkan/tu_formats.cc
++++ b/src/freedreno/vulkan/tu_formats.cc
+@@ -745,6 +745,10 @@
+       }
+       break;
+    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT:
++      if (!physical_device->has_host_import ||
++          pImageFormatInfo->tiling != VK_IMAGE_TILING_LINEAR ||
++          pImageFormatInfo->type != VK_IMAGE_TYPE_2D)
++         return vk_error(physical_device, VK_ERROR_FORMAT_NOT_SUPPORTED);
+       flags = VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
+       compat_flags = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+       break;
+--- a/src/freedreno/vulkan/tu_buffer.cc
++++ b/src/freedreno/vulkan/tu_buffer.cc
+@@ -166,10 +166,14 @@
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+       break;
+-   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT:
++   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT: {
++      VK_FROM_HANDLE(tu_physical_device, physical_device, physicalDevice);
++      if (!physical_device->has_host_import)
++         break;
+       flags = VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
+       compat_flags = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+       break;
++   }
+    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID:
+       vk_android_get_ahb_buffer_properties(
+          physicalDevice, pExternalBufferInfo, pExternalBufferProperties);

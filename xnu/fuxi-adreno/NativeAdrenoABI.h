@@ -11,8 +11,9 @@
  * disagrees with the storage. Unknown versions, methods and flags are refused
  * rather than ignored. */
 enum {
-    NativeAdrenoAbiVersion = 1,
+    NativeAdrenoAbiVersion = 2,
     NativeAdrenoAbiMaxBuffers = 16,
+    NativeAdrenoAbiHostPageBytes = 16384,
     NativeAdrenoAbiMaxBoBytesShift = 28, /* 256MiB per object */
     NativeAdrenoMethodQuery = 1,
     NativeAdrenoMethodBoAlloc = 2,
@@ -51,12 +52,17 @@ struct NativeAdrenoAbiBoAlloc {
 struct NativeAdrenoAbiBoAllocReply {
     uint64_t handle;              /* opaque to userspace, nonzero */
 };
-/* Pins [address, address + bytes) of the CALLING task and makes it a BO (reply: NativeAdrenoAbiBoAllocReply). The pages stay wired
- * until BoFree; they keep the caller's own CPU mapping and cache mode, so the caller cleans its caches before GPU use and invalidates
- * them after GPU writes (the GPU maps them non-cacheable). An imported BO has no CPU-map token. */
+/* ABI v2: pins a writable range in the opening task (and only that task may
+ * call BoImport). Reply is NativeAdrenoAbiBoAllocReply. The original CPU cache
+ * policy is preserved; no CPU-map token is issued. Kernel cleans/invalidates
+ * imported mappings before submit and invalidates after retirement/drain.
+ * GPU access uses Normal NC, outer-shareable SMMU leaves. Caller must keep the
+ * original allocation alive and externally synchronize CPU/other GPU access.
+ * BoFree/task death unmaps and unwires after DMA retirement, or quarantines on
+ * an unconfirmed drain. No foreign-device/MMIO or surface-ID import. */
 struct NativeAdrenoAbiBoImport {
-    uint64_t address;             /* 4KiB aligned */
-    uint64_t bytes;               /* 4KiB multiple, <= max_bo_bytes */
+    uint64_t address;             /* nonzero, 16KiB aligned task VA */
+    uint64_t bytes;               /* 16KiB multiple, <= max_bo_bytes */
 };
 struct NativeAdrenoAbiBoMap {
     uint64_t handle;

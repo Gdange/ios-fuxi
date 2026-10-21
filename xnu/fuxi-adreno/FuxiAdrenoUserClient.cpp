@@ -1,4 +1,4 @@
-/* NativeAdrenoABI v1 userspace lane. Minimal Metal discovery metaclass only.
+/* NativeAdrenoABI v2 userspace lane. Minimal Metal discovery metaclass only.
  * ABI and framing credit: UniXNU NativeAdreno contributors (MIT).
  * See NativeAdrenoABI.h and LICENSE.NativeAdreno for copied material.
  */
@@ -12,6 +12,8 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
 #include <kern/clock.h>
+#include <kern/task.h>
+#include <vm/pmap.h>
 #include <sys/proc.h>
 #include <pexpert/pexpert.h>
 #include "fuxi_gpu_abi.h"
@@ -72,11 +74,14 @@ class FuxiAdrenoUserClient : public IOUserClient {
  enum {MaxBos=64};
  struct Bo {
   IOBufferMemoryDescriptor *memory;
+  IOMemoryDescriptor *importMemory;
+  IOMemoryMap *importMap;
   FuxiAdrenoBoView *view;
   uint64_t handle, bytes, allocated, iova;
   uint32_t token, leases, metadataBytes;
   char metadata[64];
  } bos_[MaxBos] = {};
+ task_t task_ = TASK_NULL;
  IOLock *lock_ = nullptr;
  bool live_ = false, diagnostic_ = false, resultChecked_ = false;
  int pid_ = 0;
@@ -127,10 +132,18 @@ class FuxiAdrenoUserClient : public IOUserClient {
   if (b.iova) {
    int s=fuxi_gpu_abi_unmap(b.iova,b.bytes);
    if (s) return s==1 ? kIOReturnBusy : kIOReturnIOError;
+   b.iova=0;
   }
+  if (b.importMemory && b.importMap->wireRange(kIODirectionNone,0,b.bytes)!=kIOReturnSuccess)
+   return kIOReturnIOError;
   wired_-=b.allocated;
-  b.view->release(); /* view owns the matched prepare + backing retain */
-  b.memory->release();
+  if (b.importMemory) {
+   b.importMap->release();
+   b.importMemory->complete(); b.importMemory->release();
+  } else {
+   b.view->release(); /* view owns the matched prepare + backing retain */
+   b.memory->release();
+  }
   bzero(&b,sizeof(b));
   return kIOReturnSuccess;
  }
@@ -173,9 +186,49 @@ class FuxiAdrenoUserClient : public IOUserClient {
   out.handle=b->handle;
   return kIOReturnSuccess;
  }
+ /* The persistent memory entry captures the caller's VM object, including
+  * COW resolution, before wiring. Never translate a user VA with kernel_pmap,
+  * change its WIMG/cache mode, or manufacture a physical descriptor alias. */
+ IOReturn importHost(const NativeAdrenoAbiBoImport &r, NativeAdrenoAbiBoAllocReply &out) {
+  if (current_task()!=task_ || task_==kernel_task || !fg_abi_import_valid(r.address,r.bytes))
+   return kIOReturnBadArgument;
+  if (r.bytes>FG_ABI_MAX_BYTES-wired_) return kIOReturnNoResources;
+  Bo *b=nullptr;
+  for (auto &candidate:bos_) if (!candidate.handle) { b=&candidate; break; }
+  if (!b) return kIOReturnNoResources;
+  IOMemoryDescriptor *memory=IOMemoryDescriptor::withAddressRange(r.address,r.bytes,
+      kIODirectionInOut|kIOMemoryMapperNone|kIOMemoryPersistent,task_);
+  if (!memory) return kIOReturnNoMemory;
+  if (memory->prepare()!=kIOReturnSuccess) { memory->release(); return kIOReturnBadArgument; }
+  bool valid=memory->getLength()==r.bytes;
+  for (uint64_t off=0;valid && off<r.bytes;off+=NativeAdrenoAbiHostPageBytes) {
+   IOByteCount length=0;
+   uint64_t pa=memory->getPhysicalSegment(off,&length,kIOMemoryMapperNone);
+   valid=pa && !(pa&(NativeAdrenoAbiHostPageBytes-1)) && length>=NativeAdrenoAbiHostPageBytes &&
+       pa<(UINT64_C(1)<<FG_ABI_PA_BITS) && pmap_valid_page((ppnum_t)(pa>>14));
+   if (valid) {
+    unsigned cache=pmap_cache_attributes((ppnum_t)(pa>>14))&VM_WIMG_MASK;
+    valid=cache==VM_WIMG_DEFAULT || cache==VM_WIMG_WCOMB; // Normal WB or NC only
+   }
+  }
+  // DefaultCache inherits the memory entry's actual policy (WB or Normal NC).
+  IOMemoryMap *mapping=valid ? memory->createMappingInTask(kernel_task,0,kIOMapAnywhere|kIOMapDefaultCache) : nullptr;
+  if (!mapping || !mapping->getVirtualAddress() || mapping->getLength()!=r.bytes) {
+   if (mapping) mapping->release();
+   memory->complete(); memory->release(); return kIOReturnBadArgument;
+  }
+  // Fault/wire the kernel alias as well: pmap lookup and watchdog cache
+  // maintenance must never depend on a pageable/demand-faulted KVA mapping.
+  if (mapping->wireRange(kIODirectionInOut,0,r.bytes)!=kIOReturnSuccess) {
+   mapping->release(); memory->complete(); memory->release(); return kIOReturnNoMemory;
+  }
+  b->importMemory=memory; b->importMap=mapping; b->bytes=b->allocated=r.bytes;
+  b->handle=nextHandle_++; wired_+=r.bytes; out.handle=b->handle;
+  return kIOReturnSuccess;
+ }
  IOReturn run(unsigned method, const void *in, void *out) {
   if (method==NativeAdrenoMethodQuery) {
-   *static_cast<NativeAdrenoAbiParams *>(out)={1,31,FG_ABI_PA_BITS,0,FG_ABI_MAX_BYTES}; return kIOReturnSuccess;
+   *static_cast<NativeAdrenoAbiParams *>(out)={NativeAdrenoAbiVersion,31,FG_ABI_PA_BITS,NativeAdrenoParamsHostImport,FG_ABI_MAX_BYTES}; return kIOReturnSuccess;
   }
   if (method==NativeAdrenoMethodGetDeviceInfo) {
    /* A740 C510v2, SM8550 UBWC4; programmed UCHE ranges are checked at
@@ -200,17 +253,20 @@ class FuxiAdrenoUserClient : public IOUserClient {
    return drop(*b);
   }
   if (!fuxi_gpu_abi_available()) return kIOReturnNotReady;
+  if (method==NativeAdrenoMethodBoImport)
+   return importHost(*static_cast<const NativeAdrenoAbiBoImport *>(in),*static_cast<NativeAdrenoAbiBoAllocReply *>(out));
   if (method==NativeAdrenoMethodBoAlloc)
    return allocate(*static_cast<const NativeAdrenoAbiBoAlloc *>(in),*static_cast<NativeAdrenoAbiBoAllocReply *>(out));
   if (method==NativeAdrenoMethodBoMap) {
    const auto &r=*static_cast<const NativeAdrenoAbiBoMap *>(in);
    Bo *b=find(r.handle);
-   if (!b || b->iova || !fg_abi_map_valid(r.iova,b->bytes,r.permissions,r.writeback,r.shareability,r.reserved))
+   if (!b || b->iova || (b->importMemory && (r.writeback || r.shareability!=2)) || !fg_abi_map_valid(r.iova,b->bytes,r.permissions,r.writeback,r.shareability,r.reserved))
     return kIOReturnBadArgument;
    uint64_t deadline; clock_interval_to_deadline(150,NSEC_PER_MSEC,&deadline);
    int s;
    do {
-    s=fuxi_gpu_abi_map(r.iova,(uintptr_t)b->memory->getBytesNoCopy(),b->bytes,r.permissions,r.writeback,r.shareability);
+    s=b->importMemory ? fuxi_gpu_abi_map_import(r.iova,b->importMap->getVirtualAddress(),b->bytes,r.permissions) :
+        fuxi_gpu_abi_map(r.iova,(uintptr_t)b->memory->getBytesNoCopy(),b->bytes,r.permissions,r.writeback,r.shareability);
     if (s!=1 || mach_absolute_time()>=deadline) break;
     IOSleep(1);
    } while (true);
@@ -219,7 +275,7 @@ class FuxiAdrenoUserClient : public IOUserClient {
   }
   if (method==NativeAdrenoMethodBoCpuMap) {
    Bo *b=find(static_cast<const NativeAdrenoAbiBoCpuMap *>(in)->handle);
-   if (!b || b->leases==UINT32_MAX) return kIOReturnBadArgument;
+   if (!b || b->importMemory || b->leases==UINT32_MAX) return kIOReturnBadArgument;
    ++b->leases;
    *static_cast<NativeAdrenoAbiBoCpuMapReply *>(out)={b->token,0,b->allocated}; return kIOReturnSuccess;
   }
@@ -270,6 +326,7 @@ class FuxiAdrenoUserClient : public IOUserClient {
 public:
  bool initWithTask(task_t task, void *securityID, UInt32 type) override {
   if (!IOUserClient::initWithTask(task,securityID,type)) return false;
+  task_=task; task_reference(task_);
   pid_=proc_selfpid();
   char name[64]={}; proc_name(pid_,name,sizeof(name));
   diagnostic_=execswapTest && type==0x4147 && !strncmp(name,"fuxi-gpu-abi-",13);
@@ -332,6 +389,7 @@ public:
  void free() override {
   (void)clientClose();
   if (lock_) IOLockFree(lock_);
+  if (task_!=TASK_NULL) { task_deallocate(task_); task_=TASK_NULL; }
   IOUserClient::free();
  }
 };
@@ -381,7 +439,7 @@ extern "C" void fuxi_gpu_abi_publish(void)
   service->release(); return;
  }
  service->setName("NativeAdrenoGpu");
- service->setProperty("NativeAdrenoABI",1ULL,32);
+ service->setProperty("NativeAdrenoABI",(uint64_t)NativeAdrenoAbiVersion,32);
  service->setProperty("MetalPluginName","FuxiMetal");
  service->setProperty("MetalPluginClassName","FuxiMTLDevice");
  // Verify the exact ancestry test used by IOService's matching path before
@@ -393,6 +451,6 @@ extern "C" void fuxi_gpu_abi_publish(void)
  }
  IOLog("FUXI MTL: IOAcceleratorES metaclass match PASS plugin FuxiMetal/FuxiMTLDevice\n");
  service->registerService(); /* retained for boot lifetime */
- IOLog("FUXI GPU ABI: NativeAdrenoGpuPublished v1, open 0x4147, root only, watchdog 100 ms\n");
+ IOLog("FUXI GPU ABI: NativeAdrenoGpuPublished v2 HostImport 16K, open 0x4147, root only, watchdog 100 ms\n");
 }
 #endif

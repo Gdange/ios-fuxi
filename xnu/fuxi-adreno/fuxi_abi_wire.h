@@ -29,6 +29,11 @@ static inline int fg_abi_alloc_valid(uint64_t bytes, unsigned align, unsigned co
 {
  return bytes && !(bytes&4095) && bytes <= FG_ABI_MAX_BYTES && align >= 12 && align <= 24 && contiguous <= 1;
 }
+static inline int fg_abi_import_valid(uint64_t address, uint64_t bytes)
+{
+ return address && bytes && !((address|bytes)&(NativeAdrenoAbiHostPageBytes-1)) &&
+     bytes<=FG_ABI_MAX_BYTES && address<(UINT64_C(1)<<47) && bytes<=(UINT64_C(1)<<47)-address;
+}
 static inline int fg_abi_map_valid(uint64_t iova, uint64_t bytes, unsigned perms,
     unsigned wb, unsigned sh, unsigned reserved)
 {
