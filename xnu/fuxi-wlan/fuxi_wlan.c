@@ -278,9 +278,10 @@ rh_send_request(unsigned t, const struct wl_rh_cmd *cmd, unsigned n, bool regula
 	bool done = false;
 	for (unsigned us = 0; us < 100000 && !fw_faults; us++) {
 		/* Device (M6j): BCM commands reach ISSUED|COMPLETED with the TCS idle
-		 * while IRQ_STATUS stays 0 (its IRQ is masked here), so BCM requests
-		 * complete on per-command status. Regulator polling is unchanged. */
-		done = (!regulator || (rh_rd(4) & bit)) && rh_rd(b + RH_IDLE) != 0;
+		 * while IRQ_STATUS stays 0 (its IRQ is masked here), and after the
+		 * first BCM request regulator requests stop raising it too. Every
+		 * request completes on idle plus per-command status. */
+		done = rh_rd(b + RH_IDLE) != 0;
 		for (unsigned i = 0; i < n; i++) {
 			uint32_t mask = 0x100u | (cmd[i].wait ? 0x10000u : 0);
 			if ((rh_rd(b + i * 24 + RH_CSTAT) & mask) != mask) { done = false; }
