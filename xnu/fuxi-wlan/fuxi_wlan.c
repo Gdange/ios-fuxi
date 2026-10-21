@@ -241,7 +241,7 @@ rh_wr(uint32_t off, uint32_t v)
 struct wl_rh_cmd { uint32_t addr, data, wait; };
 static bool rh_poisoned;
 static uint32_t
-rh_send_batch(unsigned t, const struct wl_rh_cmd *cmd, unsigned n)
+rh_send_request(unsigned t, const struct wl_rh_cmd *cmd, unsigned n, bool regulator)
 {
 	/* DRV2 has three ACTIVE TCSs; preserve all sleep/wake/other slots. */
 	if (t >= 3 || !n || n > 16 || rh_poisoned || fw_faults) { return 1; }
@@ -257,7 +257,7 @@ rh_send_batch(unsigned t, const struct wl_rh_cmd *cmd, unsigned n)
 	rh_wr(0, irq_en & ~bit);
 	for (unsigned i = 0; i < n; i++) {
 		uint32_t c = b + i * 24;
-		rh_wr(c + RH_MSGID, 8u | (1u << 16) | (cmd[i].wait ? 1u << 8 : 0));
+		rh_wr(c + RH_MSGID, 8u | (1u << 16) | (!regulator || cmd[i].wait ? 1u << 8 : 0));
 		rh_wr(c + RH_ADDR, cmd[i].addr);
 		rh_wr(c + RH_DATA, cmd[i].data);
 		if (cmd[i].wait) { wait |= 1u << i; }
@@ -268,7 +268,7 @@ rh_send_batch(unsigned t, const struct wl_rh_cmd *cmd, unsigned n)
 	for (unsigned i = 0; i < n; i++) {
 		uint32_t c = b + i * 24;
 		if (rh_rd(c + RH_ADDR) != cmd[i].addr || rh_rd(c + RH_DATA) != cmd[i].data ||
-		    rh_rd(c + RH_MSGID) != (8u | (1u << 16) | (cmd[i].wait ? 1u << 8 : 0))) { programmed = false; }
+		    rh_rd(c + RH_MSGID) != (8u | (1u << 16) | (!regulator || cmd[i].wait ? 1u << 8 : 0))) { programmed = false; }
 	}
 	if (!programmed || fw_faults) { return 2; }
 	rh_wr(b + RH_CTRL, 0);
@@ -278,14 +278,27 @@ rh_send_batch(unsigned t, const struct wl_rh_cmd *cmd, unsigned n)
 	bool done = false;
 	for (unsigned us = 0; us < 100000 && !fw_faults; us++) {
 		done = (rh_rd(4) & bit) && rh_rd(b + RH_IDLE) != 0;
-		for (unsigned i = 0; i < n; i++) {
+		/* v6.18 tcs_tx_done accepts the IRQ, with no CMD_STATUS test.
+		 * Keep the original single-command regulator polling unchanged. */
+		for (unsigned i = 0; regulator && i < n; i++) {
 			uint32_t mask = 0x100u | (cmd[i].wait ? 0x10000u : 0);
 			if ((rh_rd(b + i * 24 + RH_CSTAT) & mask) != mask) { done = false; }
 		}
 		if (done) { break; }
 		fw_delay(1);
 	}
-	if (!done || fw_faults) { return 2; }
+	if (!done || fw_faults) {
+		if (!regulator) {
+			uint32_t irq = rh_rd(4), ctrl = rh_rd(b + RH_CTRL), idle = rh_rd(b + RH_IDLE);
+			for (unsigned i = 0; i < n; i++) {
+				uint32_t c = b + i * 24;
+				uint32_t msgid = rh_rd(c + RH_MSGID), status = rh_rd(c + RH_CSTAT);
+				printf("FUXI WLAN: M6j RPMh timeout TCS %u cmd %u addr %#x data %#x MSGID %#x CMD_STATUS %#x IRQ_STATUS %#x CONTROL %#x IDLE %#x faults %u\n",
+				    t, i, cmd[i].addr, cmd[i].data, msgid, status, irq, ctrl, idle, fw_faults);
+			}
+		}
+		return 2;
+	}
 	rh_wr(b + RH_CTRL, 1u << 16);
 	rh_wr(b + RH_CTRL, 0);
 	rh_wr(b + RH_EN, 0);
@@ -298,10 +311,16 @@ rh_send_batch(unsigned t, const struct wl_rh_cmd *cmd, unsigned n)
 	return 0;
 }
 static uint32_t
+rh_send_batch(unsigned t, const struct wl_rh_cmd *cmd, unsigned n)
+{
+	/* BCM requests wait for the TCS IRQ and request responses on all cmds. */
+	return rh_send_request(t, cmd, n, false);
+}
+static uint32_t
 rh_send(unsigned t, uint32_t addr, uint32_t data)
 {
 	const struct wl_rh_cmd cmd = {addr, data, 1};
-	return rh_send_batch(t, &cmd, 1);
+	return rh_send_request(t, &cmd, 1, true);
 }
 
 #define FUXI_WLAN_XNU 1
@@ -461,8 +480,9 @@ wl_icc_vote(uint32_t peak, bool download)
 		}
 		order[j] = i;
 	}
-	/* A whole VCD stays in one payload; commit/response/wait only its last
-	 * command. All six fit in a v3 TCS; geometry is checked by transport. */
+	/* M6j serializes one whole VCD per request. Linux v6.18 can pack
+	 * multiple VCDs; see docs/wlan-m6i.md for this deliberate restriction.
+	 * All commands request responses; only the last gets commit/wait. */
 	struct wl_rh_cmd cmd[WL_ICC_N];
 	for (unsigned i = 0; i < WL_ICC_N; i++) {
 		struct wl_bcm *b = &wl_bcms[order[i]];
@@ -470,13 +490,23 @@ wl_icc_vote(uint32_t peak, bool download)
 		b->data = wl_bcm_encode(b->x, b->y, commit);
 		cmd[i] = (struct wl_rh_cmd){b->addr, b->data, commit};
 	}
-	uint32_t e = rh_send_batch(0, cmd, WL_ICC_N);
-	for (unsigned i = 0; i < WL_ICC_N; i++) {
-		struct wl_bcm *b = &wl_bcms[order[i]];
-		printf("FUXI WLAN: M6i ICC %s addr %#x vote %u/%u data %#x VCD %u commit %u ack %s error %#x\n",
-		    b->name, b->addr, b->x, b->y, b->data, b->vcd, cmd[i].wait, e ? "unconfirmed" : "yes", e);
+	unsigned groups = 0;
+	for (unsigned first = 0; first < WL_ICC_N;) {
+		unsigned end = first + 1;
+		while (end < WL_ICC_N && !cmd[end - 1].wait) { end++; }
+		uint32_t e = rh_send_batch(0, cmd + first, end - first);
+		for (unsigned i = first; i < end; i++) {
+			struct wl_bcm *b = &wl_bcms[order[i]];
+			printf("FUXI WLAN: M6i ICC %s addr %#x vote %u/%u data %#x VCD %u commit %u ack %s error %#x\n",
+			    b->name, b->addr, b->x, b->y, b->data, b->vcd, cmd[i].wait, e ? "unconfirmed" : "yes", e);
+		}
+		unsigned vcd = wl_bcms[order[first]].vcd;
+		if (!e) { groups++; }
+		printf("FUXI WLAN: M6j ICC VCD %u cmds %u ack %s error %#x acked_groups %u\n",
+		    vcd, end - first, e ? "unconfirmed" : "yes", e, groups);
+		if (e) { wl_icc_failed = true; return 3; }
+		first = end;
 	}
-	if (e) { wl_icc_failed = true; return 3; }
 	wl_icc_acks++;
 	return 0;
 }

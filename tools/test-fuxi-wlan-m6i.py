@@ -35,7 +35,9 @@ static uint32_t rsc[1024], cfg, revision, fw_faults, fw_fault_esr, wl3_faults;
 static uint64_t fw_fault_far;
 static uint32_t wl3_report[128], wl4_report[64], wl5_report[128], link;
 static unsigned writes, triggers, delays, stages[32], nstages, bhi, aborts;
-static unsigned fail_status, fail_trigger, idle_busy, bad_cleanup;
+static unsigned fail_irq, fail_trigger, idle_busy, bad_cleanup;
+static uint32_t cmd_status;
+static unsigned status_reads;
 static uint64_t fault_read, fault_write, drop_write;
 static bool enabled_present, bw_present;
 static int enabled_arg, bw_arg;
@@ -47,7 +49,7 @@ static void test_printf(const char *fmt, ...) {
     va_end(ap); assert(n>=0 && (size_t)n<sizeof(logs)-loglen); loglen+=n;
 }
 #define printf test_printf
-struct sent { uint32_t addr,data,msgid; };
+struct sent { uint32_t addr,data,msgid,wait,trigger,index; };
 static struct sent sent[32];
 static unsigned nsent;
 static uint32_t usb_rd(uintptr_t base, uint32_t off) {
@@ -58,7 +60,11 @@ static uint32_t usb_rd(uintptr_t base, uint32_t off) {
         return db[off] | (uint32_t)db[off+1]<<8 | (uint32_t)db[off+2]<<16 | (uint32_t)db[off+3]<<24;
     }
     if(base==RH_DRV_PA) { assert(off==0 || off==12); return off ? cfg : revision; }
-    if(base==RH_TCS_PA) { assert(!(off&3) && off/4<1024); return rsc[off/4]; }
+    if(base==RH_TCS_PA) {
+        assert(!(off&3) && off/4<1024);
+        if(off>=0x40 && off<=0x40+15*24 && (off-0x40)%24==0) status_reads++;
+        return rsc[off/4];
+    }
     if(base==WL_DBI) { assert(off==0x80); return link; }
     assert(base==WL_GCC); return 0;
 }
@@ -76,12 +82,11 @@ static void ts_wr(uintptr_t base, uint32_t off, uint32_t v) {
         uint32_t en=rsc[0x2c/4];
         for(unsigned i=0;i<16 && (en & (1u<<i));i++) {
             assert(nsent<32);
-            sent[nsent++]=(struct sent){rsc[(0x38+i*24)/4],rsc[(0x3c+i*24)/4],rsc[(0x34+i*24)/4]};
-            uint32_t status=0x10100;
-            if((!fail_trigger || fail_trigger==triggers) && fail_status==i+1) status=0;
-            rsc[(0x40+i*24)/4]=status;
+            sent[nsent++]=(struct sent){rsc[(0x38+i*24)/4],rsc[(0x3c+i*24)/4],
+                rsc[(0x34+i*24)/4],rsc[0x20/4],triggers,i};
+            rsc[(0x40+i*24)/4]=cmd_status;
         }
-        rsc[1]|=1;
+        if(!fail_irq || (fail_trigger && fail_trigger!=triggers)) rsc[1]|=1;
         rsc[0x28/4]=idle_busy ? 0 : 1;
     }
 }
@@ -97,7 +102,7 @@ static uint64_t mach_absolute_time(void) { return 0; }
 static void absolutetime_to_nanoseconds(uint64_t t, uint64_t *ns) { *ns=t; }
 static void wlan_m3(unsigned step) {
     stages[nstages++]=step;
-    if(step==2) assert(!wl_icc_test_expect_votes || triggers==1);
+    if(step==2) assert(!wl_icc_test_expect_votes || triggers==4);
     if(step==11) { wl3_report[67]=0x70; link=0x20220000; }
 }
 static void wl_mark(unsigned s) { }
@@ -120,7 +125,7 @@ static void fixture(void) {
     memset(db,0,sizeof(db)); memset(rsc,0,sizeof(rsc));
     memset(wl3_report,0,sizeof(wl3_report)); memset(wl5_report,0,sizeof(wl5_report));
     fw_faults=wl3_faults=writes=triggers=delays=nstages=bhi=aborts=nsent=0;
-    fault_read=fault_write=drop_write=0; fail_status=fail_trigger=idle_busy=bad_cleanup=0;
+    fault_read=fault_write=drop_write=0; fail_irq=fail_trigger=idle_busy=bad_cleanup=cmd_status=status_reads=0;
     cfg=(16u<<27)|(8u<<12); revision=3u<<16;
     rsc[0x28/4]=1; rsc[0]=0xa5; rsc[1]=0x80;
     rsc[(0x2a0+0x2c)/4]=0xdead; /* another slot must survive */
@@ -134,7 +139,7 @@ static void fixture(void) {
        MC0+ACV share VCD0, SH1+SH0 VCD1; CN0 VCD2, SN7 VCD3. */
     const unsigned vcd[]={3,1,1,0,0,2};
     for(unsigned i=0;i<6;i++) {
-        wl_bcms[i]=(struct wl_bcm){.name=wl_bcms[i].name};
+        wl_bcms[i]=(struct wl_bcm){.name=wl_bcms[i].name,.mask=(i==1 || i==4 || i==5)};
         unsigned e=144+i*24, a=656+i*8;
         memcpy(db+e,wl_bcms[i].name,strlen(wl_bcms[i].name));
         put32(e+16,0x50100+i*4); put16(e+20,8); put16(e+22,i*8);
@@ -184,14 +189,17 @@ int main(void) {
     b=(struct wl_bcm){.unit=2000,.width=4};
     wl_bcm_bandwidth(&b,127,127,16,4); assert(b.x==3 && b.y==15);
     wl_bcm_bandwidth(&b,0,1,16,4); assert(b.x==0 && b.y==1);
-    fixture(); assert(!wl_icc_step(2)); assert(triggers==1 && wl_icc_acks==1 && nsent==6);
-    /* VCD ordering plus only final commit/response/wait per VCD. */
+    fixture(); assert(!wl_icc_step(2)); assert(triggers==4 && wl_icc_acks==1 && nsent==6 && !status_reads);
+    /* One trigger per VCD; response on all, commit/wait on final only. */
     const unsigned order[]={3,4,1,2,5,0};
     const unsigned commit[]={0,1,0,1,1,1};
+    const unsigned trigger[]={1,1,2,2,3,4}, index[]={0,1,0,1,0,0};
     for(unsigned i=0;i<6;i++) {
         assert(sent[i].addr==0x50100+order[i]*4);
         assert(!!(sent[i].data&(1u<<30))==commit[i]);
-        assert(!!(sent[i].msgid&(1u<<8))==commit[i]);
+        assert(sent[i].msgid==0x10108);
+        assert(sent[i].trigger==trigger[i] && sent[i].index==index[i]);
+        assert(sent[i].wait==(trigger[i]<=2 ? 2 : 1));
         assert(sent[i].data&(1u<<29));
     }
     assert(wl_bcms[0].x==0 && wl_bcms[0].y==0x3fff); /* synthetic unit saturates */
@@ -201,7 +209,7 @@ int main(void) {
     assert(rsc[0]==0xa5 && rsc[1]==0x80 && !rsc[0x2c/4] && !rsc[0x20/4]);
     assert(rsc[(0x2a0+0x2c)/4]==0xdead && !rh_poisoned);
     assert(strstr(logs,"M6i ICC MC0 addr") && strstr(logs,"ack yes"));
-    assert(!wl_icc_step(12) && triggers==2 && wl_icc_acks==2);
+    assert(!wl_icc_step(12) && triggers==8 && wl_icc_acks==2);
     assert(strstr(logs,"link/download pcie-mem 0/1000000 cpu-pcie 0/1"));
     /* Runtime metadata determines numbers; optional KIWI rows aggregate
        sum average / max peak separately for the two path segments. */
@@ -227,36 +235,96 @@ int main(void) {
         assert(!wl_icc_step(2) && !wl_icc_step(12));
         assert((wl_bcms[0].x != 0)==(row != 0));
     }
-    /* Every command status and idle are required; quarantine prevents a
-       regulator vote or a second batch from reusing uncertain state. */
-    for(unsigned i=1;i<=6;i++) {
-        fixture(); fail_status=i; assert(wl_icc_step(2));
-        assert(triggers==1 && delays==100000 && rh_poisoned && !wl_icc_acks);
+    /* IRQ completion accepts any per-command status, as v6.18 does. */
+    const uint32_t statuses[]={0,0x100,0x10000,0x10100,0xdeadbeef};
+    for(unsigned i=0;i<sizeof(statuses)/sizeof(statuses[0]);i++) {
+        fixture(); cmd_status=statuses[i]; assert(!wl_icc_step(2));
+        assert(triggers==4 && !status_reads && !rh_poisoned);
+    }
+    /* A missing fresh IRQ stops at each possible group, logs every command
+       in that group exactly once, and never triggers a later group. */
+    for(unsigned group=1;group<=4;group++) {
+        fixture(); fail_irq=1; fail_trigger=group; cmd_status=0x100;
+        assert(wl_icc_step(2));
+        const unsigned counts[]={0,2,2,1,1}, totals[]={0,2,4,5,6};
+        assert(triggers==group && nsent==totals[group] && delays==100000);
+        assert(rh_poisoned && wl_icc_failed && !wl_icc_acks);
+        assert(status_reads==counts[group]);
+        const char *at=logs;
+        for(unsigned i=0;i<counts[group];i++) {
+            const struct sent *c=&sent[totals[group]-counts[group]+i];
+            char expected[256];
+            snprintf(expected,sizeof(expected),
+                "M6j RPMh timeout TCS 0 cmd %u addr %#x data %#x MSGID 0x10108 CMD_STATUS 0x100 IRQ_STATUS 0x80 CONTROL 0x1010000 IDLE 0x1 faults 0",
+                i,c->addr,c->data);
+            at=strstr(at,expected); assert(at); at++;
+        }
+        assert(!strstr(at,"M6j RPMh timeout"));
+        char summary[160];
+        snprintf(summary,sizeof(summary),
+            "M6j ICC VCD %u cmds %u ack unconfirmed error 0x2 acked_groups %u",
+            group-1,counts[group],group-1);
+        assert(strstr(logs,summary));
+        unsigned acked=0;
+        for(at=logs;(at=strstr(at,"M6j ICC VCD"));at++) {
+            if(strstr(at,"ack yes") && strstr(at,"ack yes")<strchr(at,'\n')) acked++;
+        }
+        assert(acked==group-1);
         unsigned n=writes; assert(rh_send(0,0x40000,1));
-        assert(wl_icc_step(12) && writes==n && strstr(logs,"ack unconfirmed"));
+        assert(wl_icc_step(12) && writes==n && triggers==group);
     }
     fixture(); idle_busy=1; assert(wl_icc_step(2)); assert(rh_poisoned && !wl_icc_acks);
+    assert(strstr(logs,"IRQ_STATUS 0x81 CONTROL 0x1010000 IDLE 0 faults 0"));
     fixture(); bad_cleanup=1; assert(wl_icc_step(2)); assert(rh_poisoned && !wl_icc_acks);
     fixture(); rsc[0x2c/4]=1; assert(wl_icc_step(2)); assert(!writes);
-    fixture(); cfg=(4u<<27)|(8u<<12); assert(wl_icc_step(2)); assert(!writes);
+    fixture(); rsc[1]|=1; assert(wl_icc_step(2)); assert(!writes && !triggers);
+    fixture(); cfg=(1u<<27)|(8u<<12); assert(wl_icc_step(2)); assert(!writes);
     fixture(); revision=2u<<16; assert(wl_icc_step(2)); assert(!writes);
     fixture(); drop_write=RH_TCS_PA+0x38; assert(wl_icc_step(2)); assert(!triggers && rh_poisoned);
     fixture(); drop_write=RH_TCS_PA+0x24;
     for(unsigned i=0;i<6;i++) rsc[(0x40+i*24)/4]=0x10100;
     assert(wl_icc_step(2)); assert(!triggers && rh_poisoned && !wl_icc_acks);
     fixture(); fault_write=RH_TCS_PA+0x3c; assert(wl_icc_step(2)); assert(!triggers && rh_poisoned);
-    fixture(); fault_read=RH_TCS_PA+0x40; assert(wl_icc_step(2)); assert(triggers==1 && rh_poisoned);
-    fixture(); assert(!rh_send(0,0x40000,1000)); assert(nsent==1 && sent[0].data==1000);
+    fixture(); fail_irq=1; fault_read=RH_TCS_PA+0x40;
+    assert(wl_icc_step(2)); assert(triggers==1 && rh_poisoned && fw_faults);
+    assert(strstr(logs,"CMD_STATUS 0xffffffff") && strstr(logs,"faults 1"));
+    /* Regulator retains its exact one-command request and BOTH status bits. */
+    fixture(); cmd_status=0x10100; assert(!rh_send(0,0x40000,1000));
+    assert(nsent==1 && sent[0].addr==0x40000 && sent[0].data==1000);
+    assert(sent[0].msgid==0x10108 && sent[0].wait==1 && status_reads==1);
+    assert(writes==15 && rsc[0]==0xa5 && rsc[1]==0x80 && !rh_poisoned);
+    for(unsigned i=0;i<3;i++) {
+        fixture(); cmd_status=statuses[i]; assert(rh_send(0,0x40000,1000)==2);
+        assert(delays==100000 && status_reads==100000 && rh_poisoned);
+        assert(!strstr(logs,"M6j RPMh timeout"));
+    }
+    /* Observed VCD layout, with wholly invented addresses/data. */
+    fixture(); db[656+4*8+6]=12; db[656+5*8+6]=5; put16(656+4*8+4,0);
+    assert(!wl_icc_step(2) && triggers==5 && nsent==6);
+    const unsigned observed[]={3,1,2,0,5,4};
+    for(unsigned i=0;i<6;i++) assert(sent[i].addr==0x50100+observed[i]*4);
+    assert(strstr(logs,"M6j ICC VCD 12 cmds 1 ack yes error 0 acked_groups 5"));
+    /* VCD is a byte, not a bit mask or a hardcoded 0..9 range. */
+    fixture(); db[662]=255; assert(!wl_icc_step(2));
+    /* Even a larger single VCD remains indivisible, with one final wait. */
+    fixture(); for(unsigned i=0;i<6;i++) db[656+i*8+6]=7;
+    assert(!wl_icc_step(2) && triggers==1 && nsent==6);
+    for(unsigned i=0;i<6;i++) {
+        assert(sent[i].addr==0x50100+i*4 && sent[i].msgid==0x10108 && sent[i].wait==32);
+        assert(!!(sent[i].data&(1u<<30))==(i==5));
+    }
     /* Actual fw_run hooks: initial vote before step2 and all clocks, link
        update before endpoint setup; either failure prevents the BHI step. */
-    fixture(); fw_run(22); assert(triggers==2 && bhi==1 && aborts==1 && wl_icc_acks==2);
-    fixture(); fail_status=1; fw_run(22);
-    assert(nstages==1 && stages[0]==1 && !bhi && wl5_report[2]==2);
-    fixture(); fail_status=1; fail_trigger=2; fw_run(22);
-    assert(nstages==11 && stages[10]==11 && !bhi && wl5_report[2]==12);
+    fixture(); fw_run(22); assert(triggers==8 && bhi==1 && aborts==1 && wl_icc_acks==2);
+    for(unsigned phase=0;phase<2;phase++) for(unsigned group=1;group<=4;group++) {
+        fixture(); fail_irq=1; fail_trigger=phase*4+group; fw_run(22);
+        assert(triggers==fail_trigger && !bhi && wl_icc_failed && rh_poisoned);
+        assert(wl_icc_acks==phase && wl5_report[2]==(phase ? 12 : 2));
+        assert(nstages==(phase ? 11 : 1) && stages[nstages-1]==(phase ? 11 : 1));
+    }
     fixture(); enabled_present=true; enabled_arg=0; wl_icc_test_expect_votes=false;
     fw_run(22); assert(bhi==1 && !triggers && !wl_icc_acks);
-    puts("M6i production cmd-db/encoding/VCD/TCS/ordering/failure tests passed");
+    puts("M6i/M6j production cmd-db/encoding/VCD/TCS/ordering/failure tests passed");
     return 0;
 }
 '''

@@ -970,6 +970,8 @@ def main():
     driver = (ROOT / 'xnu/fuxi-wlan/fuxi_wlan.c').read_text()
     patch = (ROOT / 'xnu/patches/0099-fuxi-wlan.patch').read_text()
     added = patch.split('+++ b/bsd/dev/fuxi_wlan.c\n', 1)[1].split('\n--- a/', 1)[0]
+    count = re.match(r'@@ -0,0 \+1,(\d+) @@\n', added)
+    assert count and int(count[1]) == len(driver.splitlines()), 'WLAN new-file hunk count differs'
     reconstructed = '\n'.join(line[1:] for line in added.splitlines() if line.startswith('+')) + '\n'
     assert reconstructed == driver, 'integration patch and standalone WLAN C differ'
     included = patch.split('+++ b/bsd/dev/wlan.c\n', 1)[1]
