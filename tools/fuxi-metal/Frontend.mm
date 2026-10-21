@@ -113,6 +113,17 @@ static void invalid(NSString *why) {
 }
 
 @end
+// Resource/command metadata only. Keep ivars out of FuxiObject: its methods
+// are also copied onto the runtime device subclass, whose layout is private.
+@interface FuxiLabeledObject : FuxiObject { @public NSString *_label; }
+- (NSString *)label;
+- (void)setLabel:(NSString *)s;
+@end
+@implementation FuxiLabeledObject
+- (void)dealloc {[_label release];[super dealloc];}
+- (NSString *)label {CENSUS();return _label;}
+- (void)setLabel:(NSString *)s {CENSUS();NSString *next=[s copy];[_label release];_label=next;}
+@end
 @interface FuxiOwner : NSObject { @public fuxi::Backend *backend; uint64_t registry; }
 @end
 @implementation FuxiOwner
@@ -120,10 +131,10 @@ static void invalid(NSString *why) {
 @end
 static char ownerKey;
 static FuxiOwner *owner(id obj) {return (FuxiOwner *)objc_getAssociatedObject(obj,&ownerKey);}
-@interface FuxiBuffer : FuxiObject { @public id _device; fuxi::Buffer *_buffer; NSString *_label; }
+@interface FuxiBuffer : FuxiLabeledObject { @public id _device; fuxi::Buffer *_buffer; }
 @end
 @implementation FuxiBuffer
-- (void)dealloc {owner(_device)->backend->destroy(_buffer);[_device release];[_label release];[super dealloc];}
+- (void)dealloc {owner(_device)->backend->destroy(_buffer);[_device release];[super dealloc];}
 - (id)device {CENSUS();return _device;}
 - (void *)contents {CENSUS();return _buffer->contents;}
 - (NSUInteger)length {CENSUS();return _buffer->length;}
@@ -132,8 +143,6 @@ static FuxiOwner *owner(id obj) {return (FuxiOwner *)objc_getAssociatedObject(ob
 - (MTLHazardTrackingMode)hazardTrackingMode {CENSUS();return MTLHazardTrackingModeTracked;}
 - (MTLResourceOptions)resourceOptions {CENSUS();return MTLResourceStorageModeShared;}
 - (NSUInteger)allocatedSize {CENSUS();return _buffer->allocated;}
-- (NSString *)label {CENSUS();return _label;}
-- (void)setLabel:(NSString *)s {CENSUS();[_label release];_label=[s copy];}
 @end
 static id metalError(NSError **error,const char *why) {
  failureLog("FUXI MTL: pipeline/library FAIL %.256s\n",why);
@@ -273,9 +282,10 @@ static NSData *constantSnapshot(MTLFunctionConstantValues *values) {
  if([key isKindOfClass:[NSNumber class]])c.index=[key unsignedIntValue];else {const char *name=[key UTF8String];if(!name || strlen(name)>=128)return constantFailure(values,"unsupported-name");strcpy(c.name,name);}
  [data appendBytes:&c length:sizeof(c)];}return data;}
 }
-@interface FuxiLibrary : FuxiObject { @public id _device; void *_library; }
+@interface FuxiLibrary : FuxiLabeledObject { @public id _device; void *_library; }
+- (id)fuxiNewFunctionWithName:(NSString *)name error:(NSError **)error;
 @end
-@interface FuxiFunction : FuxiObject { @public FuxiLibrary *_library; NSString *_name; NSData *_constants; int _stage; }
+@interface FuxiFunction : FuxiLabeledObject { @public FuxiLibrary *_library; NSString *_name; NSData *_constants; int _stage; }
 @end
 @implementation FuxiFunction
 - (void)dealloc {[_library release];[_name release];[_constants release];[super dealloc];}
@@ -297,13 +307,24 @@ static NSData *constantSnapshot(MTLFunctionConstantValues *values) {
 - (id)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error {CENSUS();
  if(error)*error=nil;NSData *snapshot=constantSnapshot(values);
  if(!snapshot)return metalError(error,"unobserved/unsupported function constants");
- FuxiFunction *f=[self newFunctionWithName:name];if(!f)return metalError(error,"function lookup failed");
+ FuxiFunction *f=[self fuxiNewFunctionWithName:name error:error];if(!f)return nil;
  f->_constants=[snapshot copy];return f;
 }
 - (id)newFunctionWithName:(NSString *)name {CENSUS();
- if(!name || !name.length || name.length>127 || strlen(name.UTF8String)!=[name lengthOfBytesUsingEncoding:NSUTF8StringEncoding]) {unsupported(self,_cmd);return nil;}
- char error[2048]{};int stage=fuxi::Translator::get().function(_library,name.UTF8String,error,sizeof(error));
- if(!stage)return metalError(nullptr,error);
+ return [self fuxiNewFunctionWithName:name error:nullptr];
+}
+- (id)fuxiNewFunctionWithName:(NSString *)name error:(NSError **)error {
+ if(error)*error=nil;
+ if(!name || !name.length || name.length>127 || !name.UTF8String || strlen(name.UTF8String)!=[name lengthOfBytesUsingEncoding:NSUTF8StringEncoding])return metalError(error,"invalid function name");
+ // A lookup refusal returns nil/NSError, never a placeholder or a renamed
+ // shader. CA itself retries then aborts on nil; see metal-m9c.md.
+ char why[2048]{};int stage=0;
+#ifndef FUXI_MTL_FUNCTION_LOOKUP
+#define FUXI_MTL_FUNCTION_LOOKUP fuxi::Translator::get().function
+#endif
+ try {stage=FUXI_MTL_FUNCTION_LOOKUP(_library,name.UTF8String,why,sizeof(why));}
+ catch(const std::exception &e) {return metalError(error,e.what());}
+ if(!stage)return metalError(error,why[0]?why:"function lookup failed");
  FuxiFunction *f=[FuxiFunction new];f->_library=[self retain];f->_name=[name copy];f->_stage=stage;
  fprintf(stderr,"FUXI MTL: function %s class=%s stage=%d device=%u\n",name.UTF8String,object_getClassName(f),stage,[f device]==_device);return f;
 }
@@ -375,7 +396,7 @@ static NSString *pipelineRejection(MTLRenderPipelineDescriptor *d,id device) {
 static bool identitySwizzle(MTLTextureSwizzleChannels s) {
  return s.red==MTLTextureSwizzleRed && s.green==MTLTextureSwizzleGreen && s.blue==MTLTextureSwizzleBlue && s.alpha==MTLTextureSwizzleAlpha;
 }
-@interface FuxiTexture : FuxiObject { @public id _device; fuxi::Texture *_texture; MTLTextureUsage _usage; IOSurfaceRef _surface; }
+@interface FuxiTexture : FuxiLabeledObject { @public id _device; fuxi::Texture *_texture; MTLTextureUsage _usage; IOSurfaceRef _surface; }
 @end
 @implementation FuxiTexture
 - (void)dealloc {
@@ -404,38 +425,36 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
 - (MTLHazardTrackingMode)hazardTrackingMode {CENSUS();return MTLHazardTrackingModeTracked;}
 - (NSUInteger)allocatedSize {CENSUS();return _texture->allocated;}
 @end
-@interface FuxiPipeline : FuxiObject { @public id _device; fuxi::Pipeline *_pipeline; }
+@interface FuxiPipeline : FuxiLabeledObject { @public id _device; fuxi::Pipeline *_pipeline; }
 @end
 @implementation FuxiPipeline
 - (void)dealloc {owner(_device)->backend->destroy(_pipeline);[_device release];[super dealloc];}
 - (id)device {CENSUS();return _device;}
 @end
-@interface FuxiSampler : FuxiObject { @public id _device;fuxi::Sampler *_sampler;NSString *_label; }
+@interface FuxiSampler : FuxiLabeledObject { @public id _device;fuxi::Sampler *_sampler; }
 @end
 @implementation FuxiSampler
-- (void)dealloc {owner(_device)->backend->destroy(_sampler);[_device release];[_label release];[super dealloc];}
+- (void)dealloc {owner(_device)->backend->destroy(_sampler);[_device release];[super dealloc];}
 - (id)device {CENSUS();return _device;}
-- (NSString *)label {CENSUS();return _label;}
 @end
 // Only the neutral state is representable by our attachment-free backend.
-@interface FuxiDepthStencil : FuxiObject { @public id _device;NSString *_label; }
+@interface FuxiDepthStencil : FuxiLabeledObject { @public id _device; }
 @end
 @implementation FuxiDepthStencil
-- (void)dealloc {[_device release];[_label release];[super dealloc];}
+- (void)dealloc {[_device release];[super dealloc];}
 - (id)device {CENSUS();return _device;}
-- (NSString *)label {CENSUS();return _label;}
 @end
 @class FuxiCommandBuffer;
-@interface FuxiQueue : FuxiObject { @public id _device; NSString *_label; }
+@interface FuxiQueue : FuxiLabeledObject { @public id _device; }
 @end
-@interface FuxiCommandBuffer : FuxiObject {
- @public FuxiQueue *_queue; NSMutableArray *_resources,*_handlers; NSString *_label; NSError *_error;
+@interface FuxiCommandBuffer : FuxiLabeledObject {
+ @public FuxiQueue *_queue; NSMutableArray *_resources,*_handlers; NSError *_error;
  std::vector<fuxi::Operation> _ops; MTLCommandBufferStatus _status; BOOL _encoding,_rejected,_enqueued;
 }
 @end
-@interface FuxiBlit : FuxiObject { @public FuxiCommandBuffer *_command; BOOL _ended; NSString *_label; }
+@interface FuxiBlit : FuxiLabeledObject { @public FuxiCommandBuffer *_command; BOOL _ended; }
 @end
-@interface FuxiRender : FuxiObject { @public FuxiCommandBuffer *_command; FuxiTexture *_target; FuxiPipeline *_pipeline; MTLClearColor _clear; BOOL _ended,_drawn;
+@interface FuxiRender : FuxiLabeledObject { @public FuxiCommandBuffer *_command; FuxiTexture *_target; FuxiPipeline *_pipeline; MTLClearColor _clear; BOOL _ended,_drawn;
  FuxiTexture *_samples[4];FuxiSampler *_samplers[4];fuxi::BufferBind _buffers[2][4];uint32_t _load,_store;size_t _lastOp;
  fuxi::Operation _state; }
 @end
@@ -537,10 +556,8 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
 
 @end
 @implementation FuxiQueue
-- (void)dealloc {[_device release];[_label release];[super dealloc];}
+- (void)dealloc {[_device release];[super dealloc];}
 - (id)device {CENSUS();return _device;}
-- (NSString *)label {CENSUS();return _label;}
-- (void)setLabel:(NSString *)s {CENSUS();[_label release];_label=[s copy];}
 - (id)commandBuffer {CENSUS();
  FuxiCommandBuffer *b=[FuxiCommandBuffer new];b->_queue=[self retain];
  b->_resources=[NSMutableArray new];b->_handlers=[NSMutableArray new];return [b autorelease];
@@ -561,11 +578,9 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
  if(!_error)_error=[[NSError alloc] initWithDomain:MTLCommandBufferErrorDomain code:MTLCommandBufferErrorInvalidResource
   userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithFormat:@"unsupported %@",NSStringFromSelector(s)]}];
 }
-- (void)dealloc {[_queue release];[_resources release];[_handlers release];[_label release];[_error release];[super dealloc];}
+- (void)dealloc {[_queue release];[_resources release];[_handlers release];[_error release];[super dealloc];}
 - (id)device {CENSUS();return _queue->_device;}
 - (id)commandQueue {CENSUS();return _queue;}
-- (NSString *)label {CENSUS();return _label;}
-- (void)setLabel:(NSString *)s {CENSUS();[_label release];_label=[s copy];}
 - (MTLCommandBufferStatus)status {CENSUS();return _status;}
 - (NSError *)error {CENSUS();return _error;}
 - (BOOL)retainedReferences {CENSUS();return YES;}
@@ -637,10 +652,8 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
 @end
 @implementation FuxiBlit
 - (void)rejectSelector:(SEL)s {unsupported(self,s);[_command rejectSelector:s];}
-- (void)dealloc {[_command release];[_label release];[super dealloc];}
+- (void)dealloc {[_command release];[super dealloc];}
 - (id)device {CENSUS();return _command->_queue->_device;}
-- (NSString *)label {CENSUS();return _label;}
-- (void)setLabel:(NSString *)s {@try {CENSUS();[_label release];_label=[s copy];} @catch(NSException *e) {(void)e;[self rejectSelector:_cmd];}}
 - (FuxiBuffer *)validate:(id)b offset:(NSUInteger)o size:(NSUInteger)n {CENSUS();
  if(_ended || !_command->_encoding || _command->_status!=MTLCommandBufferStatusNotEnqueued) invalid(@"inactive encoder");
  if(![b isKindOfClass:[FuxiBuffer class]] || [b device]!=_command->_queue->_device) invalid(@"foreign buffer/device");
@@ -776,7 +789,9 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
 - (NSString *)vendorName {CENSUS();return @"Qualcomm";}
 - (BOOL)supportsYCBCRFormats {CENSUS();return NO;}
 - (BOOL)supportsYCBCRFormats12 {CENSUS();return NO;}
-- (BOOL)supportsNativeHardwareFP16 {CENSUS();return NO;}
+// iOS 16.7 CA uses this scalar to select lph shader names. A740 has native
+// FP16; this does not grant an Apple family or any tile/fetch/format feature.
+- (BOOL)supportsNativeHardwareFP16 {CENSUS();return YES;}
 - (BOOL)supportsTileShaders {CENSUS();return NO;}
 - (BOOL)supportsSIMDGroup {CENSUS();return NO;}
 - (id)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)n {CENSUS();
@@ -881,7 +896,7 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
  if(error)*error=nil;if(clientMode==fuxi::ClientMode::census)return nil;
  if(NSString *field=pipelineRejection(d,self))return metalError(error,field.UTF8String);
  id v=d.vertexFunction,f=d.fragmentFunction;
- FuxiPipeline *p=[FuxiPipeline new];p->_device=[self retain];
+ FuxiPipeline *p=[FuxiPipeline new];p->_device=[self retain];p->_label=[d.label copy];
  try {auto a=(FuxiFunction *)v,b=(FuxiFunction *)f;fuxi::CompileOptions o{};auto color=d.colorAttachments[0];
   o.format=(uint32_t)color.pixelFormat;o.blend=color.blendingEnabled;o.mask=(uint32_t)color.writeMask;
   o.srcRGB=(uint32_t)color.sourceRGBBlendFactor;o.dstRGB=(uint32_t)color.destinationRGBBlendFactor;o.rgbOp=(uint32_t)color.rgbBlendOperation;

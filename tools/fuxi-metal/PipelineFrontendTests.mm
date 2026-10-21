@@ -1,9 +1,20 @@
 /* Objective-C encoder/ownership tests only. CPU model; no translation/GPU claim. */
 #define FUXI_MTL_FRONTEND_TEST
 #define FUXI_MTL_BACKEND_HEADER "TestBackend.hpp"
+#include <cstddef>
+static int testFunctionLookup(void *,const char *,char *,size_t);
+#define FUXI_MTL_FUNCTION_LOOKUP testFunctionLookup
 #include "Frontend.mm"
 #include <cassert>
+#include "LabelFrontendTests.hpp"
 #include "IOS16Defaults.hpp"
+// Only the dynamic translator boundary is modeled; actual Objective-C lookup,
+// NSError propagation and specialization wrappers are exercised below.
+static int testFunctionLookup(void *,const char *name,char *why,size_t size) {
+ if(!strcmp(name,"fixture_fragment"))return 2;
+ if(!strcmp(name,"fixture_exception"))throw std::runtime_error("lookup exception");
+ snprintf(why,size,"test entry missing: %s",name);return 0;
+}
 @interface FuxiPipelineTestBase : NSObject {uint8_t bytes[520];}
 @end
 @implementation FuxiPipelineTestBase
@@ -18,11 +29,34 @@ int main() {@autoreleasepool {
  FuxiOwner *state=[FuxiOwner new];state->backend=new fuxi::Backend;state->registry=123;
  id device=[cls alloc];objc_setAssociatedObject(device,&ownerKey,state,OBJC_ASSOCIATION_RETAIN_NONATOMIC);[state release];
  id<MTLCommandQueue>queue=[device newCommandQueue];
+ { // A modeled missing entry exercises real nil/error wrappers exactly once.
+  FuxiLibrary *library=[FuxiLibrary new];library->_device=[device retain];checkLabel(library);
+  NSError *lookupError=nil;uint64_t failures=fuxi_metal_failure_count();
+  assert(![library newFunctionWithName:@"fixture_missing" constantValues:nil error:&lookupError]);
+  assert([lookupError.localizedDescription isEqualToString:@"test entry missing: fixture_missing"]);
+  assert(fuxi_metal_failure_count()==++failures);
+  MTLFunctionDescriptor *fd=[MTLFunctionDescriptor functionDescriptor];fd.name=@"fixture_missing";
+  assert(![library newFunctionWithDescriptor:fd error:&lookupError]);
+  assert([lookupError.localizedDescription isEqualToString:@"test entry missing: fixture_missing"]);
+  assert(fuxi_metal_failure_count()==++failures);
+  assert(![library newFunctionWithName:@"fixture_missing"]);
+  assert(fuxi_metal_failure_count()==++failures);
+  assert(![library newFunctionWithName:@"fixture_exception" constantValues:nil error:&lookupError]);
+  assert([lookupError.localizedDescription isEqualToString:@"lookup exception"]);
+  assert(fuxi_metal_failure_count()==++failures);
+  assert(![library newFunctionWithName:nil constantValues:nil error:&lookupError] && lookupError);
+  assert(fuxi_metal_failure_count()==++failures);
+  FuxiFunction *function=[library newFunctionWithName:@"fixture_fragment" constantValues:nil error:&lookupError];
+  assert(function && !lookupError && function.functionType==MTLFunctionTypeFragment);
+  checkLabel(function);assert(fuxi_metal_failure_count()==failures);
+  [function release];[library release];
+ }
  MTLSamplerDescriptor *sd=[MTLSamplerDescriptor new];id<MTLSamplerState>sampler=[device newSamplerStateWithDescriptor:sd];
- assert(sampler && sampler.device==device);[sampler release];sd.maxAnisotropy=2;
+ assert(sampler && sampler.device==device);checkLabel((id)sampler);[sampler release];sd.maxAnisotropy=2;
  assert(![device newSamplerStateWithDescriptor:sd]);[sd release];
  FuxiTexture *t=[FuxiTexture new];t->_device=[device retain];t->_texture=new fuxi::Texture{262144};t->_usage=MTLTextureUsageRenderTarget;
  FuxiPipeline *p=[FuxiPipeline new];p->_device=[device retain];p->_pipeline=new fuxi::Pipeline{};
+ checkLabel(t);checkLabel(p);
  NSError *error=nil;assert(![device newLibraryWithData:dispatch_data_empty error:&error] && error);
  error=nil;assert(![device newLibraryWithURL:[NSURL URLWithString:@"https://example.invalid/test"] error:&error] && error);
  error=nil;assert(![device newRenderPipelineStateWithDescriptor:[[MTLRenderPipelineDescriptor new] autorelease] error:&error] && error);
@@ -42,6 +76,7 @@ int main() {@autoreleasepool {
  MTLSamplePosition positions[4]={{0.25f,0.25f},{0.75f,0.25f},{0.25f,0.75f},{0.75f,0.75f}};[samplePass setSamplePositions:positions count:4];
  refuses(c,^{[c renderCommandEncoderWithDescriptor:samplePass];});
  FuxiRender *r=[c renderCommandEncoderWithDescriptor:pass];assert(r);
+ checkLabel(c);checkLabel(r);assert(!c->_rejected && !c.error);
  refuses(c,^{[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];});
  refuses(c,^{[r setRenderPipelineState:(id)t];});[r setRenderPipelineState:(id)p];
  refuses(c,^{[r drawPrimitives:MTLPrimitiveTypeLine vertexStart:0 vertexCount:3];});
@@ -50,6 +85,7 @@ int main() {@autoreleasepool {
  [r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
  [r drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
  [r endEncoding];refuses(c,^{[r endEncoding];});
+ checkLabel(r);checkLabel(c);assert(!c->_rejected && !c.error);
  FuxiBuffer *b=[device newBufferWithLength:262656 options:0];FuxiBlit *blit=[c blitCommandEncoder];
  refuses(c,^{[blit copyFromTexture:(id)t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(256,256,1)
  toBuffer:(id)b destinationOffset:0 destinationBytesPerRow:1000 destinationBytesPerImage:262144];});
@@ -90,7 +126,7 @@ int main() {@autoreleasepool {
  [r setFragmentTextures:textures withRange:NSMakeRange(2,1)];[r setFragmentSamplerStates:samplers withRange:NSMakeRange(3,1)];
  assert(!r->_samples[2] && !r->_samplers[3]);
  MTLDepthStencilDescriptor *depth=[MTLDepthStencilDescriptor new];
- id ds=[device newDepthStencilStateWithDescriptor:depth];assert(ds);[r setDepthStencilState:ds];[r setDepthStencilState:nil];
+ id ds=[device newDepthStencilStateWithDescriptor:depth];assert(ds);checkLabel(ds);[r setDepthStencilState:ds];[r setDepthStencilState:nil];
  depth.depthWriteEnabled=YES;assert(![device newDepthStencilStateWithDescriptor:depth]);depth.depthWriteEnabled=NO;
  depth.depthCompareFunction=MTLCompareFunctionLess;assert(![device newDepthStencilStateWithDescriptor:depth]);
  refuses(c,^{[r setDepthStencilState:(id)input];});

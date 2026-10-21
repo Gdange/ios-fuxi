@@ -4,6 +4,7 @@
 #define FUXI_MTL_BACKEND_HEADER "TestBackend.hpp"
 #include "Frontend.mm"
 #include <cassert>
+#include "LabelFrontendTests.hpp"
 @interface FuxiTestBase : NSObject {uint8_t bytes[520];}
 - (id)dangerousInheritedSelector;
 @end
@@ -15,6 +16,9 @@
 - (NSUInteger)protectionOptions;
 - (void)setProtectionOptions:(NSUInteger)o;
 - (BOOL)supportsYCBCRPackedFormats12;
+- (BOOL)supportsNativeHardwareFP16;
+- (BOOL)supportsTileShaders;
+- (BOOL)supportsMemorylessRenderTargets;
 - (id)newPipelineLibraryWithFilePath:(NSString *)path error:(NSError **)error;
 @end
 static void refuses(id<MTLCommandBuffer>command,void (^body)()) {
@@ -31,6 +35,16 @@ int main() {
   objc_setAssociatedObject(device,&ownerKey,state,OBJC_ASSOCIATION_RETAIN_NONATOMIC);[state release];
   assert([(id)device isKindOfClass:[FuxiTestBase class]] && [device conformsToProtocol:@protocol(MTLDevice)]);
   assert(![device supportsFamily:MTLGPUFamilyApple1] && device.registryID==123);
+  { // Native half selects CA's lph names without claiming a feature family.
+   uint64_t failures=fuxi_metal_failure_count();
+   assert([(id)device supportsNativeHardwareFP16]);
+   for(NSUInteger family:{0UL,1001UL,1002UL,1003UL,1005UL,2002UL,3001UL,3002UL,NSUIntegerMax})
+    assert(![device supportsFamily:(MTLGPUFamily)family]);
+   assert(![(FuxiDeviceMethods *)(id)device supportsFeatureSet:0]);
+   assert(![(id)device supportsTileShaders] && ![(id)device supportsMemorylessRenderTargets]);
+   assert(![(id)device supportsRasterOrderGroups] && ![(id)device supportsYCBCRPackedFormats12]);
+   assert(fuxi_metal_failure_count()==failures);
+  }
   assert(!device.currentAllocatedSize); // Missing public scalar returns typed zero.
   MTLSizeAndAlign unsupportedSize=[device heapBufferSizeAndAlignWithLength:64 options:0];
   assert(!unsupportedSize.size && !unsupportedSize.align); // Missing struct ABI too.
@@ -39,6 +53,7 @@ int main() {
   assert(![device newBufferWithLength:4 options:MTLResourceStorageModePrivate]);
   assert(![device newLibraryWithSource:@"kernel void x(){}" options:nil error:nil]);
   id<MTLCommandQueue>q=[device newCommandQueue];
+  checkLabel((id)q);
   assert([q commandBufferWithUnretainedReferences].retainedReferences);
   MTLCommandBufferDescriptor *commandDesc=[MTLCommandBufferDescriptor new];
   assert([q commandBufferWithDescriptor:commandDesc]);
@@ -61,12 +76,15 @@ int main() {
    assert(!memcmp(src.contents,initial,64));
    id<MTLCommandBuffer>c=q.commandBuffer;
    id<MTLBlitCommandEncoder>e=c.blitCommandEncoder;
+   checkLabel((id)src);checkLabel((id)dst);checkLabel((id)c);checkLabel((id)e);
+   assert(!((FuxiCommandBuffer *)c)->_rejected && !c.error);
    assert(!c.blitCommandEncoder);
    refuses(c,^{[e fillBuffer:src range:NSMakeRange(1,4) value:1];});
    refuses(c,^{[e copyFromBuffer:src sourceOffset:0 toBuffer:src destinationOffset:4 size:16];});
    refuses(c,^{[e fillBuffer:dst range:NSMakeRange(NSUIntegerMax,4) value:1];});
    [e fillBuffer:src range:NSMakeRange(4,56) value:(uint8_t)i];
    [e copyFromBuffer:src sourceOffset:4 toBuffer:dst destinationOffset:8 size:48];[e endEncoding];
+   checkLabel((id)e); // Metadata also works after the encoder ends.
    refuses(c,^{[e endEncoding];});
    __block unsigned calls=0;
    [c addCompletedHandler:^(id<MTLCommandBuffer>b){assert(b.status==MTLCommandBufferStatusCompleted);++calls;}];
