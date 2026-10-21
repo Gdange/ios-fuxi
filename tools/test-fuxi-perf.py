@@ -16,7 +16,12 @@ spec = importlib.util.spec_from_file_location('submit', ROOT/'tools/test-fuxi-ad
 submit = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(submit)
 actual = (ROOT/'xnu/fuxi-perf/fuxi_perf.c').read_text()
-register_functions = ''.join(submit.function(actual, n) for n in ('fp_read','fp_vote','fp_temperature','fp_init_fail','fp_init_report','fp_initialize','fp_try_initialize','fp_update_votes','fp_worker','fuxi_perf_input','fuxi_perf_swap'))
+register_functions = actual[actual.index('static uint64_t fp_duty_used('):
+                            actual.index('static int fp_thermal_guard(')]
+register_functions += ''.join(submit.function(actual, n) for n in (
+    'fp_read','fp_vote','fp_temperature','fp_init_fail','fp_init_report',
+    'fp_initialize','fp_try_initialize','fp_update_votes','fp_thermal_guard',
+    'fp_arg','fp_configure','fp_worker','fuxi_perf_input','fuxi_perf_swap'))
 # Audit the loader's zero-based wire slots and execute the host decoder without
 # importing its USB dependencies. The C model below records the governor reads.
 probe = (ROOT/'shim/fuxi-probe/probe.c').read_text()
@@ -94,8 +99,9 @@ int main(void) {
  for(unsigned d=0;d<3;d++) {
   assert(lut_reads[d]==observed_count[d]+1);
   assert(fp_cool[d]==(d==2?6:8));
-  assert(fp_high[d]==(d==0?8:19));
-  assert(fp_high_khz[d]==(d==0?1228800:d==1?2803200:2956800));
+  unsigned capped_khz;
+  assert(fp_high[d]==(unsigned)fp_level(observed_rows[d],observed_count[d],fp_high_cap[d],&capped_khz));
+  assert(fp_high_khz[d]==capped_khz && capped_khz<=fp_high_cap[d]);
  }
  for(unsigned d=0;d<3;d++) for(unsigned i=observed_count[d]+1;i<40;i++) {
   reset_init(); fault_block=d;fault_off=0x100+4*i;
@@ -179,17 +185,20 @@ int main(void) {
  /* Exercise actual worker entry, extension, hot cutoff, quorum loss and stats
   * with TRDY bit 0 clear throughout. No input still cannot enter high. */
  fp_worker(0,0);assert(fp_ready && !fp_boosted);
- ticks=101;fuxi_perf_input();fp_worker(0,0);assert(fp_boosted && fp_boosts==1 && fp_max_temp==481);
- ticks=1500;fuxi_perf_swap();ticks=1602;fp_worker(0,0);assert(fp_boosted);
+ ticks=101;fuxi_perf_input();fp_worker(0,0);
+ assert(fp_boosted && fp_boosts==1 && fp_max_temp==481 && scheduled==121);
+ ticks=121;fuxi_perf_swap();fp_worker(0,0);assert(fp_boosted);
  regs[3][(0xa0+4*13)/4]=(1u<<21)|681;
- ticks=1603;fp_worker(0,0);assert(!fp_boosted);
+ ticks=141;fp_worker(0,0);assert(!fp_boosted && fp_cuts==1 && fp_blocked && scheduled==161);
  regs[3][(0xa0+4*13)/4]=(1u<<21)|481;
- ticks=1604;fuxi_perf_input();fp_worker(0,0);assert(fp_boosted);
+ ticks=161;fuxi_perf_input();fp_worker(0,0);assert(!fp_boosted);
+ ticks=660;fp_worker(0,0);assert(!fp_boosted);
+ ticks=661;fp_worker(0,0);assert(fp_boosted);
  for(unsigned n=1;n<=5;n++)regs[3][(0xa0+4*n)/4]=480;
- ticks=1605;fp_worker(0,0);assert(!fp_boosted); /* 13/18, no stale reuse */
+ ticks=681;fp_worker(0,0);assert(!fp_boosted && fp_blocked && fp_cuts==2);
  for(unsigned n=1;n<=5;n++)regs[3][(0xa0+4*n)/4]=(1u<<21)|480;
  ticks=10100;fp_worker(0,0);
- assert(strstr(last_log,"stats boosts 2") && strstr(last_log,"max temp 681 dC valid 1 state cool"));
+ assert(strstr(last_log,"stats boosts 2") && strstr(last_log,"max temp 681 dC above 620 dC 40 ms cuts 2 valid 1 state cool"));
  /* Each included CPU sensor must independently control the hottest sample.
   * Every excluded AOSS/non-CPU sensor remains irrelevant, even at 150 C. */
  for(unsigned d=0;d<2;d++) for(unsigned n=0;n<16;n++) {
@@ -279,8 +288,105 @@ int main(void) {
   assert(fp_domain_failed[1] && !fp_domain_failed[0] && !fp_domain_failed[2]);
   fault_block=-1;fp_update_votes(1);assert(regs[1][0x320/4]==fp_cool[1]);
  }
+ /* Boot arguments: invalid values preserve safety bounds, and lowering the
+  * ceiling clamps dependent thresholds. Units match the actual timer API. */
+ reset();arg_name="fuxiperflimit";arg_value=900;fp_configure();assert(fp_limit==680);
+ arg_value=550;fp_configure();assert(fp_limit==550 && fp_hot==550 && fp_resume==540);
+ reset();arg_name="fuxiperfhot";arg_value=610;fp_configure();assert(fp_hot==610);
+ arg_name="fuxiperfresume";arg_value=570;fp_configure();assert(fp_resume==570);
+ arg_name="fuxiperfrise";arg_value=200;fp_configure();assert(fp_rise==200);
+ arg_name="fuxiperffast";arg_value=25;fp_configure();assert(fp_fast_ms==25);
+ arg_value=100;fp_configure();assert(fp_fast_ms==25);
+ arg_name="fuxiperfbudget";arg_value=123;fp_configure();assert(fp_budget==123);
+ /* 77 C open-loop burst profile: force all 18 sensors to the trace. No
+  * thermal model is assumed; assert votes, not an impossible lowering of an
+  * externally supplied temperature. Every ceiling breach cuts in <=20 ms. */
+ const int burst[]={480,490,520,550,620,680,770,776,650,590,580,570};
+ reset_init();ticks=81;fp_worker(0,0);
+ for(unsigned i=0;i<sizeof(burst)/sizeof(burst[0]);i++) {
+  ticks=101+20*i;
+  for(unsigned d=0;d<2;d++)for(unsigned n=1;n<=(d?3:15);n++)
+   regs[d+3][(0xa0+4*n)/4]=(1u<<21)|burst[i];
+  fuxi_perf_input();fp_worker(0,0);
+  if(i==0)assert(fp_boosted && scheduled==ticks+20);
+  if(i>=3)assert(!fp_boosted);
+  if(burst[i]>=680)for(unsigned d=1;d<3;d++)assert(regs[d][0x320/4]==fp_cool[d]);
+ }
+ assert(fp_cuts==1 && fp_max_temp==776);
+ /* Abrupt jump at each possible phase after a fast sample: the existing
+  * timer must remove high at the first sample, at most one fast period. */
+ for(unsigned phase=1;phase<=20;phase++) {
+  reset_init();fp_worker(0,0);ticks=101;fuxi_perf_input();fp_worker(0,0);
+  assert(fp_boosted && scheduled==121);
+  unsigned crossing=101+phase;ticks=scheduled;
+  regs[3][0xa4/4]=(1u<<21)|770;fp_worker(0,0);
+  assert(!fp_boosted && ticks-crossing<=20 && fp_cuts==1);
+  for(unsigned d=1;d<3;d++)assert(regs[d][0x320/4]==fp_cool[d]);
+ }
+ /* Sustained 48..70 C ramp: obey timer deadlines and keep touch/swaps live.
+  * Every sample at/above 62 C stays cool, without cycling near the guard. */
+ reset_init();fp_worker(0,0);unsigned ramp_high=0;
+ for(unsigned ms=0;ms<=22000;) {
+  ticks=101+ms;int t=480+(int)(ms/100);
+  for(unsigned d=0;d<2;d++)for(unsigned n=1;n<=(d?3:15);n++)
+   regs[d+3][(0xa0+4*n)/4]=(1u<<21)|t;
+  fuxi_perf_input();fuxi_perf_swap();fp_worker(0,0);
+  if(fp_boosted)ramp_high++;
+  if(t>=620)assert(fp_blocked && !fp_boosted);
+  if(t>=680)for(unsigned d=1;d<3;d++)assert(regs[d][0x320/4]==fp_cool[d]);
+  ms+=(unsigned)(scheduled-ticks);
+ }
+ assert(ramp_high);
+ /* At a sustained 51..52 C the rate/temperature guards do not latch. The
+  * rolling budget still bounds high time in EVERY trailing second, even
+  * across nominal window boundaries and with a fractional final sample. */
+ for(unsigned budget=123;budget<=200;budget+=77) {
+  reset_init();fp_budget_ms=budget;arg_name=0;fp_configure();
+  for(unsigned d=0;d<2;d++)for(unsigned n=1;n<=(d?3:15);n++)
+   regs[d+3][(0xa0+4*n)/4]=(1u<<21)|510;
+  fp_worker(0,0);
+  unsigned char high[6000]={0};unsigned rolling=0,on=0;
+  for(unsigned ms=0;ms<6000;ms++) {
+   ticks=101+ms;
+   if(!ms || ticks>=scheduled) {
+    for(unsigned d=0;d<2;d++)for(unsigned n=1;n<=(d?3:15);n++)
+     regs[d+3][(0xa0+4*n)/4]=(1u<<21)|(510+(ms/1000)%2*10);
+    fuxi_perf_input();fuxi_perf_swap();fp_worker(0,0);
+    assert(!fp_blocked);
+   }
+   high[ms]=!!fp_boosted;rolling+=high[ms];on+=high[ms];
+   if(ms>=1000)rolling-=high[ms-1000];
+   assert(rolling<=budget);
+  }
+  assert(on>=5*budget && on<=6*budget && fp_cuts>=5);
+ }
+ /* Hysteresis requires 500 continuous ms <=58 C; jitter, invalid quorum and
+  * renewals do not clear it. A fast rise alone and prediction each trip. */
+ reset();fp_rate_valid=1;fp_rate_temp=580;
+ assert(!fp_thermal_guard(1,582,100,20000000)); /* 10 C/s, below 62 C */
+ reset();fp_rate_temp=500;fp_rate_valid=1;
+ assert(!fp_thermal_guard(1,540,120,20000000)); /* predicted 74 C */
+ assert(!fp_thermal_guard(1,580,140,20000000));
+ assert(!fp_thermal_guard(1,581,639,499000000));
+ assert(!fp_thermal_guard(1,580,640,1000000));
+ assert(!fp_thermal_guard(0,-400,1000,360000000));
+ assert(!fp_thermal_guard(1,580,1020,20000000));
+ assert(!fp_thermal_guard(1,580,1519,499000000));
+ assert(fp_thermal_guard(1,580,1520,1000000));
+ reset();fp_hot=680;
+ assert(fp_thermal_guard(1,679,100,0));
+ assert(!fp_thermal_guard(1,680,120,20000000)); /* ceiling is inclusive */
+ /* 1ms input callbacks must neither invent a slope from one quantized tick
+  * nor hide a real rise by continually resetting the derivative history. */
+ reset();assert(fp_thermal_guard(1,510,100,0));
+ for(unsigned i=1;i<=20;i++)assert(fp_thermal_guard(1,514,100+i,1000000));
+ assert(fp_rate==200 && !fp_blocked); /* 0.4 C / 20 ms, still below 55 C */
+ reset();assert(fp_thermal_guard(1,550,100,0));
+ for(unsigned i=1;i<20;i++)assert(fp_thermal_guard(1,550+i,100+i,1000000));
+ assert(!fp_thermal_guard(1,570,120,1000000));
 #undef printf
- puts("PASS: observed TRDY=8/48.1 C worker boost/hot cutoff/quorum/stats; exact CPU sensor read masks; actual worker 60s retries/input gating/no-init-votes/domain enable loss and recovery; real 0097 LUTs/init failures/16K mappings/14-of-18 sensor quorum; LUT decode/duplicates/turbo/nonmonotonic selection, thermal 60/68 boundaries, input-only entry, swap extension, 1500 ms expiry, per-core vote/readback and signed/invalid CPU sensors");
+ puts("PASS: predictive/rise/62C cutoff, 68C ceiling votes within 20ms of 77C step at every phase, sustained ramp, 51-52C load, 500ms hysteresis, rolling 123/200ms duty, boot-arg bounds and actual timer deadlines");
+ puts("PASS: observed TRDY=8/48.1 C worker boost/hot cutoff/quorum/stats; exact CPU sensor read masks; actual worker 60s retries/input gating/no-init-votes/domain enable loss and recovery; real 0097 LUTs/init failures/16K mappings/14-of-18 sensor quorum; LUT decode/duplicates/turbo/nonmonotonic selection, legacy eligibility 60/68 boundaries, input-only entry, swap extension, 1500 ms expiry, per-core vote/readback and signed/invalid CPU sensors");
 }
 '''
 REGISTERS = r'''
@@ -290,8 +396,7 @@ static const uint64_t fp_epss_pa[3]={0x17d91000,0x17d92000,0x17d93000};
 static const uint64_t fp_tsens_pa[2]={0xc271000,0xc272000};
 static const char * const fp_domain[3]={"silver","gold","prime"};
 static unsigned fp_percore[3],fp_cool[3],fp_high[3],fp_cool_khz[3],fp_high_khz[3];
-static const unsigned fp_cores[3]={3,4,1};
-static const unsigned fp_cool_cap[3]={1228800,1401600,1363200};
+POLICY_CAPS
 static unsigned maps,fail_map,log_count,observed_tail_fault;
 static unsigned fp_domain_failed[3],fp_applied[3],fp_applied_valid[3];
 static uint64_t ticks,fp_retry_interval,fp_retry_at,fp_retry_end;
@@ -299,13 +404,23 @@ static unsigned fp_attempted,fp_retries,fp_enabled,fp_ready;
 static struct { const char *step; unsigned domain,offset; uint64_t pa; uint32_t value; int access,row; } fp_diagnostic;
 static uint64_t fp_input,fp_swap,fp_hold,fp_last,fp_window,fp_window_start,fp_boost_time,fp_boosts;
 static int fp_max_temp,fp_boosted;
+THERMAL_GLOBALS
+static const char *arg_name;
+static unsigned arg_value;
+static int PE_parse_boot_argn(const char *name,void *value,unsigned size) {
+ assert(size==sizeof(unsigned));
+ if(arg_name && !strcmp(name,arg_name)) { *(unsigned *)value=arg_value;return 1; }
+ return 0;
+}
 typedef void *thread_call_param_t;
 static int fp_call;
 static uint64_t scheduled;
-#define NSEC_PER_MSEC 1
+#define NSEC_PER_MSEC 1000000ULL
+#define NSEC_PER_SEC 1000000000ULL
 static uint64_t mach_absolute_time(void) { return ticks; }
-static void absolutetime_to_nanoseconds(uint64_t t,uint64_t *ns) { *ns=t; }
-static void clock_interval_to_deadline(unsigned n,unsigned unit,uint64_t *t) { *t=ticks+n*unit; }
+static void absolutetime_to_nanoseconds(uint64_t t,uint64_t *ns) { *ns=t*NSEC_PER_MSEC; }
+static void nanoseconds_to_absolutetime(uint64_t ns,uint64_t *t) { *t=ns/NSEC_PER_MSEC; }
+static void clock_interval_to_deadline(unsigned n,unsigned unit,uint64_t *t) { *t=ticks+(uint64_t)n*unit/NSEC_PER_MSEC; }
 static int thread_call_enter_delayed(int *call,uint64_t t) { (void)call;scheduled=t;return 0; }
 static int thread_call_enter(int *call) { (void)call;scheduled=ticks;return 0; }
 static int fault_block=-1;
@@ -351,7 +466,13 @@ static unsigned fuxi_gpu_access(uintptr_t address,uint64_t *v,unsigned wr,unsign
  else *v=regs[block][off/4];
  return 0;
 }
+static void fp_configure(void);
 static void reset(void) {
+ fp_hot=620;fp_limit=680;fp_resume=580;fp_rise=100;fp_fast_ms=20;fp_budget_ms=200;
+ arg_name=0;fp_configure();
+ fp_recover_since=fp_above_time=fp_cuts=fp_active_start=0;
+ fp_duty_count=0;fp_prev_temp=fp_prev_valid=fp_blocked=0;
+ fp_rate_elapsed=0;fp_rate_temp=fp_rate_valid=fp_rate=0;
  memset(tsens_reads,0,sizeof(tsens_reads));
  memset(regs,0,sizeof(regs));memset(writes,0,sizeof(writes));memset(lut_reads,0,sizeof(lut_reads));
  memset(fp_cool_khz,0,sizeof(fp_cool_khz));memset(fp_high_khz,0,sizeof(fp_high_khz));
@@ -376,6 +497,11 @@ static void reset_init(void) {
  reset();memset(fp_epss,0,sizeof(fp_epss));memset(fp_tsens,0,sizeof(fp_tsens));
 }
 '''
+thermal_globals = actual[actual.index('static unsigned fp_hot ='):actual.index('static unsigned fp_enabled, fp_started')]
+REGISTERS = REGISTERS.replace('THERMAL_GLOBALS', thermal_globals)
+policy_caps = '\n'.join(re.findall(r'^static const unsigned fp_(?:cores|cool_cap|high_cap)\[3\].*$', actual, re.M))
+assert len(policy_caps.splitlines()) == 3
+REGISTERS = REGISTERS.replace('POLICY_CAPS', policy_caps)
 TEST = TEST.replace('#define REGISTER_FUNCTIONS', REGISTERS + register_functions)
 # Verify patch snapshots are exact and hooks are present in the final patch.
 patch = (ROOT/'xnu/patches/0097-fuxi-touch-boost.patch').read_text()
