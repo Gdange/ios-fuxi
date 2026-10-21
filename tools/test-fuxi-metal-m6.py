@@ -33,7 +33,8 @@ static std::vector<uint32_t> shader(const char *name) {
  std::vector<uint32_t> words(bytes.size()/4);memcpy(words.data(),bytes.data(),bytes.size());return words;
 }
 struct Product {std::vector<uint32_t> v,f;};
-extern "C" uint32_t fuxi_m2v_abi(){return 5;}
+extern "C" int fuxi_m2v_sampler(void *,uint32_t,fuxi::BakedSampler *out,char *,size_t){*out={};return 1;}
+extern "C" uint32_t fuxi_m2v_abi(){return 6;}
 extern "C" void *fuxi_m2v_open(const uint8_t *,size_t,char *,size_t){return nullptr;}
 extern "C" void fuxi_m2v_close(void *){}
 extern "C" int fuxi_m2v_function(void *,const char *,char *,size_t){return 0;}

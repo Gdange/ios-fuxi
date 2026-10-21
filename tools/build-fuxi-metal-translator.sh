@@ -27,6 +27,7 @@ crate-type = ["cdylib"]
 [dependencies]
 metal2vulkan = { path = "$source/crates/metal2vulkan", features = ["ash"] }
 ash = { version = "0.38", default-features = false, features = ["std"] }
+sha2="0.10"
 [profile.release]
 debug = false
 strip = "debuginfo"
@@ -55,7 +56,7 @@ cat > "$bridge/NOTICE" <<NOTICE
 metal2vulkan https://github.com/steelbrain/metal2vulkan
 Revision $pin; licence choice LGPL-3.0-or-later.
 Original Fuxi C ABI adapter: see src/lib.rs and the Fuxi repository licence.
-Replace /usr/local/lib/libmetal2vulkan.dylib with an ABI-v5 compatible library;
+Replace /usr/local/lib/libmetal2vulkan.dylib with an ABI-v6 compatible library;
 ad-hoc sign it and stage it through the same offline root-image procedure.
 No translator objects are linked into FuxiMetal. Reverse engineering to debug
 modifications to this library is permitted; preserve LGPL/GPL texts and notices.

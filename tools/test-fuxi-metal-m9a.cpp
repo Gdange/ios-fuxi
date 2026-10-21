@@ -67,5 +67,5 @@ int main(int argc,char **argv) {
  }
  tr.close(library);
  auto destroy=(PFN_vkDestroyInstance)gipa(instance,"vkDestroyInstance");destroy(instance,nullptr);dlclose(icd);
- puts("PASS: ABI5 58 named/indexed bool/uchar/uchar3 constants, linked specialization, cache hit/change, overflow/type/size refusal; no GPU submits");
+ puts("PASS: ABI6 58 named/indexed bool/uchar/uchar3 constants, linked specialization, cache hit/change, overflow/type/size refusal; no GPU submits");
 }

@@ -146,6 +146,7 @@ edition="2021"
 [dependencies]
 metal2vulkan={path=''' + dependency + ''',features=["ash"]}
 ash={version="0.38",default-features=false,features=["std"]}
+sha2="0.10"
 serde_json="1"
 ''')
     with (out / 'probe-build.log').open('w') as log:

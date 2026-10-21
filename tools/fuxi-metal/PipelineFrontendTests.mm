@@ -121,7 +121,7 @@ int main() {@autoreleasepool {
  [r setVertexBuffer:input offset:16 atIndex:0];[r setFragmentBuffer:input offset:32 atIndex:3];
  float uniform[4]={1,0.5,0.25,1};[r setFragmentBytes:uniform length:sizeof(uniform) atIndex:1];memset(uniform,0,sizeof(uniform));
  [r setViewport:(MTLViewport){16,24,128,96,0,1}];[r setScissorRect:(MTLScissorRect){24,32,64,64}];
- refuses(c,^{[r setVertexBuffer:input offset:0 atIndex:4];});
+ refuses(c,^{[r setVertexBuffer:input offset:0 atIndex:16];});
  {float *u=uniform;refuses(c,^{[r setFragmentBytes:u length:4097 atIndex:1];});}
  refuses(c,^{[r drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:3 indexType:MTLIndexTypeUInt32 indexBuffer:input indexBufferOffset:0];});
  [r drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:6 indexType:MTLIndexTypeUInt16 indexBuffer:input indexBufferOffset:4];[r endEncoding];
@@ -146,6 +146,10 @@ int main() {@autoreleasepool {
  id<MTLTexture> textures[1]={nil};id<MTLSamplerState> samplers[1]={nil};
  [r setFragmentTextures:textures withRange:NSMakeRange(2,1)];[r setFragmentSamplerStates:samplers withRange:NSMakeRange(3,1)];
  assert(!r->_samples[2] && !r->_samplers[3]);
+ // M9f: slot 4 (CA second image) and the last admitted slot survive snapshots.
+ [r setVertexBuffer:input offset:8 atIndex:15];[r setFragmentBuffer:input offset:16 atIndex:15];
+ [r setFragmentTexture:(id)sample atTextureIndex:4 samplerState:sampler atSamplerIndex:15];
+ refuses(c,^{[r setFragmentTexture:(id)sample atIndex:16];});
  MTLDepthStencilDescriptor *depth=[MTLDepthStencilDescriptor new];
  id ds=[device newDepthStencilStateWithDescriptor:depth];assert(ds);checkLabel(ds);[r setDepthStencilState:ds];[r setDepthStencilState:nil];
  depth.depthWriteEnabled=YES;assert(![device newDepthStencilStateWithDescriptor:depth]);depth.depthWriteEnabled=NO;
@@ -153,6 +157,10 @@ int main() {@autoreleasepool {
  refuses(c,^{[r setDepthStencilState:(id)input];});
  [r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
  assert(c->_ops.back().buffers[0][1].offset==48 && c->_ops.back().buffers[1][3].offset==64);
+ assert(c->_ops.back().buffers[0][15].offset==8 && c->_ops.back().buffers[1][15].offset==16);
+ assert(c->_ops.back().samples[4]==sample->_texture && c->_ops.back().samplers[15]==((FuxiSampler *)sampler)->_sampler);
+ [r setFragmentTexture:nil atIndex:4];[r setFragmentSamplerState:nil atIndex:15];
+ assert(c->_ops.back().samples[4]==sample->_texture && c->_ops.back().samplers[15]==((FuxiSampler *)sampler)->_sampler);
  [r setVertexBufferOffset:80 atIndex:1];assert(c->_ops.back().buffers[0][1].offset==48);[r endEncoding];
  [ds release];[depth release];[sampler release];[sample release];
  [input release];

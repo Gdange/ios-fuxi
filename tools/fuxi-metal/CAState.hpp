@@ -3,7 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 namespace fuxi {
-inline bool bindingRange(size_t start,size_t count) {return start<=4 && count<=4-start;}
+constexpr size_t resourceSlots=16;
+inline bool bindingRange(size_t start,size_t count) {return start<=resourceSlots && count<=resourceSlots-start;}
 inline bool bindingOffset(bool bound,bool bytes,uint64_t length,uint64_t offset) {
  return bound && !bytes && offset<length;
 }

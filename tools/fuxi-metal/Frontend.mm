@@ -465,7 +465,7 @@ static NSString *pipelineRejection(MTLRenderPipelineDescriptor *d,id device) {
  CHECK("fragmentFunction.stage",fs,actual==2);
  // 20H392's getter lazily creates an empty descriptor. Presence alone cannot
  // distinguish the untouched default from an explicitly supplied empty object.
- // ABI 5 transmits exact formats/offsets/buffer slots/strides, per-vertex only.
+ // ABI 6 transmits exact formats/offsets/buffer slots/strides, per-vertex only.
  if(NSString *why=vertexDescriptorRejection(vd))return why;
  CHECK("rasterSampleCount",d.rasterSampleCount,actual==1);
  CHECK("alphaToCoverageEnabled",d.alphaToCoverageEnabled,!actual);
@@ -690,12 +690,12 @@ static thread_local FuxiCommandBuffer *completionCommand;
 @interface FuxiBlit : FuxiLabeledObject { @public FuxiCommandBuffer *_command; BOOL _ended; }
 @end
 @interface FuxiRender : FuxiLabeledObject { @public FuxiCommandBuffer *_command; FuxiTexture *_target; FuxiPipeline *_pipeline; MTLClearColor _clear; BOOL _ended,_drawn;
- FuxiTexture *_samples[4];FuxiSampler *_samplers[4];fuxi::BufferBind _buffers[2][4];uint32_t _load,_store;size_t _lastOp;
+ FuxiTexture *_samples[fuxi::resourceSlots];FuxiSampler *_samplers[fuxi::resourceSlots];fuxi::BufferBind _buffers[2][fuxi::resourceSlots];uint32_t _load,_store;size_t _lastOp;
  fuxi::Operation _state; }
 @end
 @implementation FuxiRender
 - (void)rejectSelector:(SEL)s {unsupported(self,s);[_command rejectSelector:s];}
-- (void)dealloc {[_command release];[_target release];[_pipeline release];for(unsigned i=0;i<4;++i){[_samples[i] release];[_samplers[i] release];}[super dealloc];}
+- (void)dealloc {[_command release];[_target release];[_pipeline release];for(unsigned i=0;i<fuxi::resourceSlots;++i){[_samples[i] release];[_samplers[i] release];}[super dealloc];}
 - (void)active {stage4Require("renderEncoder","ended",_ended,!_ended);stage4Require("renderEncoder","encoding",_command->_encoding,_command->_encoding);
  stage4Require("renderEncoder","commandStatus",_command->_status,_command->_status==MTLCommandBufferStatusNotEnqueued);}
 - (void)setRenderPipelineState:(id)p {@try {CENSUS();[self active];
@@ -704,7 +704,7 @@ static thread_local FuxiCommandBuffer *completionCommand;
  [p retain];[_pipeline release];_pipeline=p;
 } @catch(NSException *e) {(void)e;[self rejectSelector:_cmd];}}
 - (void)setFragmentTexture:(id)t atIndex:(NSUInteger)i {@try {CENSUS();[self active];
- stage4Require("sampling","textureIndex",i,i<4);
+ stage4Require("sampling","textureIndex",i,i<fuxi::resourceSlots);
  if(!t){[_samples[i] release];_samples[i]=nil;return;}
  if(!stage4Class("sampling","texture.class",t,[FuxiTexture class]))invalid(@"sampling texture.class");
  stage4Require("sampling","texture.device",(uint64_t)[t device],[t device]==_command->_queue->_device);
@@ -713,25 +713,25 @@ static thread_local FuxiCommandBuffer *completionCommand;
  [t retain];[_samples[i] release];_samples[i]=t;
 } @catch(NSException *e) {(void)e;[self rejectSelector:_cmd];}}
 - (void)setFragmentSamplerState:(id)s atIndex:(NSUInteger)i {@try {CENSUS();[self active];
- stage4Require("sampling","samplerIndex",i,i<4);
+ stage4Require("sampling","samplerIndex",i,i<fuxi::resourceSlots);
  if(!s){[_samplers[i] release];_samplers[i]=nil;return;}
  if(!stage4Class("sampling","sampler.class",s,[FuxiSampler class]))invalid(@"sampling sampler.class");
  stage4Require("sampling","sampler.device",(uint64_t)[s device],[s device]==_command->_queue->_device);
  [s retain];[_samplers[i] release];_samplers[i]=s;
 } @catch(NSException *e) {(void)e;[self rejectSelector:_cmd];}}
 - (void)setBuffer:(id)b offset:(NSUInteger)o index:(NSUInteger)i stage:(unsigned)stage bytes:(BOOL)bytes {
- [self active];if(i>=4 || (b && (![b isKindOfClass:[FuxiBuffer class]] || [b device]!=_command->_queue->_device || o>=[b length])))invalid(@"buffer slot/device/offset");
+ [self active];if(i>=fuxi::resourceSlots || (b && (![b isKindOfClass:[FuxiBuffer class]] || [b device]!=_command->_queue->_device || o>=[b length])))invalid(@"buffer slot/device/offset");
  if(b)[_command->_resources addObject:b];_buffers[stage][i]={b?((FuxiBuffer *)b)->_buffer:nullptr,o,(bool)bytes};
 }
 - (void)setVertexBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i {@try {CENSUS();[self setBuffer:b offset:o index:i stage:0 bytes:NO];} @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
 - (void)setFragmentBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i {@try {CENSUS();[self setBuffer:b offset:o index:i stage:1 bytes:NO];} @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
-// NativeMetal's stage adapters, retaining Fuxi's four-slot/device/poison rules.
+// NativeMetal's stage adapters, retaining Fuxi's sixteen-slot/device/poison rules.
 - (void)setVertexBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i {@try {CENSUS();[self active];
- if(i>=4)invalid(@"vertex buffer offset slot");auto &b=_buffers[0][i];
+ if(i>=fuxi::resourceSlots)invalid(@"vertex buffer offset slot");auto &b=_buffers[0][i];
  if(!fuxi::bindingOffset(b.buffer!=nullptr,b.bytes,b.buffer?b.buffer->length:0,o))invalid(@"vertex buffer offset binding/bounds");b.offset=o;
 } @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
 - (void)setFragmentBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i {@try {CENSUS();[self active];
- if(i>=4)invalid(@"fragment buffer offset slot");auto &b=_buffers[1][i];
+ if(i>=fuxi::resourceSlots)invalid(@"fragment buffer offset slot");auto &b=_buffers[1][i];
  if(!fuxi::bindingOffset(b.buffer!=nullptr,b.bytes,b.buffer?b.buffer->length:0,o))invalid(@"fragment buffer offset binding/bounds");b.offset=o;
 } @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
 - (void)setVertexBuffers:(const id<MTLBuffer> __unsafe_unretained [])b offsets:(const NSUInteger [])o withRange:(NSRange)r {@try {CENSUS();[self active];
@@ -788,7 +788,7 @@ static thread_local FuxiCommandBuffer *completionCommand;
 } @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
 - (id)device {CENSUS();return _command->_queue->_device;}
 - (void)setBytes:(const void *)bytes length:(NSUInteger)n index:(NSUInteger)i stage:(unsigned)stage {
- [self active];if(!bytes || !n || n>4096 || i>=4)invalid(@"inline bytes bound");
+ [self active];if(!bytes || !n || n>4096 || i>=fuxi::resourceSlots)invalid(@"inline bytes bound");
  FuxiBuffer *b=[FuxiBuffer new];b->_device=[_command->_queue->_device retain];
  try {b->_buffer=owner(b->_device)->backend->allocate(n);memcpy(b->_buffer->contents,bytes,n);}
  catch(const std::exception &e){[b release];invalid([NSString stringWithUTF8String:e.what()]);}
@@ -809,7 +809,7 @@ static thread_local FuxiCommandBuffer *completionCommand;
  fuxi::Operation op=_state;op.texture=_target->_texture;op.pipeline=_pipeline->_pipeline;op.vertices=(uint32_t)count;op.first=(uint32_t)start;op.strip=t==MTLPrimitiveTypeTriangleStrip;
  op.indices=indices?((FuxiBuffer *)indices)->_buffer:nullptr;op.indexOffset=offset;
  op.load=_drawn?1:_load;op.store=1;
- for(unsigned i=0;i<4;++i){op.samples[i]=_samples[i]?_samples[i]->_texture:nullptr;op.samplers[i]=_samplers[i]?_samplers[i]->_sampler:nullptr;
+ for(unsigned i=0;i<fuxi::resourceSlots;++i){op.samples[i]=_samples[i]?_samples[i]->_texture:nullptr;op.samplers[i]=_samplers[i]?_samplers[i]->_sampler:nullptr;
  if(_samples[i])[_command->_resources addObject:_samples[i]];if(_samplers[i])[_command->_resources addObject:_samplers[i]];}
  memcpy(op.buffers,_buffers,sizeof(_buffers));if(indices)[_command->_resources addObject:indices];
  op.clear[0]=_clear.red;op.clear[1]=_clear.green;op.clear[2]=_clear.blue;op.clear[3]=_clear.alpha;
@@ -1105,8 +1105,8 @@ static thread_local FuxiCommandBuffer *completionCommand;
 - (BOOL)supportsYCBCRPackedFormats12 {CENSUS();return NO;}
 - (NSUInteger)minConstantBufferAlignmentBytes {CENSUS();return 256;}
 - (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes {CENSUS();return 256;}
-- (NSUInteger)maxFragmentTextures {CENSUS();return 4;}
-- (NSUInteger)maxFragmentSamplers {CENSUS();return 4;}
+- (NSUInteger)maxFragmentTextures {CENSUS();return fuxi::resourceSlots;}
+- (NSUInteger)maxFragmentSamplers {CENSUS();return fuxi::resourceSlots;}
 - (NSUInteger)maxTextureWidth2D {CENSUS();return 256;}
 - (NSUInteger)maxTextureHeight2D {CENSUS();return 256;}
 - (NSUInteger)maxColorAttachments {CENSUS();return 1;}

@@ -25,8 +25,8 @@ int main() {
  assert(!fuxi::validFetchContract(false,0,1) && !fuxi::validFetchContract(false,1,1));
  assert(!fuxi::validFetchContract(true,0,1) && !fuxi::validFetchContract(true,1,2));
  assert(!fuxi::validFetchContract(true,2,1) && !fuxi::validFetchContract(true,1,UINT32_MAX));
- assert(fuxi::bindingRange(0,4) && fuxi::bindingRange(4,0));
- assert(!fuxi::bindingRange(4,1) && !fuxi::bindingRange(std::numeric_limits<size_t>::max(),2));
+ assert(fuxi::bindingRange(0,16) && fuxi::bindingRange(16,0));
+ assert(!fuxi::bindingRange(16,1) && !fuxi::bindingRange(std::numeric_limits<size_t>::max(),2));
  assert(fuxi::bindingOffset(true,false,128,127));
  assert(!fuxi::bindingOffset(true,false,128,128) && !fuxi::bindingOffset(false,false,128,0));
  assert(!fuxi::bindingOffset(true,true,128,0));

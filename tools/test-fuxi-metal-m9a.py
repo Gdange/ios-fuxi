@@ -119,6 +119,7 @@ crate-type=["cdylib"]
 [dependencies]
 metal2vulkan={path=''' + source + ''',features=["ash"]}
 ash={version="0.38",default-features=false,features=["std"]}
+sha2="0.10"
 ''')
     for command in ('test', 'build'):
         subprocess.run(['cargo', '+1.98.0', command, '--offline', '--manifest-path', str(build / 'Cargo.toml')], check=True)

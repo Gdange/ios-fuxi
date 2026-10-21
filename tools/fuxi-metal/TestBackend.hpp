@@ -22,7 +22,7 @@ struct Operation {
  Texture *texture{};Pipeline *pipeline{};float clear[4]{};
  Texture *sourceTexture{};Sampler *sampler{};uint32_t vertices=3;bool upload=false,clearOnly=false;
  uint32_t srcX{},srcY{},dstX{},dstY{},width{},height{};size_t rowBytes{};
- Texture *samples[4]{};Sampler *samplers[4]{};BufferBind buffers[2][4]{};Buffer *indices{};uint64_t indexOffset{};uint32_t first{},strip{},load=2,store=1;
+ Texture *samples[resourceSlots]{};Sampler *samplers[resourceSlots]{};BufferBind buffers[2][resourceSlots]{};Buffer *indices{};uint64_t indexOffset{};uint32_t first{},strip{},load=2,store=1;
  Viewport viewport{0,256,256,-256,0,1};Rect scissor{{0,0},{256,256}};
 };
 class Backend {

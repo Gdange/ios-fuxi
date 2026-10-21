@@ -25,7 +25,11 @@ int main(int argc,char **argv){try {
  auto overlay=base;overlay.load=1;overlay.samples[0]=t[1];overlay.buffers[1][1]={half,0,true};overlay.scissor={{16,24},{224,208}};
  fuxi::Operation read{};read.texture=t[2];read.dst=readback;read.to=256;
  auto refused=[&](const std::vector<fuxi::Operation> &ops){auto layout=t[2]->layout;bool defined=t[2]->defined;try{b.submit(ops);throw std::logic_error("bad draw accepted");}catch(const std::runtime_error&){}require(!b.poisoned && t[2]->layout==layout && t[2]->defined==defined,"refusal state changed");};
- auto bad=base;bad.buffers[1][1]={};refused({bad});bad=base;bad.buffers[0][0].offset=vertices->length-1;refused({bad});bad=base;bad.indexOffset=indices->length-1;refused({bad});bad=base;bad.samples[0]=t[2];refused({bad});
+ // The translator explicitly plans a zero buffer for an unbound read-only
+ // uniform. Verify real backing and its pixels instead of expecting rejection.
+ auto neutral=base;neutral.buffers[1][1]={};b.submit({neutral,read});
+ for(unsigned i=0;i<65536;++i){const uint8_t black[]={0,0,0,255};require(!memcmp((uint8_t *)readback->contents+256+4*i,black,4),"planned neutral uniform pixels");}
+ auto bad=base;bad.buffers[0][0].offset=vertices->length-1;refused({bad});bad=base;bad.indexOffset=indices->length-1;refused({bad});bad=base;bad.samples[0]=t[2];refused({bad});
  bad=base;bad.first=UINT32_MAX;refused({bad});bad=base;bad.indexOffset=UINT64_MAX-1;refused({bad});
  uint16_t saved;memcpy(&saved,(uint8_t *)indices->contents+4,2);uint16_t outOfRange=4;memcpy((uint8_t *)indices->contents+4,&outOfRange,2);refused({base});memcpy((uint8_t *)indices->contents+4,&saved,2);
  for(auto *pipeline:{p,cached}){base.pipeline=overlay.pipeline=pipeline;memset(readback->contents,0x39,readback->length);b.submit({base,overlay,read});
@@ -188,7 +192,7 @@ int main(int argc,char **argv){try {
   auto widened=unblended;widened.attributes[0]={25,0,0};widened.attributes[1]={25,4,0};
   widened.attributes[2]={format,0,1};widened.strides[0]=8;widened.strides[1]=size;
   auto *pipeline=b.compilePipeline(lib,"fuxi_layer_vertex",lib,"fuxi_layer_fragment",widened);
-  draw=base;draw.pipeline=pipeline;draw.buffers[0][0]={coordinates,0,false};draw.buffers[0][1]={colors,0,false};
+  draw=base;draw.pipeline=pipeline;draw.strip=0;draw.vertices=6;draw.buffers[0][0]={coordinates,0,false};draw.buffers[0][1]={colors,0,false};
   b.submit({draw,read});
   for(unsigned y=0;y<256;++y)for(unsigned x=0;x<256;++x){uint8_t want[4];fuxiM7Texel(0,x,y,want);want[0]=want[1]=0;
    require(!memcmp((uint8_t *)readback->contents+256+4*(y*256+x),want,4),"M9d half/multiple-buffer vertex pixels");}
