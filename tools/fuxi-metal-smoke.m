@@ -11,6 +11,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <mach/mach.h>
+/* Private libsystem_kernel call (kern_memorystatus.h). The smoke runs in place of
+ * a daemon whose launchd jetsam limit is too small for a cold shader translation. */
+extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags, void *buffer, size_t size);
+#define FUXI_MEMORYSTATUS_CMD_SET_JETSAM_TASK_LIMIT 6
+static unsigned long long footprint(void) {
+ task_vm_info_data_t i;mach_msg_type_number_t n=TASK_VM_INFO_COUNT;
+ return task_info(mach_task_self(),TASK_VM_INFO,(task_info_t)&i,&n)==KERN_SUCCESS?i.phys_footprint>>10:0;
+}
 #ifndef FUXI_MTL_CONF
 #define FUXI_MTL_CONF "/usr/local/share/fuxi/metal-smoke.conf"
 #endif
@@ -224,6 +233,7 @@ int main(int argc,char **argv) {
  (void)argc;(void)argv;setvbuf(stdout,NULL,_IONBF,0);setvbuf(stderr,NULL,_IONBF,0);signal(SIGALRM,expired);arm(30);
  @autoreleasepool { @try {
   if(geteuid()!=0)fail("requires unsandboxed root");unsigned maximum=configuration();
+  {int r=memorystatus_control(FUXI_MEMORYSTATUS_CMD_SET_JETSAM_TASK_LIMIT,getpid(),1024,NULL,0);printf("FUXI MTL: jetsam limit 1024 MB rc %d errno %d footprint %llu KiB\n",r,r?errno:0,footprint());}
   id<MTLDevice>device=MTLCreateSystemDefaultDevice();if(!device)fail("MTLCreateSystemDefaultDevice returned nil");
   Class base=objc_getClass("_MTLDevice");
   if(!base || class_getInstanceSize(base)!=528 || strcmp(class_getName(object_getClass(device)),"FuxiMTLDevice") || ![(id)device isKindOfClass:base] || !device.registryID)fail("class/size/registryID guard");
@@ -244,9 +254,9 @@ int main(int argc,char **argv) {
     }
     [b release];
    }
-   if(maximum>=4) {stage=4;name="pipeline";arm(60);@autoreleasepool {pipeline(device,q);}}
-   if(maximum>=5) {stage=5;name="composition";arm(60);@autoreleasepool {composition(device,q);}}
-   if(maximum>=6) {stage=6;name="layers";arm(60);@autoreleasepool {layers(device,q);}}
+   if(maximum>=4) {stage=4;name="pipeline";arm(60);@autoreleasepool {pipeline(device,q);}printf("FUXI MTL: stage 4 footprint %llu KiB\n",footprint());}
+   if(maximum>=5) {stage=5;name="composition";arm(60);@autoreleasepool {composition(device,q);}printf("FUXI MTL: stage 5 footprint %llu KiB\n",footprint());}
+   if(maximum>=6) {stage=6;name="layers";arm(60);@autoreleasepool {layers(device,q);}printf("FUXI MTL: stage 6 footprint %llu KiB\n",footprint());}
    arm(10);[a release];[q release];
   }
   [device release];alarm(0);puts("FUXI MTL: done PASS");
