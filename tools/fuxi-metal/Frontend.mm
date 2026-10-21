@@ -154,7 +154,7 @@ static FuxiOwner *owner(id obj) {return (FuxiOwner *)objc_getAssociatedObject(ob
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {CENSUS();
  if(state<MTLPurgeableStateKeepCurrent || state>MTLPurgeableStateEmpty){unsupported(self,_cmd);return (MTLPurgeableState)0;}
  if(_parentHeap || [(id)self allocatedSize]<16384)return MTLPurgeableStateNonVolatile;
- @synchronized(self){MTLPurgeableState before=_purgeable?:MTLPurgeableStateNonVolatile;
+ @synchronized(self){MTLPurgeableState before=_purgeable?(MTLPurgeableState)_purgeable:MTLPurgeableStateNonVolatile;
   if(state!=MTLPurgeableStateKeepCurrent)_purgeable=state;return before;}
 }
 @end
@@ -653,7 +653,8 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
  @synchronized(self){_timeline.signal(value);uint64_t actual=_timeline.value();NSArray *notices=[_notices copy];
   for(FuxiEventNotice *notice in notices)if(notice->_value<=actual){
    [_notices removeObjectIdenticalTo:notice];dispatch_async(notice->_queue,^{notice->_block((id)self,actual);});
-  }[notices release];}
+  }
+  [notices release];}
 }
 - (BOOL)waitUntilSignaledValue:(uint64_t)value timeoutMS:(uint64_t)milliseconds {CENSUS();return _timeline.wait(value,milliseconds);}
 - (void)notifyListener:(MTLSharedEventListener *)listener atValue:(uint64_t)value block:(MTLSharedEventNotificationBlock)block {CENSUS();
@@ -1134,7 +1135,8 @@ static thread_local FuxiCommandBuffer *completionCommand;
  NSMutableArray *group=[NSMutableArray new];for(NSUInteger i=0;i<count;++i)if(resources[i]){
   if(![resources[i] isKindOfClass:[FuxiResource class]] || [resources[i] device]!=self){[group release];unsupported(self,_cmd);return nil;}
   [group addObject:resources[i]];
- }return group;
+ }
+ return group;
 }
 - (id)newBufferWithLength:(NSUInteger)n options:(MTLResourceOptions)options {CENSUS();
  // Reject write-combine/untracked/private/managed/sparse and unknown options.

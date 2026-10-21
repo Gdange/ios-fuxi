@@ -36,7 +36,7 @@ int main(){@autoreleasepool {
  assert(!dispatch_semaphore_wait(delivered,dispatch_time(DISPATCH_TIME_NOW,1000000000)));
  [command waitUntilCompleted];[queue setCompletionQueue:nullptr];
  MTLHeapDescriptor *hd=[MTLHeapDescriptor new];hd.storageMode=MTLStorageModeShared;hd.size=128;
- FuxiHeap *heap=[device newHeapWithDescriptor:hd];assert(heap && [heap usedSize]==0);
+ FuxiHeap *heap=(FuxiHeap *)[device newHeapWithDescriptor:hd];assert(heap && [heap usedSize]==0);
  id<MTLBuffer> buffer=[heap newBufferWithLength:64 options:0];assert(buffer && buffer.heap==(id)heap && [heap usedSize]==64);
  assert(![heap newBufferWithLength:80 options:0]);
  assert([(id)buffer setPurgeableState:MTLPurgeableStateVolatile]==MTLPurgeableStateNonVolatile);

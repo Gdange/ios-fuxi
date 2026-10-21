@@ -45,7 +45,7 @@ int main() {
   assert(![d newDefaultLibrary]);
   requireZero(d,@selector(newLibraryWithData:error:));
   requireZero(d,@selector(newTextureWithDescriptor:iosurface:plane:));
-  assert(![d newSharedEvent]);
+  {id event=[d newSharedEvent];assert(event);[event release];} // process-local, no GPU needed (M9e)
   for(unsigned i=0;i<10;++i)assert(![d supportsFamily:MTLGPUFamilyApple1]);
   requireZero(d,@selector(heapTextureSizeAndAlignWithDescriptor:)); // structure
   requireZero(d,@selector(currentAllocatedSize)); // scalar
