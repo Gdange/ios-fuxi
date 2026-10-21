@@ -57,13 +57,15 @@ static void checkClient() {
 // objects/NSStrings and no allocation once full. Repeated messages stay silent.
 struct CensusEntry {Class cls;SEL selector;};
 static CensusEntry censusEntries[256];static size_t censusCount;static std::mutex censusLock;
+static bool caTrace() {return !strcmp(clientProcess,"fuxi-ca-smoke");}
 static void censusLog(id object,SEL selector,bool implemented) {
- if(clientMode!=fuxi::ClientMode::census)return;
+ // The isolated CA smoke also traces each class/selector's first use (diagnostic only).
+ if(clientMode!=fuxi::ClientMode::census && !caTrace())return;
  Class cls=object_getClass(object);std::lock_guard<std::mutex> lock(censusLock);
  for(size_t i=0;i<censusCount;++i)if(censusEntries[i].cls==cls && censusEntries[i].selector==selector)return;
  if(censusCount==256)return;
  censusEntries[censusCount++]={cls,selector};
- fprintf(stderr,"FUXI MTL: census %s %s %s %s\n",clientProcess,class_getName(cls),sel_getName(selector),implemented?"implemented":"unsupported");
+ fprintf(stderr,"FUXI MTL: %s %s %s %s %s\n",clientMode==fuxi::ClientMode::census?"census":"trace",clientProcess,class_getName(cls),sel_getName(selector),implemented?"implemented":"unsupported");
  if(censusCount==256)fprintf(stderr,"FUXI MTL: census limit %s 256\n",clientProcess);
 }
 #define CENSUS() censusLog(self,_cmd,true)
@@ -558,6 +560,7 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
  }catch(const std::exception &e){backend->destroy(staging);invalid([NSString stringWithUTF8String:e.what()]);}
 }
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image {
+ if(caTrace())fprintf(stderr,"FUXI MTL: trace replaceRegion %lu,%lu %lux%lu row %lu format %lu\n",(unsigned long)r.origin.x,(unsigned long)r.origin.y,(unsigned long)r.size.width,(unsigned long)r.size.height,(unsigned long)row,(unsigned long)[self pixelFormat]);
  [self transfer:const_cast<void *>(bytes) row:row image:image region:r level:level slice:slice write:YES];
 }
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row {
@@ -581,6 +584,7 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
  t->_backingBuffer=[self retain];t->_backingOffset=offset;t->_backingRow=row;return t;
 }
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)row {
+ if(caTrace())fprintf(stderr,"FUXI MTL: trace linearTexture %lux%lu offset %lu row %lu format %lu usage %lu\n",(unsigned long)d.width,(unsigned long)d.height,(unsigned long)offset,(unsigned long)row,(unsigned long)d.pixelFormat,(unsigned long)d.usage);
  return [self newLinearTextureWithDescriptor:d offset:offset bytesPerRow:row bytesPerImage:0];
 }
 @end
@@ -1014,6 +1018,7 @@ static thread_local FuxiCommandBuffer *completionCommand;
 } @catch(NSException *e) {(void)e;[self rejectSelector:_cmd];}}
 - (void)copyFromBuffer:(id)b sourceOffset:(NSUInteger)offset sourceBytesPerRow:(NSUInteger)row sourceBytesPerImage:(NSUInteger)image
  sourceSize:(MTLSize)z toTexture:(id)t destinationSlice:(NSUInteger)s destinationLevel:(NSUInteger)l destinationOrigin:(MTLOrigin)o {@try {CENSUS();
+ if(caTrace())fprintf(stderr,"FUXI MTL: trace bufferToTexture offset %lu row %lu %lux%lu to %lu,%lu format %lu\n",(unsigned long)offset,(unsigned long)row,(unsigned long)z.width,(unsigned long)z.height,(unsigned long)o.x,(unsigned long)o.y,(unsigned long)[t pixelFormat]);
  FuxiTexture *dst=[self texture:t slice:s level:l origin:o size:z];
  FuxiBuffer *src=[self imageBuffer:b offset:offset row:row image:image size:z pixel:fuxi::Backend::texelBytes((uint32_t)[dst pixelFormat])];
  fuxi::Operation op{};op.src=src->_buffer;op.from=offset;op.texture=dst->_texture;op.upload=true;op.dstX=o.x;op.dstY=o.y;op.width=z.width;op.height=z.height;op.rowBytes=row;
