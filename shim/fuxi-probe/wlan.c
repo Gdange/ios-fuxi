@@ -315,6 +315,31 @@ static uint32_t wl_pcie_cap(void)
  return 0;
 }
 
+/* Shared initial/resume PHY sequence. Resume holds PHY BCR for the
+ * downstream reset-control 1 ms; initial bring-up retains its 250 us hold. */
+static int wl3_phy_init(unsigned reset_us)
+{
+  uint32_t *r = wl3_report;
+  unsigned i;
+  wl_set(WL_GCC, 0x6c01c, 1); delay(reset_us);
+  if (!(usb_rd(WL_GCC, 0x6c01c) & 1u)) return 1;
+  wl_clr(WL_GCC, 0x6c01c, 1); delay(10);
+  if (usb_rd(WL_GCC, 0x6c01c) & 1u) return 1;
+  wl_pwr(WL_PHY + 0x240, wl_prd(WL_PHY + 0x240) | 3u);       /* SW_PWRDN|REFCLK_DRV_DSBL */
+  for (i = 0; i < sizeof(wl_phy_tbl) / sizeof(wl_phy_tbl[0]); i++)
+   wl_pwr(WL_PHY + wl_phy_tbl[i][0], wl_phy_tbl[i][1]);
+  wl_wr(WL_GCC, 0x6b070, usb_rd(WL_GCC, 0x6b070) & ~3u);     /* pipe mux: PHY pipe */
+  wl_set(WL_GCC, 0x52008, 1u << 4);                          /* pipe branch vote */
+  wl_pwr(WL_PHY + 0x200, wl_prd(WL_PHY + 0x200) & ~1u);      /* SW_RESET release */
+  wl_pwr(WL_PHY + 0x244, wl_prd(WL_PHY + 0x244) | 3u);       /* SERDES|PCS start */
+  delay(1000);
+  for (i = 0; i < 10000; i += 10) { if (!(wl_prd(WL_PHY + 0x214) & (1u << 6))) break; delay(10); }
+  r[62] = i; r[63] = wl_prd(WL_PHY + 0x214);
+  r[64] = usb_rd(WL_GCC, 0x6b048); r[65] = usb_rd(WL_GCC, 0x6b070);
+  if (wl3_faults) return 1;
+  return (r[63] & (1u << 6)) ? 2 : 0;
+}
+
 /* Returns 0 on success or a nonzero reason; the caller encodes step<<8. */
 static int wl3_step(unsigned step)
 {
@@ -391,7 +416,9 @@ static int wl3_step(unsigned step)
  }
  case 8: /* core reset + PARF (qcom_pcie_init_2_7_0) */
   wl_set(WL_GCC, 0x6b000, 1); delay(1000);
+  if (!(usb_rd(WL_GCC, 0x6b000) & 1u)) return 1;
   wl_clr(WL_GCC, 0x6b000, 1); delay(1000);
+  if (usb_rd(WL_GCC, 0x6b000) & 1u) return 1;
   wl_pwr(WL_PARF + 0x1000, 4);
   wl_pwr(WL_PARF + 0x40, wl_prd(WL_PARF + 0x40) & ~1u);
 #ifdef FUXI_WLAN_XNU
@@ -413,24 +440,7 @@ static int wl3_step(unsigned step)
   r[58] = wl_prd(WL_PARF + 0x1000); r[59] = wl_prd(WL_PARF + 0x40);
   r[60] = wl_prd(WL_PARF + 0x350); r[61] = wl_prd(WL_PARF + 0x634);
   return (wl3_faults || (r[58] & 0xf) != 4) ? 1 : 0;
- case 9: { /* QMP PHY */
-  unsigned i;
-  wl_set(WL_GCC, 0x6c01c, 1); delay(250);
-  wl_clr(WL_GCC, 0x6c01c, 1); delay(10);
-  wl_pwr(WL_PHY + 0x240, wl_prd(WL_PHY + 0x240) | 3u);       /* SW_PWRDN|REFCLK_DRV_DSBL */
-  for (i = 0; i < sizeof(wl_phy_tbl) / sizeof(wl_phy_tbl[0]); i++)
-   wl_pwr(WL_PHY + wl_phy_tbl[i][0], wl_phy_tbl[i][1]);
-  wl_wr(WL_GCC, 0x6b070, usb_rd(WL_GCC, 0x6b070) & ~3u);     /* pipe mux: PHY pipe */
-  wl_set(WL_GCC, 0x52008, 1u << 4);                          /* pipe branch vote */
-  wl_pwr(WL_PHY + 0x200, wl_prd(WL_PHY + 0x200) & ~1u);      /* SW_RESET release */
-  wl_pwr(WL_PHY + 0x244, wl_prd(WL_PHY + 0x244) | 3u);       /* SERDES|PCS start */
-  delay(1000);
-  for (i = 0; i < 10000; i += 10) { if (!(wl_prd(WL_PHY + 0x214) & (1u << 6))) break; delay(10); }
-  r[62] = i; r[63] = wl_prd(WL_PHY + 0x214);
-  r[64] = usb_rd(WL_GCC, 0x6b048); r[65] = usb_rd(WL_GCC, 0x6b070);
-  if (wl3_faults) return 1;
-  return (r[63] & (1u << 6)) ? 2 : 0;
- }
+ case 9: return wl3_phy_init(250); /* QMP PHY, initial reset hold */
  case 10: /* PERST# deassert */
 #ifdef FUXI_WLAN_XNU
   if (wl_m6o_host(10)) return 0x6f;
