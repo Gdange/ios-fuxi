@@ -34,6 +34,7 @@ public:
  ResourceLimits limits;ObjectCache<Pipeline> objects;
  static constexpr size_t maxBufferLength=ResourceLimits::single;
  static inline std::atomic<uint64_t> pipelineHits{0},pipelineMisses{0},gpuNanos{0},gpuSamples{0};
+ static inline std::atomic<uint64_t> submits{0},submitPrepareNanos{0},submitWaitNanos{0},submitRetireNanos{0};
  static inline bool modelPipelines=false;
  uint32_t maxTextureDimension() const{return limits.dimension;}
  ~Backend(){objects.clear([&](Pipeline *p){destroy(p);});}

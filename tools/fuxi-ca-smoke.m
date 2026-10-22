@@ -133,6 +133,12 @@ static void displayStage(id<MTLDevice> device,Class rendererClass,SEL factory,NS
  uint64_t (*hits)(void)=(uint64_t(*)(void))dlsym(plugin,"fuxi_metal_pipeline_cache_hits");
  uint64_t (*misses)(void)=(uint64_t(*)(void))dlsym(plugin,"fuxi_metal_pipeline_cache_misses");
  if(!gpu || !samples || !hits || !misses)fail("display diagnostic exports");
+ // Optional CPU breakdown of the backend submit; absent in older plugins.
+ uint64_t (*submits)(void)=(uint64_t(*)(void))dlsym(plugin,"fuxi_metal_submits");
+ uint64_t (*prepare)(void)=(uint64_t(*)(void))dlsym(plugin,"fuxi_metal_submit_prepare_nanoseconds");
+ uint64_t (*waited)(void)=(uint64_t(*)(void))dlsym(plugin,"fuxi_metal_submit_wait_nanoseconds");
+ uint64_t (*retired)(void)=(uint64_t(*)(void))dlsym(plugin,"fuxi_metal_submit_retire_nanoseconds");
+ int breakdown=submits && prepare && waited && retired;uint64_t warmStart[4]={0},warmEnd[4]={0};
  arm(60);uint64_t startDraws=draws(),startHits=hits(),startMisses=misses();double times[60],wall[60];unsigned late=0;
  // Let IOSurface choose the padded row (1080*4 need not be a Vulkan row pitch).
  IOSurfaceRef surface=IOSurfaceCreate((CFDictionaryRef)@{(id)kIOSurfaceWidth:@1080,(id)kIOSurfaceHeight:@2400,
@@ -166,6 +172,7 @@ static void displayStage(id<MTLDevice> device,Class rendererClass,SEL factory,NS
    if(!(times[frame]>0))fail("display frame=%u nonpositive GPU time",frame);
    // Cold frame 0 is measured separately; the following 59 frames target 60 Hz.
    if(!frame)epoch=end;
+   if(breakdown && (frame==0 || frame==59)){uint64_t *v=frame?warmEnd:warmStart;v[0]=submits();v[1]=prepare();v[2]=waited();v[3]=retired();}
    else if(wall[frame]>1000.0/60.0 || end>epoch+(frame+1)/60.0)++late;
    if(frame<59){CFTimeInterval deadline=epoch+(frame+1)/60.0,now=CACurrentMediaTime();
     if(deadline>now)usleep((useconds_t)((deadline-now)*1e6));}
@@ -184,6 +191,10 @@ static void displayStage(id<MTLDevice> device,Class rendererClass,SEL factory,NS
  printf("FUXI CA: display GPU min/median/max=%.3f/%.3f/%.3f ms cold=%.3f ms frames=60 cache_hits=%llu cache_misses=%llu\n",
   times[0],(times[29]+times[30])/2,times[59],cold,(unsigned long long)(hits()-startHits),(unsigned long long)(misses()-startMisses));
  printf("FUXI CA: display warm wall min/median/max=%.3f/%.3f/%.3f ms late=%u/59 target_hz=60\n",warm[0],warm[29],warm[58],late);
+ if(breakdown){double sum=0;for(unsigned i=1;i<60;++i)sum+=wall[i];
+  double p=(warmEnd[1]-warmStart[1])/1e6/59,w=(warmEnd[2]-warmStart[2])/1e6/59,r=(warmEnd[3]-warmStart[3])/1e6/59;
+  printf("FUXI CA: display warm per-frame submits=%.2f prepare=%.3f wait=%.3f retire=%.3f other=%.3f wall=%.3f ms\n",
+   (double)(warmEnd[0]-warmStart[0])/59,p,w,r,sum/59-p-w-r,sum/59);}
  if(!fuxiCAAcceptSize(m,1080,2400))fail("pixels=2592000 max=%u mean=%.4f bad=%u",m.max_error,m.mean_error,m.bad_pixels);
  if(failures() || hits()==startHits)fail("display frontend errors/cache reuse missing");
  // Pixel PASS alone cannot prove display rate. Require every warm frame's render

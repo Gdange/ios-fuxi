@@ -78,6 +78,10 @@ extern "C" uint64_t fuxi_metal_pipeline_cache_hits() {return fuxi::Backend::pipe
 extern "C" uint64_t fuxi_metal_pipeline_cache_misses() {return fuxi::Backend::pipelineMisses.load();}
 extern "C" uint64_t fuxi_metal_gpu_nanoseconds() {return fuxi::Backend::gpuNanos.load();}
 extern "C" uint64_t fuxi_metal_gpu_samples() {return fuxi::Backend::gpuSamples.load();}
+extern "C" uint64_t fuxi_metal_submits() {return fuxi::Backend::submits.load();}
+extern "C" uint64_t fuxi_metal_submit_prepare_nanoseconds() {return fuxi::Backend::submitPrepareNanos.load();}
+extern "C" uint64_t fuxi_metal_submit_wait_nanoseconds() {return fuxi::Backend::submitWaitNanos.load();}
+extern "C" uint64_t fuxi_metal_submit_retire_nanoseconds() {return fuxi::Backend::submitRetireNanos.load();}
 static void failureLog(const char *format,...) {
  uint64_t n=failureCount.fetch_add(1);if(n>=64)return;
  va_list args;va_start(args,format);vfprintf(stderr,format,args);va_end(args);

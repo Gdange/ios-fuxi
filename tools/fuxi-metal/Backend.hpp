@@ -9,6 +9,7 @@
 #include <cstring>
 #include <mutex>
 #include <atomic>
+#include <chrono>
 #include "ResourceLimits.hpp"
 #include "ObjectCache.hpp"
 #include <functional>
@@ -85,6 +86,8 @@ public:
  bool poisoned=false;
  static constexpr size_t maxBufferLength=ResourceLimits::single;
  static inline std::atomic<uint64_t> pipelineHits{0},pipelineMisses{0},gpuNanos{0},gpuSamples{0};
+ // CPU cost of submit(): entry to QueueSubmit (incl. the lock), the fence wait, and retirement.
+ static inline std::atomic<uint64_t> submits{0},submitPrepareNanos{0},submitWaitNanos{0},submitRetireNanos{0};
  uint32_t maxTextureDimension() const{return limits.dimension;}
  size_t resourceBytes() const{return limits.used;}
  bool supportsTimestamps() const{return timestampBits && timestampPeriod>0;}
@@ -514,6 +517,8 @@ public:
   }catch(...) {cleanup();destroyPipelineUnlocked(p);throw;}
  }
  void submit(std::vector<Operation> ops,const std::function<void()> &scheduled={}) {
+  auto submitStart=std::chrono::steady_clock::now();auto submitQueued=submitStart,submitDone=submitStart;
+  auto since=[](std::chrono::steady_clock::time_point t){return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-t).count();};
   std::lock_guard<std::mutex> guard(mutex);requireLive();
   VkQueryPool timestamps{};VkCommandPool pool{};VkFence fence{};bool submitted=false,completed=false;std::vector<VkImageView> sampleViews;std::vector<VkFramebuffer> frames;std::vector<VkDescriptorPool> descriptorPools;std::vector<Texture *> textures;std::vector<VkImageLayout> oldLayouts;std::vector<bool> oldDefined;
   Buffer *neutralBuffer=nullptr;
@@ -702,21 +707,21 @@ public:
    check(EndCommandBuffer(cmd));VkFenceCreateInfo fi{};fi.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;check(CreateFence(device,&fi,nullptr,&fence));
    VkSubmitInfo si{};si.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO;si.commandBufferCount=1;si.pCommandBuffers=&cmd;
    // Any failure after attempting submission poisons ownership and avoids unsafe teardown.
-   submitted=true;check(QueueSubmit(queue,1,&si,fence));if(scheduled)scheduled();// Lavapipe can JIT a generic CA shader on its submission worker. The
+   submitted=true;submitQueued=std::chrono::steady_clock::now();submitPrepareNanos+=(uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(submitQueued-submitStart).count();check(QueueSubmit(queue,1,&si,fence));if(scheduled)scheduled();// Lavapipe can JIT a generic CA shader on its submission worker. The
    // offline qualifier may extend only its host wait; production stays 2 s.
 #if defined(FUXI_MTL_HOST_TEST) && defined(FUXI_MTL_HOST_FENCE_NS)
    check(WaitForFences(device,1,&fence,VK_TRUE,FUXI_MTL_HOST_FENCE_NS));
 #else
    check(WaitForFences(device,1,&fence,VK_TRUE,2000000000ULL));
 #endif
-   submitted=false;completed=true;
+   submitted=false;completed=true;submitWaitNanos+=since(submitQueued);submitDone=std::chrono::steady_clock::now();
    if(timestamps){uint64_t ticks[2]{};check(GetQueryPoolResults(device,timestamps,0,2,sizeof(ticks),ticks,sizeof(uint64_t),VK_QUERY_RESULT_64_BIT));
     uint64_t mask=timestampBits>=64?UINT64_MAX:(uint64_t(1)<<timestampBits)-1;
     gpuNanos.fetch_add((uint64_t)(double((ticks[1]-ticks[0])&mask)*timestampPeriod));++gpuSamples;
    }
    for(auto *t:textures)if(t->mapped) {VkMappedMemoryRange r{};r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;r.memory=t->memory;r.size=VK_WHOLE_SIZE;check(InvalidateMappedMemoryRanges(device,1,&r));}
    for(auto *b:buffers) {VkMappedMemoryRange r{};r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;r.memory=b->memory;r.size=VK_WHOLE_SIZE;check(InvalidateMappedMemoryRanges(device,1,&r));}
-   cleanup();
+   cleanup();++submits;submitRetireNanos+=since(submitDone);
   } catch(...) {if(submitted) poisoned=true;else {if(!completed)for(size_t i=0;i<oldLayouts.size();++i){textures[i]->layout=oldLayouts[i];textures[i]->defined=oldDefined[i];}cleanup();}throw;}
  }
 };
