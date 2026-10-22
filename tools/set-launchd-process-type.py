@@ -6,9 +6,11 @@
 Edits /System/Library/xpc/launchd.plist (the cache launchd reads when booted
 with launchd_unsecure_cache=1). Exactly one job must run a program whose
 basename is PROGRAM. The CA smoke is exec-swapped in for peakpowermanagerd
-(sweetexecswap), so it inherits that job's Background type: launchd clamps the
-process to throttled priority 4, a time-constraint request is accepted but not
-applied, and sleeps get the background timer leeway (up to 100 ms, observed).
+(sweetexecswap), so it inherits that job's Adaptive type, which launchd runs as
+background without an activity assertion: the process is clamped to throttled
+priority 4, a time-constraint request is accepted but not applied, and sleeps get
+the background timer leeway (up to 100 ms). With Interactive the smoke's thread
+reaches RT priority 97 and stage 5 meets 60 Hz (observed).
 """
 import os
 from pathlib import Path
