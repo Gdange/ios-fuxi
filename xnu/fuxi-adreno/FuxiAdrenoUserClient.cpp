@@ -79,7 +79,15 @@ class FuxiAdrenoUserClient : public IOUserClient {
   uint64_t handle, bytes, allocated, iova;
   uint32_t token, leases, metadataBytes;
   char metadata[64];
- } bos_[MaxBos] = {};
+ };
+ /* 1024 entries no longer fit the 16 KiB OSObject size limit; kept separate. */
+ struct BoRange {
+  Bo *first, *last;
+  Bo *begin() const { return first; } Bo *end() const { return last; }
+  Bo &operator[](size_t i) const { return first[i]; }
+ };
+ Bo *boTable_ = nullptr;
+ BoRange bos_ = {};
  task_t task_ = TASK_NULL;
  IOLock *lock_ = nullptr;
  bool live_ = false, diagnostic_ = false, resultChecked_ = false;
@@ -336,6 +344,9 @@ public:
   pid_=proc_selfpid();
   char name[64]={}; proc_name(pid_,name,sizeof(name));
   diagnostic_=execswapTest && type==0x4147 && !strncmp(name,"fuxi-gpu-abi-",13);
+  boTable_=IONewZero(Bo,MaxBos);
+  if (!boTable_) return false;
+  bos_={boTable_,boTable_+MaxBos};
   lock_=IOLockAlloc(); return lock_!=nullptr;
  }
  bool mount() {
@@ -395,6 +406,8 @@ public:
  void free() override {
   (void)clientClose();
   if (lock_) IOLockFree(lock_);
+  /* Quarantined BOs keep their own references; only the table goes. */
+  if (boTable_) { IODelete(boTable_,Bo,MaxBos); boTable_=nullptr; bos_={}; }
   if (task_!=TASK_NULL) { task_deallocate(task_); task_=TASK_NULL; }
   IOUserClient::free();
  }

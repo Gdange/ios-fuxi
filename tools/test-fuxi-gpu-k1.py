@@ -163,6 +163,9 @@ def main():
     # find() is pointer-returning, so use its adjacent source boundaries.
     find = source[source.index(' Bo *find('):source.index(' IOReturn wait(')]
     model = prefix+EXTRA+helper+'struct Client {\n'+bo+r'''
+ /* The kernel allocates the table in initWithTask; the model owns it inline. */
+ Bo storage_[MaxBos]={};
+ Client(){bos_={storage_,storage_+MaxBos};}
  task_t task_=7;uint64_t nextHandle_=1,wired_=0,lastFence_=0,firstFence_=0;
  uint32_t nextToken_=1;bool queues_[8]={true};
  int *lock_=&clientLock;bool live_=true;int pid_=0;

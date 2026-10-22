@@ -186,6 +186,9 @@ def main():
     bo = source[source.index(' struct Bo {'):source.index(' task_t task_')]
     close = method(source, 'clientClose').replace(' override', '').replace('openLock);', '&openLock);')
     model = PREFIX + helper + 'struct Client {\n enum {MaxBos=FG_ABI_MAX_BOS};\n' + bo + r'''
+ /* The kernel allocates the table in initWithTask; the model owns it inline. */
+ Bo storage_[MaxBos]={};
+ Client(){bos_={storage_,storage_+MaxBos};}
  task_t task_=7;uint64_t nextHandle_=1,wired_=0,lastFence_=1;
  int *lock_=&clientLock;bool live_=true;int pid_=0;
  void terminate(){}
