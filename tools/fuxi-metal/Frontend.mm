@@ -47,7 +47,11 @@ static char clientProcess[64]="unknown";
 #ifndef FUXI_MTL_BACKBOARD_MODE
 #define FUXI_MTL_BACKBOARD_MODE() fuxi::systemBackboardMode()
 #endif
-static fuxi::Survey &backboardSurvey=*new fuxi::Survey;
+// observeConstants is an __attribute__((constructor)) and reaches checkClient
+// before this file's C++ initializers run; a file-scope reference was still
+// null there and crashed backboardd (device, M9l survey boot). Construct on use.
+static fuxi::Survey &surveyInstance(){static fuxi::Survey *survey=new fuxi::Survey;return *survey;}
+#define backboardSurvey (surveyInstance())
 #ifndef FUXI_MTL_SURVEY_NOW
 #define FUXI_MTL_SURVEY_NOW() std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count()
 #endif
