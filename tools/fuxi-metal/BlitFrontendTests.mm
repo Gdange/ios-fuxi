@@ -3,6 +3,9 @@
 #define FUXI_MTL_BACKEND_HEADER "TestBackend.hpp"
 #include "Frontend.mm"
 #include <cassert>
+/* The tests call deprecated sync selectors and pass nil on purpose to check refusal. */
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#pragma clang diagnostic ignored "-Wnonnull"
 @interface FuxiBlitTestBase : NSObject {uint8_t bytes[520];}
 @end
 @implementation FuxiBlitTestBase
