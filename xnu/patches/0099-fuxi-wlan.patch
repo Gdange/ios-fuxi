@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,3146 @@
+@@ -0,0 +1,3157 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -2089,14 +2089,19 @@
 +static unsigned wl_seq_undos, wl_eq_bank;
 +static bool wl_cycle_powered;
 +static uint32_t wl_msi_saved[5];
-+static bool wl_msi_pvm;
++static bool wl_msi_pvm, wl_msi_64;
++/* MSI capability layout: KIWI reports 32-bit addressing with per-vector
++ * masking (cap 0x010a7005 on device), so data/mask follow the low address. */
++static unsigned wl_msi_data_off(void) { return wl_msi_64 ? 12 : 8; }
++static unsigned wl_msi_mask_off(void) { return wl_msi_64 ? 16 : 12; }
++static unsigned wl_msi_words(void) { return wl_msi_mask_off() / 4 + (wl_msi_pvm ? 1 : 0); }
 +
 +static int
 +wl_m6o_write(const char *what, uint64_t pa, uint32_t value, uint32_t mask)
 +{
 +	printf("FUXI WLAN: M6o begin %s offset %#llx value %#x mask %#x\n", what, pa, value, mask);
 +	uint32_t old = wl_prd(pa);
-+	if (fw_faults || (old == ~0u && !(wl_msi_pvm && pa == WL_EPCFG+wl_msi_cap+16)) || wl_seq_undos >= 96) { return 1; }
++	if (fw_faults || (old == ~0u && !(wl_msi_pvm && pa == WL_EPCFG+wl_msi_cap+wl_msi_mask_off())) || wl_seq_undos >= 96) { return 1; }
 +	uint32_t v = (old & ~mask) | (value & mask);
 +	/* PCI command/control shares a dword with W1C status. */
 +	if ((pa >= WL_EPCFG && pa < WL_EPCFG + 0x1000 && mask == 0xffff) ||
@@ -2422,14 +2427,20 @@
 +	if (wl_seq_flags & WL_O_MSI) {
 +		unsigned p = wl_m6o_cap(5);
 +		uint32_t cap = p ? wl_prd(WL_EPCFG+p) : 0;
-+		/* KIWI 64-bit MSI, >=32 messages. Require room for addr/data. */
-+		if (!p || p > 0xe8 || !(cap & (1u<<23)) || ((cap>>17)&7) < 5 ||
++		/* >=32 messages; 32- or 64-bit addressing. Require room for addr/data. */
++		if (!p || p > 0xe8 || ((cap>>17)&7) < 5 ||
 +		    wl_disable_irqs() || wl_dma_alloc(&wl_msi_sink, PAGE_SIZE)) {
 +			printf("FUXI WLAN: M6o MSI cap %#x at %#x sink %p\n", cap, p, (void *)wl_msi_sink.va);
 +			return wl_m6o_master_fail("MSI capability/IRQ disable/sink");
 +		}
 +		wl_msi_pvm = !!(cap & (1u<<24));
-+		for (unsigned i = 0; i < (wl_msi_pvm ? 5u : 4u); i++) { wl_msi_saved[i] = wl_prd(WL_EPCFG+p+4*i); }
++		wl_msi_64 = !!(cap & (1u<<23));
++		if (!wl_msi_64 && (wl_msi_sink.iova >> 32)) {
++			printf("FUXI WLAN: M6o MSI 32-bit capability but sink IOVA %#llx above 4 GiB\n", wl_msi_sink.iova);
++			return wl_m6o_master_fail("MSI 32-bit sink address");
++		}
++		printf("FUXI WLAN: M6o MSI cap %#x at %#x %u-bit%s\n", cap, p, wl_msi_64 ? 64 : 32, wl_msi_pvm ? " per-vector mask" : "");
++		for (unsigned i = 0; i < wl_msi_words(); i++) { wl_msi_saved[i] = wl_prd(WL_EPCFG+p+4*i); }
 +		wl_msi_saved[0] &= ~(1u<<16); /* cleanup never reenables inherited IRQs */
 +		if (fw_faults) { return wl_m6o_master_fail("MSI save fault"); }
 +		wl_msi_cap = p;
@@ -2444,10 +2455,10 @@
 +	    wl_m6o_config_restore(&cfg) || wl_download_aspm()) { return wl_m6o_master_fail("D0/config restore/ASPM"); }
 +	if (wl_seq_flags & WL_O_MSI) {
 +		unsigned p = wl_msi_cap;
-+		if (wl_m6o_write("MSI address high", WL_EPCFG+p+8, (uint32_t)(wl_msi_sink.iova>>32), ~0u) ||
++		if ((wl_msi_64 && wl_m6o_write("MSI address high", WL_EPCFG+p+8, (uint32_t)(wl_msi_sink.iova>>32), ~0u)) ||
 +		    wl_m6o_write("MSI address low", WL_EPCFG+p+4, (uint32_t)wl_msi_sink.iova, ~0u) ||
-+		    wl_m6o_write("MSI data base", WL_EPCFG+p+12, 0, 0xffff) ||
-+		    (wl_msi_pvm && wl_m6o_write("MSI unmask sink vectors", WL_EPCFG+p+16, 0, ~0u)) ||
++		    wl_m6o_write("MSI data base", WL_EPCFG+p+wl_msi_data_off(), 0, 0xffff) ||
++		    (wl_msi_pvm && wl_m6o_write("MSI unmask sink vectors", WL_EPCFG+p+wl_msi_mask_off(), 0, ~0u)) ||
 +		    wl_m6o_write("MSI 32 vectors enabled", WL_EPCFG+p, (5u<<20)|(1u<<16), 0x00710000)) { return 1; }
 +		printf("FUXI WLAN: M6o MSI 32 vectors (MHI 0..2) sink IOVA %#llx, polling; no ITS/GIC changes\n", wl_msi_sink.iova);
 +	}
@@ -2507,8 +2518,8 @@
 +	uint64_t pa = WL_EPCFG+wl_msi_cap;
 +	if (wl_contain_wr(pa, wl_msi_saved[0]) ||
 +	    (wl_prd(pa)&0x00710000) != (wl_msi_saved[0]&0x00710000)) { return 1; }
-+	for (unsigned i = 1; i < (wl_msi_pvm ? 5u : 4u); i++) {
-+		uint32_t mask = i == 3 ? 0xffff : ~0u;
++	for (unsigned i = 1; i < wl_msi_words(); i++) {
++		uint32_t mask = i == wl_msi_data_off() / 4 ? 0xffff : ~0u;
 +		if (wl_contain_wr(pa+4*i, wl_msi_saved[i]&mask) ||
 +		    (wl_prd(pa+4*i)&mask) != (wl_msi_saved[i]&mask)) { return 1; }
 +	}
@@ -2876,9 +2887,9 @@
 +			unsigned p = wl_msi_cap;
 +			if (!p || (wl_prd(WL_EPCFG+p)&0x00710000) != 0x00510000 ||
 +			    wl_prd(WL_EPCFG+p+4) != (uint32_t)wl_msi_sink.iova ||
-+			    wl_prd(WL_EPCFG+p+8) != (uint32_t)(wl_msi_sink.iova>>32) ||
-+			    (wl_prd(WL_EPCFG+p+12)&0xffff) ||
-+			    (wl_msi_pvm && wl_prd(WL_EPCFG+p+16))) { return 0x6f; }
++			    (wl_msi_64 && wl_prd(WL_EPCFG+p+8) != (uint32_t)(wl_msi_sink.iova>>32)) ||
++			    (wl_prd(WL_EPCFG+p+wl_msi_data_off())&0xffff) ||
++			    (wl_msi_pvm && wl_prd(WL_EPCFG+p+wl_msi_mask_off()))) { return 0x6f; }
 +		}
 +		if (!wl_m6o_early()) { wl_pwr(WL_EPCFG + 4, (wl_prd(WL_EPCFG + 4) & 0xffff) | 0x404); }
 +		if ((wl_prd(WL_EPCFG + 4) & 0x406) != 0x406 || fw_faults) { return 2; }

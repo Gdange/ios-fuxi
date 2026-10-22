@@ -405,6 +405,12 @@ int main(void) {
     }
     setup("msi"); setreg(WL_EPCFG+0x50,0x018a7005); setreg(WL_EPCFG+0x60,~0u);
     assert(!run(21) && !wl_prd(WL_EPCFG+0x60)); cleanup(22); assert(wl_prd(WL_EPCFG+0x60)==~0u);
+    /* Device KIWI layout (observed cap 0x010a7005): 32-bit address, data at +8, mask at +0xc. */
+    setup("msi"); setreg(WL_EPCFG+0x50,0x010a7005); setreg(WL_EPCFG+0x5c,~0u);
+    assert(!run(21) && (wl_prd(WL_EPCFG+0x50)&0x710000)==0x510000);
+    assert(!(wl_msi_sink.iova>>32) && wl_prd(WL_EPCFG+0x54)==(uint32_t)wl_msi_sink.iova);
+    assert(!(wl_prd(WL_EPCFG+0x58)&0xffff) && !wl_prd(WL_EPCFG+0x5c) && !writes(WL_EPCFG+0x60));
+    cleanup(22); assert(wl_prd(WL_EPCFG+0x5c)==~0u && wl_prd(WL_EPCFG+0x54)==0x12340000);
     setup("prefix"); file_size=WL_FW_MAX; assert(!run(21) && wl_image.size==WL_CHUNK && !wl_vectors.va); cleanup(22);
     setup("prefix"); read_resid=1; assert(run(19)==19); cleanup(19);
     setup("por"); random_value=0; assert(!run(20) && wl_mrd(wl_bhie+0x70)==1); cleanup(20);
