@@ -14,6 +14,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <mach/mach.h>
+#include <mach/mach_time.h>
+#include <mach/thread_policy.h>
 #include "fuxi-metal/CACompare.h"
 #ifndef FUXI_CA_CONF
 #define FUXI_CA_CONF "/usr/local/share/fuxi/ca-smoke.conf"
@@ -161,6 +164,13 @@ static void displayStage(id<MTLDevice> device,Class rendererClass,SEL factory,NS
   if(!renderer)fail("display renderer");
   [CATransaction begin];[CATransaction setDisableActions:YES];CALayer *root=displayScene(space,NO);
   [renderer setLayer:root];[renderer setBounds:CGRectMake(0,0,1080,2400)];[CATransaction commit];[CATransaction flush];
+  // Pace like a compositor's render thread: a time-constraint thread gets no timer
+  // coalescing leeway. As a daemon the default leeway let 6 ms sleeps overshoot by up
+  // to 100 ms (observed), which measured the policy rather than the GPU path.
+  {mach_timebase_info_data_t tb;mach_timebase_info(&tb);uint64_t ms=1000000ull*tb.denom/tb.numer;
+   thread_time_constraint_policy_data_t rt={(uint32_t)(ms*50/3),(uint32_t)(ms*10),(uint32_t)(ms*50/3),FALSE};
+   kern_return_t kr=thread_policy_set(mach_thread_self(),THREAD_TIME_CONSTRAINT_POLICY,(thread_policy_t)&rt,THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+   printf("FUXI CA: display time-constraint policy period=16.667 computation=10 constraint=16.667 ms kr=%d\n",kr);}
   CFTimeInterval epoch=0;
   for(unsigned frame=0;frame<60;++frame){
    arm(60); // Keep each cold frame bounded; never increase the existing jetsam limit.
