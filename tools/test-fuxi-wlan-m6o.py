@@ -20,8 +20,18 @@ static uint32_t special_mask[128];
 static bool cycle_peer=true, l23_peer=true, reset_peer=true, reset_stuck;
 static uint32_t eqvec[2], eqfmdc[2];
 static unsigned fail_nth_alloc;
+static const char *last_log_line(void) {
+    size_t start=loglen;
+    if(start && logbuf[start-1]=='\n') start--;
+    while(start && logbuf[start-1]!='\n') start--;
+    return logbuf+start;
+}
 static unsigned test_rh_send(unsigned t, unsigned addr, unsigned data) {
     assert(t==0 && nrail<64);
+    char expected[128];
+    if(addr&4) snprintf(expected,sizeof(expected),"FUXI WLAN: M6o begin rail enable addr %#x value %u\n",addr,data);
+    else snprintf(expected,sizeof(expected),"FUXI WLAN: M6o begin rail voltage addr %#x mV %u\n",addr,data);
+    assert(!strcmp(last_log_line(),expected));
     rail_addr[nrail]=addr; rail_data[nrail++]=data;
     return fail_rail && nrail==fail_rail;
 }
@@ -33,6 +43,12 @@ static bool special(uint64_t p) {
         p==TS_TLMM+0x1000*80+4 || p==TS_TLMM+0x1000*94+4;
 }
 static void model_write(uint64_t pa, uint32_t v) {
+    if(pa==TS_TLMM+0x1000*80+4) {
+        /* The breadcrumb must already exist when the GPIO write is attempted. */
+        if(v&2) assert(strstr(last_log_line(),"begin cycle WLAN_EN high"));
+        else assert(strstr(last_log_line(),"begin cycle WLAN_EN low") ||
+                    strstr(last_log_line(),"cycle undo begin WLAN_EN low"));
+    }
     uint32_t requested=v;
     if(pa==WL_DBI+0x154 || pa==WL_DBI+0x188) assert(wl_prd(WL_DBI+0x8bc)&1);
     raw_pwr(pa,v);
@@ -102,7 +118,7 @@ static unsigned run(unsigned last) {
 static void cleanup(unsigned step) {
     fault_special=drop_special=0; wl5_abort(step);
     if(wl_cycle_powered && fw_faults && frees!=allocations) {
-        assert(!frees); /* failed rail undo quarantines until access recovers */
+        assert(!frees); /* failed containment quarantines until access recovers */
         fw_faults=0; wl5_abort(step);
     }
     if(frees!=allocations) fprintf(stderr,"cleanup flags=%#x step=%u special=%u frees=%u alloc=%u\n%s",wl_seq_flags,step,special_writes,frees,allocations,logbuf);
@@ -113,7 +129,8 @@ int main(void) {
     setup(NULL); assert(!wl_seq_flags && !wl_seq_requested);
     ne=0; assert(!wl_m6o_host(8) && !wl_m6o_host(10) && !wl_m6o_host(11) && !wl_m6o_host(12) && !ne);
     setup("off"); assert(!wl_seq_flags && !wl_variant_invalid);
-    const char *bad[]={"",",","parf,","parf,,dbi","off,msi","PARF","parf,parf","wat", "parfxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"};
+    setup("cyclerails,cycle"); assert(!wl_variant_invalid && wl_seq_flags==(WL_O_CYCLE|WL_O_CYCLERAILS));
+    const char *bad[]={"",",","parf,","parf,,dbi","off,msi","PARF","parf,parf","cyclerails,cyclerails","cycle,cycle,cyclerails","wat", "parfxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"};
     for(unsigned i=0;i<sizeof(bad)/sizeof(*bad);i++) {
         setup(bad[i]); assert(wl_variant_invalid && wl5_step(17)==0x6c && !allocations && !ne);
     }
@@ -122,10 +139,11 @@ int main(void) {
     setup("msi"); probe_arg="unmapped"; wl_probe_configure(); assert(wl_variant_invalid);
     setup("por"); probe_arg="pattern"; wl_probe_configure(); assert(wl_variant_invalid);
 
-    /* Every selector alone AND all 255 nonempty combinations use actual steps. */
-    for(unsigned flags=1;flags<256;flags++) {
+    /* All 511 token combinations, including cyclerails implying cycle, use actual steps. */
+    for(unsigned tokens=1;tokens<512;tokens++) {
+        unsigned flags=tokens|((tokens&WL_O_CYCLERAILS)?WL_O_CYCLE:0);
         char arg[96]={0};
-        for(unsigned i=0;i<8;i++) if(flags&(1u<<i)) {
+        for(unsigned i=0;i<9;i++) if(tokens&(1u<<i)) {
             if(*arg) strcat(arg,","); strcat(arg,wl_seq_names[i]);
         }
         setup(arg); assert(wl_seq_flags==flags && !wl_variant_invalid);
@@ -136,8 +154,8 @@ int main(void) {
         if(flags&WL_O_HOSTIRQ) assert(wl_prd(WL_PARF+0x22c)==0x3fc0d202);
         assert(!wl5_step(17));
         if(flags&WL_O_CYCLE) {
-            assert(nrail==18 && wl_cycle_attempted);
-            /* wl_vrm emits voltage then enable: six off + twelve on commands. */
+            assert(nrail==((flags&WL_O_CYCLERAILS)?18u:0u) && wl_cycle_attempted);
+            /* Only cyclerails sends six off + twelve on commands. */
             assert(wl_prd(WL_EPCFG+0x10)==(WL_BAR0|4));
             assert(wl_prd(WL_EPCFG+0x78)==0x1234 && wl_prd(WL_EPCFG+0x80)==0x4567);
         }
@@ -182,28 +200,50 @@ int main(void) {
         assert(wl5_step(22)==0x6c && strstr(logbuf,"M6o result"));
         assert(wl5_step(21)==0x6b && writes(WL_BAR0+wl_bhie+0x3c)==1);
         cleanup(22);
+        assert(nrail==((flags&WL_O_CYCLERAILS)?24u:0u));
         if(flags&WL_O_MSI) assert(!(wl_prd(WL_EPCFG+0x50)&0x10000) && wl_prd(WL_EPCFG+0x54)==0x12340000 && wl_prd(WL_EPCFG+0x5c)==0x20);
         assert(!wl_seq_undos);
         if(flags&WL_O_EQ) assert(eqvec[0]==0x23ab4501 && eqvec[1]==0x34cd6702 && eqfmdc[0]==0x95 && eqfmdc[1]==0x8a && wl_prd(WL_DBI+0x154)==0x11223344 && wl_prd(WL_DBI+0x188)==0x22334455 && !wl_prd(WL_DBI+0x8bc));
     }
 
-    /* Cycle order and exact regulator commands, both before and during resume. */
-    setup("cycle"); assert(!wl5_step(17));
-    assert(nrail==18);
+    /* Plain cycle leaves all votes intact through success, abort and containment. */
+    setup("cycle"); fail_rail=1; wl3_report[20]=0x1234;
+    assert(!wl5_step(17) && !nrail && sleeps==41);
+    assert(wl_cycle_attempted && !wl_m6o_rails(false) && !wl_m6o_rails(true) && !nrail);
+    assert(strstr(logbuf,"cycle retains all six rails; WLAN_EN only"));
+    assert(wl_m6o_cycle() && !nrail); cleanup(17); assert(!nrail);
+    /* Exact regulator commands are reserved for the explicit cyclerails opt-in. */
+    setup("cyclerails"); assert(wl_seq_flags==(WL_O_CYCLE|WL_O_CYCLERAILS));
+    assert(!wl5_step(17) && nrail==18 && sleeps==41);
     const unsigned addr[]={0x40504,0x40604,0x40204,0x40404,0x44004,0x40a04,0x40a00,0x40a04,0x44000,0x44004,0x40400,0x40404,0x40200,0x40204,0x40600,0x40604,0x40500,0x40504};
     const unsigned data[]={0,0,0,0,0,0,1800,1,1000,1,980,1,950,1,1900,1,1350,1};
     for(unsigned i=0;i<18;i++) assert(rail_addr[i]==addr[i] && rail_data[i]==data[i]);
+    assert(strstr(logbuf,"begin rail enable addr 0x40504 value 0") &&
+           strstr(logbuf,"begin rail voltage addr 0x40a00 mV 1800"));
     int d3=firstwrite(WL_EPCFG+0x44,3,3), pme=firstwrite(WL_DBI+0xf24,~0u,0x10), off=firstwrite(TS_TLMM+0x1000*80+4,2,0);
     assert(d3>=0 && pme>d3 && off>pme);
     assert(wl_m6o_cycle() && nrail==18); cleanup(17);
+    assert(nrail==24);
+    for(unsigned i=0;i<6;i++) assert(rail_addr[18+i]==addr[i] && !rail_data[18+i]);
     for(unsigned nth=1;nth<=18;nth++) {
-        setup("cycle"); fail_rail=nth; assert(wl5_step(17)==0x6f); fail_rail=0; cleanup(17);
+        setup("cyclerails"); fail_rail=nth; assert(wl5_step(17)==0x6f); fail_rail=0; cleanup(17);
     }
     /* A dead link still aborts before any rail command. */
     setup("cycle"); cycle_peer=false; assert(wl5_step(17)==0x6f && !nrail); cleanup(17);
     /* A missing L23_READY alone is logged and the power cycle continues, as downstream. */
-    setup("cycle"); l23_peer=false; assert(!wl5_step(17) && nrail==18); cleanup(17);
-    setup("cycle"); wl3_report[20]=0x1234; assert(wl5_step(17)==0x6f); cleanup(17);
+    setup("cycle"); l23_peer=false; assert(!wl5_step(17) && !nrail && sleeps==141); cleanup(17); assert(!nrail);
+    setup("cyclerails"); l23_peer=false; assert(!wl5_step(17) && nrail==18); cleanup(17);
+    setup("cyclerails"); wl3_report[20]=0x1234; assert(wl5_step(17)==0x6f); cleanup(17);
+    /* A local root-status read fault is announced before the access, before GPIO/rails. */
+    setup("cycle"); read_fault_pa=WL_DBI+0x80;
+    assert(wl5_step(17)==0x6f && !nrail && !writes(TS_TLMM+0x1000*80+4));
+    assert(strstr(logbuf,"cycle root Link Status local DBI DLLLA wait down") &&
+           strstr(logbuf,"begin wait 0x60000080 mask 0x20000000 expected 0 limit 100 ms"));
+    read_fault_pa=0; cleanup(17); assert(!nrail);
+    setup("cycle"); read_fault_pa=TS_TLMM+0x1000*80+4;
+    assert(wl5_step(17)==0x6f && !nrail && !writes(read_fault_pa));
+    assert(strstr(last_log_line(),"begin cycle WLAN_EN low"));
+    read_fault_pa=0; cleanup(17); assert(!nrail);
 
     /* Every new host write rejects a mismatch/fault and rolls back partial state. */
     const char *groups[]={"parf","dbi","eq","hostirq"};
@@ -232,13 +272,14 @@ int main(void) {
         assert(wl5_step(18)==0x6f && !writes(WL_BAR0+0x118)); read_fault_pa=0; cleanup(18);
     }
     /* Actual cycle/MSI/RX write faults must stop before the BHI image doorbell. */
-    const char *paths[]={"cycle","msi","por","cycle,msi,por,prefix"};
-    for(unsigned path=0;path<4;path++) {
+    const char *paths[]={"cycle","cyclerails","msi","por","cycle,msi,por,prefix","cyclerails,msi,por,prefix"};
+    for(unsigned path=0;path<sizeof(paths)/sizeof(*paths);path++) {
         setup(paths[path]); assert(!run(20));
         unsigned count=special_writes; cleanup(20);
         for(unsigned nth=1;nth<=count;nth++) {
             setup(paths[path]); fault_special=nth; unsigned failed=run(20);
             assert(failed && fw_faults && !writes(WL_BAR0+0x118)); cleanup(failed);
+            if(!(wl_seq_flags&WL_O_CYCLERAILS)) assert(!nrail);
         }
     }
     for(unsigned nth=1;nth<=6;nth++) {
@@ -264,7 +305,7 @@ int main(void) {
     setup("parf"); assert(!wl_m6o_host(8) && !run(21));
     corrupt_write_pa=WL_PARF+0x358; wl5_abort(22); assert(!frees && wl_seq_undos);
     corrupt_write_pa=0; cleanup(22);
-    puts("M6o 255 combinations, cycle/rails, exact host writes, MSI sink/BME, RX/POR, prefix, faults and quarantine passed");
+    puts("M6o 511 combinations, safe cycle/explicit rails, exact host writes, MSI sink/BME, RX/POR, prefix, faults and quarantine passed");
     return 0;
 }
 '''

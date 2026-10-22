@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,3000 @@
+@@ -0,0 +1,3040 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -49,6 +49,7 @@
 + *   fuxiwlanvec=early|rddm  M6l TX staging or RDDM RX experiment
 + *   fuxiwlancnss=pdc  M6n AOP WLAN PDC setup before rails (default off)
 + *   fuxiwlanseq=cycle,parf,dbi,eq,hostirq,msi,por,prefix  M6o opt-ins
++ *   fuxiwlanseq=cyclerails  also cycle shared rails (froze the SoC once)
 + * Steps 17..28 probe DMA safety and load rootfs firmware through BHI/BHIe.
 + * Completion is polled; M6o can enable MSI to a RAM sink. No channels/QMI;
 + * see docs-lanes/wlan-bt.md M6.
@@ -760,11 +761,12 @@
 +
 +/* Independent default-off sequence deltas; register facts: docs/wlan-m6o.md. */
 +enum { WL_O_CYCLE=1, WL_O_PARF=2, WL_O_DBI=4, WL_O_EQ=8,
-+    WL_O_HOSTIRQ=16, WL_O_MSI=32, WL_O_POR=64, WL_O_PREFIX=128 };
++    WL_O_HOSTIRQ=16, WL_O_MSI=32, WL_O_POR=64, WL_O_PREFIX=128,
++    WL_O_CYCLERAILS=256 };
 +static unsigned wl_seq_flags;
 +static bool wl_cycle_attempted, wl_seq_requested;
 +static unsigned wl_msi_cap, wl_pm_cap;
-+static const char *const wl_seq_names[] = {"cycle", "parf", "dbi", "eq", "hostirq", "msi", "por", "prefix"};
++static const char *const wl_seq_names[] = {"cycle", "parf", "dbi", "eq", "hostirq", "msi", "por", "prefix", "cyclerails"};
 +static bool wl_m6o_parf(void) { return !!(wl_seq_flags & WL_O_PARF); }
 +static bool wl_m6o_early(void) { return !!(wl_seq_flags & (WL_O_CYCLE | WL_O_MSI)); }
 +static void
@@ -783,7 +785,7 @@
 +		while (*end && *end != ',') { end++; }
 +		bool more = *end == ','; *end = 0;
 +		unsigned bit = 0;
-+		for (unsigned i = 0; i < 8; i++) {
++		for (unsigned i = 0; i < sizeof(wl_seq_names)/sizeof(wl_seq_names[0]); i++) {
 +			if (!strcmp(part, wl_seq_names[i])) { bit = 1u << i; break; }
 +		}
 +		if (!bit || (wl_seq_flags & bit)) { wl_variant_invalid = true; break; }
@@ -793,6 +795,8 @@
 +		if (!*part) { wl_variant_invalid = true; }
 +	}
 +	if (!*arg) { wl_variant_invalid = true; }
++	/* Imply cycle only after duplicate detection, independent of list order. */
++	if (wl_seq_flags & WL_O_CYCLERAILS) { wl_seq_flags |= WL_O_CYCLE; }
 +}
 +
 +static bool wl_variant_active(void) { return wl_pre || wl_full || wl_vec || wl_fw || wl_cnss || wl_seq_flags; }
@@ -2083,6 +2087,7 @@
 +static int
 +wl_m6o_write(const char *what, uint64_t pa, uint32_t value, uint32_t mask)
 +{
++	printf("FUXI WLAN: M6o begin %s offset %#llx value %#x mask %#x\n", what, pa, value, mask);
 +	uint32_t old = wl_prd(pa);
 +	if (fw_faults || (old == ~0u && !(wl_msi_pvm && pa == WL_EPCFG+wl_msi_cap+16)) || wl_seq_undos >= 48) { return 1; }
 +	uint32_t v = (old & ~mask) | (value & mask);
@@ -2170,6 +2175,7 @@
 +static int
 +wl_m6o_wait(uint64_t pa, uint32_t mask, uint32_t expected, unsigned ms)
 +{
++	printf("FUXI WLAN: M6o begin wait %#llx mask %#x expected %#x limit %u ms\n", pa, mask, expected, ms);
 +	for (unsigned i = 0; i <= ms; i++) {
 +		uint32_t v = wl_prd(pa);
 +		if (fw_faults || v == ~0u) { return 1; }
@@ -2183,17 +2189,26 @@
 +	return 1;
 +}
 +
-+/* Only six existing WLAN votes; no PHY rail/clock recipe is changed. */
++/* Explicit cyclerails only: the original rail cycle froze the SoC once.
++ * These six votes may be shared; plain cycle and its undo never alter them. */
 +static int
 +wl_m6o_rails(bool on)
 +{
++	if (!(wl_seq_flags & WL_O_CYCLERAILS)) { return 0; }
 +	static const unsigned idx[] = {0, 4, 2, 1, 5, 3};
 +	static const unsigned mv[] = {1800, 1000, 980, 950, 1900, 1350};
 +	for (unsigned n = 0; n < 6; n++) {
 +		unsigned i = on ? n : 5-n, addr = wl3_report[20+idx[i]];
 +		static const unsigned expected[] = {0x40a00, 0x44000, 0x40400, 0x40200, 0x40600, 0x40500};
 +		if (addr != expected[i] || fw_faults) { return 1; }
-+		unsigned e = on ? wl_vrm(addr, mv[i]) : rh_send(0, addr+4, 0);
++		unsigned e = 0;
++		if (on) {
++			printf("FUXI WLAN: M6o begin rail voltage addr %#x mV %u\n", addr, mv[i]);
++			e = rh_send(0, addr, mv[i]);
++			if (e) { return 1; }
++		}
++		printf("FUXI WLAN: M6o begin rail enable addr %#x value %u\n", addr+4, on ? 1u : 0u);
++		e = rh_send(0, addr+4, on ? 1 : 0);
 +		printf("FUXI WLAN: M6o WLAN rail %#x %s mV %u completion %#x\n", addr, on ? "on" : "off", mv[i], e);
 +		if (e) { return 1; }
 +	}
@@ -2226,6 +2241,18 @@
 +	return wl_m6o_write("restore command", WL_EPCFG+4, (cfg->value[0]&~4u)|0x402, 0xffff);
 +}
 +
++/* X PCIe0 dm_core is 0x60000000, distinct from conf at 0x60100000.
++ * K msm_pcie_dll_link_active reads dm_core + CAP_LINKCTRLSTATUS (0x80),
++ * also used by our initial link training in shim/wlan.c. This is local RC
++ * DLLLA, not an endpoint CFG0 transaction requiring a live link. Controller
++ * clocks/PHY/apertures stay on throughout this cycle. See docs/wlan-m6o.md. */
++static int
++wl_m6o_cycle_link(bool up)
++{
++	printf("FUXI WLAN: M6o cycle root Link Status local DBI DLLLA wait %s\n", up ? "up" : "down");
++	return wl_m6o_wait(WL_DBI+0x80, 1u<<29, up ? 1u<<29 : 0, up ? 1000 : 100);
++}
++
 +static int
 +wl_m6o_cycle(void)
 +{
@@ -2246,29 +2273,41 @@
 +	     (printf("FUXI WLAN: M6o cycle L23_READY not received, continuing as downstream\n"), 0)) ||
 +	    wl_m6o_write("cycle PERST low", TS_TLMM+0x1000ull*94+4, 0, 2) ||
 +	    wl_m6o_write("cycle LTSSM off", WL_PARF+0x1b0, 0, 0x100) ||
-+	    wl_m6o_wait(WL_DBI+0x80, 1u<<29, 0, 100) ||
++	    wl_m6o_cycle_link(false) ||
 +	    wl_m6o_write("cycle WLAN_EN low", TS_TLMM+0x1000ull*80+4, 0, 2)) { return 1; }
-+	wl_cycle_powered = true; /* partial vote sequence also requires off cleanup */
-+	if (wl_m6o_rails(false)) { return 1; }
++	wl_cycle_powered = true; /* WLAN_EN containment; partial rail votes only if selected */
++	if (!(wl_seq_flags & WL_O_CYCLERAILS)) {
++		printf("FUXI WLAN: M6o cycle retains all six rails; WLAN_EN only\n");
++	}
++	if ((wl_seq_flags & WL_O_CYCLERAILS) && wl_m6o_rails(false)) { return 1; }
++	printf("FUXI WLAN: M6o cycle begin WLAN_EN low dwell 10 ms\n");
 +	wl_sleep(10);
-+	if (wl_m6o_rails(true) ||
++	if (((wl_seq_flags & WL_O_CYCLERAILS) && wl_m6o_rails(true)) ||
 +	    wl_m6o_write("cycle WLAN_EN high", TS_TLMM+0x1000ull*80+4, 2, 2)) { return 1; }
++	printf("FUXI WLAN: M6o cycle begin WLAN_EN high dwell 10 ms\n");
 +	wl_sleep(10); /* X PCIe0 ep-latency before PERST release */
 +	/* Keep controller clocks/PHY and outbound apertures: L23/PERST is the
 +	 * link boundary. This isolates the WLAN probe cycle from PHY recipes. */
 +	if (wl_m6o_write("cycle PME_TURNOFF clear", WL_DBI+0xf24, 0, ~0u) ||
 +	    wl_m6o_write("cycle PERST high", TS_TLMM+0x1000ull*94+4, 2, 2)) { return 1; }
++	printf("FUXI WLAN: M6o cycle begin PERST high dwell 1 ms\n");
 +	wl_sleep(1); wl_perst_done = mach_absolute_time();
 +	if (wl_m6o_write("cycle LTSSM resume", WL_PARF+0x1b0, 0x100, 0x100) ||
-+	    wl_m6o_wait(WL_DBI+0x80, 1u<<29, 1u<<29, 1000)) { return 1; }
++	    wl_m6o_cycle_link(true)) { return 1; }
 +	wl_link_done = mach_absolute_time();
++	printf("FUXI WLAN: M6o cycle begin endpoint ID check\n");
 +	if (wl_prd(WL_EPCFG) != 0x110717cb ||
 +	    wl_m6o_write("cycle D0", WL_EPCFG+pm+4, 0, 3)) { return 1; }
++	printf("FUXI WLAN: M6o cycle begin D0 dwell 10 ms\n");
 +	wl_sleep(10);
 +	if (wl_m6o_write("cycle enable function", WL_EPCFG+4, 0x402, 0xffff)) { return 1; }
-+	if (wl_m6o_config_restore(&cfg) ||
-+	    wl_mrd(0x28) != wl_bhi || wl_mrd(0x2c) != wl_bhie ||
-+	    wl_mrd(wl_bhi+0x28) != 0 || fw_faults) { return 1; }
++	if (wl_m6o_config_restore(&cfg)) { return 1; }
++	printf("FUXI WLAN: M6o cycle begin BHIOFF check offset 0x28\n");
++	if (wl_mrd(0x28) != wl_bhi || fw_faults) { return 1; }
++	printf("FUXI WLAN: M6o cycle begin BHIEOFF check offset 0x2c\n");
++	if (wl_mrd(0x2c) != wl_bhie || fw_faults) { return 1; }
++	printf("FUXI WLAN: M6o cycle begin PBL EE check offset %#x\n", wl_bhi+0x28);
++	if (wl_mrd(wl_bhi+0x28) != 0 || fw_faults) { return 1; }
 +	printf("FUXI WLAN: M6o cycle resumed D0/config; MASTER follows owned SMMU install; WLAON skipped (KIWI DT gate absent)\n");
 +	return 0;
 +}
@@ -2394,9 +2433,10 @@
 +		wl_seq_undos--;
 +	}
 +	if (wl_cycle_powered) {
++		printf("FUXI WLAN: M6o cycle undo begin WLAN_EN low\n");
 +		bad |= wl_contain_wr(TS_TLMM+0x1000ull*80+4, 0);
 +		bad |= !!(wl_prd(TS_TLMM+0x1000ull*80+4)&2);
-+		bad |= wl_m6o_rails(false);
++		if (wl_seq_flags & WL_O_CYCLERAILS) { bad |= wl_m6o_rails(false); }
 +		if (!bad) { wl_cycle_powered = false; }
 +	}
 +	bad |= fw_faults != faults0;

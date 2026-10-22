@@ -17,8 +17,10 @@ was used for this change.
 
 `fuxiwlanseq` accepts a comma-separated list of the following tokens, in any
 order. Absent or `off` preserves the existing sequence and performs no extra
-experiment MMIO. A single token boots independently; all eight tokens can be
-combined. List order does not change hardware order. Duplicates, empty tokens,
+experiment MMIO. A single token boots independently; all eight original tokens can be
+combined. `cyclerails` is an additional hazardous opt-in that implies `cycle`;
+`cycle,cyclerails` is also accepted in either order. List order does not change
+hardware order. Duplicates, empty tokens,
 unknown values and truncated lists are rejected before power writes. Combining
 any experiment with `probe=unmapped` or `pattern` is invalid. `prefix` also
 rejects `bhi=full` and `vec=early`: those require the full image/TX allocation
@@ -33,7 +35,8 @@ fuxiwlan=22 fuxiwlanclk=1 fuxiwlanprobe=civac fuxiwlanpre=off fuxiwlanfw=off fux
 
 | Variant | Append to control |
 | --- | --- |
-| Downstream probe off/on chronology | `fuxiwlanseq=cycle` |
+| Probe off/on via WLAN_EN, six rails retained | `fuxiwlanseq=cycle` |
+| Also drop/reapply six rail votes; **froze the SoC once on device** | `fuxiwlanseq=cyclerails` |
 | Downstream PARF decode | `fuxiwlanseq=parf` |
 | Dynamic width / transaction controls | `fuxiwlanseq=dbi` |
 | DBI equalization and core presets | `fuxiwlanseq=eq` |
@@ -41,16 +44,20 @@ fuxiwlan=22 fuxiwlanclk=1 fuxiwlanprobe=civac fuxiwlanpre=off fuxiwlanfw=off fux
 | 32-message MSI capability / early MASTER | `fuxiwlanseq=msi` |
 | MHI prepare/RDDM/POR | `fuxiwlanseq=por` |
 | Separate 512-KiB BHI allocation | `fuxiwlanseq=prefix` |
-| All deltas | `fuxiwlanseq=cycle,parf,dbi,eq,hostirq,msi,por,prefix` |
+| All deltas with rails retained | `fuxiwlanseq=cycle,parf,dbi,eq,hostirq,msi,por,prefix` |
 | Existing behavior | `fuxiwlanseq=off` |
 
 All active variants observe for five seconds, print `FUXI WLAN: M6o result seq
 mask ... EE ... STATUS ... ERRCODE ...`, and deliberately fail/contain at step
 22 (`0x166c`), including unexpected BHI success. They never issue an AMSS TX
 doorbell. Step 21 remains one-shot. The mask bits are cycle=1, parf=2, dbi=4,
-eq=8, hostirq=16, msi=32, por=64, prefix=128. Each write prints its name,
-address, written value, readback and writable mask; bounded waits print their
-readback or timeout. Rail logs report command completion, not analog voltage.
+eq=8, hostirq=16, msi=32, por=64, prefix=128, cyclerails=256 (also sets
+cycle=1). Cycle/config/host writes print their name/address/value/mask
+**before the initial read and write**, then their readback. Bounded waits announce the
+address/mask/expected value before the first read, then report success or
+timeout. Cycle dwell periods, resume checks and each rail command also print
+a `FUXI WLAN` line before the action. Rail logs report command completion,
+not analog voltage.
 Use fresh boots for independent comparisons. PDC need not be rerun; its policy
 persists independently as described in M6n.
 
@@ -70,7 +77,24 @@ firmware, or downloaded source is included in the repository.
   `13913424c9d0af031a8b8f9981c003bbb9632f73` (matching public KIWI child;
   the same qualification as M6n).
 
-## `cycle`: probe-time power off, then actual power-up
+## `cycle`: WLAN_EN off/on with all six rails retained
+
+The caller observed `cycle,parf,dbi,eq,hostirq,msi,por,prefix` pass steps 1–16,
+clear MASTER/save config, disable the function, enter D3hot and send
+PME_TURNOFF. L23_READY timed out after 100 ms and the cycle continued, asserted
+PERST and disabled LTSSM (`write 0xd read 0x5`). No further WLAN line appeared;
+other kernel output continued briefly, then the whole SoC froze, USB console
+died, and no panic was reported. This is an observed freeze, **not proof that
+rail disable caused it**: the next action was the local DBI Link Status read,
+followed by WLAN_EN low and rail disable. A DBI access stall is another
+possibility. The APPS DRV being the only voter on a shared rail is a guess.
+
+Plain `cycle` now keeps the six existing votes on throughout the cycle and
+containment: **no RPMh enable=0 or voltage commands**. KIWI power control uses
+WLAN_EN low/high with the same 10-ms low and 10-ms high dwell periods.
+`cyclerails` restores the original six-vote off/on experiment and implies
+`cycle`. It **froze the SoC once on device**; do not treat it as the default
+comparison. No new device result is claimed for the revised sequence.
 
 The chronology comes from [C probe/off](https://github.com/MiCode/vendor_qcom_opensource_wlan/blob/518147fd7e0199758efe9bd96a22c9c2ea30bcd9/platform/cnss2/pci.c#L5952),
 [C suspend/resume](https://github.com/MiCode/vendor_qcom_opensource_wlan/blob/518147fd7e0199758efe9bd96a22c9c2ea30bcd9/platform/cnss2/pci.c#L1177),
@@ -88,15 +112,20 @@ After initial enumeration/BAR setup and validation of BHI offsets, step 17:
 2. Disable function decode (COMMAND=`0x400`, INTx disabled), PMCSR state=3
    (D3hot), wait 10 ms. PMCSR preserves other controls and writes zero to its
    PME-status W1C bit.
-3. Write DBI ELBI SYS_CTRL `+0xf24=0x10` (PME_TURNOFF); require PARF PM_STTS
-   `+0x24` bit5 within 100 ms. Assert PERST GPIO94 OUT=0; clear PARF LTSSM
-   `+0x1b0` bit8; require root Link Status DLLLA=0 within 100 ms.
-4. Drive WLAN_EN GPIO80 OUT=0; send enable=0 for the six existing WLAN RPMh
-   votes in reverse downstream order: S4G, S6G, S4E, S2G, S5G, L15B; wait
-   10 ms. Then voltage-before-enable in downstream order: L15B=1800,
-   S5G=1000, S2G=980, S4E=950, S6G=1900, S4G=1350 mV. Each command must
-   complete through the existing bounded RSC transport. Resource addresses
-   are checked against the six existing cmd-db results before use.
+3. Write DBI ELBI SYS_CTRL `+0xf24=0x10` (PME_TURNOFF); poll PARF PM_STTS
+   `+0x24` bit5 for up to 100 ms. As downstream, a missing
+   L23_READY is logged and suspension continues; an access fault still aborts.
+   Assert PERST GPIO94 OUT=0; clear PARF LTSSM `+0x1b0` bit8; announce and
+   require **local root** Link Status DLLLA=0 within 100 ms (address justified
+   below).
+4. Drive WLAN_EN GPIO80 OUT=0; **retain all six rails**, wait 10 ms. Only with
+   `cyclerails`, send enable=0 before that dwell in reverse downstream order:
+   S4G, S6G, S4E, S2G, S5G, L15B. After the dwell, only `cyclerails` sends
+   voltage-before-enable in downstream order: L15B=1800, S5G=1000, S2G=980,
+   S4E=950, S6G=1900, S4G=1350 mV. That is 18 commands (six off, twelve on).
+   Each command is announced before submission and must complete through
+   the existing bounded RSC transport. Resource addresses are checked against
+   the six existing cmd-db results before use.
 5. GPIO80 OUT=1, wait 10 ms (X PCIe0 EP latency); clear ELBI SYS_CTRL, deassert PERST, wait 1 ms,
    enable LTSSM, require DLLLA=1 within 1 s and PCI ID `17cb:1107`. PMCSR D0,
    wait 10 ms, enable MEMORY/disable INTx, restore saved BARs/controls and
@@ -107,8 +136,24 @@ After initial enumeration/BAR setup and validation of BHI offsets, step 17:
    (MEMORY|MASTER|INTx-disable) before MHI contexts/RX preparation. New owned
    DMA leaves are published and TLB faults invalidated at step 20.
 
-This is the WLAN supply/PERST/L23 chronology experiment. It **retains the
-controller clocks, PHY and outbound apertures** during suspension; it does
+The Link Status register remains DBI `+0x80` (`0x60000080`), bit29 DLLLA.
+This is a local controller register, accessible without an endpoint link
+while controller clocks remain enabled. [X PCIe0 resources](https://github.com/MiCode/kernel_devicetree/blob/5647c799a064dfec73332a4fe2ef7aa3fb2f4887/qcom/kalama-pcie.dtsi#L7-L13)
+map `dm_core` at `0x60000000` separately from the endpoint `conf` window at
+`0x60100000`. [K DLLLA helper](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/pci/controller/pci-msm.c#L1456-L1480)
+reads `dm_core + PCIE20_CAP_LINKCTRLSTATUS` (`0x70+0x10`), before any optional
+endpoint presence check. Our [initial step 11](../shim/fuxi-probe/wlan.c)
+also uses this root register to wait for a previously down link. The cycle
+uses this same register for both down/up waits, never endpoint Link Status
+while down, and logs before the first read. The controller clocks, PHY and
+apertures remain enabled. This source evidence establishes the intended local
+access path; a software polling timeout cannot recover an interconnect
+transaction that itself never returns. A future freeze's last pre-action
+line will distinguish that read from subsequent GPIO or RPMh operations.
+
+This is the WLAN_EN/PERST/L23 chronology experiment; `cyclerails` additionally
+cycles the supply votes. It **retains the controller clocks, PHY and outbound
+apertures** during suspension; it does
 not reproduce Linux clock/regulator framework teardown and reinitialization.
 No PHY table is changed or replayed. A negative result therefore tests this
 specific chronology, not every internal effect of Linux runtime PM.
@@ -229,16 +274,20 @@ is never restored. On abort after early host changes, PERST is contained even
 before MHI becomes available. The original global fault latch is retained.
 MSI is disabled and its saved address/data/mask restored after BME clear and
 before PERST assertion; its sink stays allocated until containment is proven.
-Host undo occurs under asserted PERST. A cycle also drives WLAN_EN low and
-attempts six disable votes. A latched access/RSC fault can prevent rail undo;
-that uncertainty is logged and buffers remain quarantined. No guessed voltage
+Host undo occurs under asserted PERST. A cycle also announces and drives
+WLAN_EN low. Only `cyclerails` attempts six additional disable votes during
+containment; plain `cycle` leaves all votes intact even on abort. A latched
+access/RSC fault can prevent rail undo for `cyclerails`; that uncertainty is
+logged and buffers remain quarantined. No guessed voltage
 rollback or repeated power-up is attempted. The normal BME-off/PERST/drain and
 owned SMMU undo remain prerequisites for freeing DMA allocations.
 
 [The M6o host suite](../tools/test-fuxi-wlan-m6o.py) compiles production C with
-ASan/UBSan. It checks all 255 nonempty combinations, exact host constants,
-regulator order/data, actual config loss/restoration during a synthetic cycle,
-MSI mapping/32 message values, complete RX clears/HIGH→LOW/random DB, POR
+ASan/UBSan. It checks all 511 nonempty token combinations (including the
+original 255), exact host constants, no cycle/undo rail commands without
+`cyclerails`, all 18 opt-in regulator commands/order/data (plus six on undo),
+unchanged dwell timing, root-status read faults, pre-access GPIO/RPMh logging, actual config
+loss/restoration during a synthetic cycle, MSI mapping/32 message values, complete RX clears/HIGH→LOW/random DB, POR
 SYS_ERR-only reset, stuck/reset-state failures, prefix bytes/maximum-size file without full allocation,
 invalid selectors/capabilities, failures at new register writes/regulator
 commands/allocations, one-shot BHI/step-22 stop, undo and quarantine. M6i also
