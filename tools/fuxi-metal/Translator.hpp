@@ -57,6 +57,7 @@ public:
  int (*sampler)(void *,uint32_t,BakedSampler *,char *,size_t){};
  int (*identity)(void *,const char *,void *,const char *,const CompileOptions *,uint8_t *,char *,size_t){};
  int (*product_hash)(void *,uint8_t *){};
+ uint32_t (*texture_type)(void *,uint32_t){}; // Optional ABI-8 reflected Metal type; UINT32_MAX means unused.
  void (*free)(void *){};
  Translator() {
   dylib=dlopen(FUXI_MTL_TRANSLATOR,RTLD_NOW|RTLD_LOCAL);
@@ -66,6 +67,7 @@ public:
 #define LOAD(n) n=(decltype(n))dlsym(dylib,"fuxi_m2v_" #n);if(!n) {dlclose(dylib);throw std::runtime_error("missing translator " #n);}
   LOAD(open) LOAD(close) LOAD(function) LOAD(compile) LOAD(draw) LOAD(variant) LOAD(sampler) LOAD(identity) LOAD(product_hash) LOAD(free)
 #undef LOAD
+  texture_type=(decltype(texture_type))dlsym(dylib,"fuxi_m2v_texture_type");
  }
  ~Translator() {if(dylib)dlclose(dylib);}
  Translator(const Translator&)=delete;Translator& operator=(const Translator&)=delete;

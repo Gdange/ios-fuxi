@@ -6,7 +6,7 @@
 #include <iterator>
 static void reject(const std::function<void()> &f){bool failed=false;try{f();}catch(const std::runtime_error &){failed=true;}assert(failed);}
 int main(int argc,char **argv){
- assert(argc==2);static_assert(sizeof(fuxi::DrawInput)==1056);
+ assert(argc==4);static_assert(sizeof(fuxi::DrawInput)==1056);
  std::ifstream in(argv[1],std::ios::binary);std::vector<uint8_t> air{std::istreambuf_iterator<char>(in),{}};
  auto &tr=fuxi::Translator::get();char error[512]{};void *lib=tr.open(air.data(),air.size(),error,sizeof(error));assert(lib);
  fuxi::Backend b;auto baseline=b.resourceBytes();
@@ -35,11 +35,11 @@ int main(int argc,char **argv){
   for(unsigned y=0;y<nh;++y)for(unsigned x=0;x<nw;++x)for(unsigned c=0;c<4;++c){unsigned sum=0,n=0;for(unsigned dy=0;dy<(h>1?2u:1u);++dy)for(unsigned dx=0;dx<(w>1?2u:1u);++dx){sum+=cpu[((2*y+dy)*w+2*x+dx)*4+c];++n;}next[(y*nw+x)*4+c]=(sum+n/2)/n;}
   auto gpu=get(mips,l);for(size_t i=0;i<gpu.size();++i)assert(abs(int(gpu[i])-int(next[i]))<=int(l));cpu=next;w=nw;h=nh;
  }
- // Same-image copies are legal across distinct mip subresources, while aliases
- // within one level remain refused. Copies never silently resize.
+ // Same-image copies use a snapshot, including within one level.
+ // Copies never silently resize.
  fuxi::Operation same{};same.texture=same.sourceTexture=mips;same.srcLevel=0;same.dstLevel=4;same.width=same.height=1;b.submit({same});
  auto base=get(mips,0);assert(get(mips,4)==std::vector<uint8_t>(base.begin(),base.begin()+4));
- same.dstLevel=0;reject([&]{b.submit({same});});b.submit({gen});
+ same.dstLevel=0;b.submit({same});assert(get(mips,0)==base);b.submit({gen});
  // Pre-submit failure must restore all level definition bits and layouts.
  mips->setDefined(4,false);auto mask=mips->definedLevels;auto layout=mips->layout;b.failBeforeQueue=true;reject([&]{b.submit({gen});});assert(mips->definedLevels==mask && mips->layout==layout && !b.poisoned);b.submit({gen});
  // Invalid counts/levels/LOD fail before submission, without allocating or poisoning.
@@ -72,6 +72,35 @@ int main(int argc,char **argv){
  // Sample the packed target through the real bridge, checking logical channels.
  auto unpack=draw;unpack.dstLevel=2;unpack.samples[0]=target10;unpack.sampleBase[0]=0;unpack.sampleCount[0]=1;b.submit({unpack});auto unpacked=get(target,2);
  for(size_t i=0;i<unpacked.size();i+=4){for(unsigned c=0;c<3;++c)assert(abs(int(unpacked[i+c])-144)<=1);assert(abs(int(unpacked[i+3])-170)<=1);}
+ // M9n: actual translated 1D sampling, including a rebased descriptor view.
+ // This catches an image/view dimension mismatch that transfer-only tests miss.
+ std::ifstream oneIn(argv[2],std::ios::binary);std::vector<uint8_t> oneAir{std::istreambuf_iterator<char>(oneIn),{}};
+ void *oneLib=tr.open(oneAir.data(),oneAir.size(),error,sizeof(error));assert(oneLib);
+ auto *onePipeline=b.compilePipeline(oneLib,"fuxi_layer_vertex",oneLib,"fuxi_layer_fragment",options);
+ for(uint32_t format:{25u,55u,105u}){
+  auto *one=b.allocateTexture(format,1,8,1,2,0);std::vector<uint8_t> data(4*b.texelBytes(format));
+  for(unsigned x=0;x<4;++x){if(format==25){uint16_t half=0x3800;memcpy(data.data()+x*2,&half,2);}else {float value=0.5f;memcpy(data.data()+x*b.texelBytes(format),&value,4);if(format==105)memcpy(data.data()+x*8+4,&value,4);}}
+  put(one,1,data);auto sample1d=draw;sample1d.pipeline=onePipeline;sample1d.samples[0]=one;sample1d.sampleBase[0]=1;sample1d.sampleCount[0]=1;b.submit({sample1d});
+  auto pixels=get(target,2);for(size_t i=0;i<pixels.size();i+=4){assert(pixels[i]==0 && abs(int(pixels[i+2])-128)<=1 && pixels[i+3]==255);assert(format==105?abs(int(pixels[i+1])-128)<=1:pixels[i+1]==0);}
+  auto *wrong=b.allocateTexture(format,1,8,1,2);auto mismatch=sample1d;mismatch.samples[0]=wrong;reject([&]{b.submit({mismatch});});b.destroy(wrong);
+  mismatch=sample1d;mismatch.pipeline=p;reject([&]{b.submit({mismatch});});
+  b.destroy(one);
+ }
+ b.destroy(onePipeline);tr.close(oneLib);
+ std::ifstream uintIn(argv[3],std::ios::binary);std::vector<uint8_t> uintAir{std::istreambuf_iterator<char>(uintIn),{}};
+ void *uintLib=tr.open(uintAir.data(),uintAir.size(),error,sizeof(error));assert(uintLib);
+ auto *uintPipeline=b.compilePipeline(uintLib,"fuxi_layer_vertex",uintLib,"fuxi_layer_fragment",options);
+ auto *uintTexture=b.allocateTexture(23,1,8,1,1,0);std::vector<uint8_t> uintData(16);for(unsigned x=0;x<8;++x)uintData[x*2]=1;put(uintTexture,0,uintData);
+ auto uintDraw=draw;uintDraw.pipeline=uintPipeline;uintDraw.samples[0]=uintTexture;uintDraw.sampleBase[0]=0;uintDraw.sampleCount[0]=1;b.submit({uintDraw});
+ auto uintPixels=get(target,2);for(size_t i=0;i<uintPixels.size();i+=4)assert(uintPixels[i]==0 && uintPixels[i+1]==0 && uintPixels[i+2]==255 && uintPixels[i+3]==255);
+ auto *filtered=b.allocateSampler(true,true);uintDraw.samplers[0]=filtered;reject([&]{b.submit({uintDraw});});b.destroy(filtered);
+ b.destroy(uintTexture);b.destroy(uintPipeline);tr.close(uintLib);
+
+ // The BGR5A1 render pipeline uses the same packed format as allocation.
+ auto five=options;five.format=43;auto *p5=b.compilePipeline(lib,"fuxi_layer_vertex",lib,"fuxi_layer_fragment",five);auto *target5=b.allocateTexture(43,5,4,2);
+ auto d5=draw;d5.texture=target5;d5.pipeline=p5;d5.dstLevel=0;b.submit({d5});auto packed5=get(target5,0);
+ for(size_t i=0;i<packed5.size();i+=2){uint16_t word;memcpy(&word,packed5.data()+i,2);assert((word&31)==18 && ((word>>5)&31)==18 && ((word>>10)&31)==18 && (word>>15)==1);}
+ b.destroy(target5);b.destroy(p5);puts("PASS: M9n real bridge 1D uint/float/half/RG sampling with rebased views and BGR5A1 render packing");
  b.destroy(target10);b.destroy(p10);b.destroy(sam);b.destroy(target);b.destroy(mips);b.destroy(p);b.destroy(vertices);b.destroy(indices);b.destroy(ones);b.destroy(upload);b.destroy(read);b.dropPipelineCacheForTest();assert(b.resourceBytes()==baseline);tr.close(lib);
  puts("PASS: M9k mip creation/NPOT/skinny/bytes/copies, GPU box-filter generation, level views/LOD sampling/render-to-level, BGR10/RG/R8/A8/float formats, budget/bounds/rollback");
 }

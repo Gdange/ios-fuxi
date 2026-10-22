@@ -70,6 +70,19 @@ int main() {
   if(getenv("FUXI_TEST_GATE_EXPECT"))assert((clientMode==fuxi::ClientMode::allow)==!strcmp(getenv("FUXI_TEST_GATE_EXPECT"),"allow"));
   if(getenv("FUXI_TEST_GATE_SURVEY")){
    assert(backboardSurvey.active() && !fuxi::backboardGate.blocked());
+   // M9n: a legal aliased copy must reach completion before any refusal,
+   // without poisoning the gate or arming the diagnostic deadline.
+   {id device=[NSObject new];FuxiOwner *state=[FuxiOwner new];state->backend=new fuxi::Backend;
+    objc_setAssociatedObject(device,&ownerKey,state,OBJC_ASSOCIATION_RETAIN_NONATOMIC);[state release];fuxi::Backend::modelTextures=true;
+    FuxiQueue *queue=[FuxiQueue new];queue->_device=[device retain];
+    FuxiTexture *texture=[FuxiTexture new];texture->_device=[device retain];texture->_shared=YES;texture->_texture=owner(device)->backend->allocateTexture(80,5,8,4);
+    uint8_t input[128];for(unsigned i=0;i<128;++i)input[i]=(uint8_t)i;
+    [texture replaceRegion:MTLRegionMake2D(0,0,8,4) mipmapLevel:0 withBytes:input bytesPerRow:32];
+    FuxiCommandBuffer *cb=(FuxiCommandBuffer *)[queue commandBuffer];id<MTLBlitCommandEncoder> blit=(id)[cb blitCommandEncoder];
+    [blit copyFromTexture:(id)texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(7,3,1) toTexture:(id)texture destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(1,1,0)];
+    [blit endEncoding];[cb commit];assert(!cb.error && cb.status==MTLCommandBufferStatusCompleted);
+    assert(!fuxi::backboardGate.blocked() && !backboardSurvey.distinct() && !deadlineArms);
+    [texture release];[queue release];[device release];}
    // A single refusal persists denial immediately, even beyond the normal log cap.
    failureCount=1000;failureLog("survey distinct first\n");assert(backboardExits==0 && fuxi::backboardGate.blocked());
    for(unsigned i=0;i<100;++i)failureLog("survey distinct first\n");assert(backboardSurvey.distinct()==1 && deadlineArms==1 && surveyDeadline);

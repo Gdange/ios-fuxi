@@ -13,13 +13,14 @@
 #include <atomic>
 #include "ResourceLimits.hpp"
 #include "TextureLevels.hpp"
+#include "PixelFormats.hpp"
 #include "ObjectCache.hpp"
 #include "Translator.hpp"
 #include "DrawSafety.hpp"
 namespace fuxi {
 struct Buffer {void *contents;size_t length,allocated;};
 struct Texture : TextureLevels {size_t allocated{},charged{};uint32_t format=80;std::vector<uint8_t> pixels{};
- size_t offset(uint32_t level) const {size_t o=0;for(uint32_t l=0;l<level;++l)o+=levelWidth(l)*levelHeight(l)*(format==115?8:format==1 || format==10?1:format==30?2:4);return o;}
+ size_t offset(uint32_t level) const {size_t o=0;for(uint32_t l=0;l<level;++l)o+=levelWidth(l)*levelHeight(l)*metalTexelBytes(format);return o;}
 };
 struct Pipeline {bool sampled=false;size_t references=1;};
 struct Sampler {};
@@ -62,7 +63,7 @@ public:
   limits.reserve(n);auto *b=new Buffer{calloc(1,n),n,n};++live;return b;
  }
  void destroy(Buffer *b) {if(b){limits.release(b->allocated);free(b->contents);delete b;--live;}}
- static size_t texelBytes(uint32_t f){return f==115?8:(f==1 || f==10)?1:f==30?2:4;}
+ static size_t texelBytes(uint32_t f){return metalTexelBytes(f);}
  bool supportsOrderedColorAccess() const {return false;}
  static inline bool modelHostImport=false;
  static inline void *importBase=nullptr;static inline size_t importBytes=0,importRow=0,importOffset=0;
@@ -76,10 +77,11 @@ public:
  Texture *linearTexture(Buffer *,uint32_t,uint32_t,uint32_t,uint32_t,size_t,size_t) {throw std::runtime_error("no modeled linear texture");}
  Sampler *allocateSampler(bool,bool,uint32_t=0,float=0,float=0) {return new Sampler{};}
  void destroy(Sampler *s) {delete s;}
- Texture *allocateTexture(uint32_t format=80,uint32_t=5,uint32_t width=256,uint32_t height=256,uint32_t levels=1) {
+ Texture *allocateTexture(uint32_t format=80,uint32_t usage=5,uint32_t width=256,uint32_t height=256,uint32_t levels=1,uint32_t type=2) {
   if(!modelTextures)throw std::runtime_error("M4 CPU model has no rendering");
+  if(!textureShapeAccepted(type,height,usage))throw std::runtime_error("texture dimension/usage");
   if(!limits.extent(width,height,texelBytes(format)))throw std::runtime_error("extent");
-  auto *t=new Texture{};t->format=format;t->width=width;t->height=height;t->levels=levels;t->allocated=t->offset(levels);limits.reserve(t->allocated);t->charged=t->allocated;t->pixels.resize(t->allocated);return t;
+  auto *t=new Texture{};t->format=format;t->width=width;t->height=height;t->levels=levels;t->textureType=type;t->allocated=t->offset(levels);limits.reserve(t->allocated);t->charged=t->allocated;t->pixels.resize(t->allocated);return t;
  }
  Pipeline *compilePipeline(void *,const char *v,void *,const char *f,const CompileOptions &options=CompileOptions{}) {
   if(!modelPipelines)throw std::runtime_error("M4 CPU model has no translation");
@@ -108,7 +110,7 @@ public:
     }else {
      size_t width=op.width?op.width:w,height=op.height?op.height:h,row=op.rowBytes?op.rowBytes:width*pixel;
      if(op.upload){for(size_t y=0;y<height;++y)memcpy(data+((op.dstY+y)*w+op.dstX)*pixel,(uint8_t *)op.src->contents+op.from+y*row,width*pixel);t->setDefined(l);}
-     else if(op.sourceTexture){auto *src=op.sourceTexture;assert(src->isDefined(op.srcLevel));for(size_t y=0;y<height;++y)memcpy(data+((op.dstY+y)*w+op.dstX)*pixel,src->pixels.data()+src->offset(op.srcLevel)+((op.srcY+y)*src->levelWidth(op.srcLevel)+op.srcX)*pixel,width*pixel);t->setDefined(l);}
+     else if(op.sourceTexture){auto *src=op.sourceTexture;assert(src->isDefined(op.srcLevel));std::vector<uint8_t> snapshot(width*height*pixel);for(size_t y=0;y<height;++y)memcpy(snapshot.data()+y*width*pixel,src->pixels.data()+src->offset(op.srcLevel)+((op.srcY+y)*src->levelWidth(op.srcLevel)+op.srcX)*pixel,width*pixel);for(size_t y=0;y<height;++y)memcpy(data+((op.dstY+y)*w+op.dstX)*pixel,snapshot.data()+y*width*pixel,width*pixel);t->setDefined(l);}
      else {if(!t->isDefined(l))throw std::runtime_error("undefined model readback");for(size_t y=0;y<height;++y)memcpy((uint8_t *)op.dst->contents+op.to+y*row,data+((op.srcY+y)*w+op.srcX)*pixel,width*pixel);}
     }
     continue;

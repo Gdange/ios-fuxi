@@ -298,7 +298,7 @@ unsafe fn name<'a>(p:*const c_char)->Result<&'a str,String> {
             vd.layouts.insert(a.buffer,metal2vulkan::pipeline::VertexBufferLayoutDescriptor::new(Some(options.strides[a.buffer as usize])));
         }
         descriptor.vertex_descriptor=Some(vd);
-        let product=make_product(device,descriptor,options,baseline_state(),metal2vulkan::cache::VariantKey::default())?;
+        let product=make_product(device,descriptor,options,baseline_state(),metal2vulkan::cache::VariantKey::default(),true)?;
         let size=product_size(&product);
         if size<=16*1024*1024 {
             while cache.len()>=8 || cache.iter().map(|(_,p)|product_size(p)).sum::<usize>()+size>16*1024*1024 {cache.pop_front();}
@@ -439,7 +439,36 @@ fn baseline_state()->BindState {
         }
  state
 }
-fn make_product(device:Device,descriptor:RenderPipelineDescriptor,options:&CompileOptions,state:BindState,variant:metal2vulkan::cache::VariantKey)->Result<Product,String> {
+// The shader fixes image dimensionality. ABI-8 draw records carry format and
+// sampler facts; recover dimensions from the compiled public interface rather
+// than silently binding every sampled texture as 2D.
+fn reflect_textures(pipeline:&metal2vulkan::pipeline::RenderPipeline,state:&mut BindState,baseline:bool)->Result<(),String> {
+ for (slot,interface) in &pipeline.interface.slots {
+  if let metal2vulkan::pipeline::SlotInterface::Texture(texture)=interface {
+   if slot.stage!=Stage::Fragment || slot.index>=SLOTS || !matches!(texture.texture_type,TextureType::Type1D|TextureType::Type2D){return Err("bounded fragment texture dimension".into());}
+   if let Some(table)=state.stages.get_mut(&slot.stage) {if let Some(BoundTexture::Texture{facts,..})=table.textures.get_mut(&slot.index){
+    facts.texture_type=texture.texture_type;
+    if baseline {facts.pixel_format=match texture.sampled_type {metal2vulkan::pipeline::SampledType::Float=>PixelFormat::BGRA8Unorm,metal2vulkan::pipeline::SampledType::Uint=>PixelFormat::R32Uint,metal2vulkan::pipeline::SampledType::Sint=>PixelFormat::R32Sint,_=>return Err("unsupported texture numeric type".into())};}
+   }}
+  }
+ }
+ Ok(())
+}
+// Optional ABI-8 metadata. Older adapters remain usable for 2D pipelines;
+// the consumer refuses 1D sampling unless it can verify the shader's type.
+#[no_mangle] pub unsafe extern "C" fn fuxi_m2v_texture_type(product:*mut c_void,index:u32)->u32 {
+ if product.is_null() || index>=SLOTS{return u32::MAX;}
+ let pipeline=&(*(product as *const Product)).pipeline;
+ for (slot,interface) in &pipeline.interface.slots {
+  if slot.stage==Stage::Fragment && slot.class==SlotClass::Texture && slot.index==index {
+   if let metal2vulkan::pipeline::SlotInterface::Texture(texture)=interface {
+    return match texture.texture_type {TextureType::Type1D=>0,TextureType::Type2D=>2,_=>u32::MAX};
+   }
+  }
+ }
+ u32::MAX
+}
+fn make_product(device:Device,descriptor:RenderPipelineDescriptor,options:&CompileOptions,mut state:BindState,variant:metal2vulkan::cache::VariantKey,initial:bool)->Result<Product,String> {
         let pipeline=device.compile_render_variant(&descriptor,&variant,&Budget::standard()).map_err(|e|e.to_string())?;
         // Refuse resources outside the bounded descriptor/vertex/push consumer.
         // Never discard a binding/plan requirement and pretend its SPIR-V is standalone.
@@ -469,7 +498,7 @@ fn make_product(device:Device,descriptor:RenderPipelineDescriptor,options:&Compi
         for i in 0..options.color_count as usize {
             let c=options.color(i);
             if c.format==0 {if g.color_attachments[i].is_some(){return Err("unexpected planned attachment".into());}}
-            else if g.color_attachments[i].as_ref().map(|a|a.format.as_raw() as u32)!=Some(match c.format {80=>44,70=>37,94=>58,115=>97,10=>9,30=>16,_=>return Err("unsupported color format".into())}){return Err(format!("planned attachment[{i}] format mismatch"));}
+            else if g.color_attachments[i].as_ref().map(|a|a.format.as_raw() as u32)!=Some(match c.format {80=>44,70=>37,94=>58,115=>97,10=>9,30=>16,43=>8,_=>return Err("unsupported color format".into())}){return Err(format!("planned attachment[{i}] format mismatch"));}
             colors[i].mask=blend[i].0.as_raw();colors[i].blend=blend[i].1.is_some() as u32;
             if let Some(b)=&blend[i].1 {let factors=[b.src_color.as_raw() as u32,b.dst_color.as_raw() as u32,b.color_op.as_raw() as u32,b.src_alpha.as_raw() as u32,b.dst_alpha.as_raw() as u32,b.alpha_op.as_raw() as u32];
                 if factors[0]>9 || factors[1]>9 || factors[3]>9 || factors[4]>9 || factors[2]>4 || factors[5]>4{return Err("blend requires unsupported factors".into());}
@@ -504,6 +533,7 @@ fn make_product(device:Device,descriptor:RenderPipelineDescriptor,options:&Compi
         reject_graphics!(g.shadow_stencil.is_some());
         reject_graphics!(g.mesh_records.is_some());
         for stage in &pipeline.stages {for note in &stage.precision_notes {eprintln!("FUXI MTL: translator precision {:?}",note);}}
+        reflect_textures(&pipeline,&mut state,initial)?;
         let plan=pipeline.plan(&device,&state.shape()).map_err(|e|e.to_string())?;
         check_plan(&plan,&variant)?;
         if plan.specialization.entries.len()>32 || plan.specialization.data.len()>256 {return Err("specialization bound".into());}
@@ -562,7 +592,7 @@ fn check_plan(p:&metal2vulkan::bind::BindingPlan,expected:&metal2vulkan::cache::
   if product.is_null() || input.is_null() || out.is_null(){return Err("nil draw argument".into());}
   let p=&*(product as *const Product);let i=&*input;
   if i.count<3 || i.count>65536 || i.start>65536-i.count || (i.indexed!=0 && i.start!=0){return Err("bounded draw count/start".into());}
-  let state=draw_state(i)?;
+  let mut state=draw_state(i)?;reflect_textures(&p.pipeline,&mut state,false)?;
   let plan=p.pipeline.plan(&p.device,&state.shape()).map_err(|e|e.to_string())?;check_plan(&plan,&p.variant)?;
   if plan.specialization.data!=p.spec_data || plan.specialization.entries.iter().map(|e|(e.constant_id,e.offset,e.size as u32)).collect::<Vec<_>>()!=p.specs.iter().map(|e|(e.id,e.offset,e.size)).collect::<Vec<_>>() {return Err("draw requires different specialization".into());}
   let call=if i.indexed!=0 {if i.index_offset%2!=0 || i.index_offset>i.index_length || i.count as u64*2>i.index_length-i.index_offset{return Err("index bounds".into());}
@@ -599,18 +629,21 @@ fn check_plan(p:&metal2vulkan::bind::BindingPlan,expected:&metal2vulkan::cache::
      let r=c.descriptor_ranges.iter().find(|r|r.set==0 && r.binding==w.binding).ok_or("missing planned buffer range")?;d.offset=r.range.offset;d.range=r.range.range;
     },
     WriteSource::Texture{slot,view}=>{
-     if d.ty!=2 || d.stages!=16 || slot.stage!=Stage::Fragment || slot.class!=SlotClass::Texture || slot.index>=SLOTS || i.formats[slot.index as usize]==0 || view.view_type.as_raw()!=1 || view.aspect.as_raw()!=1 || view.layout.as_raw()!=5 || view.level.is_some() || view.twin || view.shader_swizzle{return Err(format!("M6 draw texture slot={} view={} aspect={} layout={}",slot.index,view.view_type.as_raw(),view.aspect.as_raw(),view.layout.as_raw()));}
+     if d.ty!=2 || d.stages!=16 || slot.stage!=Stage::Fragment || slot.class!=SlotClass::Texture || slot.index>=SLOTS || i.formats[slot.index as usize]==0 || !matches!(view.view_type.as_raw(),0|1) || view.aspect.as_raw()!=1 || view.layout.as_raw()!=5 || view.level.is_some() || view.twin || view.shader_swizzle{return Err(format!("M6 draw texture slot={} view={} aspect={} layout={}",slot.index,view.view_type.as_raw(),view.aspect.as_raw(),view.layout.as_raw()));}
      d.slot=slot.index;d.format=view.format.as_raw() as u32;d.components=[view.components.r.as_raw() as u32,view.components.g.as_raw() as u32,view.components.b.as_raw() as u32,view.components.a.as_raw() as u32];
     },
-    WriteSource::Sampler{slot,compare:false,integer:false,opaque_black:OpaqueBlackBorder::Stated}=>{
-     if d.ty!=0 || d.stages!=16 || slot.stage!=Stage::Fragment || slot.class!=SlotClass::Sampler || slot.index>=SLOTS || i.filters[slot.index as usize]==0{return Err(format!("M6 draw sampler slot={}",slot.index));}d.sampler=slot.index;
+    WriteSource::Sampler{slot,compare:false,integer,opaque_black:OpaqueBlackBorder::Stated}=>{
+     if d.ty!=0 || d.stages!=16 || slot.stage!=Stage::Fragment || slot.class!=SlotClass::Sampler || slot.index>=SLOTS || i.filters[slot.index as usize]==0{return Err(format!("M6 draw sampler slot={}",slot.index));}if *integer && i.filters[slot.index as usize]&(2|4|16)!=0{return Err("integer sampler requires nearest filtering".into());}d.sampler=slot.index;
     },
     WriteSource::CombinedImageSampler{image:ImageSource::Texture{slot,view},sampler:SamplerSource::Immutable}=>{
-     if d.ty!=1 || d.stages!=16 || d.sampler!=u32::MAX || slot.stage!=Stage::Fragment || slot.class!=SlotClass::Texture || slot.index>=SLOTS || i.formats[slot.index as usize]==0 || view.view_type.as_raw()!=1 || view.aspect.as_raw()!=1 || view.layout.as_raw()!=5 || view.level.is_some() || view.twin || view.shader_swizzle{return Err(format!("M6 draw constexpr image slot={} view={}",slot.index,view.view_type.as_raw()));}
+     if d.ty!=1 || d.stages!=16 || d.sampler!=u32::MAX || slot.stage!=Stage::Fragment || slot.class!=SlotClass::Texture || slot.index>=SLOTS || i.formats[slot.index as usize]==0 || !matches!(view.view_type.as_raw(),0|1) || view.aspect.as_raw()!=1 || view.layout.as_raw()!=5 || view.level.is_some() || view.twin || view.shader_swizzle{return Err(format!("M6 draw constexpr image slot={} view={}",slot.index,view.view_type.as_raw()));}
      d.slot=slot.index;d.format=view.format.as_raw() as u32;d.components=[view.components.r.as_raw() as u32,view.components.g.as_raw() as u32,view.components.b.as_raw() as u32,view.components.a.as_raw() as u32];
     },
-    WriteSource::CombinedImageSampler{image:ImageSource::Texture{slot,view},sampler:SamplerSource::Slot{slot:s,compare:false,integer:false,opaque_black:OpaqueBlackBorder::Stated}}=>{
-     if slot.stage!=Stage::Fragment || slot.class!=SlotClass::Texture || slot.index>=SLOTS || s.stage!=Stage::Fragment || s.class!=SlotClass::Sampler || s.index>=SLOTS || i.formats[slot.index as usize]==0 || i.filters[s.index as usize]==0 || view.view_type.as_raw()!=1 || view.aspect.as_raw()!=1 || view.layout.as_raw()!=5 || view.level.is_some() || view.twin || view.shader_swizzle{return Err(format!("M6 draw sample texture={} sampler={} view={} aspect={} layout={} level={} twin={} swizzle={}",slot.index,s.index,view.view_type.as_raw(),view.aspect.as_raw(),view.layout.as_raw(),view.level.is_some(),view.twin,view.shader_swizzle));}
+    WriteSource::CombinedImageSampler{image:ImageSource::Texture{slot,view},sampler:SamplerSource::Slot{slot:s,compare:false,integer,opaque_black:OpaqueBlackBorder::Stated}}=>{
+     if slot.stage!=Stage::Fragment || slot.class!=SlotClass::Texture || slot.index>=SLOTS || s.stage!=Stage::Fragment || s.class!=SlotClass::Sampler || s.index>=SLOTS || i.formats[slot.index as usize]==0 || i.filters[s.index as usize]==0 || !matches!(view.view_type.as_raw(),0|1) || view.aspect.as_raw()!=1 || view.layout.as_raw()!=5 || view.level.is_some() || view.twin || view.shader_swizzle{return Err(format!("M6 draw sample texture={} sampler={} view={} aspect={} layout={} level={} twin={} swizzle={}",slot.index,s.index,view.view_type.as_raw(),view.aspect.as_raw(),view.layout.as_raw(),view.level.is_some(),view.twin,view.shader_swizzle));}
+     if *integer && i.filters[s.index as usize]&(2|4|16)!=0{return Err("integer sampler requires nearest filtering".into());}
+     // Runtime samplers are clamp-to-edge, so integer/float border colors
+     // cannot affect a sampled texel. Comparison sampling remains refused.
      d.slot=slot.index;d.sampler=s.index;d.format=view.format.as_raw() as u32;d.components=[view.components.r.as_raw() as u32,view.components.g.as_raw() as u32,view.components.b.as_raw() as u32,view.components.a.as_raw() as u32];
     },_=>{let kind=format!("{:?}",w.source);return Err(format!("unsupported planned descriptor source {}",kind));}
    }o.descriptors[o.descriptor_count as usize]=d;o.descriptor_count+=1;
@@ -673,9 +706,9 @@ fn draw_state(i:&DrawInput)->Result<BindState,String> {
 #[no_mangle] pub unsafe extern "C" fn fuxi_m2v_variant(product:*mut c_void,input:*const DrawInput,out:*mut Translation,err:*mut c_char,cap:usize)->i32 {
  attempt(err,cap,|| {
   if product.is_null() || input.is_null() || out.is_null(){return Err("nil variant argument".into());}
-  let p=&*(product as *const Product);let state=draw_state(&*input)?;
+  let p=&*(product as *const Product);let mut state=draw_state(&*input)?;reflect_textures(&p.pipeline,&mut state,false)?;
   let plan=p.pipeline.plan(&p.device,&state.shape()).map_err(|e|e.to_string())?;
-  let product=make_product(p.device.clone(),p.descriptor.clone(),&p.options,state,plan.variant)?;
+  let product=make_product(p.device.clone(),p.descriptor.clone(),&p.options,state,plan.variant,false)?;
   output(out,product);Ok(1)
  }).unwrap_or(0)
 }
