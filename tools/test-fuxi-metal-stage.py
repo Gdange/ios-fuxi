@@ -52,10 +52,53 @@ def policy_storage_tests():
         except ValueError:pass
     print('PASS: staging opt-in/default deny, SpringBoard/census deny, target launchd UID resolution and 0755 root/0700 client storage')
 
+def native_staging_tests():
+    # Authored Mach-O command-layout models, not executable/signing evidence.
+    with tempfile.TemporaryDirectory() as tmp:
+        d=Path(tmp);root=d/'root';(root/'System/Library').mkdir(parents=True)
+        def binary(path,kind):
+            path.parent.mkdir(parents=True,exist_ok=True)
+            path.write_bytes(struct.pack('<8I',0xfeedfacf,0x100000c,0,kind,2,40,0,0)+
+                             struct.pack('<6I',0x32,24,2,0x100000,0x100000,0)+struct.pack('<4I',0x1d,16,72,1)+b'S')
+        bundle=d/'FuxiMetal.bundle';native=d/'FuxiNativeMetal.bundle'
+        for directory,exe,identifier,principal in [(bundle,'FuxiMetal','org.fuxi.metal','FuxiMTLDevice'),
+                                                    (native,'FuxiNativeMetal','com.fuxi.NativeMetal',None)]:
+            binary(directory/exe,6)
+            info={'CFBundleExecutable':exe,'CFBundleIdentifier':identifier}
+            if principal:info['NSPrincipalClass']=principal
+            (directory/'Info.plist').write_bytes(plistlib.dumps(info))
+            (directory/'LICENSE.NativeMetal').write_text('MIT test notice')
+            (directory/'_CodeSignature').mkdir();(directory/'_CodeSignature/CodeResources').write_text('model')
+        for name,kind in [('icd',6),('libmetal2vulkan.dylib',6),('fuxi-metal-smoke',2),('fuxi-ca-smoke',2),('libnative_metal_bridge.dylib',6)]:binary(d/name,kind)
+        (d/'metal-smoke.metallib').write_bytes(b'MTLB model')
+        for name in ('metal2vulkan-source.tar.gz','nativemetal-source.tar.gz'):(d/name).write_bytes(b'\x1f\x8b model')
+        (d/'conf').write_text('4\n');(d/'clients').write_text('fuxi-metal-smoke\n')
+        def stage(**kwargs):
+            m.stage(root,d/'icd',bundle,d/'fuxi-metal-smoke',d/'conf',d/'clients',ca_conf=d/'conf',**kwargs)
+        with patch.object(m.os,'geteuid',return_value=0),patch.object(m.os,'chown'):
+            native_args=dict(native_bundle=native,native_bridge=d/'libnative_metal_bridge.dylib',native_source=d/'nativemetal-source.tar.gz')
+            stage(**native_args)
+            assert (root/'usr/local/lib/libnative_metal_bridge.dylib').read_bytes()==(d/'libnative_metal_bridge.dylib').read_bytes()
+            assert (root/'System/Library/Extensions/FuxiNativeMetal.bundle/Info.plist').read_bytes()==(native/'Info.plist').read_bytes()
+            assert (root/'usr/local/share/fuxi/metal-clients.conf').read_bytes()==b'fuxi-metal-smoke\n'
+            for key in native_args:
+                incomplete=dict(native_args);del incomplete[key]
+                with patch.object(m.shutil,'copyfile') as copied:
+                    try:stage(**incomplete);raise AssertionError('incomplete native stage accepted')
+                    except ValueError:pass
+                    copied.assert_not_called()
+            target=root/'usr/local/lib/libnative_metal_bridge.dylib';target.unlink();target.symlink_to(d/'escape')
+            with patch.object(m.shutil,'copyfile') as copied:
+                try:stage(**native_args);raise AssertionError('native destination escape accepted')
+                except ValueError:pass
+                copied.assert_not_called()
+    print('PASS: NativeMetal offline staging, complete dylib/source trio, smoke-only policy and destination containment')
+
 def main():
     ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--out',type=Path,default=Path('tools/out'))
     ap.add_argument('--policy-storage-only',action='store_true');a=ap.parse_args()
     policy_storage_tests()
+    native_staging_tests()
     if a.policy_storage_only:return
     with tempfile.TemporaryDirectory() as tmp:
         d=Path(tmp);root=d/'root';(root/'System/Library').mkdir(parents=True)

@@ -1,0 +1,30 @@
+diff --git a/bridge/NativeMetalBridge.rs b/bridge/NativeMetalBridge.rs
+index 40a753f..b01151a 100644
+--- a/bridge/NativeMetalBridge.rs
++++ b/bridge/NativeMetalBridge.rs
+@@ -23,7 +23,10 @@ use std::ptr::NonNull;
+ use std::time::Duration;
+
+ /// The runtime's own example library (validation/fixtures/public/examples/runtime_examples.ll), assembled to AIR at build time.
++#[cfg(feature = "host-fixtures")]
+ static FIXTURE_AIR: &[u8] = include_bytes!(env!("NMB_FIXTURE_AIR"));
++#[cfg(not(feature = "host-fixtures"))]
++static FIXTURE_AIR: &[u8] = &[];
+
+ unsafe extern "C" {
+     /// libkern (libSystem): clean and invalidate the data cache over a range, from user space.
+diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
+index 8418de9..9d8dac1 100644
+--- a/bridge/NativeMetalObjects.rs
++++ b/bridge/NativeMetalObjects.rs
+@@ -114,7 +114,10 @@ pub extern "C" fn nmb_last_error() -> *const c_char {
+ }
+
+ /// The runtime's kernel_function_constant_gate_fold fixture, assembled to AIR at build time.
++#[cfg(feature = "host-fixtures")]
+ static FUNCTION_CONSTANT_AIR: &[u8] = include_bytes!(env!("NMB_FC_AIR"));
++#[cfg(not(feature = "host-fixtures"))]
++static FUNCTION_CONSTANT_AIR: &[u8] = &[];
+
+ /// # Safety
+ /// `length` is writable.

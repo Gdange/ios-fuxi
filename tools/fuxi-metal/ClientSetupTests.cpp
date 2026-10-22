@@ -17,7 +17,7 @@ int main(){
  values["TU_DEBUG"]="override";values["CA_DISABLE_FRAMEBUFFER_COMPRESSION"]="0";preferences.clear();
  fuxi::setupMetalClient(true,"backboardd",env,pref);
  assert(values.at("TU_DEBUG")=="override" && values.at("CA_DISABLE_FRAMEBUFFER_COMPRESSION")=="1");
- assert((preferences==std::vector<std::string>{"CAEnableFramebufferCompression","CAEnableIOSurfaceCompression"}));
+ assert((preferences==std::vector<std::string>{"CAEnableFramebufferCompression","CAEnableDeepFramebuffer","CAEnableIOSurfaceCompression"}));
  values["TU_DEBUG"]="";fuxi::setupTurnip(env);assert(values.at("TU_DEBUG").empty());
  puts("PASS: admitted-only startup, sysmem/nocb default and override, render-server/client compression policy via hooks");
 }

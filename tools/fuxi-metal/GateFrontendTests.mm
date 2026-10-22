@@ -16,7 +16,7 @@ static bool testAdmission(){const char *dir=getenv("FUXI_TEST_GATE_DIR");assert(
  return fuxi::backboardGate.admit("aaaaaaaa-1111-2222-3333-444444444444",open(dir,O_RDONLY|O_DIRECTORY|O_NOFOLLOW));}
 static unsigned preferenceWrites,setupEnvironments;
 static void testPreference(const char *key){
- assert(!strcmp(key,"CAEnableFramebufferCompression") || !strcmp(key,"CAEnableIOSurfaceCompression"));++preferenceWrites;
+ assert(!strcmp(key,"CAEnableDeepFramebuffer") || !strcmp(key,"CAEnableFramebufferCompression") || !strcmp(key,"CAEnableIOSurfaceCompression"));++preferenceWrites;
 }
 static int testEnvironment(const char *key,const char *value,int overwrite){
  if(!strcmp(key,"TU_DEBUG")){assert(!strcmp(value,"sysmem,nocb") && !overwrite);}
@@ -26,6 +26,7 @@ static int testEnvironment(const char *key,const char *value,int overwrite){
 #define FUXI_MTL_SET_CA_PREFERENCE(key) testPreference(key)
 #define FUXI_MTL_SET_ENV(key,value,overwrite) testEnvironment(key,value,overwrite)
 #define FUXI_MTL_READ_CLIENTS testPolicy
+#define FUXI_MTL_BOOTARGS(out,size) (snprintf(out,size,"%s",getenv("FUXI_TEST_BOOTARGS")?:""),true)
 #define FUXI_MTL_BACKBOARD_ADMIT() testAdmission()
 #define FUXI_MTL_BACKBOARD_MODE() fuxi::backboardMode(getenv("FUXI_TEST_BOOTARGS"))
 static std::atomic<double> testSurveyTime{100};
@@ -64,7 +65,7 @@ int main() {
    assert(![[cls alloc] initWithAcceleratorPort:(getenv("FUXI_TEST_GATE_ALLOW")?0:1)]);
   }
   unsigned expected=clientMode==fuxi::ClientMode::allow?(!strcmp(clientProcess,"backboardd")?2u:1u):0u;
-  assert(preferenceWrites==expected && setupEnvironments==expected);
+  assert(preferenceWrites==expected+(expected && !strcmp(clientProcess,"backboardd")?1u:0u) && setupEnvironments==expected);
   assert(policyReads==1 && fuxi::Backend::constructed==0 && fuxi::Backend::live==0 && fuxi::Backend::submissions==0);
   if(getenv("FUXI_TEST_GATE_EXPECT"))assert((clientMode==fuxi::ClientMode::allow)==!strcmp(getenv("FUXI_TEST_GATE_EXPECT"),"allow"));
   if(getenv("FUXI_TEST_GATE_SURVEY")){

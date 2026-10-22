@@ -5,8 +5,8 @@ root=$(cd "$(dirname "$0")/../.." && pwd)
 usage() {
     cat <<'HELP'
 Usage: tools/ci/build.sh TARGET [--dry-run]
-Targets: kernel-metal4, kernel-wlan6g, metal, mesa, tools
-       tools/ci/build.sh --plan KERNEL METAL MESA TOOLS
+Targets: kernel-metal4, kernel-wlan6g, metal, nativemetal, mesa, tools
+       tools/ci/build.sh --plan KERNEL METAL MESA TOOLS [NATIVEMETAL]
 KERNEL: none|metal4|wlan6g|all; remaining plan arguments: true|false
 Outputs: tools/out/ci/TARGET/ (explicit allowlist, logs, SHA256SUMS)
 Caches: deps/ci-downloads/; isolated build directories: deps/ci-work-TARGET/
@@ -20,16 +20,16 @@ die() { echo "fuxi-ci: $*" >&2; exit 2; }
 case "$1" in
     -h|--help) [[ $# == 1 ]] || die 'unexpected help arguments'; usage; exit 0 ;;
     --plan)
-        [[ $# == 5 ]] || die '--plan needs KERNEL METAL MESA TOOLS'
+        [[ $# == 5 || $# == 6 ]] || die '--plan needs KERNEL METAL MESA TOOLS [NATIVEMETAL]'
         case "$2" in none|metal4|wlan6g|all) ;; *) die 'invalid kernel selection' ;; esac
-        for flag in "$3" "$4" "$5"; do
+        for flag in "$3" "$4" "$5" "${6:-false}"; do
             [[ $flag == true || $flag == false ]] || die 'plan flags must be true or false'
         done
-        python3 - "$2" "$3" "$4" "$5" <<'PY'
+        python3 - "$2" "$3" "$4" "$5" "${6:-false}" <<'PY'
 import json, sys
 kernel, *flags = sys.argv[1:]
 targets = ["kernel-" + v for v in ("metal4", "wlan6g") if kernel in (v, "all")]
-targets += [t for t, f in zip(("metal", "mesa", "tools"), flags) if f == "true"]
+targets += [t for t, f in zip(("metal", "mesa", "tools", "nativemetal"), flags) if f == "true"]
 if not targets:
     raise SystemExit("Select at least one target")
 print(json.dumps({"target": targets}))
@@ -38,7 +38,7 @@ PY
 esac
 target=$1
 shift
-case "$target" in kernel-metal4|kernel-wlan6g|metal|mesa|tools) ;; *) die "unknown target: $target" ;; esac
+case "$target" in kernel-metal4|kernel-wlan6g|metal|nativemetal|mesa|tools) ;; *) die "unknown target: $target" ;; esac
 dry=false
 if [[ $# == 1 && $1 == --dry-run ]]; then dry=true; shift; fi
 [[ $# == 0 ]] || die 'unexpected arguments'
@@ -245,7 +245,18 @@ metal() {
     echo "Metal tools: $FUXI_METAL_TOOLS"
     [[ -x $FUXI_METAL_TOOLS/metal ]] || die 'no Metal compiler next to the iOS runtime library'
 
-    bash tools/build-fuxi-metal.sh "$work/mesa/include" "$work/outputs"
+    if [[ $target == nativemetal ]]; then
+        source_checkout nativemetal https://github.com/UniXNU/NativeMetal.git "$NATIVEMETAL_SHA" "$work/nativemetal"
+        # The fallback translator's checkout stays unpatched and independently replaceable.
+        source_checkout metal2vulkan https://github.com/steelbrain/metal2vulkan.git "$M2V_SHA" "$work/native-metal2vulkan"
+        export FUXI_NATIVEMETAL_SOURCE=$work/nativemetal FUXI_NATIVE_M2V_SOURCE=$work/native-metal2vulkan
+        export FUXI_NATIVE_BUILD=$work/native-build
+        bash tools/build-fuxi-nativemetal.sh "$work/mesa/include" "$work/outputs"
+        cp -R "$work/outputs/FuxiNativeMetal.bundle" "$out/"
+        cp "$work/outputs/libnative_metal_bridge.dylib" "$work/outputs/nativemetal-source.tar.gz" "$out/"
+    else
+        bash tools/build-fuxi-metal.sh "$work/mesa/include" "$work/outputs"
+    fi
     # Explicit allowlist preserves the complete ad-hoc signed bundle; no AIR,
     # SDK libraries, intermediate build directories or external fixture blobs.
     # The CA diagnostic loads system CA resources; no Apple shaders are shipped.
@@ -314,7 +325,7 @@ build() {
     cat tools/ci/pins.env
     case "$target" in
         kernel-*) kernel ;;
-        metal) metal ;;
+        metal|nativemetal) metal ;;
         mesa) mesa ;;
         tools) user_tools ;;
     esac

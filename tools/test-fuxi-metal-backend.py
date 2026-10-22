@@ -39,9 +39,10 @@ def main():
     ap.add_argument('--icd',type=Path,default=Path('/lib/x86_64-linux-gnu/libvulkan_lvp.so'));a=ap.parse_args()
     spec=importlib.util.spec_from_file_location('m3',ROOT/'tools/test-fuxi-vk-smoke.py');m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
     with tempfile.TemporaryDirectory() as tmp:
-        d=Path(tmp);proxy=m.PROXY.replace('static bool compute;','static bool compute,corrupted;').replace(
+        d=Path(tmp);proxy=m.PROXY.replace('getenv("TU_DEBUG"),"nocb"','getenv("TU_DEBUG"),"sysmem,nocb"').replace('static bool compute;','static bool compute,corrupted;').replace(
             'if(getenv("BAD_FILL") || (compute && getenv("BAD_COMPUTE")))static_cast<uint32_t *>(pointer)[16383]^=1;',
-            'if(!corrupted && getenv("BAD_FILL")){static_cast<uint32_t *>(pointer)[16383]^=1;corrupted=true;}')
+            '').replace('return wait(d,n,f,all,ns);',
+            'VkResult result=wait(d,n,f,all,ns);if(result==VK_SUCCESS && !corrupted && getenv("BAD_FILL")){static_cast<uint32_t *>(pointer)[16383]^=1;corrupted=true;}return result;')
         (d/'proxy.cpp').write_text(proxy);(d/'test.cpp').write_text(TEST)
         flags=['clang++','-std=c++17','-Wall','-Wextra','-Werror','-I'+str(a.headers)]
         subprocess.run(flags+['-shared','-fPIC',str(d/'proxy.cpp'),'-ldl','-o',str(d/'proxy.so')],check=True)

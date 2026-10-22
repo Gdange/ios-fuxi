@@ -90,7 +90,7 @@ def prepare_backboard_storage(root,account):
     print('staged /private/var/db/fuxi-metal/backboardd-%u uid=%u gid=%u 0700'%(uid,uid,gid))
 
 
-def stage(root,icd,bundle,smoke,conf,clients=Path(__file__).with_name('metal-clients.conf'),translator=None,metallib=None,source=None,ca_smoke=None,ca_conf=Path(__file__).with_name('ca-smoke.conf'),enable_backboardd=False):
+def stage(root,icd,bundle,smoke,conf,clients=Path(__file__).with_name('metal-clients.conf'),translator=None,metallib=None,source=None,ca_smoke=None,ca_conf=Path(__file__).with_name('ca-smoke.conf'),enable_backboardd=False,native_bundle=None,native_bridge=None,native_source=None):
     if os.geteuid()!=0:raise PermissionError('run as root to set root:wheel 0:0')
     root=root.resolve()
     if not (root/'System/Library').is_dir():raise ValueError('expected mounted iOS root')
@@ -124,6 +124,22 @@ def stage(root,icd,bundle,smoke,conf,clients=Path(__file__).with_name('metal-cli
         source=bundle/src
         if not source.is_file() or source.is_symlink():raise ValueError('missing/linked bundle member')
         artifacts.append((source,'System/Library/Extensions/FuxiMetal.bundle/'+src,0o755 if src=='FuxiMetal' else 0o644))
+    if any(p is not None for p in (native_bundle,native_bridge,native_source)):
+        if any(p is None for p in (native_bundle,native_bridge,native_source)):
+            raise ValueError('native bundle, bridge and corresponding source are required together')
+        native_info=plistlib.loads((native_bundle/'Info.plist').read_bytes())
+        if native_info.get('CFBundleExecutable')!='FuxiNativeMetal' or native_info.get('CFBundleIdentifier')!='com.fuxi.NativeMetal' or 'NSPrincipalClass' in native_info:
+            raise ValueError('unexpected NativeMetal helper plist')
+        macho(native_bundle/'FuxiNativeMetal',6);macho(native_bridge,6)
+        if not native_source.is_file():raise ValueError('missing NativeMetal corresponding source archive')
+        with native_source.open('rb') as archive:
+            if archive.read(2)!=b'\x1f\x8b':raise ValueError('invalid NativeMetal corresponding source archive')
+        artifacts.extend([(native_bridge,'usr/local/lib/libnative_metal_bridge.dylib',0o755),
+                          (native_source,'usr/local/share/fuxi/nativemetal-source.tar.gz',0o644)])
+        for src in ('FuxiNativeMetal','Info.plist','LICENSE.NativeMetal','_CodeSignature/CodeResources'):
+            source=native_bundle/src
+            if not source.is_file() or source.is_symlink():raise ValueError('missing/linked native bundle member')
+            artifacts.append((source,'System/Library/Extensions/FuxiNativeMetal.bundle/'+src,0o755 if src=='FuxiNativeMetal' else 0o644))
     for source,name,mode in artifacts:
         target=root/name
         if not target.resolve().is_relative_to(root):raise ValueError('target escapes root')
@@ -153,5 +169,8 @@ if __name__=='__main__':
     ap.add_argument('--translator',type=Path)
     ap.add_argument('--metallib',type=Path)
     ap.add_argument('--source',type=Path,help='external library corresponding source and licence archive')
+    ap.add_argument('--native-bundle',type=Path,help='optional signed FuxiNativeMetal helper bundle')
+    ap.add_argument('--native-bridge',type=Path,help='separately replaceable native Rust dylib')
+    ap.add_argument('--native-source',type=Path,help='NativeMetal corresponding-source archive')
     ap.add_argument('--enable-backboardd',action='store_true',help='add backboardd allow entry and private storage; also requires boot arg fuxibbgpu=1 (2 is a diagnostic survey; may blank screen for ~20s)')
-    a=ap.parse_args();stage(a.root,a.icd,a.bundle,a.smoke,a.conf,a.clients,a.translator,a.metallib,a.source,a.ca_smoke,a.ca_conf,a.enable_backboardd)
+    a=ap.parse_args();stage(a.root,a.icd,a.bundle,a.smoke,a.conf,a.clients,a.translator,a.metallib,a.source,a.ca_smoke,a.ca_conf,a.enable_backboardd,a.native_bundle,a.native_bridge,a.native_source)

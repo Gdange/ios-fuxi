@@ -1,0 +1,1589 @@
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 632b501..7d01e49 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -24,6 +24,13 @@
+ #include <mach/mach.h>
+ #include "bridge/NativeMetalObjects.h"
+ #include "NativeBridgeMetalFrontend.h"
++#include "FuxiNativeABI.h"
++#include <exception>
++extern "C" void _objc_msgForward(void);
++static FuxiNativeHooks gFuxiHooks={};
++extern "C" void fuxi_native_metal_set_hooks(const FuxiNativeHooks *hooks){gFuxiHooks=*hooks;}
++static bool fuxiBlocked(){return gFuxiHooks.blocked && gFuxiHooks.blocked();}
++static void fuxiFailure(const char *text){if(gFuxiHooks.failure)gFuxiHooks.failure(text);}
+
+ extern "C" void sys_dcache_flush(void *start, size_t length);
+
+@@ -50,13 +57,14 @@ static Timed gTimeResourceWait;
+ static std::atomic<uint64_t> gResourceChecks,gResourceSkipped;
+ static Timed gTimeSurfaceFlush;
+ static std::atomic<uint64_t> gSurfaceFlushBytes,gSurfaceFlushDuplicates;
+-struct EncodedWork {uint32_t passes,draws,dispatches,blits;uint64_t pixels;};
++struct EncodedWork {uint32_t passes,draws,dispatches,blits;uint64_t pixels;bool storedSurface;};
+ struct CommitRecord {uint64_t committedUs=0,callbackUs=0,ageUs=0;int64_t scheduledUs=-1;uint32_t index=0;EncodedWork work={};};
+ static CommitRecord gCommitRing[32];
+ static std::mutex gCommitLock;
+ static std::mutex gProblemLock;
+ static char gLastProblems[2][200];
+ static void noteProblem(NSString *what) {
++ fuxiFailure(what.UTF8String);
+  gProblems++;
+  std::lock_guard<std::mutex> lock(gProblemLock);
+  memcpy(gLastProblems[1],gLastProblems[0],sizeof gLastProblems[0]);
+@@ -72,6 +80,10 @@ static std::atomic<uint64_t> gSurfaceTextures,gSurfaceRefusals,gSurfacePlanar;
+ struct SurfaceRefusal {uint32_t step,format,planes,plane,pixelFormat;uint64_t offset,row,allocation,width,height;};
+ static SurfaceRefusal gSurfaceLastRefusal;
+ static void refuseSurface(uint32_t step,IOSurfaceRef surface,MTLTextureDescriptor *d,NSUInteger plane,uint64_t offset,uint64_t row) {
++ noteProblem([NSString stringWithFormat:@"IOSurface refused step=%u fourcc=0x%08x plane=%lu planes=%lu offset=%llu row=%llu bytes=%lu size=%lux%lu pixel=%lu",
++  step,surface?IOSurfaceGetPixelFormat(surface):0,(unsigned long)plane,(unsigned long)(surface?IOSurfaceGetPlaneCount(surface):0),
++  (unsigned long long)offset,(unsigned long long)row,(unsigned long)(surface?IOSurfaceGetAllocSize(surface):0),
++  (unsigned long)(d?d.width:0),(unsigned long)(d?d.height:0),(unsigned long)(d?d.pixelFormat:0)]);
+  gSurfaceRefusals++;
+  SurfaceRefusal r={step,surface?IOSurfaceGetPixelFormat(surface):0,surface?(uint32_t)IOSurfaceGetPlaneCount(surface):0,(uint32_t)plane,
+                    d?(uint32_t)d.pixelFormat:0,offset,row,surface?IOSurfaceGetAllocSize(surface):0,d?d.width:0,d?d.height:0};
+@@ -84,6 +96,7 @@ static void noteFormat(uint32_t format,bool made) {
+  if(gFormatCount<8)gFormats[gFormatCount++]=format;
+ }
+ static NSError *nbError(NSString *why) {
++ noteProblem(why?:@"refused");
+  return [NSError errorWithDomain:@"org.blu-sharky.native-metal" code:-1 userInfo:@{NSLocalizedDescriptionKey:why?:@"refused"}];
+ }
+ static NSString *lastError() {return [NSString stringWithUTF8String:nmb_last_error()];}
+@@ -103,12 +116,17 @@ static void journal(const std::string &line) {
+ @property(atomic,copy) NSString *label;
+ @end
+ @implementation NBObject
+-- (id<MTLDevice>)device {return gDeviceObject;}
+-- (void)doesNotRecognizeSelector:(SEL)selector {
++- (void)forwardInvocation:(NSInvocation *)invocation { try { @try {
++ noteProblem([NSString stringWithFormat:@"missing %s %s",class_getName(object_getClass(self)),sel_getName(invocation.selector)]);
++ NSUInteger bytes=invocation.methodSignature.methodReturnLength;
++ if(bytes){void *zero=calloc(1,bytes);[invocation setReturnValue:zero];free(zero);}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLDevice>)device { try { @try {return gDeviceObject;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)doesNotRecognizeSelector:(SEL)selector { try { @try {
+  if(gMissing)gMissing(class_getName(object_getClass(self)),sel_getName(selector));
+  noteProblem([NSString stringWithFormat:@"missing %s %s",class_getName(object_getClass(self)),sel_getName(selector)]);
+  [super doesNotRecognizeSelector:selector];
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ @end
+
+ // ---- resources ----
+@@ -119,11 +137,11 @@ static void waitForResource(id resource);
+ // Resource SPI the runtime has no state for: no protected content (Metal's default options), and no owner transfer
+ // (memory attribution is the kernel driver's, by the importing task), refused as not supported.
+ #define NB_RESOURCE_SPI \
+-- (uint64_t)protectionOptions {return 0;} \
+-- (id<MTLHeap>)heap {return _parentHeap;} \
+-- (BOOL)isAliasable {return NO;} \
+-- (int)setOwnerWithIdentity:(unsigned)identity {(void)identity;return 46; /* KERN_NOT_SUPPORTED */} \
+-- (void)waitUntilComplete {waitForResource(self);}
++- (uint64_t)protectionOptions { try { @try {return 0;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} } \
++- (id<MTLHeap>)heap { try { @try {return _parentHeap;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} } \
++- (BOOL)isAliasable { try { @try {return NO;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} } \
++- (int)setOwnerWithIdentity:(unsigned)identity { try { @try {(void)identity;return 46; /* KERN_NOT_SUPPORTED */} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} } \
++- (void)waitUntilComplete { try { @try {waitForResource(self);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ @interface NBBuffer : NBObject
+ @property(nonatomic) NmbBuffer *handle;
+ @property(nonatomic) MTLResourceOptions options;
+@@ -151,24 +169,24 @@ static void releaseBlock(void *context,void *pointer,uint64_t length) {
+ }
+ static void releaseSurface(void *context,void *,uint64_t) {gSurfaceImportsReleased++;CFRelease((IOSurfaceRef)context);}
+ @implementation NBBuffer
+-- (void)dealloc {
++- (void)dealloc { try { @try {
+  nmb_buffer_release(_handle);
+-}
+-- (NSUInteger)length {return nmb_buffer_length(_handle);}
+-- (void *)contents {return nmb_buffer_contents(_handle);}
+-- (uint64_t)gpuAddress {return nmb_buffer_gpu_address(_handle);}
+-- (MTLResourceOptions)resourceOptions {return _options;}
+-- (MTLStorageMode)storageMode {return (MTLStorageMode)((_options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);}
+-- (MTLCPUCacheMode)cpuCacheMode {return (MTLCPUCacheMode)((_options&MTLResourceCPUCacheModeMask)>>MTLResourceCPUCacheModeShift);}
+-- (MTLHazardTrackingMode)hazardTrackingMode {return (MTLHazardTrackingMode)((_options&MTLResourceHazardTrackingModeMask)>>MTLResourceHazardTrackingModeShift);}
+-- (void)didModifyRange:(NSRange)range {(void)range;}
+-- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSUInteger)length { try { @try {return nmb_buffer_length(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void *)contents { try { @try {return nmb_buffer_contents(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (uint64_t)gpuAddress { try { @try {return nmb_buffer_gpu_address(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (MTLResourceOptions)resourceOptions { try { @try {return _options;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (MTLStorageMode)storageMode { try { @try {return (MTLStorageMode)((_options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (MTLCPUCacheMode)cpuCacheMode { try { @try {return (MTLCPUCacheMode)((_options&MTLResourceCPUCacheModeMask)>>MTLResourceCPUCacheModeShift);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (MTLHazardTrackingMode)hazardTrackingMode { try { @try {return (MTLHazardTrackingMode)((_options&MTLResourceHazardTrackingModeMask)>>MTLResourceHazardTrackingModeShift);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)didModifyRange:(NSRange)range { try { @try {(void)range;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { try { @try {
+  const uint64_t answer=nmb_buffer_set_purgeable_state(_handle,state);
+  if(!answer)NBLOG(@"native-metal: buffer setPurgeableState refused: %@",lastError());
+  return (MTLPurgeableState)answer;
+-}
+-- (NSUInteger)allocatedSize {return nmb_buffer_length(_handle);}
+-- (IOSurfaceRef)iosurface {return nullptr;}   // a buffer is never the backing of a surface here (surfaces back textures)
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSUInteger)allocatedSize { try { @try {return nmb_buffer_length(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (IOSurfaceRef)iosurface { try { @try {return nullptr;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }   // a buffer is never the backing of a surface here (surfaces back textures)
+ NB_RESOURCE_SPI
+ @end
+ // Reuse only an import still held by a texture/view or pending command. Weak
+@@ -203,68 +221,70 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
+  return buffer;
+ }
+ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out) {
+- if(!d)return false;
++ if(!d){noteProblem(@"nil texture descriptor");return false;}
+  *out={(uint64_t)d.textureType,(uint64_t)d.pixelFormat,d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions};
+  return true;
+ }
+ @implementation NBTexture
+-- (void)dealloc {nmb_texture_release(_handle);if(_surface)CFRelease(_surface);}
+-- (MTLTextureType)textureType {return (MTLTextureType)_descriptor.type;}
+-- (MTLPixelFormat)pixelFormat {return (MTLPixelFormat)_descriptor.format;}
+-- (NSUInteger)width {return _descriptor.width;}
+-- (NSUInteger)height {return _descriptor.height;}
+-- (NSUInteger)depth {return _descriptor.depth;}
+-- (NSUInteger)mipmapLevelCount {return _descriptor.levels;}
+-- (NSUInteger)sampleCount {return _descriptor.samples;}
+-- (NSUInteger)arrayLength {return _descriptor.array_length;}
+-- (MTLTextureUsage)usage {return (MTLTextureUsage)_descriptor.usage;}
+-- (MTLResourceOptions)resourceOptions {return (MTLResourceOptions)_descriptor.options;}
+-- (MTLStorageMode)storageMode {return (MTLStorageMode)((_descriptor.options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);}
+-- (MTLCPUCacheMode)cpuCacheMode {return (MTLCPUCacheMode)((_descriptor.options&MTLResourceCPUCacheModeMask)>>MTLResourceCPUCacheModeShift);}
+-- (BOOL)isFramebufferOnly {return NO;}
+-- (IOSurfaceRef)iosurface {return _surface;}
+-- (NSUInteger)iosurfacePlane {return 0;}
+-- (id<MTLBuffer>)buffer {return _surface?nil:(id<MTLBuffer>)_buffer;}
+-- (NSUInteger)bufferOffset {return _offset;}
+-- (NSUInteger)bufferBytesPerRow {return _rowBytes;}
+-- (id<MTLTexture>)parentTexture {return _parent;}
+-- (NSUInteger)rotation {return 0;}
+-- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {
++- (void)dealloc { try { @try {nmb_texture_release(_handle);if(_surface)CFRelease(_surface);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (MTLTextureType)textureType { try { @try {return (MTLTextureType)_descriptor.type;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (MTLPixelFormat)pixelFormat { try { @try {return (MTLPixelFormat)_descriptor.format;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSUInteger)width { try { @try {return _descriptor.width;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSUInteger)height { try { @try {return _descriptor.height;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSUInteger)depth { try { @try {return _descriptor.depth;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSUInteger)mipmapLevelCount { try { @try {return _descriptor.levels;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSUInteger)sampleCount { try { @try {return _descriptor.samples;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSUInteger)arrayLength { try { @try {return _descriptor.array_length;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (MTLTextureUsage)usage { try { @try {return (MTLTextureUsage)_descriptor.usage;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (MTLResourceOptions)resourceOptions { try { @try {return (MTLResourceOptions)_descriptor.options;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (MTLStorageMode)storageMode { try { @try {return (MTLStorageMode)((_descriptor.options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (MTLCPUCacheMode)cpuCacheMode { try { @try {return (MTLCPUCacheMode)((_descriptor.options&MTLResourceCPUCacheModeMask)>>MTLResourceCPUCacheModeShift);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (BOOL)isFramebufferOnly { try { @try {return NO;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (IOSurfaceRef)iosurface { try { @try {return _surface;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSUInteger)iosurfacePlane { try { @try {return 0;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLBuffer>)buffer { try { @try {return _surface?nil:(id<MTLBuffer>)_buffer;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSUInteger)bufferOffset { try { @try {return _offset;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSUInteger)bufferBytesPerRow { try { @try {return _rowBytes;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLTexture>)parentTexture { try { @try {return _parent;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSUInteger)rotation { try { @try {return 0;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { try { @try {
+  const uint64_t answer=nmb_texture_set_purgeable_state(_handle,state);
+  if(!answer)NBLOG(@"native-metal: texture setPurgeableState refused: %@",lastError());
+  return (MTLPurgeableState)answer;
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ NB_RESOURCE_SPI
+-- (id<MTLTexture>)view:(NmbTexture *)handle {
++- (id<MTLTexture>)view:(NmbTexture *)handle { try { @try {
+  if(!handle){NBLOG(@"native-metal: texture view refused: %@",lastError());return nil;}
+  NBTexture *view=[NBTexture new];view.handle=handle;NmbTextureDescriptor descriptor;nmb_texture_describe(handle,&descriptor);view.descriptor=descriptor;
+  view.parent=(id<MTLTexture>)self;view.buffer=_buffer;view.offset=_offset;view.rowBytes=_rowBytes;
+  if(_surface)view.surface=(IOSurfaceRef)CFRetain(_surface);
+  return (id<MTLTexture>)view;
+-}
+-- (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format { try { @try {
+  return [self view:nmb_texture_new_view(_handle,format,0,nullptr,nullptr,true)];
+-}
+-- (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format textureType:(MTLTextureType)type levels:(NSRange)levels slices:(NSRange)slices {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format textureType:(MTLTextureType)type levels:(NSRange)levels slices:(NSRange)slices { try { @try {
+  const uint64_t l[2]={levels.location,levels.length},s[2]={slices.location,slices.length};
+  return [self view:nmb_texture_new_view(_handle,format,type,l,s,false)];
+-}
+-- (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image { try { @try {
+  const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,r.size.width,r.size.height,r.size.depth};
+  const uint64_t length=(r.size.depth>1?image*(r.size.depth-1):0)+row*r.size.height;
++ if(fuxiBlocked()){noteProblem(@"survey skipped texture upload after latch");return;}
+  if(!nmb_texture_replace(_handle,region,level,slice,bytes,row,image,length))NBLOG(@"native-metal: replaceRegion refused: %@",lastError());
+-}
+-- (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row { try { @try {
+  [self replaceRegion:r mipmapLevel:level slice:0 withBytes:bytes bytesPerRow:row bytesPerImage:row*r.size.height];
+-}
+-- (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice { try { @try {
+  const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,r.size.width,r.size.height,r.size.depth};
+  const uint64_t length=(r.size.depth>1?image*(r.size.depth-1):0)+row*r.size.height;
++ if(fuxiBlocked()){noteProblem(@"survey skipped texture readback after latch");return;}
+  if(!nmb_texture_get_bytes(_handle,bytes,row,image,length,region,level,slice))NBLOG(@"native-metal: getBytes refused: %@",lastError());
+-}
+-- (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)row fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)row fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level { try { @try {
+  [self getBytes:bytes bytesPerRow:row bytesPerImage:row*r.size.height fromRegion:r mipmapLevel:level slice:0];
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ @end
+ // A command can use many independent imports/views of one IOSurface. Their
+ // owners keep the mapping live through this phase. Maintain each exact CPU
+@@ -303,16 +323,16 @@ static NBTexture *textureOnSurface(NBBuffer *buffer,MTLTextureDescriptor *d,IOSu
+  texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;return texture;
+ }
+ @implementation NBBuffer (Textures)
+-- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)row {
++- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)row { try { @try {
+  return (id<MTLTexture>)textureOnBuffer(self,d,offset,row,false);
+-}
+-- (id<MTLTexture>)newLinearTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLTexture>)newLinearTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image { try { @try {
+  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
+  NmbTexture *handle=nmb_texture_new_linear(self.handle,&descriptor,offset,row,image);
+  if(!handle){NBLOG(@"native-metal: linear texture refused: %@",lastError());return nil;}
+  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
+  texture.buffer=self;texture.offset=offset;texture.rowBytes=row;return (id<MTLTexture>)texture;
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ @end
+
+ // ---- libraries, functions, states ----
+@@ -326,8 +346,8 @@ static NBTexture *textureOnSurface(NBBuffer *buffer,MTLTextureDescriptor *d,IOSu
+ @property(nonatomic) std::string constantsText;   // name:type:hex of each constant value it was specialized with (the journal's)
+ @end
+ @implementation NBFunction
+-- (void)dealloc {nmb_function_release(_handle);}
+-- (MTLFunctionOptions)options {return MTLFunctionOptionNone;}
++- (void)dealloc { try { @try {nmb_function_release(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (MTLFunctionOptions)options { try { @try {return MTLFunctionOptionNone;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ @end
+ // The target's own accessors of MTLFunctionConstantValues (as the offline frontend reads them); their ABI is checked before any call.
+ @interface MTLFunctionConstantValues (NBOriginalConstantAccess)
+@@ -364,8 +384,8 @@ static uint64_t constantBytes(uint64_t type) {
+ }
+ static std::string quartzCoreCallers();
+ @implementation NBLibrary
+-- (void)dealloc {nmb_library_release(_handle);}
+-- (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error {
++- (void)dealloc { try { @try {nmb_library_release(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error { try { @try {
+  if(!name || !values || !methodABI(values,@selector(newIndexedConstantArray),"@16@0:8") || !methodABI(values,@selector(newNamedConstantArray),"@16@0:8")) {
+   if(error)*error=nbError(@"unqualified function constant values");return nil;
+  }
+@@ -403,67 +423,67 @@ static std::string quartzCoreCallers();
+  }
+  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
+  function.constantsText=text;if(error)*error=nil;return (id<MTLFunction>)function;
+-}
+-- (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values completionHandler:(void (^)(id<MTLFunction>,NSError *))handler { try { @try {
+  NSError *error=nil;id<MTLFunction> function=[self newFunctionWithName:name constantValues:values error:&error];
+  handler(function,error);
+-}
+-- (MTLLibraryType)type {return MTLLibraryTypeExecutable;}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (MTLLibraryType)type { try { @try {return MTLLibraryTypeExecutable;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // The descriptor's name and constants; its specialized name only labels Metal's function and its options ask for compile-time work the
+ // runtime does when the function is made.
+-- (id<MTLFunction>)newFunctionWithDescriptor:(MTLFunctionDescriptor *)d error:(NSError **)error {
++- (id<MTLFunction>)newFunctionWithDescriptor:(MTLFunctionDescriptor *)d error:(NSError **)error { try { @try {
+  if(!d.name){if(error)*error=nbError(@"a function name is required");return nil;}
+  if(d.constantValues)return [self newFunctionWithName:d.name constantValues:d.constantValues error:error];
+  id<MTLFunction> function=[self newFunctionWithName:d.name];
+  if(!function){if(error)*error=nbError([NSString stringWithFormat:@"function %@: %@",d.name,lastError()]);return nil;}
+  if(error)*error=nil;return function;
+-}
+-- (NSArray<NSString *> *)functionNames {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSArray<NSString *> *)functionNames { try { @try {
+  NSMutableArray *names=[NSMutableArray array];
+  for(uint32_t i=0,n=nmb_library_function_count(_handle);i<n;i++) {
+   char name[256];nmb_library_function_name(_handle,i,name,sizeof name);[names addObject:[NSString stringWithUTF8String:name]];
+  }
+  return names;
+-}
+-- (id<MTLFunction>)newFunctionWithName:(NSString *)name {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLFunction>)newFunctionWithName:(NSString *)name { try { @try {
+  const uint64_t functionBegan=nowUs();
+  NmbFunction *handle=name?nmb_function_new(_handle,name.UTF8String):nullptr;gTimeFunction.add(functionBegan);
+- if(!handle)return nil;
++ if(!handle){noteProblem(lastError());return nil;}
+  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
+  return (id<MTLFunction>)function;
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ @end
+ @interface NBComputePipeline : NBObject
+ @property(nonatomic) NmbComputePipeline *handle;
+ @end
+ @implementation NBComputePipeline
+-- (void)dealloc {nmb_compute_pipeline_release(_handle);}
+-- (NSUInteger)maxTotalThreadsPerThreadgroup {return nmb_compute_pipeline_max_threads(_handle);}
+-- (NSUInteger)threadExecutionWidth {return nmb_compute_pipeline_execution_width(_handle);}
++- (void)dealloc { try { @try {nmb_compute_pipeline_release(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSUInteger)maxTotalThreadsPerThreadgroup { try { @try {return nmb_compute_pipeline_max_threads(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSUInteger)threadExecutionWidth { try { @try {return nmb_compute_pipeline_execution_width(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ @end
+ @interface NBRenderPipeline : NBObject
+ @property(nonatomic) NmbRenderPipeline *handle;
+ @end
+ @implementation NBRenderPipeline
+-- (void)dealloc {nmb_render_pipeline_release(_handle);}
++- (void)dealloc { try { @try {nmb_render_pipeline_release(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // The threadgroup size a tile dispatch of this pipeline could use: the device's limit (no tile shaders are offered).
+-- (NSUInteger)maxTotalThreadsPerThreadgroup {
++- (NSUInteger)maxTotalThreadsPerThreadgroup { try { @try {
+  uint64_t s[3]={};if(!nmb_device_max_threads_per_threadgroup(gDevice,s))return 0;
+  return s[0];
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ @end
+ @interface NBSampler : NBObject
+ @property(nonatomic) NmbSampler *handle;
+ @end
+ @implementation NBSampler
+-- (void)dealloc {nmb_sampler_release(_handle);}
+-- (NSUInteger)pixelFormat {return MTLPixelFormatInvalid;}   // SPI: a sampler built from a plain descriptor names no format
++- (void)dealloc { try { @try {nmb_sampler_release(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSUInteger)pixelFormat { try { @try {return MTLPixelFormatInvalid;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }   // SPI: a sampler built from a plain descriptor names no format
+ @end
+ @interface NBDepthStencil : NBObject
+ @property(nonatomic) NmbDepthStencil *handle;
+ @end
+ @implementation NBDepthStencil
+-- (void)dealloc {nmb_depth_stencil_release(_handle);}
++- (void)dealloc { try { @try {nmb_depth_stencil_release(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ @end
+
+ // ---- events and fences ----
+@@ -471,17 +491,17 @@ static std::string quartzCoreCallers();
+ @property(nonatomic) NmbEvent *handle;
+ @end
+ @implementation NBEvent
+-- (void)dealloc {nmb_event_release(_handle);}
++- (void)dealloc { try { @try {nmb_event_release(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ @end
+ @interface NBSharedEvent : NBEvent
+ @end
+ static void notified(void *context,uint64_t value);
+ @implementation NBSharedEvent
+-- (uint64_t)signaledValue {return nmb_shared_event_value(self.handle);}
+-- (void)setSignaledValue:(uint64_t)value {nmb_shared_event_set_value(self.handle,value);}
+-- (BOOL)waitUntilSignaledValue:(uint64_t)value timeoutMS:(uint64_t)milliseconds {return nmb_shared_event_wait(self.handle,value,milliseconds);}
++- (uint64_t)signaledValue { try { @try {return nmb_shared_event_value(self.handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setSignaledValue:(uint64_t)value { try { @try {nmb_shared_event_set_value(self.handle,value);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (BOOL)waitUntilSignaledValue:(uint64_t)value timeoutMS:(uint64_t)milliseconds { try { @try {return fuxiBlocked()?YES:nmb_shared_event_wait(self.handle,value,milliseconds);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // The block runs on the listener's dispatch queue (Metal's contract); the bridge's listener thread only forwards it there.
+-- (void)notifyListener:(MTLSharedEventListener *)listener atValue:(uint64_t)value block:(MTLSharedEventNotificationBlock)block {
++- (void)notifyListener:(MTLSharedEventListener *)listener atValue:(uint64_t)value block:(MTLSharedEventNotificationBlock)block { try { @try {
+  if(!block)return;
+  dispatch_queue_t queue=listener.dispatchQueue?:dispatch_get_global_queue(QOS_CLASS_DEFAULT,0);
+  NSArray *job=@[self,queue,[block copy]];
+@@ -489,12 +509,13 @@ static void notified(void *context,uint64_t value);
+   (void)(__bridge_transfer NSArray *)(__bridge void *)job;
+   NBLOG(@"native-metal: notifyListener refused: %@",lastError());
+  }
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // A handle for another process needs a kernel-backed event this bridge does not have yet: refused, never a handle that could not work.
+-- (MTLSharedEventHandle *)newSharedEventHandle {
++- (MTLSharedEventHandle *)newSharedEventHandle { try { @try {
++ noteProblem(@"cross-process shared event handles unsupported");
+  if(gMissing)gMissing("NBSharedEvent","newSharedEventHandle (cross-process)");
+  return nil;
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ @end
+ static void notified(void *context,uint64_t value) {
+  NSArray *job=(__bridge_transfer NSArray *)context;
+@@ -505,7 +526,7 @@ static void notified(void *context,uint64_t value) {
+ @property(nonatomic) NmbFence *handle;
+ @end
+ @implementation NBFence
+-- (void)dealloc {nmb_fence_release(_handle);}
++- (void)dealloc { try { @try {nmb_fence_release(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ @end
+
+ // ---- command buffers and encoders ----
+@@ -518,6 +539,8 @@ static void notified(void *context,uint64_t value) {
+  EncodedWork encodedWork;   // the command buffer's single encoder thread, not global counter deltas
+  uint64_t createdUs;
+ }
++@property(nonatomic) BOOL fuxiNoop;
++@property(nonatomic,strong) NSMutableArray *fuxiSignals;
+ @property(nonatomic) NmbCommandBuffer *handle;
+ @property(nonatomic,strong) NBQueue *queue;
+ @property(atomic,copy) NSString *encodeFailure;
+@@ -553,181 +576,184 @@ static void waitForResource(id resource) {
+  gTimeResourceWait.add(began);
+ }
+ @implementation NBEncoder
+-- (void)dealloc {if(_handle)nmb_encoder_discard(_handle);}
+-- (bool)check:(bool)ok what:(const char *)what {
++- (void)dealloc { try { @try {if(_handle)nmb_encoder_discard(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (bool)check:(bool)ok what:(const char *)what { try { @try {
+  if(!ok)[_commandBuffer refuse:[NSString stringWithFormat:@"%s: %@",what,lastError()]];
+  return ok;
+-}
+-- (void)endEncoding {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)endEncoding { try { @try {
+  NmbEncoder *handle=_handle;_handle=nullptr;
+  if(!handle){[_commandBuffer refuse:@"endEncoding twice"];return;}
+  [self check:nmb_encoder_end(handle) what:"endEncoding"];
+-}
+-- (void)insertDebugSignpost:(NSString *)s {(void)s;}
+-- (void)pushDebugGroup:(NSString *)s {(void)s;}
+-- (void)popDebugGroup {}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)insertDebugSignpost:(NSString *)s { try { @try {(void)s;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)pushDebugGroup:(NSString *)s { try { @try {(void)s;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)popDebugGroup { try { @try {} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // Stage 0 compute, 1 vertex, 2 fragment (the bridge's numbering).
+-- (void)buffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
++- (void)buffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage { try { @try {
+  if(buffer && ![(id)buffer isKindOfClass:[NBBuffer class]]){[_commandBuffer refuse:@"foreign buffer"];return;}
+  if(buffer)[_commandBuffer.resourceOwners addObject:buffer];
+  [self check:nmb_encoder_set_buffer(_handle,stage,buffer?[(NBBuffer *)buffer handle]:nullptr,offset,(uint32_t)index) what:"setBuffer"];
+-}
+-- (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)stage {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)stage { try { @try {
+  if(texture && ![(id)texture isKindOfClass:[NBTexture class]]){[_commandBuffer refuse:@"foreign texture"];return;}
+  if(texture)[_commandBuffer.resourceOwners addObject:texture];
+  if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
+  [self check:nmb_encoder_set_texture(_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"];
+-}
+-- (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage { try { @try {
+  if(sampler && ![(id)sampler isKindOfClass:[NBSampler class]]){[_commandBuffer refuse:@"foreign sampler"];return;}
+  [self check:nmb_encoder_set_sampler(_handle,stage,sampler?[(NBSampler *)sampler handle]:nullptr,(uint32_t)index) what:"setSamplerState"];
+-}
+-- (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index stage:(uint32_t)stage {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index stage:(uint32_t)stage { try { @try {
+  [self check:nmb_encoder_set_bytes(_handle,stage,bytes,length,(uint32_t)index) what:"setBytes"];
+-}
+-- (void)fence:(id<MTLFence>)fence stages:(uint64_t)stages update:(bool)update {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)fence:(id<MTLFence>)fence stages:(uint64_t)stages update:(bool)update { try { @try {
+  if(![(id)fence isKindOfClass:[NBFence class]]){[_commandBuffer refuse:@"foreign fence"];return;}
+  NmbFence *handle=[(NBFence *)fence handle];
+  [self check:update?nmb_encoder_update_fence(_handle,handle,stages):nmb_encoder_wait_fence(_handle,handle,stages) what:update?"updateFence":"waitForFence"];
+-}
+-- (void)updateFence:(id<MTLFence>)fence {[self fence:fence stages:0 update:true];}
+-- (void)waitForFence:(id<MTLFence>)fence {[self fence:fence stages:0 update:false];}
+-- (void)offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)updateFence:(id<MTLFence>)fence { try { @try {[self fence:fence stages:0 update:true];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)waitForFence:(id<MTLFence>)fence { try { @try {[self fence:fence stages:0 update:false];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage { try { @try {
+  [self check:nmb_encoder_set_buffer_offset(_handle,stage,offset,(uint32_t)index) what:"setBufferOffset"];
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ @end
+
+ @interface NBComputeEncoder : NBEncoder
+ @end
+ @implementation NBComputeEncoder
+-- (MTLDispatchType)dispatchType {return MTLDispatchTypeSerial;}
+-- (void)setComputePipelineState:(id<MTLComputePipelineState>)state {
++- (MTLDispatchType)dispatchType { try { @try {return MTLDispatchTypeSerial;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setComputePipelineState:(id<MTLComputePipelineState>)state { try { @try {
+  if(![(id)state isKindOfClass:[NBComputePipeline class]]){[self.commandBuffer refuse:@"foreign compute pipeline"];return;}
+  [self check:nmb_compute_set_pipeline(self.handle,[(NBComputePipeline *)state handle]) what:"setComputePipelineState"];
+-}
+-- (void)setBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:0];}
+-- (void)setBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i {[self offset:o index:i stage:0];}
+-- (void)setBuffers:(const id<MTLBuffer> __unsafe_unretained [])b offsets:(const NSUInteger [])o withRange:(NSRange)r {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i { try { @try {[self buffer:b offset:o index:i stage:0];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i { try { @try {[self offset:o index:i stage:0];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setBuffers:(const id<MTLBuffer> __unsafe_unretained [])b offsets:(const NSUInteger [])o withRange:(NSRange)r { try { @try {
+  for(NSUInteger k=0;k<r.length;k++)[self buffer:b[k] offset:o[k] index:r.location+k stage:0];
+-}
+-- (void)setBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {[self bytes:p length:n index:i stage:0];}
+-- (void)setTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {[self texture:t index:i stage:0];}
+-- (void)setTextures:(const id<MTLTexture> __unsafe_unretained [])t withRange:(NSRange)r {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i { try { @try {[self bytes:p length:n index:i stage:0];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { try { @try {[self texture:t index:i stage:0];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setTextures:(const id<MTLTexture> __unsafe_unretained [])t withRange:(NSRange)r { try { @try {
+  for(NSUInteger k=0;k<r.length;k++)[self texture:t[k] index:r.location+k stage:0];
+-}
+-- (void)setSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i {[self sampler:s index:i stage:0];}
+-- (void)setThreadgroupMemoryLength:(NSUInteger)n atIndex:(NSUInteger)i {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { try { @try {[self sampler:s index:i stage:0];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setThreadgroupMemoryLength:(NSUInteger)n atIndex:(NSUInteger)i { try { @try {
+  [self check:nmb_compute_set_threadgroup_memory(self.handle,(uint32_t)n,(uint32_t)i) what:"setThreadgroupMemoryLength"];
+-}
+-- (void)dispatch:(MTLSize)size group:(MTLSize)group threads:(bool)threads {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)dispatch:(MTLSize)size group:(MTLSize)group threads:(bool)threads { try { @try {
+  gDispatches++;self.commandBuffer->encodedWork.dispatches++;
+  const uint64_t s[3]={size.width,size.height,size.depth},g[3]={group.width,group.height,group.depth};
+  [self check:nmb_compute_dispatch(self.handle,s,g,threads) what:"dispatch"];
+-}
+-- (void)dispatchThreads:(MTLSize)t threadsPerThreadgroup:(MTLSize)g {[self dispatch:t group:g threads:true];}
+-- (void)dispatchThreadgroups:(MTLSize)t threadsPerThreadgroup:(MTLSize)g {[self dispatch:t group:g threads:false];}
+-- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u {(void)r;(void)u;}
+-- (void)memoryBarrierWithScope:(MTLBarrierScope)s {(void)s;}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)dispatchThreads:(MTLSize)t threadsPerThreadgroup:(MTLSize)g { try { @try {[self dispatch:t group:g threads:true];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)dispatchThreadgroups:(MTLSize)t threadsPerThreadgroup:(MTLSize)g { try { @try {[self dispatch:t group:g threads:false];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u { try { @try {(void)r;(void)u;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)memoryBarrierWithScope:(MTLBarrierScope)s { try { @try {(void)s;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ @end
+
+ @interface NBRenderEncoder : NBEncoder
++@property(nonatomic) BOOL fuxiStoredSurface;
+ @end
+ @implementation NBRenderEncoder
+-- (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
++- (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state { try { @try {
+  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
+  [self check:nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handle]) what:"setRenderPipelineState"];
+-}
+-- (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:1];}
+-- (void)setFragmentBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:2];}
+-- (void)setVertexBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i {[self offset:o index:i stage:1];}
+-- (void)setFragmentBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i {[self offset:o index:i stage:2];}
+-- (void)setVertexBuffers:(const id<MTLBuffer> __unsafe_unretained [])b offsets:(const NSUInteger [])o withRange:(NSRange)r {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i { try { @try {[self buffer:b offset:o index:i stage:1];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setFragmentBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i { try { @try {[self buffer:b offset:o index:i stage:2];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setVertexBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i { try { @try {[self offset:o index:i stage:1];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setFragmentBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i { try { @try {[self offset:o index:i stage:2];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setVertexBuffers:(const id<MTLBuffer> __unsafe_unretained [])b offsets:(const NSUInteger [])o withRange:(NSRange)r { try { @try {
+  for(NSUInteger k=0;k<r.length;k++)[self buffer:b[k] offset:o[k] index:r.location+k stage:1];
+-}
+-- (void)setFragmentBuffers:(const id<MTLBuffer> __unsafe_unretained [])b offsets:(const NSUInteger [])o withRange:(NSRange)r {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setFragmentBuffers:(const id<MTLBuffer> __unsafe_unretained [])b offsets:(const NSUInteger [])o withRange:(NSRange)r { try { @try {
+  for(NSUInteger k=0;k<r.length;k++)[self buffer:b[k] offset:o[k] index:r.location+k stage:2];
+-}
+-- (void)setVertexBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {[self bytes:p length:n index:i stage:1];}
+-- (void)setFragmentBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {[self bytes:p length:n index:i stage:2];}
+-- (void)setVertexTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {[self texture:t index:i stage:1];}
+-- (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {[self texture:t index:i stage:2];}
+-- (void)setFragmentTextures:(const id<MTLTexture> __unsafe_unretained [])t withRange:(NSRange)r {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setVertexBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i { try { @try {[self bytes:p length:n index:i stage:1];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setFragmentBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i { try { @try {[self bytes:p length:n index:i stage:2];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setVertexTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { try { @try {[self texture:t index:i stage:1];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { try { @try {[self texture:t index:i stage:2];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setFragmentTextures:(const id<MTLTexture> __unsafe_unretained [])t withRange:(NSRange)r { try { @try {
+  for(NSUInteger k=0;k<r.length;k++)[self texture:t[k] index:r.location+k stage:2];
+-}
+-- (void)setVertexSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i {[self sampler:s index:i stage:1];}
+-- (void)setFragmentSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i {[self sampler:s index:i stage:2];}
+-- (void)setDepthStencilState:(id<MTLDepthStencilState>)state {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setVertexSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { try { @try {[self sampler:s index:i stage:1];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setFragmentSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { try { @try {[self sampler:s index:i stage:2];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setDepthStencilState:(id<MTLDepthStencilState>)state { try { @try {
+  if(state && ![(id)state isKindOfClass:[NBDepthStencil class]]){[self.commandBuffer refuse:@"foreign depth/stencil state"];return;}
+  [self check:nmb_render_set_depth_stencil(self.handle,state?[(NBDepthStencil *)state handle]:nullptr) what:"setDepthStencilState"];
+-}
+-- (void)setViewport:(MTLViewport)v {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setViewport:(MTLViewport)v { try { @try {
+  const double values[6]={v.originX,v.originY,v.width,v.height,v.znear,v.zfar};
+  [self check:nmb_render_set_viewport(self.handle,values) what:"setViewport"];
+-}
+-- (void)setScissorRect:(MTLScissorRect)r {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setScissorRect:(MTLScissorRect)r { try { @try {
+  const uint64_t values[4]={r.x,r.y,r.width,r.height};
+  [self check:nmb_render_set_scissor(self.handle,values) what:"setScissorRect"];
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // The runtime takes cull mode, winding and fill mode together; this encoder keeps Metal's defaults until each is set.
+-- (void)raster {
++- (void)raster { try { @try {
+  NSNumber *cull=objc_getAssociatedObject(self,"cull"),*winding=objc_getAssociatedObject(self,"winding"),*fill=objc_getAssociatedObject(self,"fill");
+  [self check:nmb_render_set_raster(self.handle,cull.unsignedLongLongValue,winding.unsignedLongLongValue,fill.unsignedLongLongValue) what:"raster state"];
+-}
+-- (void)setCullMode:(MTLCullMode)m {objc_setAssociatedObject(self,"cull",@(m),OBJC_ASSOCIATION_RETAIN);[self raster];}
+-- (void)setFrontFacingWinding:(MTLWinding)w {objc_setAssociatedObject(self,"winding",@(w),OBJC_ASSOCIATION_RETAIN);[self raster];}
+-- (void)setTriangleFillMode:(MTLTriangleFillMode)f {objc_setAssociatedObject(self,"fill",@(f),OBJC_ASSOCIATION_RETAIN);[self raster];}
+-- (void)setDepthBias:(float)bias slopeScale:(float)slope clamp:(float)clamp {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setCullMode:(MTLCullMode)m { try { @try {objc_setAssociatedObject(self,"cull",@(m),OBJC_ASSOCIATION_RETAIN);[self raster];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setFrontFacingWinding:(MTLWinding)w { try { @try {objc_setAssociatedObject(self,"winding",@(w),OBJC_ASSOCIATION_RETAIN);[self raster];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setTriangleFillMode:(MTLTriangleFillMode)f { try { @try {objc_setAssociatedObject(self,"fill",@(f),OBJC_ASSOCIATION_RETAIN);[self raster];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setDepthBias:(float)bias slopeScale:(float)slope clamp:(float)clamp { try { @try {
+  [self check:nmb_render_set_depth_bias(self.handle,bias,slope,clamp) what:"setDepthBias"];
+-}
+-- (void)setLineWidth:(float)width {[self check:nmb_render_set_line_width(self.handle,width) what:"setLineWidth"];}
+-- (void)setVisibilityResultMode:(MTLVisibilityResultMode)mode offset:(NSUInteger)offset {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setLineWidth:(float)width { try { @try {[self check:nmb_render_set_line_width(self.handle,width) what:"setLineWidth"];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setVisibilityResultMode:(MTLVisibilityResultMode)mode offset:(NSUInteger)offset { try { @try {
+  [self check:nmb_render_set_visibility_mode(self.handle,mode,offset) what:"setVisibilityResultMode"];
+-}
+-- (void)setFragmentTexture:(id<MTLTexture>)t atTextureIndex:(NSUInteger)ti samplerState:(id<MTLSamplerState>)s atSamplerIndex:(NSUInteger)si {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setFragmentTexture:(id<MTLTexture>)t atTextureIndex:(NSUInteger)ti samplerState:(id<MTLSamplerState>)s atSamplerIndex:(NSUInteger)si { try { @try {
+  [self texture:t index:ti stage:2];[self sampler:s index:si stage:2];
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // Tile shaders and imageblock tile memory (Apple GPU families 4 and up) are not offered: supportsTileShaders answers no, and a call that
+ // reaches one anyway fails its command buffer.
+-- (NSUInteger)tileWidth {return 0;}
+-- (NSUInteger)tileHeight {return 0;}
+-- (void)setTileTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {(void)t;(void)i;[self.commandBuffer refuse:@"tile shaders are not supported"];}
+-- (void)setTileBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {(void)p;(void)n;(void)i;[self.commandBuffer refuse:@"tile shaders are not supported"];}
+-- (void)dispatchThreadsPerTile:(MTLSize)size {(void)size;[self.commandBuffer refuse:@"tile shaders are not supported"];}
+-- (void)dispatchThreadsPerTile:(MTLSize)size inRegion:(MTLRegion)region {(void)size;(void)region;[self.commandBuffer refuse:@"tile shaders are not supported"];}
+-- (void)setStencilReferenceValue:(uint32_t)v {[self check:nmb_render_set_stencil_reference(self.handle,v,v) what:"setStencilReferenceValue"];}
+-- (void)setStencilFrontReferenceValue:(uint32_t)f backReferenceValue:(uint32_t)b {
++- (NSUInteger)tileWidth { try { @try {return 0;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSUInteger)tileHeight { try { @try {return 0;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setTileTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { try { @try {(void)t;(void)i;[self.commandBuffer refuse:@"tile shaders are not supported"];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setTileBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i { try { @try {(void)p;(void)n;(void)i;[self.commandBuffer refuse:@"tile shaders are not supported"];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)dispatchThreadsPerTile:(MTLSize)size { try { @try {(void)size;[self.commandBuffer refuse:@"tile shaders are not supported"];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)dispatchThreadsPerTile:(MTLSize)size inRegion:(MTLRegion)region { try { @try {(void)size;(void)region;[self.commandBuffer refuse:@"tile shaders are not supported"];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setStencilReferenceValue:(uint32_t)v { try { @try {[self check:nmb_render_set_stencil_reference(self.handle,v,v) what:"setStencilReferenceValue"];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setStencilFrontReferenceValue:(uint32_t)f backReferenceValue:(uint32_t)b { try { @try {
+  [self check:nmb_render_set_stencil_reference(self.handle,f,b) what:"setStencilReferenceValues"];
+-}
+-- (void)setBlendColorRed:(float)r green:(float)g blue:(float)b alpha:(float)a {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setBlendColorRed:(float)r green:(float)g blue:(float)b alpha:(float)a { try { @try {
+  const float c[4]={r,g,b,a};[self check:nmb_render_set_blend_color(self.handle,c) what:"setBlendColor"];
+-}
+-- (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b { try { @try {
++ if(self.fuxiStoredSurface)self.commandBuffer->encodedWork.storedSurface=true;
+  gDraws++;self.commandBuffer->encodedWork.draws++;
+  [self check:nmb_render_draw(self.handle,t,(uint32_t)s,(uint32_t)n,(uint32_t)i,(uint32_t)b) what:"drawPrimitives"];
+-}
+-- (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i { try { @try {
+  [self drawPrimitives:t vertexStart:s vertexCount:n instanceCount:i baseInstance:0];
+-}
+-- (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n { try { @try {
+  [self drawPrimitives:t vertexStart:s vertexCount:n instanceCount:1 baseInstance:0];
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o
+-                instanceCount:(NSUInteger)i baseVertex:(NSInteger)v baseInstance:(NSUInteger)bi {
++                instanceCount:(NSUInteger)i baseVertex:(NSInteger)v baseInstance:(NSUInteger)bi { try { @try {
+  if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign index buffer"];return;}
+  [self.commandBuffer.resourceOwners addObject:b];
++ if(self.fuxiStoredSurface)self.commandBuffer->encodedWork.storedSurface=true;
+  gDraws++;self.commandBuffer->encodedWork.draws++;
+  [self check:nmb_render_draw_indexed(self.handle,t,(uint32_t)n,k,[(NBBuffer *)b handle],o,(uint32_t)i,(int32_t)v,(uint32_t)bi) what:"drawIndexedPrimitives"];
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o
+-                instanceCount:(NSUInteger)i {
++                instanceCount:(NSUInteger)i { try { @try {
+  [self drawIndexedPrimitives:t indexCount:n indexType:k indexBuffer:b indexBufferOffset:o instanceCount:i baseVertex:0 baseInstance:0];
+-}
+-- (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o { try { @try {
+  [self drawIndexedPrimitives:t indexCount:n indexType:k indexBuffer:b indexBufferOffset:o instanceCount:1 baseVertex:0 baseInstance:0];
+-}
+-- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u stages:(MTLRenderStages)s {(void)r;(void)u;(void)s;}
+-- (void)updateFence:(id<MTLFence>)fence afterStages:(MTLRenderStages)stages {[self fence:fence stages:stages update:true];}
+-- (void)waitForFence:(id<MTLFence>)fence beforeStages:(MTLRenderStages)stages {[self fence:fence stages:stages update:false];}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u stages:(MTLRenderStages)s { try { @try {(void)r;(void)u;(void)s;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)updateFence:(id<MTLFence>)fence afterStages:(MTLRenderStages)stages { try { @try {[self fence:fence stages:stages update:true];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)waitForFence:(id<MTLFence>)fence beforeStages:(MTLRenderStages)stages { try { @try {[self fence:fence stages:stages update:false];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ @end
+
+ @interface NBBlitEncoder : NBEncoder
+@@ -736,12 +762,12 @@ static void waitForResource(id resource) {
+ // The arguments are passed as a plain array: an NSArray literal raises on a nil element, and a nil resource (a refused allocation) must fail the
+ // command buffer like any invalid argument, not abort the host process.
+ #define NB_OBJECTS(...) ((__unsafe_unretained id[]){__VA_ARGS__})
+-- (bool)buffers:(__unsafe_unretained id *)objects count:(size_t)count {
++- (bool)buffers:(__unsafe_unretained id *)objects count:(size_t)count { try { @try {
+  for(size_t i=0;i<count;i++)if(![objects[i] isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"missing or foreign blit buffer"];return false;}
+  for(size_t i=0;i<count;i++)[self.commandBuffer.resourceOwners addObject:objects[i]];
+  return true;
+-}
+-- (bool)textures:(__unsafe_unretained id *)objects count:(size_t)count {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (bool)textures:(__unsafe_unretained id *)objects count:(size_t)count { try { @try {
+  for(size_t i=0;i<count;i++) {
+   id o=objects[i];
+   if(![o isKindOfClass:[NBTexture class]]){[self.commandBuffer refuse:@"missing or foreign blit texture"];return false;}
+@@ -749,22 +775,22 @@ static void waitForResource(id resource) {
+   if([(NBTexture *)o surface])[self.commandBuffer.surfaces addObject:o];
+  }
+  return true;
+-}
+-- (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)so toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)dO size:(NSUInteger)n {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)so toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)dO size:(NSUInteger)n { try { @try {
+  if(![self buffers:NB_OBJECTS(s,d) count:2])return;
+  [self check:nmb_blit_copy_buffer(self.handle,[(NBBuffer *)s handle],so,[(NBBuffer *)d handle],dO,n) what:"copyFromBuffer:toBuffer:"];
+-}
+-- (void)fillBuffer:(id<MTLBuffer>)b range:(NSRange)r value:(uint8_t)v {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)fillBuffer:(id<MTLBuffer>)b range:(NSRange)r value:(uint8_t)v { try { @try {
+  if(![self buffers:NB_OBJECTS(b) count:1])return;
+  [self check:nmb_blit_fill_buffer(self.handle,[(NBBuffer *)b handle],r.location,r.location+r.length,v) what:"fillBuffer"];
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
+-              toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO {
++              toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO { try { @try {
+  if(![self textures:NB_OBJECTS(s,d) count:2])return;
+  const uint64_t a[3]={so.x,so.y,so.z},size[3]={z.width,z.height,z.depth},b[3]={dO.x,dO.y,dO.z};
+  [self check:nmb_blit_copy_texture(self.handle,[(NBTexture *)s handle],ss,sl,a,size,[(NBTexture *)d handle],ds,dl,b) what:"copyFromTexture:toTexture:"];
+-}
+-- (void)copyFromTexture:(id<MTLTexture>)s toTexture:(id<MTLTexture>)d {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)copyFromTexture:(id<MTLTexture>)s toTexture:(id<MTLTexture>)d { try { @try {
+  if(![self textures:NB_OBJECTS(s,d) count:2])return;
+  const NSUInteger levels=MIN(s.mipmapLevelCount,d.mipmapLevelCount),slices=MIN(s.arrayLength,d.arrayLength);
+  for(NSUInteger slice=0;slice<slices;slice++)for(NSUInteger level=0;level<levels;level++) {
+@@ -772,83 +798,85 @@ static void waitForResource(id resource) {
+   [self copyFromTexture:s sourceSlice:slice sourceLevel:level sourceOrigin:MTLOriginMake(0,0,0) sourceSize:size toTexture:d destinationSlice:slice
+        destinationLevel:level destinationOrigin:MTLOriginMake(0,0,0)];
+  }
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)o sourceBytesPerRow:(NSUInteger)row sourceBytesPerImage:(NSUInteger)image
+             sourceSize:(MTLSize)z toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level
+-     destinationOrigin:(MTLOrigin)dO {
++     destinationOrigin:(MTLOrigin)dO { try { @try {
+  if(![self buffers:NB_OBJECTS(s) count:1] || ![self textures:NB_OBJECTS(d) count:1])return;
+  const uint64_t size[3]={z.width,z.height,z.depth},b[3]={dO.x,dO.y,dO.z};
+  [self check:nmb_blit_buffer_to_texture(self.handle,[(NBBuffer *)s handle],o,row,image,size,[(NBTexture *)d handle],slice,level,b) what:"copyFromBuffer:toTexture:"];
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)slice sourceLevel:(NSUInteger)level sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
+-               toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)o destinationBytesPerRow:(NSUInteger)row destinationBytesPerImage:(NSUInteger)image {
++               toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)o destinationBytesPerRow:(NSUInteger)row destinationBytesPerImage:(NSUInteger)image { try { @try {
+  if(![self textures:NB_OBJECTS(s) count:1] || ![self buffers:NB_OBJECTS(d) count:1])return;
+  const uint64_t a[3]={so.x,so.y,so.z},size[3]={z.width,z.height,z.depth};
+  [self check:nmb_blit_texture_to_buffer(self.handle,[(NBTexture *)s handle],slice,level,a,size,[(NBBuffer *)d handle],o,row,image) what:"copyFromTexture:toBuffer:"];
+-}
+-- (void)generateMipmapsForTexture:(id<MTLTexture>)t {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)generateMipmapsForTexture:(id<MTLTexture>)t { try { @try {
+  if(![self textures:NB_OBJECTS(t) count:1])return;
+  [self check:nmb_blit_generate_mipmaps(self.handle,[(NBTexture *)t handle]) what:"generateMipmapsForTexture"];
+-}
+-- (void)synchronizeResource:(id<MTLResource>)r {(void)r;}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)synchronizeResource:(id<MTLResource>)r { try { @try {(void)r;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ @end
+
+ static void completed(void *context);
+ static void scheduled(void *context);
+ @implementation NBCommandBuffer
+-- (instancetype)init {
+- if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
++- (instancetype)init { try { @try {
++ if((self=[super init])){_fuxiSignals=[NSMutableArray array];_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
+  if(self)createdUs=nowUs();
+  return self;
+-}
+-- (void)dealloc {nmb_command_buffer_release(_handle);}
+-- (id<MTLCommandQueue>)commandQueue {return (id<MTLCommandQueue>)_queue;}
+-- (BOOL)retainedReferences {return YES;}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)dealloc { try { @try {nmb_command_buffer_release(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLCommandQueue>)commandQueue { try { @try {return (id<MTLCommandQueue>)_queue;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (BOOL)retainedReferences { try { @try {return YES;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // Protected content is not supported (the runtime's AppleOnlyCall::SetProtectionOptions takes Metal's default only): any other option fails
+ // the command buffer.
+-- (uint64_t)protectionOptions {return 0;}
+-- (void)setProtectionOptions:(uint64_t)options {if(options)[self refuse:[NSString stringWithFormat:@"protection options 0x%llx",options]];}
+-- (void)refuse:(NSString *)what {
++- (uint64_t)protectionOptions { try { @try {return 0;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setProtectionOptions:(uint64_t)options { try { @try {if(options)[self refuse:[NSString stringWithFormat:@"protection options 0x%llx",options]];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)refuse:(NSString *)what { try { @try {
+  if(!self.encodeFailure){self.encodeFailure=what;NBLOG(@"native-metal: command buffer refused: %@",what);}
+-}
+-- (MTLCommandBufferStatus)status {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (MTLCommandBufferStatus)status { try { @try {
++ if(self.fuxiNoop)return MTLCommandBufferStatusCompleted;
+  if(self.failedLocally)return MTLCommandBufferStatusError;
+  return (MTLCommandBufferStatus)nmb_command_buffer_status(_handle);
+-}
+-- (NSError *)error {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSError *)error { try { @try {
++ if(self.fuxiNoop)return nil;
+  if(self.failedLocally)return nbError(self.encodeFailure);
+  if(self.status!=MTLCommandBufferStatusError)return nil;
+  char text[512]={};nmb_command_buffer_error(_handle,text,sizeof text);
+  return nbError([NSString stringWithUTF8String:text]);
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // Debug groups and cache hints name work for tools and the driver's caches; they change nothing the GPU computes here.
+-- (void)pushDebugGroup:(NSString *)name {(void)name;}
+-- (void)popDebugGroup {}
+-- (void)encodeCacheHintTag:(uint64_t)tag resourceGroups:(const id __unsafe_unretained [])groups count:(NSUInteger)count {(void)tag;(void)groups;(void)count;}
+-- (void)encodeCacheHintFinalize:(uint64_t)tag resourceGroups:(const id __unsafe_unretained [])groups count:(NSUInteger)count {(void)tag;(void)groups;(void)count;}
++- (void)pushDebugGroup:(NSString *)name { try { @try {(void)name;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)popDebugGroup { try { @try {} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)encodeCacheHintTag:(uint64_t)tag resourceGroups:(const id __unsafe_unretained [])groups count:(NSUInteger)count { try { @try {(void)tag;(void)groups;(void)count;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)encodeCacheHintFinalize:(uint64_t)tag resourceGroups:(const id __unsafe_unretained [])groups count:(NSUInteger)count { try { @try {(void)tag;(void)groups;(void)count;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // The kernel driver's own submission times are not recorded: 0 is Metal's answer where they are unavailable.
+-- (CFTimeInterval)kernelStartTime {return 0;}
+-- (CFTimeInterval)kernelEndTime {return 0;}
+-- (BOOL)commitAndWaitUntilSubmitted {[(id<MTLCommandBuffer>)self commit];[self waitUntilScheduled];return !self.failedLocally;}
+-- (CFTimeInterval)GPUStartTime {return nmb_command_buffer_gpu_time(_handle,false);}
+-- (CFTimeInterval)GPUEndTime {return nmb_command_buffer_gpu_time(_handle,true);}
+-- (id)encoder:(NBEncoder *)encoder handle:(NmbEncoder *)handle what:(NSString *)what {
++- (CFTimeInterval)kernelStartTime { try { @try {return 0;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (CFTimeInterval)kernelEndTime { try { @try {return 0;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (BOOL)commitAndWaitUntilSubmitted { try { @try {[(id<MTLCommandBuffer>)self commit];[self waitUntilScheduled];return !self.failedLocally;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (CFTimeInterval)GPUStartTime { try { @try {return nmb_command_buffer_gpu_time(_handle,false);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (CFTimeInterval)GPUEndTime { try { @try {return nmb_command_buffer_gpu_time(_handle,true);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id)encoder:(NBEncoder *)encoder handle:(NmbEncoder *)handle what:(NSString *)what { try { @try {
+  if(self.committed){[self refuse:[what stringByAppendingString:@" after commit"]];return nil;}
+  if(!handle){[self refuse:[NSString stringWithFormat:@"%@: %@",what,lastError()]];return nil;}
+  encoder.handle=handle;encoder.commandBuffer=self;return encoder;
+-}
+-- (id<MTLComputeCommandEncoder>)computeCommandEncoder {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLComputeCommandEncoder>)computeCommandEncoder { try { @try {
+  return [self encoder:[NBComputeEncoder new] handle:self.committed?nullptr:nmb_compute_encoder_new(_handle) what:@"computeCommandEncoder"];
+-}
+-- (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDispatchType:(MTLDispatchType)type {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDispatchType:(MTLDispatchType)type { try { @try {
+  if(type!=MTLDispatchTypeSerial){[self refuse:@"concurrent compute dispatch"];return nil;}
+  return [self computeCommandEncoder];
+-}
+-- (id<MTLBlitCommandEncoder>)blitCommandEncoder {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLBlitCommandEncoder>)blitCommandEncoder { try { @try {
+  gBlits++;encodedWork.blits++;
+  return [self encoder:[NBBlitEncoder new] handle:self.committed?nullptr:nmb_blit_encoder_new(_handle) what:@"blitCommandEncoder"];
+-}
+-- (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d { try { @try {
+  NmbRenderPassDescriptor pass={};
+  {
+   id<MTLTexture> first=d.colorAttachments[0].texture;
+@@ -867,9 +895,14 @@ static void scheduled(void *context);
+   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
+   return true;
+  };
++ bool storesSurface=false;
+  for(unsigned i=0;i<8;i++) {
+   MTLRenderPassColorAttachmentDescriptor *c=d.colorAttachments[i];
+   if(!attachment(c,pass.colors[i])){[self refuse:@"foreign color attachment"];return nil;}
++  if(c.texture && [(NBTexture *)c.texture surface] && c.storeAction==MTLStoreActionStore){
++   storesSurface=true;
++   if(c.loadAction==MTLLoadActionClear || c.loadAction==MTLLoadActionLoad)encodedWork.storedSurface=true;
++  }
+   pass.colors[i].clear[0]=c.clearColor.red;pass.colors[i].clear[1]=c.clearColor.green;pass.colors[i].clear[2]=c.clearColor.blue;pass.colors[i].clear[3]=c.clearColor.alpha;
+  }
+  if(!attachment(d.depthAttachment,pass.depth) || !attachment(d.stencilAttachment,pass.stencil)){[self refuse:@"foreign depth/stencil attachment"];return nil;}
+@@ -880,25 +913,28 @@ static void scheduled(void *context);
+   [_resourceOwners addObject:d.visibilityResultBuffer];
+   pass.visibility=[(NBBuffer *)d.visibilityResultBuffer handle];
+  }
+- return [self encoder:[NBRenderEncoder new] handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
+-}
+-- (void)addScheduledHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}}
+-- (void)addCompletedHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_completedHandlers addObject:[block copy]];}}
++ NBRenderEncoder *encoder=[NBRenderEncoder new];encoder.fuxiStoredSurface=storesSurface;
++ return [self encoder:encoder handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)addScheduledHandler:(MTLCommandBufferHandler)block { try { @try {if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)addCompletedHandler:(MTLCommandBufferHandler)block { try { @try {if(block)@synchronized(self){[_completedHandlers addObject:[block copy]];}} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // A drawable (RenderBox's CAMetalLayer path) is presented once the GPU has written it: this runtime's scheduling comes before completion.
+-- (void)presentDrawable:(id<MTLDrawable>)drawable {[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable present];}];}
+-- (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time {[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable presentAtTime:time];}];}
+-- (void)enqueue {}
+-- (void)event:(id<MTLEvent>)event value:(uint64_t)value signal:(bool)signal {
++- (void)presentDrawable:(id<MTLDrawable>)drawable { try { @try {[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable present];}];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time { try { @try {[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable presentAtTime:time];}];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)enqueue { try { @try {} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)event:(id<MTLEvent>)event value:(uint64_t)value signal:(bool)signal { try { @try {
+  if(![(id)event isKindOfClass:[NBEvent class]]){[self refuse:@"foreign event"];return;}
+  if(self.committed){[self refuse:@"event encoded after commit"];return;}
++ if(signal)[_fuxiSignals addObject:@[event,@(value)]];
++ if(fuxiBlocked())return;
+  NmbEvent *handle=[(NBEvent *)event handle];
+  if(!(signal?nmb_command_buffer_signal_event(_handle,handle,value):nmb_command_buffer_wait_event(_handle,handle,value)))
+   [self refuse:[NSString stringWithFormat:@"%s: %@",signal?"encodeSignalEvent":"encodeWaitForEvent",lastError()]];
+-}
+-- (void)encodeSignalEvent:(id<MTLEvent>)event value:(uint64_t)value {[self event:event value:value signal:true];}
+-- (void)encodeWaitForEvent:(id<MTLEvent>)event value:(uint64_t)value {[self event:event value:value signal:false];}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)encodeSignalEvent:(id<MTLEvent>)event value:(uint64_t)value { try { @try {[self event:event value:value signal:true];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)encodeWaitForEvent:(id<MTLEvent>)event value:(uint64_t)value { try { @try {[self event:event value:value signal:false];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // The runtime has submitted the work. Deliver scheduling without waiting for GPU completion.
+-- (void)didSchedule {
++- (void)didSchedule { try { @try {
+  {
+   const uint64_t took=nowUs()-self.committedUs;
+   std::lock_guard<std::mutex> lock(gCommitLock);
+@@ -916,9 +952,9 @@ static void scheduled(void *context);
+  // Run on the runtime's scheduled-handler thread, preserving its ordering and own-wait
+  // deadlock checks. The queue's completionQueue routes completed handlers only.
+  run();
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
+-- (void)finish {
++- (void)finish { try { @try {
+  flushSurfaces(_surfaces);
+  // Actual GPU completion (or a local refusal that never submitted) is the
+  // release point. A retained completed command must not pin every old frame.
+@@ -936,8 +972,8 @@ static void scheduled(void *context);
+  };
+  dispatch_queue_t queue=_queue.completionQueue;
+  if(queue)dispatch_async(queue,run);else run();
+-}
+-- (void)commit {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)commit { try { @try {
+  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
+  self.committed=YES;
+  self.committedUs=nowUs();
+@@ -951,6 +987,12 @@ static void scheduled(void *context);
+  dispatch_group_enter(_handlers);
+  dispatch_group_enter(_schedulingHandlers);
+  @synchronized(gInFlight){[gInFlight addObject:self];}
++ if(fuxiBlocked()){
++  self.fuxiNoop=YES;
++  for(NSArray *signal in _fuxiSignals)if(!nmb_shared_event_set_value([(NBEvent *)signal[0] handle],[signal[1] unsignedLongLongValue]))noteProblem(@"survey event signal refused");
++  [self didSchedule];
++  dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT,0),^{[self finish];});return;
++ }
+  if(!self.encodeFailure) {
+   flushSurfaces(_surfaces);
+   // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
+@@ -962,29 +1004,38 @@ static void scheduled(void *context);
+  }
+  self.failedLocally=YES;gCommitFailures++;
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT,0),^{[self finish];});
+-}
+-- (void)waitUntilCompleted {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)waitUntilCompleted { try { @try {
+  if(!self.committed)return;
+  const uint64_t began=nowUs();
+- if(!self.failedLocally)nmb_command_buffer_wait(_handle,0);
++ if(!self.failedLocally && !self.fuxiNoop && nmb_command_buffer_wait(_handle,0)!=0)NBLOG(@"native-metal: waitUntilCompleted refused: %@",lastError());
+  dispatch_group_wait(_handlers,DISPATCH_TIME_FOREVER);
+  gTimeWaitCompleted.add(began);
+-}
+-- (void)waitUntilScheduled {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)waitUntilScheduled { try { @try {
+  if(!self.committed)return;
+  const uint64_t began=nowUs();
+- if(!self.failedLocally && !nmb_command_buffer_wait_scheduled(_handle)){
++ if(!self.failedLocally && !self.fuxiNoop && !nmb_command_buffer_wait_scheduled(_handle)){
+   NBLOG(@"native-metal: waitUntilScheduled refused: %@",lastError());return;
+  }
+  dispatch_group_wait(_schedulingHandlers,DISPATCH_TIME_FOREVER);
+  gTimeWaitScheduled.add(began);
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ @end
+ static void scheduled(void *context) {[(__bridge NBCommandBuffer *)context didSchedule];}
+ // The runtime's completion: the command buffer's own reference, taken at commit, is given back here.
+ static void completed(void *context) {
+  gCompleted++;
+  NBCommandBuffer *commandBuffer=(__bridge_transfer NBCommandBuffer *)context;
++ if(nmb_command_buffer_status(commandBuffer.handle)==MTLCommandBufferStatusError){
++  char text[512]={};nmb_command_buffer_error(commandBuffer.handle,text,sizeof(text));fuxiFailure(text);
++ }else if(gFuxiHooks.completed){
++  // Report actual completion counters; only stored IOSurface passes qualify the gate.
++  double start=nmb_command_buffer_gpu_time(commandBuffer.handle,false),end=nmb_command_buffer_gpu_time(commandBuffer.handle,true);
++  gFuxiHooks.completed(end>start?uint64_t((end-start)*1e9):0,double(nowUs()-commandBuffer.committedUs)/1000.0,
++   commandBuffer->encodedWork.draws,commandBuffer->encodedWork.storedSurface);
++ }
++
+  {
+   const uint64_t took=nowUs()-commandBuffer.committedUs;
+   gTimeEncodeToCommit.count++;gTimeEncodeToCommit.total+=took;
+@@ -997,22 +1048,22 @@ static void completed(void *context) {
+ }
+
+ @implementation NBQueue
+-- (void)dealloc {nmb_queue_release(_handle);}
+-- (id<MTLCommandBuffer>)commandBuffer {
++- (void)dealloc { try { @try {nmb_queue_release(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLCommandBuffer>)commandBuffer { try { @try {
+  NmbCommandBuffer *handle=nmb_command_buffer_new(_handle);
+  if(!handle){NBLOG(@"native-metal: commandBuffer refused: %@",lastError());return nil;}
+  NBCommandBuffer *commandBuffer=[NBCommandBuffer new];commandBuffer.handle=handle;commandBuffer.queue=self;return (id<MTLCommandBuffer>)commandBuffer;
+-}
+-- (id<MTLCommandBuffer>)commandBufferWithUnretainedReferences {return [self commandBuffer];}
+-- (void)setSubmissionQueue:(dispatch_queue_t)queue {(void)queue;}   // submission happens on the caller's thread here
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLCommandBuffer>)commandBufferWithUnretainedReferences { try { @try {return [self commandBuffer];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)setSubmissionQueue:(dispatch_queue_t)queue { try { @try {(void)queue;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }   // submission happens on the caller's thread here
+ // setCompletionQueue: is the property's setter.
+ // GPU priorities are not applied (one hardware queue): reported as not applied.
+-- (BOOL)setGPUPriority:(NSUInteger)priority {(void)priority;return NO;}
+-- (BOOL)setBackgroundGPUPriority:(NSUInteger)priority {(void)priority;return NO;}
++- (BOOL)setGPUPriority:(NSUInteger)priority { try { @try {(void)priority;return NO;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (BOOL)setBackgroundGPUPriority:(NSUInteger)priority { try { @try {(void)priority;return NO;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // What a new Metal queue reports (MTLIOAccelCommandQueue: normal 1, background 3). RenderBox and Core Image read both before any frame.
+-- (NSUInteger)getGPUPriority {return 1;}
+-- (NSUInteger)getBackgroundGPUPriority {return 3;}
+-- (id<MTLCommandBuffer>)commandBufferWithDescriptor:(MTLCommandBufferDescriptor *)d {(void)d;return [self commandBuffer];}
++- (NSUInteger)getGPUPriority { try { @try {return 1;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSUInteger)getBackgroundGPUPriority { try { @try {return 3;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLCommandBuffer>)commandBufferWithDescriptor:(MTLCommandBufferDescriptor *)d { try { @try {(void)d;return [self commandBuffer];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ @end
+
+ // ---- the device ----
+@@ -1111,41 +1162,41 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
+ @property(nonatomic) MTLHeapType heapType;
+ @end
+ @implementation NBHeap
+-- (void)dealloc {nmb_heap_release(_handle);}
+-- (NSUInteger)size {return nmb_heap_size(_handle);}
+-- (NSUInteger)usedSize {return nmb_heap_used_size(_handle);}
+-- (NSUInteger)currentAllocatedSize {return nmb_heap_allocated_size(_handle);}
+-- (NSUInteger)maxAvailableSizeWithAlignment:(NSUInteger)alignment {return nmb_heap_max_available_size(_handle,alignment);}
+-- (MTLResourceOptions)resourceOptions {return _options;}
+-- (MTLStorageMode)storageMode {return (MTLStorageMode)((_options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);}
+-- (MTLCPUCacheMode)cpuCacheMode {return (MTLCPUCacheMode)((_options&MTLResourceCPUCacheModeMask)>>MTLResourceCPUCacheModeShift);}
+-- (MTLHazardTrackingMode)hazardTrackingMode {return (MTLHazardTrackingMode)((_options&MTLResourceHazardTrackingModeMask)>>MTLResourceHazardTrackingModeShift);}
+-- (MTLHeapType)type {return _heapType;}
+-- (uint64_t)protectionOptions {return 0;}
+-- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {
++- (void)dealloc { try { @try {nmb_heap_release(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSUInteger)size { try { @try {return nmb_heap_size(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSUInteger)usedSize { try { @try {return nmb_heap_used_size(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSUInteger)currentAllocatedSize { try { @try {return nmb_heap_allocated_size(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSUInteger)maxAvailableSizeWithAlignment:(NSUInteger)alignment { try { @try {return nmb_heap_max_available_size(_handle,alignment);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (MTLResourceOptions)resourceOptions { try { @try {return _options;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (MTLStorageMode)storageMode { try { @try {return (MTLStorageMode)((_options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (MTLCPUCacheMode)cpuCacheMode { try { @try {return (MTLCPUCacheMode)((_options&MTLResourceCPUCacheModeMask)>>MTLResourceCPUCacheModeShift);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (MTLHazardTrackingMode)hazardTrackingMode { try { @try {return (MTLHazardTrackingMode)((_options&MTLResourceHazardTrackingModeMask)>>MTLResourceHazardTrackingModeShift);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (MTLHeapType)type { try { @try {return _heapType;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (uint64_t)protectionOptions { try { @try {return 0;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { try { @try {
+  const uint64_t answer=nmb_heap_set_purgeable_state(_handle,state);
+  if(!answer)NBLOG(@"native-metal: heap setPurgeableState refused: %@",lastError());
+  return (MTLPurgeableState)answer;
+-}
+-- (id<MTLBuffer>)bufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options offset:(uint64_t)offset {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLBuffer>)bufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options offset:(uint64_t)offset { try { @try {
+  NmbBuffer *handle=nmb_heap_new_buffer(_handle,length,options,offset);
+  if(!handle){NBLOG(@"native-metal: heap buffer refused: %@",lastError());return nil;}
+  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.parentHeap=(id<MTLHeap>)self;
+  buffer.heapOffset=offset==UINT64_MAX?0:offset;return (id<MTLBuffer>)buffer;
+-}
+-- (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {return [self bufferWithLength:length options:options offset:UINT64_MAX];}
+-- (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options offset:(NSUInteger)offset {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options { try { @try {return [self bufferWithLength:length options:options offset:UINT64_MAX];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options offset:(NSUInteger)offset { try { @try {
+  return [self bufferWithLength:length options:options offset:offset];
+-}
+-- (id<MTLTexture>)textureWithDescriptor:(MTLTextureDescriptor *)d offset:(uint64_t)offset {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLTexture>)textureWithDescriptor:(MTLTextureDescriptor *)d offset:(uint64_t)offset { try { @try {
+  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
+  NmbTexture *handle=nmb_heap_new_texture(_handle,&descriptor,offset);
+  if(!handle){NBLOG(@"native-metal: heap texture refused: %@",lastError());return nil;}
+  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
+  texture.parentHeap=(id<MTLHeap>)self;texture.heapOffset=offset==UINT64_MAX?0:offset;return (id<MTLTexture>)texture;
+-}
+-- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {return [self textureWithDescriptor:d offset:UINT64_MAX];}
+-- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset {return [self textureWithDescriptor:d offset:offset];}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d { try { @try {return [self textureWithDescriptor:d offset:UINT64_MAX];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset { try { @try {return [self textureWithDescriptor:d offset:offset];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ @end
+ // Apple's SPI resource groups name resources for cache hints (encodeCacheHintTag:/Finalize:); a group only keeps its resources alive.
+ @interface NBResourceGroup : NBObject
+@@ -1184,24 +1235,24 @@ static bool computeDescriptor(MTLComputePipelineDescriptor *d,NmbComputePipeline
+ @property(nonatomic) NmbBinaryArchive *handle;
+ @end
+ @implementation NBBinaryArchive
+-- (void)dealloc {nmb_binary_archive_release(_handle);}
+-- (NSUInteger)options {return 0;}
+-- (BOOL)addRenderPipelineFunctionsWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {
++- (void)dealloc { try { @try {nmb_binary_archive_release(_handle);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSUInteger)options { try { @try {return 0;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (BOOL)addRenderPipelineFunctionsWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)error { try { @try {
+  auto *p=new NmbRenderPipelineDescriptor();
+  const bool ok=renderDescriptor(d,p,error) && nmb_binary_archive_add_render(_handle,p);delete p;
+  if(!ok)return failWith<BOOL>(error,@"archive render pipeline",NO);
+  if(error)*error=nil;return YES;
+-}
+-- (BOOL)addComputePipelineFunctionsWithDescriptor:(MTLComputePipelineDescriptor *)d error:(NSError **)error {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (BOOL)addComputePipelineFunctionsWithDescriptor:(MTLComputePipelineDescriptor *)d error:(NSError **)error { try { @try {
+  NmbComputePipelineDescriptor p={};if(!computeDescriptor(d,&p,error))return NO;
+  if(!nmb_binary_archive_add_compute_descriptor(_handle,&p))return failWith<BOOL>(error,@"archive compute pipeline",NO);
+  if(error)*error=nil;return YES;
+-}
+-- (BOOL)serializeToURL:(NSURL *)url error:(NSError **)error {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (BOOL)serializeToURL:(NSURL *)url error:(NSError **)error { try { @try {
+  if(!url.isFileURL){if(error)*error=nbError(@"a file URL is required");return NO;}
+  if(!nmb_binary_archive_serialize(_handle,url.fileSystemRepresentation))return failWith<BOOL>(error,@"archive serialize",NO);
+  if(error)*error=nil;return YES;
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ @end
+
+ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &archives,NSError **error) {
+@@ -1215,93 +1266,111 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+ @interface NBDeviceMethods : NSObject
+ @end
+ @implementation NBDeviceMethods
+-- (NSString *)name {return gName;}
+-- (uint64_t)registryID {return gRegistryID;}
+-- (NSUInteger)maxBufferLength {return nmb_device_max_buffer_length(gDevice);}
+-- (BOOL)hasUnifiedMemory {return YES;}
++- (id)_deviceWrapper { try { @try {return self;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSMethodSignature *)methodSignatureForSelector:(SEL)selector { try { @try {
++ Method m=class_getInstanceMethod(object_getClass(self),selector);
++ if(m)return [NSMethodSignature signatureWithObjCTypes:method_getTypeEncoding(m)];
++ for(const char *name : {"MTLDevice","MTLDeviceSPI"}){
++  Protocol *protocol=objc_getProtocol(name);if(!protocol)continue;
++  for(BOOL required : {YES,NO}){
++   objc_method_description d=protocol_getMethodDescription(protocol,selector,required,YES);
++   if(d.types)return [NSMethodSignature signatureWithObjCTypes:d.types];
++  }
++ }
++ return [NSMethodSignature signatureWithObjCTypes:"@@:"];
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)forwardInvocation:(NSInvocation *)invocation { try { @try {
++ noteProblem([NSString stringWithFormat:@"missing device %s",sel_getName(invocation.selector)]);
++ NSUInteger bytes=invocation.methodSignature.methodReturnLength;
++ if(bytes){void *zero=calloc(1,bytes);[invocation setReturnValue:zero];free(zero);}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSString *)name { try { @try {return gName;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (uint64_t)registryID { try { @try {return gRegistryID;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSUInteger)maxBufferLength { try { @try {return nmb_device_max_buffer_length(gDevice);} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (BOOL)hasUnifiedMemory { try { @try {return YES;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // Core Image's CIMetalDeviceGetLimits reads both (Apple's GPU devices answer them; _MTLDevice does not): without them every CIContext
+ // creation threw and iconservicesagent aborted while rasterizing symbol glyphs. The GPU has no memory of its own; it shares the system's.
+-- (uint64_t)dedicatedMemorySize {return 0;}
+-- (uint64_t)sharedMemorySize {return [NSProcessInfo processInfo].physicalMemory;}
+-- (BOOL)isLowPower {return NO;}
+-- (BOOL)isRemovable {return NO;}
+-- (BOOL)isHeadless {return NO;}
++- (uint64_t)dedicatedMemorySize { try { @try {return 0;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (uint64_t)sharedMemorySize { try { @try {return [NSProcessInfo processInfo].physicalMemory;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (BOOL)isLowPower { try { @try {return NO;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (BOOL)isRemovable { try { @try {return NO;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (BOOL)isHeadless { try { @try {return NO;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // supportsFamily: and the other queries the runtime answers are installed from it (installAnswers); supportsFamily: also answers the target
+ // hardware's families (the bridge's TARGET_FAMILIES, journaled with their waived rows as F lines). No legacy feature set is claimed: the
+ // base implementation reads Apple tables this device does not have.
+-- (BOOL)supportsFeatureSet:(MTLFeatureSet)set {(void)set;return NO;}
++- (BOOL)supportsFeatureSet:(MTLFeatureSet)set { try { @try {(void)set;return NO;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // The original discovery (_MTLAddDevice) runs these four on every device it registers. The target's own versions fill the base class's limits
+ // and feature tables from a hardware profile (`featureProfile`, `indirectArgumentBufferCapabilities`, a table of Apple GPUs) that this device
+ // has not got: running them would claim an Apple GPU's capabilities. They are empty here, so a limit or feature the runtime measured is answered
+ // by this file's own answers (installAnswers) and any other stays the base class's neutral 0/NO. Nothing is claimed that nothing measured.
+-- (void)initLimits {}
+-- (void)initFeatureQueries {}
+-- (void)initGPUFamilySupport {}
+-- (void)initWorkarounds {}
+-- (NSString *)productName {return gName;}
+-- (NSString *)vendorName {char name[64]={};nmb_device_vendor_name(gDevice,name,sizeof name);return [NSString stringWithUTF8String:name];}
+-- (MTLSize)maxThreadsPerThreadgroup {
++- (void)initLimits { try { @try {} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)initFeatureQueries { try { @try {} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)initGPUFamilySupport { try { @try {} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)initWorkarounds { try { @try {} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSString *)productName { try { @try {return gName;} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSString *)vendorName { try { @try {char name[64]={};nmb_device_vendor_name(gDevice,name,sizeof name);return [NSString stringWithUTF8String:name];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (MTLSize)maxThreadsPerThreadgroup { try { @try {
+  uint64_t s[3]={};if(!nmb_device_max_threads_per_threadgroup(gDevice,s))NBLOG(@"native-metal: maxThreadsPerThreadgroup: %@",lastError());
+  return MTLSizeMake(s[0],s[1],s[2]);
+-}
+-- (void)doesNotRecognizeSelector:(SEL)selector {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)doesNotRecognizeSelector:(SEL)selector { try { @try {
+  if(gMissing)gMissing("NativeBridgeMetalDevice",sel_getName(selector));
+  noteProblem([NSString stringWithFormat:@"missing device %s",sel_getName(selector)]);
+  [super doesNotRecognizeSelector:selector];
+-}
+-- (id<MTLEvent>)newEvent {
+- NmbEvent *handle=nmb_event_new(gDevice,false);if(!handle)return nil;
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLEvent>)newEvent { try { @try {
++ NmbEvent *handle=nmb_event_new(gDevice,false);if(!handle){noteProblem(lastError());return nil;}
+  NBEvent *event=[NBEvent new];event.handle=handle;return (id<MTLEvent>)event;
+-}
+-- (id<MTLSharedEvent>)newSharedEvent {
+- NmbEvent *handle=nmb_event_new(gDevice,true);if(!handle)return nil;
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLSharedEvent>)newSharedEvent { try { @try {
++ NmbEvent *handle=nmb_event_new(gDevice,true);if(!handle){noteProblem(lastError());return nil;}
+  NBSharedEvent *event=[NBSharedEvent new];event.handle=handle;return (id<MTLSharedEvent>)event;
+-}
+-- (id<MTLFence>)newFence {
+- NmbFence *handle=nmb_fence_new(gDevice);if(!handle)return nil;
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLFence>)newFence { try { @try {
++ NmbFence *handle=nmb_fence_new(gDevice);if(!handle){noteProblem(lastError());return nil;}
+  NBFence *fence=[NBFence new];fence.handle=handle;return (id<MTLFence>)fence;
+-}
+-- (id<MTLCommandQueue>)newCommandQueue {
+- NmbQueue *handle=nmb_queue_new(gDevice);if(!handle)return nil;
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLCommandQueue>)newCommandQueue { try { @try {
++ NmbQueue *handle=nmb_queue_new(gDevice);if(!handle){noteProblem(lastError());return nil;}
+  NBQueue *queue=[NBQueue new];queue.handle=handle;return (id<MTLCommandQueue>)queue;
+-}
+-- (id<MTLHeap>)newHeapWithDescriptor:(MTLHeapDescriptor *)d {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLHeap>)newHeapWithDescriptor:(MTLHeapDescriptor *)d { try { @try {
+  if(!d)return nil;
+  NmbHeap *handle=nmb_heap_new(gDevice,d.type,d.size,(uint64_t)d.resourceOptions);
+  if(!handle){NBLOG(@"native-metal: heap refused: %@",lastError());return nil;}
+  NBHeap *heap=[NBHeap new];heap.handle=handle;heap.options=d.resourceOptions;heap.heapType=d.type;return (id<MTLHeap>)heap;
+-}
+-- (id)newResourceGroupFromResources:(const id __unsafe_unretained [])resources count:(NSUInteger)count {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id)newResourceGroupFromResources:(const id __unsafe_unretained [])resources count:(NSUInteger)count { try { @try {
+  NBResourceGroup *group=[NBResourceGroup new];
+  NSMutableArray *held=[NSMutableArray arrayWithCapacity:count];
+  for(NSUInteger i=0;i<count;i++)if(resources[i])[held addObject:resources[i]];
+  group.resources=held;return group;
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // Not made here: a texture over raw memory in Apple's layout, and Apple's texture layout object. Both are refused, with the reason, rather than
+ // answered with a guessed shape.
+-- (id<MTLTexture>)newTextureWithBytesNoCopy:(void *)bytes length:(NSUInteger)length descriptor:(MTLTextureDescriptor *)d deallocator:(void (^)(void *,NSUInteger))deallocator {
++- (id<MTLTexture>)newTextureWithBytesNoCopy:(void *)bytes length:(NSUInteger)length descriptor:(MTLTextureDescriptor *)d deallocator:(void (^)(void *,NSUInteger))deallocator { try { @try {
+  (void)bytes;(void)length;(void)d;(void)deallocator;
+  NBLOG(@"native-metal: newTextureWithBytesNoCopy:length:descriptor:deallocator: is not implemented (Apple's texture layout of raw memory is not known)");
+  return nil;
+-}
+-- (id)newTextureLayoutWithDescriptor:(MTLTextureDescriptor *)d isHeapOrBufferBacked:(BOOL)backed {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id)newTextureLayoutWithDescriptor:(MTLTextureDescriptor *)d isHeapOrBufferBacked:(BOOL)backed { try { @try {
+  (void)d;(void)backed;
+  NBLOG(@"native-metal: newTextureLayoutWithDescriptor:isHeapOrBufferBacked: is not implemented (Apple's layout object is not known)");
+  return nil;
+-}
+-- (id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)count {(void)count;return [(id<MTLDevice>)self newCommandQueue];}
+-- (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)count { try { @try {(void)count;return [(id<MTLDevice>)self newCommandQueue];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options { try { @try {
+  NmbBuffer *handle=nmb_buffer_new(gDevice,length,options,nullptr);
+  if(!handle){NBLOG(@"native-metal: buffer refused: %@",lastError());return nil;}
+  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;return (id<MTLBuffer>)buffer;
+-}
+-- (id<MTLBuffer>)newBufferWithBytes:(const void *)bytes length:(NSUInteger)length options:(MTLResourceOptions)options {
+- if(!bytes)return nil;
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLBuffer>)newBufferWithBytes:(const void *)bytes length:(NSUInteger)length options:(MTLResourceOptions)options { try { @try {
++ if(!bytes){noteProblem(@"missing library or buffer bytes");return nil;}
+  NmbBuffer *handle=nmb_buffer_new(gDevice,length,options,bytes);
+  if(!handle){NBLOG(@"native-metal: buffer refused: %@",lastError());return nil;}
+  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;return (id<MTLBuffer>)buffer;
+-}
+-- (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options deallocator:(void (^)(void *,NSUInteger))deallocator {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options deallocator:(void (^)(void *,NSUInteger))deallocator { try { @try {
+  void *context=deallocator?(__bridge_retained void *)[deallocator copy]:nullptr;
+  NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,pointer,length,options,context?releaseBlock:nullptr,context);
+  if(!handle) {
+@@ -1311,16 +1380,16 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+  gNoCopyAll++;if(context)gNoCopyMade++;
+  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.wrapped=pointer;
+  return (id<MTLBuffer>)buffer;
+-}
+-- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d { try { @try {
+  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
+  NmbTexture *handle=nmb_texture_new(gDevice,&descriptor);noteFormat((uint32_t)descriptor.format,handle!=nullptr);
+  if(!handle){NBLOG(@"native-metal: texture refused: %@",lastError());return nil;}
+  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;return (id<MTLTexture>)texture;
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // The surface's pages are the texels: its mapping in this process is imported without a copy (pinned by the kernel, mapped into the GPU's
+ // 4 KiB context by Turnip), so every process that imports the surface renders and samples the same memory.
+-- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane {
++- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane { try { @try {
+  // A planar surface (Apple's lossless-compressed BGRA spelling has one plane, video formats two) is imported whole; the texture starts at
+  // the plane's own address and rows. Only a plain surface has no planes, and then only plane 0 exists.
+  const size_t planes=surface?IOSurfaceGetPlaneCount(surface):0;
+@@ -1336,119 +1405,122 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+  NBTexture *texture=planes>=2?textureOnSurface(buffer,d,surface,plane,start-(uintptr_t)base,row):textureOnBuffer(buffer,d,start-(uintptr_t)base,row,true);
+  if(!texture){refuseSurface(5,surface,d,plane,start-(uintptr_t)base,row);return nil;}
+  gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);return (id<MTLTexture>)texture;
+-}
+-- (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error { try { @try {
+  const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);
+  const uint64_t libraryBegan=nowUs();
+  NmbLibrary *handle=nmb_library_new(gDevice,bytes,size,false);(void)mapped;gTimeLibrary.add(libraryBegan);
+  if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);
+  NBLibrary *library=[NBLibrary new];library.handle=handle;if(error)*error=nil;return (id<MTLLibrary>)library;
+-}
+-- (id<MTLLibrary>)newLibraryWithFile:(NSString *)path error:(NSError **)error {
+- NSData *bytes=path?[NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:error]:nil;if(!bytes)return nil;
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLLibrary>)newLibraryWithFile:(NSString *)path error:(NSError **)error { try { @try {
++ NSData *bytes=path?[NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:error]:nil;if(!bytes){noteProblem(@"missing library or buffer bytes");return nil;}
+  const uint64_t libraryBegan=nowUs();
+  NmbLibrary *handle=nmb_library_new(gDevice,bytes.bytes,bytes.length,false);gTimeLibrary.add(libraryBegan);
+  if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);
+  NBLibrary *library=[NBLibrary new];library.handle=handle;if(error)*error=nil;return (id<MTLLibrary>)library;
+-}
+-- (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(NSError **)error {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(NSError **)error { try { @try {
+  if(!url.isFileURL){if(error)*error=nbError(@"a file URL is required");return nil;}
+  return [(id<MTLDevice>)self newLibraryWithFile:url.path error:error];
+-}
+-- (id<MTLLibrary>)newDefaultLibraryWithBundle:(NSBundle *)bundle error:(NSError **)error {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLLibrary>)newDefaultLibraryWithBundle:(NSBundle *)bundle error:(NSError **)error { try { @try {
+  NSURL *url=[bundle URLForResource:@"default" withExtension:@"metallib"];
+  if(!url){if(error)*error=nbError(@"the bundle has no default.metallib");return nil;}
+  return [(id<MTLDevice>)self newLibraryWithURL:url error:error];
+-}
+-- (id<MTLLibrary>)newDefaultLibrary {return [(id<MTLDevice>)self newDefaultLibraryWithBundle:[NSBundle mainBundle] error:nil];}
+-- (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)function error:(NSError **)error {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLLibrary>)newDefaultLibrary { try { @try {return [(id<MTLDevice>)self newDefaultLibraryWithBundle:[NSBundle mainBundle] error:nil];} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)function error:(NSError **)error { try { @try {
+  return [(id<MTLDevice>)self newComputePipelineStateWithFunction:function options:MTLPipelineOptionNone reflection:nil error:error];
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)function options:(MTLPipelineOption)options
+-                                                         reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error {
++                                                         reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error { try { @try {
+  if(reflection)*reflection=nil;
+- if(![(id)function isKindOfClass:[NBFunction class]]){if(error)*error=nbError(@"foreign function");return nil;}
++ if(fuxiBlocked()){if(error)*error=nil;return (id)[NBComputePipeline new];}
++ if(![(id)function isKindOfClass:[NBFunction class]]){if(error)*error=nbError(@"foreign function");noteProblem(@"NBComputePipeline descriptor or function refused");if(fuxiBlocked()){if(error)*error=nil;return (id)[NBComputePipeline new];}return nil;}
+  const NmbPipelineOptions creation={(uint64_t)options,nullptr,0};
+  const uint64_t pipelineBegan=nowUs();
+  NmbComputePipeline *handle=nmb_compute_pipeline_new_with_options(gDevice,[(NBFunction *)function handle],&creation);gTimePipeline.add(pipelineBegan);
+- if(!handle)return failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);
++ if(!handle){auto refused=failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);if(fuxiBlocked()){if(error)*error=nil;return (id)[NBComputePipeline new];}return refused;}
+  NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLComputePipelineState>)state;
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(MTLPipelineOption)options
+-                                                       reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error {
++                                                       reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error { try { @try {
+  if(reflection)*reflection=nil;
+- NmbComputePipelineDescriptor p={};if(!computeDescriptor(d,&p,error))return nil;
++ if(fuxiBlocked()){if(error)*error=nil;return (id)[NBComputePipeline new];}
++ NmbComputePipelineDescriptor p={};if(!computeDescriptor(d,&p,error)){noteProblem(@"NBComputePipeline descriptor or function refused");if(fuxiBlocked()){if(error)*error=nil;return (id)[NBComputePipeline new];}return nil;}
+  std::vector<NmbBinaryArchive *> archives;
+- if(!pipelineArchives(d.binaryArchives,archives,error))return nil;
++ if(!pipelineArchives(d.binaryArchives,archives,error)){noteProblem(@"NBComputePipeline descriptor or function refused");if(fuxiBlocked()){if(error)*error=nil;return (id)[NBComputePipeline new];}return nil;}
+  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
+  const uint64_t pipelineBegan=nowUs();
+  NmbComputePipeline *handle=nmb_compute_pipeline_new_with_descriptor(gDevice,&p,&creation);gTimePipeline.add(pipelineBegan);
+- if(!handle)return failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);
++ if(!handle){auto refused=failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);if(fuxiBlocked()){if(error)*error=nil;return (id)[NBComputePipeline new];}return refused;}
+  NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;state.label=d.label;gPipelines++;
+  if(error)*error=nil;return (id<MTLComputePipelineState>)state;
+-}
+-- (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)error { try { @try {
+  return [(id<MTLDevice>)self newRenderPipelineStateWithDescriptor:d options:MTLPipelineOptionNone reflection:nil error:error];
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d options:(MTLPipelineOption)options
+-                                                        reflection:(MTLAutoreleasedRenderPipelineReflection *)reflection error:(NSError **)error {
++                                                        reflection:(MTLAutoreleasedRenderPipelineReflection *)reflection error:(NSError **)error { try { @try {
+  if(reflection)*reflection=nil;
++ if(fuxiBlocked()){if(error)*error=nil;return (id)[NBRenderPipeline new];}
+  auto *p=new NmbRenderPipelineDescriptor();
+- if(!renderDescriptor(d,p,error)){delete p;return nil;}
++ if(!renderDescriptor(d,p,error)){delete p;noteProblem(@"NBRenderPipeline descriptor or function refused");if(fuxiBlocked()){if(error)*error=nil;return (id)[NBRenderPipeline new];}return nil;}
+  std::vector<NmbBinaryArchive *> archives;
+- if(!pipelineArchives(d.binaryArchives,archives,error)){delete p;return nil;}
++ if(!pipelineArchives(d.binaryArchives,archives,error)){delete p;noteProblem(@"NBRenderPipeline descriptor or function refused");if(fuxiBlocked()){if(error)*error=nil;return (id)[NBRenderPipeline new];}return nil;}
+  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
+  const uint64_t pipelineBegan=nowUs();const NBCost costBegan=NBCost::now();
+  NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);delete p;gTimePipeline.add(pipelineBegan);
+  journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),gJournalPath.empty()?std::string():NBCost::now().since(costBegan));
+- if(!handle)return failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);
++ if(!handle){auto refused=failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);if(fuxiBlocked()){if(error)*error=nil;return (id)[NBRenderPipeline new];}return refused;}
+  NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLRenderPipelineState>)state;
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // The asynchronous forms make the pipeline on the caller's thread and call the handler before returning, as the library's
+ // newFunctionWithName:constantValues:completionHandler: does (RenderBox's pipeline loader, Core Image's bilateral solver).
+-- (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d completionHandler:(MTLNewRenderPipelineStateCompletionHandler)handler {
++- (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d completionHandler:(MTLNewRenderPipelineStateCompletionHandler)handler { try { @try {
+  NSError *error=nil;id<MTLRenderPipelineState> state=[(id<MTLDevice>)self newRenderPipelineStateWithDescriptor:d error:&error];
+  handler(state,error);
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d options:(MTLPipelineOption)options
+-                           completionHandler:(MTLNewRenderPipelineStateWithReflectionCompletionHandler)handler {
++                           completionHandler:(MTLNewRenderPipelineStateWithReflectionCompletionHandler)handler { try { @try {
+  NSError *error=nil;id<MTLRenderPipelineState> state=[(id<MTLDevice>)self newRenderPipelineStateWithDescriptor:d options:options reflection:nil error:&error];
+  handler(state,nil,error);
+-}
+-- (void)newComputePipelineStateWithFunction:(id<MTLFunction>)function completionHandler:(MTLNewComputePipelineStateCompletionHandler)handler {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (void)newComputePipelineStateWithFunction:(id<MTLFunction>)function completionHandler:(MTLNewComputePipelineStateCompletionHandler)handler { try { @try {
+  NSError *error=nil;id<MTLComputePipelineState> state=[(id<MTLDevice>)self newComputePipelineStateWithFunction:function error:&error];
+  handler(state,error);
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ - (void)newComputePipelineStateWithFunction:(id<MTLFunction>)function options:(MTLPipelineOption)options
+-                          completionHandler:(MTLNewComputePipelineStateWithReflectionCompletionHandler)handler {
++                          completionHandler:(MTLNewComputePipelineStateWithReflectionCompletionHandler)handler { try { @try {
+  NSError *error=nil;id<MTLComputePipelineState> state=[(id<MTLDevice>)self newComputePipelineStateWithFunction:function options:options reflection:nil error:&error];
+  handler(state,nil,error);
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ // SPI: a precompiled pipeline library (RenderBox.framework/default.pipelinelib) holds Apple GPU binaries. None is opened; the caller logs the
+ // error and builds its pipelines from the shader library instead (RB::Device::render_pipeline_state).
+-- (id)newPipelineLibraryWithFilePath:(NSString *)path error:(NSError **)error {
+- if(error)*error=nbError([NSString stringWithFormat:@"no pipeline library on this GPU: %@",path.lastPathComponent]);
++- (id)newPipelineLibraryWithFilePath:(NSString *)path error:(NSError **)error { try { @try {
++ if(error)*error=[NSError errorWithDomain:@"org.fuxi.native-metal.optional" code:-1 userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithFormat:@"no pipeline library on this GPU: %@",path.lastPathComponent]}];
+  return nil;
+-}
+-- (id<MTLBinaryArchive>)newBinaryArchiveWithDescriptor:(MTLBinaryArchiveDescriptor *)d error:(NSError **)error {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLBinaryArchive>)newBinaryArchiveWithDescriptor:(MTLBinaryArchiveDescriptor *)d error:(NSError **)error { try { @try {
+  if(d.url && !d.url.isFileURL){if(error)*error=nbError(@"a file URL is required");return nil;}
+  NmbBinaryArchive *handle=nmb_binary_archive_new(gDevice,d.url?d.url.fileSystemRepresentation:nullptr);
+  if(!handle)return failWith<id<MTLBinaryArchive>>(error,@"binary archive",nil);
+  NBBinaryArchive *archive=[NBBinaryArchive new];archive.handle=handle;if(error)*error=nil;return (id<MTLBinaryArchive>)archive;
+-}
+-- (NSUInteger)requiredLinearTextureBytesPerRowForDescriptor:(MTLTextureDescriptor *)d {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (NSUInteger)requiredLinearTextureBytesPerRowForDescriptor:(MTLTextureDescriptor *)d { try { @try {
+  const uint64_t row=nmb_device_linear_bytes_per_row(gDevice,d.pixelFormat,d.width);
+  if(!row)NBLOG(@"native-metal: requiredLinearTextureBytesPerRow: %@",lastError());
+  return row;
+-}
+-- (id<MTLSamplerState>)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)d {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLSamplerState>)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)d { try { @try {
+  NmbSamplerDescriptor s={(uint64_t)d.minFilter,(uint64_t)d.magFilter,(uint64_t)d.mipFilter,(uint64_t)d.sAddressMode,(uint64_t)d.tAddressMode,(uint64_t)d.rAddressMode,
+      (uint64_t)d.borderColor,(uint64_t)d.normalizedCoordinates,d.maxAnisotropy,(uint64_t)d.compareFunction,(uint64_t)d.lodAverage,d.lodMinClamp,d.lodMaxClamp};
+  NmbSampler *handle=nmb_sampler_new(gDevice,&s);
+  if(!handle){NBLOG(@"native-metal: sampler refused: %@",lastError());return nil;}
+  NBSampler *sampler=[NBSampler new];sampler.handle=handle;return (id<MTLSamplerState>)sampler;
+-}
+-- (id<MTLDepthStencilState>)newDepthStencilStateWithDescriptor:(MTLDepthStencilDescriptor *)d {
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
++- (id<MTLDepthStencilState>)newDepthStencilStateWithDescriptor:(MTLDepthStencilDescriptor *)d { try { @try {
+  auto face=[](MTLStencilDescriptor *s)->NmbStencil {
+   return {(uint64_t)s.stencilCompareFunction,(uint64_t)s.stencilFailureOperation,(uint64_t)s.depthFailureOperation,(uint64_t)s.depthStencilPassOperation,s.readMask,s.writeMask};
+  };
+@@ -1456,7 +1528,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+  NmbDepthStencil *handle=nmb_depth_stencil_new(gDevice,&s);
+  if(!handle){NBLOG(@"native-metal: depth/stencil state refused: %@",lastError());return nil;}
+  NBDepthStencil *state=[NBDepthStencil new];state.handle=handle;return (id<MTLDepthStencilState>)state;
+-}
++} @catch(NSException *e){fuxiFailure(e.reason.UTF8String);@throw;} } catch(const std::exception &e){fuxiFailure(e.what());throw;} catch(...){fuxiFailure("NativeMetal C++ exception");throw;} }
+ @end
+
+ // The device queries the runtime answers (nmb_device_answer_selector), as methods of the device class. One without an argument is read once
+@@ -1484,16 +1556,23 @@ static void installAnswers(Class cls) {
+    // swap's surface was '&w4a', 8 bytes per pixel, and every swap was refused).
+    if(!strcmp(name,"supportsExtendedXR10Formats"))value=0;
+    gAnswers[sel]=value;
+-   class_addMethod(cls,sel,kind==NMB_ANSWER_COUNT?(IMP)countAnswer:(IMP)flagAnswer,kind==NMB_ANSWER_COUNT?"Q16@0:8":"B16@0:8");
++   class_replaceMethod(cls,sel,kind==NMB_ANSWER_COUNT?(IMP)countAnswer:(IMP)flagAnswer,kind==NMB_ANSWER_COUNT?"Q16@0:8":"B16@0:8");
+    break;
+-  case NMB_ANSWER_COUNT_ARG: class_addMethod(cls,sel,(IMP)countArgAnswer,"Q24@0:8Q16");break;
+-  case NMB_ANSWER_FLAG_ARG: class_addMethod(cls,sel,(IMP)flagArgAnswer,"B24@0:8Q16");break;
++  case NMB_ANSWER_COUNT_ARG: class_replaceMethod(cls,sel,(IMP)countArgAnswer,"Q24@0:8Q16");break;
++  case NMB_ANSWER_FLAG_ARG: class_replaceMethod(cls,sel,(IMP)flagArgAnswer,"B24@0:8Q16");break;
+   }
+  }
+ }
+
++static void fuxiDeviceInitialize(Class,SEL) {}
++
+ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
+  if(gDeviceObject)return gDeviceObject;
++#if TARGET_OS_IPHONE
++ Class guardedBase=objc_getClass("_MTLDevice");
++ if(!guardedBase || class_getInstanceSize(guardedBase)!=528){fuxiFailure("NativeMetal _MTLDevice size must be 528");return nil;}
++#endif
++
+  gMissing=missing;gInFlight=[NSMutableSet set];
+  gDevice=nmb_device_open(loader,cache);
+  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
+@@ -1514,20 +1593,31 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
+ #endif
+  if(!base)base=[NSObject class];
+  Class cls=objc_allocateClassPair(base,"NativeBridgeMetalDevice",0);if(!cls)return nil;
+- unsigned count=0;Method *methods=class_copyMethodList([NBDeviceMethods class],&count);
+- for(unsigned i=0;i<count;i++)class_addMethod(cls,method_getName(methods[i]),method_getImplementation(methods[i]),method_getTypeEncoding(methods[i]));
++ // Never enter private Apple base implementations with uninitialized ivars.
++ for(Class c=base;c && c!=[NSObject class];c=class_getSuperclass(c)){
++  unsigned count=0;Method *methods=class_copyMethodList(c,&count);
++  for(unsigned i=0;i<count;++i)if(strncmp(sel_getName(method_getName(methods[i])),".cxx_",5))
++   class_addMethod(cls,method_getName(methods[i]),(IMP)_objc_msgForward,method_getTypeEncoding(methods[i]));
++  free(methods);
++ }
++ unsigned count=0;Method *methods=class_copyMethodList([NSObject class],&count);
++ for(unsigned i=0;i<count;++i)class_replaceMethod(cls,method_getName(methods[i]),method_getImplementation(methods[i]),method_getTypeEncoding(methods[i]));
++ free(methods);
++ methods=class_copyMethodList([NBDeviceMethods class],&count);
++ for(unsigned i=0;i<count;i++)class_replaceMethod(cls,method_getName(methods[i]),method_getImplementation(methods[i]),method_getTypeEncoding(methods[i]));
+  free(methods);installAnswers(cls);class_addProtocol(cls,@protocol(MTLDevice));
+  // The original registration (_MTLAddDevice) asserts that a plugin's device conforms to Metal's private device protocol as well; the target's own
+  // drivers get it from their IOGPU base class. Conformance only answers conformsToProtocol:, the methods are still looked up one by one.
+  if(Protocol *spi=objc_getProtocol("MTLDeviceSPI"))class_addProtocol(cls,spi);
++ class_replaceMethod(object_getClass(cls),sel_registerName("initialize"),(IMP)fuxiDeviceInitialize,"v@:");
+  objc_registerClassPair(cls);
+- gDeviceObject=[cls new];
++ gDeviceObject=class_createInstance(cls,0);
+  return gDeviceObject;
+ }
+
+ // Bare AIR bitcode (no metallib wrapper), which Metal itself refuses: for the bridge's own fixtures only.
+ extern "C" id native_bridge_metal_library_with_air(const void *bytes,size_t length) {
+- NmbLibrary *handle=gDevice?nmb_library_new(gDevice,bytes,length,true):nullptr;if(!handle)return nil;
++ NmbLibrary *handle=gDevice?nmb_library_new(gDevice,bytes,length,true):nullptr;if(!handle){noteProblem(lastError());return nil;}
+  NBLibrary *library=[NBLibrary new];library.handle=handle;return library;
+ }
+ extern "C" bool native_bridge_metal_shader_cache_stats(NmbShaderCacheStats *out) {
+@@ -1701,3 +1791,8 @@ extern "C" size_t native_bridge_metal_formats(char *out,size_t size) {
+  std::lock_guard<std::mutex> lock(gProblemLock);
+  return native_bridge_metal_formats_locked(out,size);
+ }
++
++extern "C" uint64_t fuxi_native_metal_metric(unsigned index){
++ uint64_t work[10]={};if(!gDevice || !nmb_device_work_stats(gDevice,work))return 0;
++ return index==0?work[7]:index==1?work[8]:0;
++}

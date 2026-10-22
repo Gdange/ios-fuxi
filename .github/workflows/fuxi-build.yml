@@ -12,6 +12,10 @@ on:
         description: Signed FuxiMetal, smoke, own metallib and pinned metal2vulkan
         type: boolean
         default: false
+      nativemetal:
+        description: Opt-in NativeMetal port with Fuxi gate and fallback
+        type: boolean
+        default: false
       mesa:
         description: Pinned patched Turnip ICD with build recipes and patches
         type: boolean
@@ -37,10 +41,11 @@ jobs:
         env:
           KERNEL: ${{ inputs.kernel }}
           METAL: ${{ inputs.metal }}
+          NATIVEMETAL: ${{ inputs.nativemetal }}
           MESA: ${{ inputs.mesa }}
           TOOLS: ${{ inputs.tools }}
         run: |
-          matrix=$(bash tools/ci/build.sh --plan "$KERNEL" "$METAL" "$MESA" "$TOOLS")
+          matrix=$(bash tools/ci/build.sh --plan "$KERNEL" "$METAL" "$MESA" "$TOOLS" "$NATIVEMETAL")
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   build:
@@ -67,11 +72,11 @@ jobs:
           path: deps/ci-downloads
           key: fuxi-source-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('tools/ci/pins.env', 'tools/ci/build.sh') }}
       - uses: actions/cache@v4
-        if: matrix.target == 'metal'
+        if: matrix.target == 'metal' || matrix.target == 'nativemetal'
         with:
           path: |
             ~/.cargo/registry
-          key: fuxi-cargo-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/ci/pins.env', 'tools/fuxi-metal2vulkan-bridge.rs', 'tools/build-fuxi-metal-translator.sh') }}
+          key: fuxi-cargo-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/ci/pins.env', 'tools/fuxi-metal2vulkan-bridge.rs', 'tools/build-fuxi-metal-translator.sh', 'tools/build-fuxi-nativemetal.py', 'tools/patches/nativemetal-fuxi-*.patch') }}
       - name: Build selected target (no boot-image packing)
         run: bash tools/ci/build.sh "$TARGET"
       - name: Upload target outputs and logs

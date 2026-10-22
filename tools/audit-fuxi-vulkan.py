@@ -12,7 +12,7 @@ import struct
 import subprocess
 
 
-def audit(path, required_export="_vk_icdGetInstanceProcAddr"):
+def audit(path, required_export="_vk_icdGetInstanceProcAddr", allowed_loads=()):
     raw=path.read_bytes()
     magic,cpu,subtype,kind,ncmds,size,flags,reserved=struct.unpack_from('<8I',raw)
     assert (magic,cpu,subtype)==(0xfeedfacf,0x100000c,0), 'plain arm64 Mach-O required'
@@ -44,7 +44,7 @@ def audit(path, required_export="_vk_icdGetInstanceProcAddr"):
         pos+=sz
     assert len(minimum)==1 and minimum[0][0:2]==(2,0x100000), minimum
     assert signature, 'unsigned artifact'
-    assert loads and all(s.startswith(('/usr/lib/','/System/Library/Frameworks/')) for s in loads), loads
+    assert loads and all((s.startswith(('/usr/lib/','/System/Library/Frameworks/')) or s in allowed_loads) for s in loads), loads
     assert all((w[0]&0xffffffe0)!=0xd53b0020 for code in texts for w in struct.iter_unpack('<I',code)), 'CTR_EL0 read'
     print(path.name+': arm64; platform iOS; minos 16.0; SDK %d.%d; signed; no CTR_EL0 reads'%
           (minimum[0][2]>>16,(minimum[0][2]>>8)&255))

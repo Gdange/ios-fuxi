@@ -32,13 +32,17 @@ int main() {
  assert(!fuxi::bindingOffset(true,true,128,0));
  assert(fuxi::neutralDepth(7,false) && !fuxi::neutralDepth(7,true) && !fuxi::neutralDepth(1,false));
  assert(fuxi::neutralStencil(7,0,0,0) && !fuxi::neutralStencil(7,0,0,1));
- fuxi::PipelineCache cache;cache.close();cache.open(VK_NULL_HANDLE,create,destroy,size);
- auto first=cache.get();assert(first && cache.get()==first && made==1);
- for(unsigned i=0;i<fuxi::PipelineCache::maxPairs-1;++i){cache.finishedPair();assert(cache.get()==first);}
- cache.finishedPair();assert(live.empty());auto second=cache.get();assert(second!=first);
- blobSize=fuxi::PipelineCache::maxBytes+1;cache.finishedPair();assert(live.empty());
- blobSize=32;cache.get();failSize=true;cache.finishedPair();assert(live.empty());failSize=false;
- failCreate=true;assert(!cache.get());cache.finishedPair();assert(live.empty());failCreate=false;
+ fuxi::PipelineCache cache;cache.close();
+ VkPhysicalDeviceProperties props{};VkPhysicalDeviceDriverProperties driver{};VkPhysicalDeviceIDProperties id{};
+ auto open=[&](){cache.open(VK_NULL_HANDLE,create,destroy,size,props,driver,id,nullptr,"cache-test");};
+ open();auto first=cache.get();assert(first && cache.get()==first && made==1);
+ // Persistent caches keep a healthy generation; pair counts no longer retire it.
+ for(unsigned i=0;i<128;++i){cache.finishedPair();assert(cache.get()==first && made==1);}
+ blobSize=fuxi::PipelineCache::maxBytes+1;cache.finishedPair();
+ auto second=cache.get();assert(second && second!=first && live.size()==1);
+ blobSize=32;failSize=true;cache.finishedPair();assert(cache.get()!=second && live.size()==1);failSize=false;
+ failCreate=true;blobSize=fuxi::PipelineCache::maxBytes+1;cache.finishedPair();assert(!cache.get() && live.empty());
+ cache.finishedPair();cache.close();failCreate=false;blobSize=32;open();
  assert(cache.get());cache.close();cache.close();assert(live.empty() && made==dropped);
- puts("PASS: production CA bounds/neutral-state controls; cache reuse, generation/size retirement, query/create failure and teardown; no submissions");
+ puts("PASS: production CA bounds/neutral-state controls; persistent cache reuse, size/query recreation, create failure and teardown; no submissions");
 }

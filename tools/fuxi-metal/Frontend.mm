@@ -9,6 +9,9 @@
 #include <unistd.h>
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
+#include <mach/mach.h>
+#include "NativeSelection.hpp"
+#include "NativeBackend.hpp"
 #include <mutex>
 #include <atomic>
 #include <cstdarg>
@@ -37,6 +40,16 @@ extern "C" void _objc_msgForward(void);
 #endif
 static fuxi::ClientMode clientMode=fuxi::ClientMode::deny;
 static char clientProcess[64]="unknown";
+static fuxi::MetalBackend selectedBackend=fuxi::MetalBackend::fuxi;
+#ifndef FUXI_MTL_BOOTARGS
+#define FUXI_MTL_BOOTARGS(out,size) fuxi::systemString("kern.bootargs",out,size)
+#endif
+#ifndef FUXI_MTL_NATIVE_PREFLIGHT
+#define FUXI_MTL_NATIVE_PREFLIGHT(port) nativeHostImportPreflight(port)
+#endif
+#ifndef FUXI_MTL_NATIVE_OPEN
+#define FUXI_MTL_NATIVE_OPEN(process,registry,hooks) openNativeMetal(process,registry,hooks)
+#endif
 #ifndef FUXI_MTL_READ_CLIENTS
 #define FUXI_MTL_READ_CLIENTS fuxi::readClients
 #endif
@@ -84,6 +97,11 @@ static void checkClient() {
    if(fuxi::clientName(name)) {memcpy(clientProcess,name,strlen(name)+1);identified=true;}
   }
   clientMode=identified?FUXI_MTL_READ_CLIENTS(FUXI_MTL_CLIENTS_CONF,clientProcess):fuxi::ClientMode::deny;
+  if(clientMode==fuxi::ClientMode::allow){
+   char args[4096]={};
+   (void)FUXI_MTL_BOOTARGS(args,sizeof(args));
+   selectedBackend=fuxi::selectMetalBackend(args);if(selectedBackend==fuxi::MetalBackend::invalid)clientMode=fuxi::ClientMode::deny;
+  }
   if(!strcmp(clientProcess,"backboardd")) {
    if(clientMode!=fuxi::ClientMode::allow)fprintf(stderr,"FUXI MTL: backboardd gate deny reason=policy-or-bootarg\n");
    else if(!FUXI_MTL_BACKBOARD_ADMIT())clientMode=fuxi::ClientMode::deny;
@@ -102,8 +120,9 @@ static void checkClient() {
   fuxi::setupMetalClient(clientMode==fuxi::ClientMode::allow,clientProcess,
    [](const char *key,const char *value,int overwrite){return FUXI_MTL_SET_ENV(key,value,overwrite);},
    [](const char *key){FUXI_MTL_SET_CA_PREFERENCE(key);});
+  if(clientMode==fuxi::ClientMode::allow)fprintf(stderr,"FUXI MTL: backend %s\n",selectedBackend==fuxi::MetalBackend::native?"native":"fuxi");
   if(clientMode==fuxi::ClientMode::allow)fprintf(stderr,"FUXI MTL: compression %s CAEnableIOSurfaceCompression=false%s\n",clientProcess,
-   !strcmp(clientProcess,"backboardd")?" CA_DISABLE_FRAMEBUFFER_COMPRESSION=1 CAEnableFramebufferCompression=false":"");
+   !strcmp(clientProcess,"backboardd")?" CA_DISABLE_FRAMEBUFFER_COMPRESSION=1 CAEnableFramebufferCompression=false CAEnableDeepFramebuffer=false":"");
   clientCheckUs=observationMicros();
   fprintf(stderr,"FUXI MTL: gate %s %s\n",clientMode==fuxi::ClientMode::deny?"deny":"allow",clientProcess);
   if(clientMode==fuxi::ClientMode::census)fprintf(stderr,"FUXI MTL: census enabled %s (no GPU)\n",clientProcess);
@@ -131,8 +150,8 @@ static std::atomic<uint64_t> failureCount{0},completedDraws{0};
 extern "C" uint64_t fuxi_metal_failure_count() {return failureCount.load();}
 extern "C" uint64_t fuxi_metal_completed_draws() {return completedDraws.load();}
 extern "C" uint64_t fuxi_metal_dropped_draws() {return fuxi::droppedDraws.load();}
-extern "C" uint64_t fuxi_metal_pipeline_cache_hits() {return fuxi::Backend::pipelineHits.load();}
-extern "C" uint64_t fuxi_metal_pipeline_cache_misses() {return fuxi::Backend::pipelineMisses.load();}
+extern "C" uint64_t fuxi_metal_pipeline_cache_hits() {return selectedBackend==fuxi::MetalBackend::native?nativeMetric(0):fuxi::Backend::pipelineHits.load();}
+extern "C" uint64_t fuxi_metal_pipeline_cache_misses() {return selectedBackend==fuxi::MetalBackend::native?nativeMetric(1):fuxi::Backend::pipelineMisses.load();}
 extern "C" uint64_t fuxi_metal_pipeline_cache_load_result() {return fuxi::Backend::pipelineCacheLoadResult.load();}
 extern "C" uint64_t fuxi_metal_pipeline_cache_load_bytes() {return fuxi::Backend::pipelineCacheLoadBytes.load();}
 extern "C" uint64_t fuxi_metal_pipeline_cache_save_result() {return fuxi::Backend::pipelineCacheSaveResult.load();}
@@ -1325,11 +1344,34 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
   FuxiOwner *state=[FuxiOwner new];
   objc_setAssociatedObject(self,&ownerKey,state,OBJC_ASSOCIATION_RETAIN_NONATOMIC);[state release];return self;
  }
+#ifndef FUXI_MTL_REGISTRY_ID
  void *io=dlopen("/System/Library/Frameworks/IOKit.framework/IOKit",RTLD_NOW|RTLD_LOCAL);
  auto getID=io?(int(*)(uint32_t,uint64_t *))dlsym(io,"IORegistryEntryGetRegistryEntryID"):nullptr;
  uint64_t registry=0;int rc=getID?getID(port,&registry):-1;
  if(io)dlclose(io);
+#else
+ uint64_t registry=0;int rc=FUXI_MTL_REGISTRY_ID(port,&registry);
+#endif
  if(rc || !registry) {failureLog("FUXI MTL: registryID FAIL\n");[self release];return nil;}
+ if(selectedBackend==fuxi::MetalBackend::native){
+  if(!FUXI_MTL_NATIVE_PREFLIGHT(port)){
+   failureLog("FUXI MTL: NativeMetal host-import ABI-2 preflight FAIL\n");[self release];return nil;
+  }
+  static const FuxiNativeHooks hooks={FUXI_NATIVE_ABI,sizeof(FuxiNativeHooks),
+   [](const char *why){failureLog("FUXI MTL: native refusal %s\n",why?why:"unknown");},
+   [](){return fuxi::backboardGate.blocked();},
+   [](uint64_t gpu,double wall,uint64_t draws,bool storedSurface){
+    if(fuxi::backboardGate.blocked())return;
+    completedDraws.fetch_add(draws);if(gpu){fuxi::Backend::gpuNanos.fetch_add(gpu);++fuxi::Backend::gpuSamples;}
+    if(storedSurface)fuxi::backboardGate.completed(gpu,wall);
+    if(fuxi::backboardGate.blocked())failureLog("FUXI MTL: native completion latch\n");}};
+  id device=nil;
+  try { @try {device=FUXI_MTL_NATIVE_OPEN(clientProcess,registry,&hooks);}
+  @catch(NSException *e){failureLog("FUXI MTL: native open exception %s\n",e.reason.UTF8String);} }
+  catch(const std::exception &e){failureLog("FUXI MTL: native open exception %s\n",e.what());}
+  if(!device)failureLog("FUXI MTL: native device unavailable\n");
+  [self release];return [device retain];
+ }
  FuxiOwner *state=[FuxiOwner new];state->registry=registry;
  try {if(clientMode!=fuxi::ClientMode::census)state->backend=new fuxi::Backend(clientProcess);}
  catch(const std::exception &e) {failureLog("FUXI MTL: device FAIL %s\n",e.what());[state release];[self release];return nil;}

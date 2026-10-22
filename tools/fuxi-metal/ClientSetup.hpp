@@ -15,6 +15,7 @@ void setupMetalClient(bool admitted,const char *process,Environment env,Preferen
  if(!strcmp(process,"backboardd")){
   env("CA_DISABLE_FRAMEBUFFER_COMPRESSION","1",1);
   preference("CAEnableFramebufferCompression");
+  preference("CAEnableDeepFramebuffer");
  }
  preference("CAEnableIOSurfaceCompression");
 }
