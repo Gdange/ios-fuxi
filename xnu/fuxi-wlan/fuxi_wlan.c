@@ -2053,7 +2053,8 @@ wl_disable_irqs(void)
  * Journal only host configuration, never W1C/status, DMA doorbells or BME.
  * Banked equalization entries carry their selector for bounded reverse undo. */
 struct wl_seq_undo { uint64_t pa; uint32_t old, mask; unsigned bank; };
-static struct wl_seq_undo wl_seq_undo[96];
+#define WL_SEQ_UNDO_MAX 96u
+static struct wl_seq_undo wl_seq_undo[WL_SEQ_UNDO_MAX];
 static unsigned wl_seq_undos, wl_eq_bank;
 static bool wl_cycle_powered;
 static uint32_t wl_msi_saved[5];
@@ -2068,23 +2069,39 @@ static int
 wl_m6o_write(const char *what, uint64_t pa, uint32_t value, uint32_t mask)
 {
 	printf("FUXI WLAN: M6o begin %s offset %#llx value %#x mask %#x\n", what, pa, value, mask);
+	bool host = (pa >= WL_PARF && pa < WL_PARF + 0x4000) ||
+	    (pa >= WL_DBI && pa < WL_DBI + 0x1000);
+	/* Cycle link control is contained by PERST, not restored to running. */
+	bool journal = host && pa != WL_PARF + 0x1b0 && pa != WL_DBI + 0xf24;
 	uint32_t old = wl_prd(pa);
-	if (fw_faults || (old == ~0u && !(wl_msi_pvm && pa == WL_EPCFG+wl_msi_cap+wl_msi_mask_off())) || wl_seq_undos >= 96) { return 1; }
+	/* W9: try8's zero-fault POR abort implies an all-ones old INTVEC.
+	 * No old bits are used or journaled for this full write. Earlier BHI
+	 * preflights read zero after writing it: keep strict readback below,
+	 * including after SYS_ERR reset; this is not a write-only assumption. */
+	bool intvec_zero = wl_mhi_valid && (wl_seq_flags & WL_O_POR) &&
+	    pa == WL_BAR0+wl_bhi+0x20 && value == 0 && mask == ~0u;
+	bool ones_bad = old == ~0u && !intvec_zero &&
+	    !(wl_msi_pvm && pa == WL_EPCFG+wl_msi_cap+wl_msi_mask_off());
+	bool full = journal && wl_seq_undos >= WL_SEQ_UNDO_MAX;
+	if (fw_faults || ones_bad || full) {
+		printf("FUXI WLAN: M6o refused %s offset %#llx old %#x faults %u undos %u/%u journal %u reason %s\n",
+		    what, pa, old, fw_faults, wl_seq_undos, WL_SEQ_UNDO_MAX, journal,
+		    fw_faults ? "access fault" : ones_bad ? "old all ones" : "undo full");
+		return 1;
+	}
 	uint32_t v = (old & ~mask) | (value & mask);
 	/* PCI command/control shares a dword with W1C status. */
 	if ((pa >= WL_EPCFG && pa < WL_EPCFG + 0x1000 && mask == 0xffff) ||
 	    pa == WL_EPCFG+4 || pa == WL_DBI+0x78 || (wl_pm_cap && pa == WL_EPCFG+wl_pm_cap+4)) { v &= 0xffff; }
 	if (wl_pm_cap && pa == WL_EPCFG+wl_pm_cap+4) { v &= ~0x8000u; } /* PME status W1C */
-	bool host = (pa >= WL_PARF && pa < WL_PARF + 0x4000) ||
-	    (pa >= WL_DBI && pa < WL_DBI + 0x1000);
-	/* Cycle link control is contained by PERST, not restored to running. */
-	if (host && pa != WL_PARF + 0x1b0 && pa != WL_DBI + 0xf24) {
+	if (journal) {
 		wl_seq_undo[wl_seq_undos++] = (struct wl_seq_undo){pa, old, mask,
 		    pa == WL_DBI + 0x8a8 || pa == WL_DBI + 0x8ac || (pa == WL_DBI+0x890 && mask == 1) ? wl_eq_bank : 0};
 	}
 	wl_pwr(pa, v);
 	uint32_t rb = wl_prd(pa);
-	printf("FUXI WLAN: M6o %s offset %#llx write %#x read %#x mask %#x\n", what, pa, v, rb, mask);
+	printf("FUXI WLAN: M6o %s offset %#llx write %#x read %#x mask %#x old %#x faults %u undos %u/%u\n",
+	    what, pa, v, rb, mask, old, fw_faults, wl_seq_undos, WL_SEQ_UNDO_MAX);
 	/* PME_TURNOFF self-clears once the message is sent; PM_STTS is checked next. */
 	if (pa == WL_DBI + 0xf24) { return fw_faults ? 1 : 0; }
 	return fw_faults || (rb & mask) != (v & mask);
@@ -2450,6 +2467,12 @@ wl_m6o_rx_clear(void)
 static int
 wl_m6o_prepare(void)
 {
+	/* Recheck discovery before RX writes; BHIE in wl5_status is TXSTATUS
+	 * (+0x44), not BHIEOFF. Never infer a new base from that status word. */
+	uint32_t bhi = wl_mrd(0x28), bhie = wl_mrd(0x2c);
+	printf("FUXI WLAN: W9 prepare BHIOFF %#x/%#x BHIEOFF %#x/%#x (live/saved) INTVEC offset %#x undos %u/%u faults %u\n",
+	    bhi, wl_bhi, bhie, wl_bhie, wl_bhi+0x20, wl_seq_undos, WL_SEQ_UNDO_MAX, fw_faults);
+	if (fw_faults || bhi != wl_bhi || bhie != wl_bhie) { return 1; }
 	uint64_t addr = wl_rxvectors.iova;
 	unsigned bytes = (WL_RDDM_SIZE/WL_CHUNK)*sizeof(struct wl_vector);
 	uint32_t seq; read_random(&seq, sizeof(seq)); seq &= WL_SEQ_MASK; if (!seq) { seq = 1; }

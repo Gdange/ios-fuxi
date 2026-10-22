@@ -128,7 +128,10 @@ static void model_write(uint64_t pa, uint32_t v) {
         }
     }
     if(pa==WL_BAR0+0x38 && requested==2) {
-        if(reset_peer) setreg(WL_BAR0+0x48,0);
+        if(reset_peer) {
+            setreg(WL_BAR0+0x48,0);
+            setreg(WL_BAR0+0x120,~0u); /* POR INTVEC has no usable old value. */
+        }
         if(reset_stuck) setreg(WL_BAR0+0x38,2);
     }
 }
@@ -207,6 +210,7 @@ int main(void) {
     setup("msi"); probe_arg="unmapped"; wl_probe_configure(); assert(wl_variant_invalid);
     setup("por"); probe_arg="pattern"; wl_probe_configure(); assert(wl_variant_invalid);
 
+    unsigned max_undos=0;
     /* All 511 token combinations, including cyclerails implying cycle, use actual steps. */
     for(unsigned tokens=1;tokens<512;tokens++) {
         unsigned flags=tokens|((tokens&WL_O_CYCLERAILS)?WL_O_CYCLE:0);
@@ -244,6 +248,7 @@ int main(void) {
         assert(!wl5_step(19));
         assert(wl_image.size==((flags&WL_O_PREFIX)?WL_CHUNK:round_page(sizeof(fixture))));
         assert(!wl5_step(20));
+        if(wl_seq_undos>max_undos) max_undos=wl_seq_undos;
         assert(!!wl_vectors.va==!(flags&WL_O_PREFIX));
         assert(!memcmp((void *)wl_image.va,fixture,WL_CHUNK));
         if(flags&WL_O_POR) {
@@ -273,6 +278,85 @@ int main(void) {
         assert(!wl_seq_undos);
         if(flags&WL_O_EQ) assert(eqvec[0]==0x23ab4501 && eqvec[1]==0x34cd6702 && eqfmdc[0]==0x95 && eqfmdc[1]==0x8a && wl_prd(WL_DBI+0x154)==0x11223344 && wl_prd(WL_DBI+0x188)==0x22334455 && !wl_prd(WL_DBI+0x8bc));
     }
+    assert(max_undos==46 && max_undos<WL_SEQ_UNDO_MAX); /* Gen4, both EQ banks, initial + replay. */
+
+    /* W9: reproduce the device's Gen3 path, cap and unknown initial INTVEC.
+       A raw BHIE TXSTATUS sequence is not an offset or a transfer failure. */
+    setup("cycle,parf,dbi,eq,hostirq,msi,por,prefix");
+    setreg(WL_DBI+0x7c,3); setreg(WL_EPCFG+0x50,0x010a7005);
+    setreg(WL_EPCFG+0x5c,~0u); setreg(WL_BAR0+0x268,0x6aa00c7d);
+    assert(!wl_m6o_host(8) && !wl_m6o_host(10) && !wl_m6o_host(11) && !wl_m6o_host(12));
+    assert(!run(19) && wl_seq_undos==36);
+    setreg(WL_BAR0+0x120,~0u);
+    assert(!wl5_step(20) && wl_seq_undos==36 && writes(WL_BAR0+0x120)==1);
+    assert(strstr(logbuf,"W9 prepare BHIOFF 0x100/0x100 BHIEOFF 0x224/0x224") &&
+           strstr(logbuf,"mask 0xffffffff old 0xffffffff faults 0 undos 36/96"));
+    assert(!wl5_step(21) && writes(WL_BAR0+0x118)==1);
+    assert(wl5_step(21)==0x6b && writes(WL_BAR0+0x118)==1); cleanup(21);
+
+    /* Ordinary all-ones, partial/nonzero INTVEC writes and access faults
+       still fail before writing; the exception is only a full POR zero. */
+    setup("por"); assert(!run(19)); setreg(WL_BAR0+0x120,~0u);
+    unsigned before=ne;
+    assert(wl_m6o_write("partial INTVEC",WL_BAR0+0x120,0,0xffff) && ne==before);
+    assert(strstr(last_log_line(),"old 0xffffffff faults 0 undos 0/96 journal 0 reason old all ones"));
+    assert(wl_m6o_write("nonzero INTVEC",WL_BAR0+0x120,1,~0u) && ne==before);
+    setreg(WL_BAR0+0x284,~0u);
+    assert(wl_m6o_write("RX all ones",WL_BAR0+0x284,0,~0u) && ne==before);
+    read_fault_pa=WL_BAR0+0x120;
+    assert(wl_m6o_write("fault INTVEC",read_fault_pa,0,~0u) && ne==before);
+    assert(strstr(last_log_line(),"faults 1 undos 0/96 journal 0 reason access fault"));
+    read_fault_pa=0; cleanup(19);
+
+    setup("por"); assert(!run(19)); setreg(WL_BAR0+0x120,~0u);
+    fault_special=special_writes+1;
+    assert(wl_m6o_write("write fault INTVEC",WL_BAR0+0x120,0,~0u) && fw_faults);
+    assert(!writes(WL_BAR0+0x120) && !writes(WL_BAR0+0x118));
+    assert(strstr(last_log_line(),"old 0xffffffff faults 1")); cleanup(19);
+    setup("prefix"); assert(!run(19)); setreg(WL_BAR0+0x120,~0u);
+    assert(wl_m6o_write("without POR",WL_BAR0+0x120,0,~0u) && !writes(WL_BAR0+0x120));
+    assert(strstr(last_log_line(),"reason old all ones")); cleanup(19);
+
+    /* No write-only bypass: persistent all-ones and nonzero readback stop
+       step 20 with one attempted zero write and no image doorbell. */
+    for(unsigned value=1;value<=2;value++) {
+        setup("por"); assert(!run(19));
+        read_masks[nread_masks++]=(struct read_mask){WL_BAR0+0x120,value==1?~0u:1,0};
+        assert(wl5_step(20)==1 && writes(WL_BAR0+0x120)==1 && !writes(WL_BAR0+0x118));
+        assert(strstr(logbuf,value==1?"write 0 read 0xffffffff":"write 0 read 0x1"));
+        nread_masks=0; cleanup(20);
+    }
+    setup("por"); assert(!run(19)); read_fault_pa=WL_BAR0+0x120;
+    assert(wl5_step(20)==1 && !writes(WL_BAR0+0x120) && !writes(WL_BAR0+0x118));
+    read_fault_pa=0; cleanup(20);
+
+    /* Discovery drift must stop before installing RX addresses or INTVEC. */
+    for(unsigned off=0x28;off<=0x2c;off+=4) {
+        setup("por"); assert(!run(19)); setreg(WL_BAR0+off,0x300);
+        assert(wl5_step(20)==1 && !writes(WL_BAR0+0x120) && !writes(WL_BAR0+0x118));
+        assert(wl_mrd(wl_bhie+0x60)==0 && strstr(logbuf,"(live/saved)")); cleanup(20);
+    }
+
+    /* Fill the real journal: the last slot is usable, overflow refuses
+       before a host write, and nonjournaled INTVEC consumes no capacity. */
+    setup("por"); assert(!run(19));
+    for(unsigned i=0;i<WL_SEQ_UNDO_MAX;i++) assert(!wl_m6o_write("fill",WL_PARF+0x350,i,~0u));
+    before=ne;
+    assert(wl_m6o_write("overflow",WL_PARF+0x350,99,~0u) && ne==before);
+    assert(strstr(last_log_line(),"faults 0 undos 96/96 journal 1 reason undo full"));
+    setreg(WL_BAR0+0x120,~0u);
+    assert(!wl_m6o_write("POR INTVEC zero",WL_BAR0+0x120,0,~0u) && wl_seq_undos==WL_SEQ_UNDO_MAX);
+    cleanup(19); assert(!wl_seq_undos && !wl_prd(WL_PARF+0x350));
+
+    /* SMMUv2 FSR.Format[10:9]=2 is AArch64; every actual fault bit
+       in the existing mask still aborts, including MULTI and SS. */
+    setup("msi"); assert(!run(18));
+    uint64_t fsr_pa=wl_cb_addr(wl_cb)+0x58;
+    setreg(fsr_pa,0x400); assert(!wl_smmu_fault(20));
+    for(unsigned bit=0;bit<32;bit++) if((1u<<bit)&0xc00001fe) {
+        setreg(fsr_pa,0x400|(1u<<bit)); assert(wl_smmu_fault(20));
+    }
+    setreg(fsr_pa,0x400); cleanup(18);
 
     /* Plain cycle leaves all votes intact through success, abort and containment. */
     setup("cycle"); fail_rail=1; wl3_report[20]=0x1234;
@@ -313,7 +397,7 @@ int main(void) {
     cleanup(17); assert(!nrail && strstr(logbuf,"refused while the PCIe link is down"));
     setup("cycle"); read_fault_pa=TS_TLMM+0x1000*80+4;
     assert(wl5_step(17)==0x6f && !nrail && !writes(read_fault_pa));
-    assert(strstr(last_log_line(),"begin cycle WLAN_EN low"));
+    assert(strstr(last_log_line(),"refused cycle WLAN_EN low") && strstr(last_log_line(),"reason access fault"));
     read_fault_pa=0; cleanup(17); assert(!nrail);
 
     /* Real shared routines: every reset/table/start write is exercised and
@@ -428,7 +512,7 @@ int main(void) {
     setup("parf"); assert(!wl_m6o_host(8) && !run(21));
     corrupt_write_pa=WL_PARF+0x358; wl5_abort(22); assert(!frees && wl_seq_undos);
     corrupt_write_pa=0; cleanup(22);
-    puts("M6o 511 combinations, safe cycle/explicit rails, exact host writes, MSI sink/BME, RX/POR, prefix, faults and quarantine passed");
+    puts("M6o/W9 511 combinations, journal bounds, INTVEC/offset diagnostics, FSR, safe cycle/rails, MSI, RX/POR, faults and quarantine passed");
     return 0;
 }
 '''
