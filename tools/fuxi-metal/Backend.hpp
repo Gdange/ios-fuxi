@@ -27,7 +27,12 @@ namespace fuxi {
 inline bool hostRangesOverlap(const void *a,size_t an,const void *b,size_t bn){
  if(!a || !b || !an || !bn)return false;auto x=(uintptr_t)a,y=(uintptr_t)b;return x<=y?y-x<an:x-y<bn;
 }
-inline void check(VkResult r) { if(r!=VK_SUCCESS) throw std::runtime_error("Vulkan rc "+std::to_string(r)); }
+// Live Vulkan memory objects of this process: each is one kernel BO, a per-client-limited resource.
+inline std::atomic<int64_t> liveMemoryObjects{0},liveMemoryBytes{0};
+// The line names the failing call; the counters tell a BO quota refusal from real exhaustion.
+inline void check(VkResult r,int line=__builtin_LINE()) {
+ if(r!=VK_SUCCESS) throw std::runtime_error("Vulkan rc "+std::to_string(r)+" at Backend.hpp:"+std::to_string(line)+" (memory objects "+std::to_string(liveMemoryObjects.load())+", "+std::to_string(liveMemoryBytes.load()>>10)+" KiB)");
+}
 #define FUXI_VK_FUNCTIONS(X) \
  X(CreateQueryPool) X(DestroyQueryPool) X(GetQueryPoolResults) X(CmdResetQueryPool) X(CmdWriteTimestamp) \
  X(DestroyDevice) X(GetDeviceQueue) X(CreateBuffer) X(DestroyBuffer) X(GetBufferMemoryRequirements) \
@@ -42,8 +47,8 @@ inline void check(VkResult r) { if(r!=VK_SUCCESS) throw std::runtime_error("Vulk
  X(CreatePipelineLayout) X(DestroyPipelineLayout) X(CreateGraphicsPipelines) X(DestroyPipeline) \
  X(CreatePipelineCache) X(DestroyPipelineCache) X(GetPipelineCacheData) \
  X(CmdBindVertexBuffers) X(CmdBindIndexBuffer) X(CmdDrawIndexed) X(CmdSetViewport) X(CmdSetScissor) X(CmdPushConstants) X(CmdBeginRenderPass) X(CmdEndRenderPass) X(CmdBindPipeline) X(CmdDraw) X(CmdCopyImageToBuffer) X(CmdPipelineBarrier) X(CreateFence) X(DestroyFence) X(QueueSubmit) X(WaitForFences)
-struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; void *contents{}; size_t length{}, allocated{},charged{};uint32_t memoryType{};bool imported=false; };
-struct Texture {VkImage image{};VkDeviceMemory memory{};VkImageView view{};size_t allocated{},charged{};
+struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; void *contents{}; size_t length{}, allocated{},charged{},memoryBytes{};uint32_t memoryType{};bool imported=false; };
+struct Texture {VkImage image{};VkDeviceMemory memory{};VkImageView view{};size_t allocated{},charged{},memoryBytes{};
  uint32_t width=256,height=256;VkImageUsageFlags usage{};uint32_t format=80;VkFormat vkFormat=VK_FORMAT_B8G8R8A8_UNORM;
  VkImageTiling tiling=VK_IMAGE_TILING_OPTIMAL;VkImageLayout layout=VK_IMAGE_LAYOUT_UNDEFINED;void *mapped{};bool imported=false,defined=false,borrowedMemory=false;};
 struct Sampler {VkSampler sampler{};uint32_t filters=1;};
@@ -189,7 +194,7 @@ public:
    if(type==memory.memoryTypeCount) throw std::runtime_error("no host-visible memory");
    VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.allocationSize=req.size;ai.memoryTypeIndex=type;b->memoryType=type;
    limits.reserve(ai.allocationSize);b->charged=ai.allocationSize;
-   check(AllocateMemory(device,&ai,nullptr,&b->memory));check(BindBufferMemory(device,b->buffer,b->memory,0));
+   check(AllocateMemory(device,&ai,nullptr,&b->memory));++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;b->memoryBytes=ai.allocationSize;check(BindBufferMemory(device,b->buffer,b->memory,0));
    check(MapMemory(device,b->memory,0,VK_WHOLE_SIZE,0,&b->contents));memset(b->contents,0,(length+15)&~size_t(15));return b;
   } catch(...) {destroyUnlocked(b);throw;}
  }
@@ -216,7 +221,7 @@ public:
    VkImportMemoryHostPointerInfoEXT hi{};hi.sType=VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;hi.handleType=VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;hi.pHostPointer=base;
    VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.pNext=&hi;ai.allocationSize=bytes;ai.memoryTypeIndex=type;
    limits.reserve(ai.allocationSize);b->charged=ai.allocationSize;
-   check(AllocateMemory(device,&ai,nullptr,&b->memory));b->allocated=bytes;b->memoryType=type;check(BindBufferMemory(device,b->buffer,b->memory,0));
+   check(AllocateMemory(device,&ai,nullptr,&b->memory));++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;b->memoryBytes=ai.allocationSize;b->allocated=bytes;b->memoryType=type;check(BindBufferMemory(device,b->buffer,b->memory,0));
    check(MapMemory(device,b->memory,0,VK_WHOLE_SIZE,0,&b->contents));return b;
   }catch(...){destroyUnlocked(b);throw;}
  }
@@ -254,14 +259,14 @@ public:
   if(!poisoned) {
    if(b->contents) UnmapMemory(device,b->memory);
    if(b->buffer) DestroyBuffer(device,b->buffer,nullptr);
-   if(b->memory) FreeMemory(device,b->memory,nullptr);
+   if(b->memory) {FreeMemory(device,b->memory,nullptr);--liveMemoryObjects;liveMemoryBytes-=b->memoryBytes;}
   }
   limits.release(b->charged);delete b;
  }
  void destroy(Buffer *b) {std::lock_guard<std::mutex> guard(mutex);destroyUnlocked(b);}
  bool destroy(Texture *t) {
   std::lock_guard<std::mutex> guard(mutex);if(!t)return !poisoned;
-  if(!poisoned) {if(t->mapped && !t->borrowedMemory)UnmapMemory(device,t->memory);if(t->view)DestroyImageView(device,t->view,nullptr);if(t->image)DestroyImage(device,t->image,nullptr);if(t->memory && !t->borrowedMemory)FreeMemory(device,t->memory,nullptr);}limits.release(t->charged);delete t;return !poisoned;
+  if(!poisoned) {if(t->mapped && !t->borrowedMemory)UnmapMemory(device,t->memory);if(t->view)DestroyImageView(device,t->view,nullptr);if(t->image)DestroyImage(device,t->image,nullptr);if(t->memory && !t->borrowedMemory){FreeMemory(device,t->memory,nullptr);--liveMemoryObjects;liveMemoryBytes-=t->memoryBytes;}}limits.release(t->charged);delete t;return !poisoned;
  }
  bool supportsHostImport() const {return hostImport && hostAlignment && GetMemoryHostPointerPropertiesEXT && GetPhysicalDeviceImageFormatProperties2;}
  void destroy(Sampler *s) {std::lock_guard<std::mutex> guard(mutex);if(s){if(!poisoned && s->sampler)DestroySampler(device,s->sampler,nullptr);delete s;}}
@@ -310,7 +315,7 @@ public:
    VkImportMemoryHostPointerInfoEXT hi{};hi.sType=VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;hi.handleType=external.handleType;hi.pHostPointer=base;
    VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.pNext=&hi;ai.allocationSize=bytes;ai.memoryTypeIndex=type;
    limits.reserve(ai.allocationSize);t->charged=ai.allocationSize;
-   check(AllocateMemory(device,&ai,nullptr,&t->memory));t->allocated=bytes;check(BindImageMemory(device,t->image,t->memory,0));
+   check(AllocateMemory(device,&ai,nullptr,&t->memory));++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;t->memoryBytes=ai.allocationSize;t->allocated=bytes;check(BindImageMemory(device,t->image,t->memory,0));
    check(MapMemory(device,t->memory,0,VK_WHOLE_SIZE,0,&t->mapped));
    VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=t->image;vi.viewType=VK_IMAGE_VIEW_TYPE_2D;vi.format=info.format;
    vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};check(CreateImageView(device,&vi,nullptr,&t->view));return t;
@@ -339,7 +344,7 @@ public:
    if(type==memory.memoryTypeCount)throw std::runtime_error("no device-local texture memory");
    VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.allocationSize=req.size;ai.memoryTypeIndex=type;
    limits.reserve(ai.allocationSize);t->charged=ai.allocationSize;
-   check(AllocateMemory(device,&ai,nullptr,&t->memory));check(BindImageMemory(device,t->image,t->memory,0));
+   check(AllocateMemory(device,&ai,nullptr,&t->memory));++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;t->memoryBytes=ai.allocationSize;check(BindImageMemory(device,t->image,t->memory,0));
    VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=t->image;vi.viewType=VK_IMAGE_VIEW_TYPE_2D;vi.format=ii.format;
    vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};check(CreateImageView(device,&vi,nullptr,&t->view));return t;
   }catch(...) {guard.unlock();destroy(t);throw;}
