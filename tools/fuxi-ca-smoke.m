@@ -19,6 +19,8 @@
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <mach/thread_policy.h>
+#include <mach/processor_info.h>
+#include <mach/arm/processor_info.h>
 #include "fuxi-metal/CACompare.h"
 #ifndef FUXI_CA_CONF
 #define FUXI_CA_CONF "/usr/local/share/fuxi/ca-smoke.conf"
@@ -135,10 +137,20 @@ static int compareDouble(const void *a,const void *b){double x=*(const double *)
 // keeping every core busy. Overshoot that vanishes under load points at idle wake-up.
 static atomic_int spinning;
 static void *spin(void *arg){(void)arg;while(atomic_load(&spinning)){}return NULL;}
-static void sleepProbe(const char *label){double o[20];
+// Per-CPU interrupt counters (timer, IPI, all IRQs) from the kernel's cpu_stat.
+static unsigned cpuStats(processor_cpu_stat_data_t *out,unsigned max){natural_t n=0;processor_info_array_t info;mach_msg_type_number_t count;
+ if(host_processor_info(mach_host_self(),PROCESSOR_CPU_STAT,&n,&info,&count)!=KERN_SUCCESS)return 0;
+ if(n>max)n=max;memcpy(out,info,n*sizeof(*out));vm_deallocate(mach_task_self(),(vm_address_t)info,count*sizeof(integer_t));return n;}
+static void sleepProbe(const char *label){double o[20];processor_cpu_stat_data_t a[8],b[8];unsigned n=cpuStats(a,8);
+ CFTimeInterval t0=CACurrentMediaTime();
  for(unsigned i=0;i<20;++i){CFTimeInterval t=CACurrentMediaTime();usleep(4000);o[i]=(CACurrentMediaTime()-t)*1000-4;}
+ double wall=(CACurrentMediaTime()-t0)*1000;
  qsort(o,20,sizeof(double),compareDouble);
- printf("FUXI CA: timer probe %s usleep(4ms) overshoot min/median/max=%.3f/%.3f/%.3f ms\n",label,o[0],o[10],o[19]);}
+ printf("FUXI CA: timer probe %s usleep(4ms) overshoot min/median/max=%.3f/%.3f/%.3f ms\n",label,o[0],o[10],o[19]);
+ if(n&&cpuStats(b,8)==n)for(unsigned c=0;c<n;++c)
+  printf("FUXI CA: timer probe %s cpu%u in %.1f ms timer=%u ipi=%u irq=%u\n",label,c,wall,
+   b[c].timer_cnt-a[c].timer_cnt,b[c].ipi_cnt-a[c].ipi_cnt,b[c].irq_ex_cnt-a[c].irq_ex_cnt);
+ else printf("FUXI CA: timer probe %s cpu stats unavailable\n",label);}
 static void timerProbe(void){
  sleepProbe("idle");
  pthread_t t[8];unsigned n=0;atomic_store(&spinning,1);
