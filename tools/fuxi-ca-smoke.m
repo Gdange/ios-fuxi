@@ -19,6 +19,8 @@
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <mach/thread_policy.h>
+#include <mach/thread_info.h>
+#include <sys/resource.h>
 #include <mach/processor_info.h>
 #include <mach/arm/processor_info.h>
 #include "fuxi-metal/CACompare.h"
@@ -151,6 +153,11 @@ static void sleepProbe(const char *label){double o[20];processor_cpu_stat_data_t
   printf("FUXI CA: timer probe %s cpu%u in %.1f ms timer=%u ipi=%u irq=%u\n",label,c,wall,
    b[c].timer_cnt-a[c].timer_cnt,b[c].ipi_cnt-a[c].ipi_cnt,b[c].irq_ex_cnt-a[c].irq_ex_cnt);
  else printf("FUXI CA: timer probe %s cpu stats unavailable\n",label);}
+// darwin-bg state and the thread's effective scheduled priority (RT runs at 97 and up).
+static void schedReport(const char *label){thread_extended_info_data_t i;mach_msg_type_number_t n=THREAD_EXTENDED_INFO_COUNT;
+ int bg=getpriority(PRIO_DARWIN_PROCESS,0);kern_return_t kr=thread_info(mach_thread_self(),THREAD_EXTENDED_INFO,(thread_info_t)&i,&n);
+ printf("FUXI CA: display sched %s darwin_bg=%d policy=%d curpri=%d priority=%d kr=%d\n",label,bg,
+  kr?-1:i.pth_policy,kr?-1:i.pth_curpri,kr?-1:i.pth_priority,kr);}
 static void timerProbe(void){
  sleepProbe("idle");
  pthread_t t[8];unsigned n=0;atomic_store(&spinning,1);
@@ -193,12 +200,16 @@ static void displayStage(id<MTLDevice> device,Class rendererClass,SEL factory,NS
   [CATransaction begin];[CATransaction setDisableActions:YES];CALayer *root=displayScene(space,NO);
   [renderer setLayer:root];[renderer setBounds:CGRectMake(0,0,1080,2400)];[CATransaction commit];[CATransaction flush];
   // Pace like a compositor's render thread: a time-constraint thread gets no timer
-  // coalescing leeway. As a daemon the default leeway let 6 ms sleeps overshoot by up
-  // to 100 ms (observed), which measured the policy rather than the GPU path.
+  // coalescing leeway. The smoke inherits the exec-swapped daemon's darwin-bg policy,
+  // which keeps RT from taking effect and gives sleeps the background leeway
+  // (32x the interval, at most 100 ms): 4 ms sleeps overshot by up to 100 ms (observed).
+  schedReport("inherited");
+  if(setpriority(PRIO_DARWIN_PROCESS,0,0))printf("FUXI CA: display clear darwin-bg errno=%d\n",errno);
   {mach_timebase_info_data_t tb;mach_timebase_info(&tb);uint64_t ms=1000000ull*tb.denom/tb.numer;
    thread_time_constraint_policy_data_t rt={(uint32_t)(ms*50/3),(uint32_t)(ms*10),(uint32_t)(ms*50/3),FALSE};
    kern_return_t kr=thread_policy_set(mach_thread_self(),THREAD_TIME_CONSTRAINT_POLICY,(thread_policy_t)&rt,THREAD_TIME_CONSTRAINT_POLICY_COUNT);
    printf("FUXI CA: display time-constraint policy period=16.667 computation=10 constraint=16.667 ms kr=%d\n",kr);}
+  schedReport("paced");
   timerProbe();
   CFTimeInterval epoch=0;
   for(unsigned frame=0;frame<60;++frame){
