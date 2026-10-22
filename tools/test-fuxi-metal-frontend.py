@@ -18,7 +18,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         d=Path(tmp);conf=d/'smoke.conf'
         compiler=['xcrun','clang++'] if os.uname().sysname=='Darwin' else ['clang++']
-        for name in ('ClientGateTests','BackboardGateTests','TextureLevelsTests'):
+        for name in ('ClientGateTests','BackboardGateTests','TextureLevelsTests','SurveyTests'):
             subprocess.run([*compiler,'-std=c++17','-Wall','-Wextra','-Werror','-pthread',
                             '-fsanitize=address,undefined',str(ROOT/'tools/fuxi-metal'/(name+'.cpp')),
                             '-o',str(d/name)],check=True)
@@ -48,10 +48,15 @@ def main():
         frameworks=['-framework','Foundation','-framework','Metal','-framework','IOSurface']
         def call(command):subprocess.run(command,check=True)
         if a.compile_only:
-            for name in ['ConstantFrontendTests','FrontendTests','PipelineFrontendTests','CAFrontendTests','MipFrontendTests','GateFrontendTests','CensusTests']:
+            for name in ['ConstantFrontendTests','FrontendTests','PipelineFrontendTests','CAFrontendTests','MipFrontendTests','MRTFrontendTests','GateFrontendTests','CensusTests']:
                 call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal'/(name+'.mm')),*frameworks,'-o',str(d/name)])
             print('PASS: compile-only frontend tests; no test executables run')
             return
+        call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/MRTFrontendTests.mm'),*frameworks,'-o',str(d/'mrt')])
+        mrt=subprocess.run([str(d/'mrt')],env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0'),text=True,capture_output=True,check=True,timeout=15)
+        refusals=[line for line in mrt.stderr.splitlines() if 'renderPass reject ' in line]
+        assert len(refusals)>=9 and all('desc=renderPass' in line and '7:texture=' in line and 'clear=' in line and 'slice=' in line for line in refusals),mrt.stderr
+        print(mrt.stdout,end='')
         call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/MipFrontendTests.mm'),*frameworks,'-o',str(d/'mips')])
         mip=subprocess.run([str(d/'mips')],env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0'),text=True,capture_output=True,check=True,timeout=15)
         rejects=[line for line in mip.stderr.splitlines() if 'FUXI MTL: texture reject ' in line]
@@ -87,12 +92,21 @@ def main():
         compositor('backboardd','backboardd\n')
         compositor('backboardd','','fuxibbgpu=1')
         compositor('SpringBoard','SpringBoard\n','fuxibbgpu=1')
+        compositor('SpringBoard','SpringBoard\n','fuxibbgpu=2')
+        compositor('backboardd','','fuxibbgpu=2')
         compositor('SpringBoard','census SpringBoard\n','fuxibbgpu=1')
         private=d/'backboardd';private.mkdir(mode=0o700)
         p=compositor('backboardd','backboardd\n','fuxibbgpu=1','allow',
                      FUXI_TEST_GATE_DIR=str(private),FUXI_TEST_GATE_FAULT='1')
         assert 'backboardd gate good frames=120' in p.stderr and 'next-respawn=CPU persisted=1' in p.stderr,p.stderr
         compositor('backboardd','backboardd\n','fuxibbgpu=1',FUXI_TEST_GATE_DIR=str(private))
+        for mode in ('timer','cap'):
+            survey_dir=d/('survey-'+mode);survey_dir.mkdir(mode=0o700)
+            survey=compositor('backboardd','backboardd\n','fuxibbgpu=2','allow',FUXI_TEST_GATE_DIR=str(survey_dir),FUXI_TEST_GATE_SURVEY=mode)
+            assert survey.stderr.count('survey distinct first\n')==1 and survey.stderr.count('survey summary ')==1,survey.stderr
+            assert ('reason='+mode) in survey.stderr and 'next-respawn=CPU persisted=1' in survey.stderr,survey.stderr
+            assert ' denied\n' in (survey_dir/'gate.state').read_text()
+            compositor('backboardd','backboardd\n','fuxibbgpu=2',FUXI_TEST_GATE_DIR=str(survey_dir))
         call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/CensusTests.mm'),*frameworks,'-o',str(d/'census')])
         census=subprocess.run([str(d/'census')],env=env,text=True,capture_output=True,check=True,timeout=15)
         assert census.stderr.count(' supportsFamily: implemented')==1,census.stderr

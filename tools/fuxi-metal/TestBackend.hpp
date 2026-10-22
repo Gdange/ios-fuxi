@@ -25,6 +25,7 @@ struct Sampler {};
 struct Viewport {float x,y,width,height,minDepth,maxDepth;};
 struct Rect {struct {int32_t x,y;}offset;struct {uint32_t width,height;}extent;};
 struct BufferBind {Buffer *buffer{};uint64_t offset{};bool bytes=false;};
+struct ColorTarget {Texture *texture{};uint32_t level{},load=2,store=1;float clear[4]{};};
 struct Operation {
  Buffer *src, *dst; size_t from, to, size; uint8_t value;
  Texture *texture{};Pipeline *pipeline{};float clear[4]{};
@@ -34,6 +35,10 @@ struct Operation {
  Viewport viewport{0,256,256,-256,0,1};Rect scissor{{0,0},{256,256}};
  uint32_t areaWidth{},areaHeight{};
  uint32_t srcLevel{},dstLevel{},sampleBase[resourceSlots]{},sampleCount[resourceSlots]{};bool generateMips=false;uint32_t mipBase{},mipCount{};
+ std::string diagnostic;uint32_t colorCount=1,colorMask=1;ColorTarget colors[7]{};
+ ColorTarget color(unsigned i) const {if(!(colorMask&(1u<<i)))return {};if(i)return colors[i-1];ColorTarget c{texture,dstLevel,load,store,{}};memcpy(c.clear,clear,sizeof(clear));return c;}
+ void setColor(unsigned i,const ColorTarget &c){if(i){colors[i-1]=c;return;}texture=c.texture;dstLevel=c.level;load=c.load;store=c.store;memcpy(clear,c.clear,sizeof(clear));}
+
 };
 class Backend {
 public:
@@ -71,7 +76,7 @@ public:
  Pipeline *compilePipeline(void *,const char *v,void *,const char *f,const CompileOptions &options=CompileOptions{}) {
   if(!modelPipelines)throw std::runtime_error("M4 CPU model has no translation");
   // The ABI input consists only of initialized 32-bit fields/byte arrays.
-  static_assert(sizeof(CompileOptions)==40100);
+  static_assert(sizeof(CompileOptions)==40360);
   std::string key=std::string(v)+"/"+f+"/";key.append((const char *)&options,sizeof(options));
   if(auto *p=objects.acquire(key)){++pipelineHits;return p;}
   ++pipelineMisses;auto *p=new Pipeline{};objects.insert(key,key,p,sizeof(Pipeline),[&](Pipeline *old){destroy(old);});return p;

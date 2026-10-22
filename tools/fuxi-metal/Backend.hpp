@@ -59,8 +59,9 @@ struct Texture : TextureLevels {VkImage image{};VkDeviceMemory memory{};VkImageV
  VkImageTiling tiling=VK_IMAGE_TILING_OPTIMAL;VkImageLayout layout=VK_IMAGE_LAYOUT_UNDEFINED;void *mapped{};bool imported=false,borrowedMemory=false;
  std::vector<VkImageView> attachmentViews;bool canGenerate=false;};
 struct Sampler {VkSampler sampler{};uint32_t filters=1;float lodMin=0,lodMax=0;};
-struct Pipeline {size_t references=1,retainedBytes=0;void *translation{};CompileOptions options{};uint32_t fetchMask{};bool orderedColorAccess=false;VkRenderPass renders[3][2]{};VkPipeline pipeline{},stripPipeline{};VkPipelineLayout layout{};VkRenderPass render{};uint32_t pushOffset{},pushSize{},pushStages{};uint8_t pushBytes[128]{};VkDescriptorSetLayout setLayout{};VkSampler bakedSamplers[16]{};std::vector<Descriptor> descriptors;std::vector<Buffer *> constantBlobs;std::vector<std::array<uint8_t,32>> blobHashes;std::vector<std::pair<std::string,Pipeline *>> variants;};
+struct Pipeline {size_t references=1,retainedBytes=0;void *translation{};CompileOptions options{};uint32_t fetchMask{};bool orderedColorAccess=false;std::vector<std::pair<uint32_t,VkRenderPass>> renders;VkPipeline pipeline{},stripPipeline{};VkPipelineLayout layout{};VkRenderPass render{};uint32_t pushOffset{},pushSize{},pushStages{};uint8_t pushBytes[128]{};VkDescriptorSetLayout setLayout{};VkSampler bakedSamplers[16]{};std::vector<Descriptor> descriptors;std::vector<Buffer *> constantBlobs;std::vector<std::array<uint8_t,32>> blobHashes;std::vector<std::pair<std::string,Pipeline *>> variants;};
 struct BufferBind {Buffer *buffer{};uint64_t offset{};bool bytes=false;};
+struct ColorTarget {Texture *texture{};uint32_t level{},load=2,store=1;float clear[4]{};};
 struct Operation {
  Buffer *src, *dst; size_t from, to, size; uint8_t value;
  Texture *texture{};Pipeline *pipeline{};float clear[4]{};
@@ -71,16 +72,22 @@ struct Operation {
  // Metal renderTargetWidth/Height: the pass's top-left render area; 0 means the whole target.
  uint32_t areaWidth{},areaHeight{};
  uint32_t srcLevel{},dstLevel{},sampleBase[resourceSlots]{},sampleCount[resourceSlots]{};bool generateMips=false;uint32_t mipBase{},mipCount{};
+ std::string diagnostic;// texture/dstLevel also name the first present target when slot 0 is absent.
+ uint32_t colorCount=1,colorMask=1;ColorTarget colors[7]{};
+ ColorTarget color(unsigned i) const {if(!(colorMask&(1u<<i)))return {};if(i)return colors[i-1];ColorTarget c{texture,dstLevel,load,store,{}};memcpy(c.clear,clear,sizeof(clear));return c;}
+ void setColor(unsigned i,const ColorTarget &c){if(i){colors[i-1]=c;return;}texture=c.texture;dstLevel=c.level;load=c.load;store=c.store;memcpy(clear,c.clear,sizeof(clear));}
+
 };
 class Backend {
  void *library{};
  VkInstance instance{}; VkPhysicalDevice physical{}; VkDevice device{}; VkQueue queue{};
+ bool independentBlend=false;uint32_t maxColorAttachments=1;
  PipelineCache pipelineCache;
  ObjectCache<Pipeline> objects;ResourceLimits limits;
  // One synchronous lane, protected by mutex; never reset while GPU ownership is uncertain.
  VkCommandPool commandPool{};VkCommandBuffer command{};VkFence submitFence{};VkQueryPool queryPool{};
  VkDescriptorPool descriptorPool{};uint32_t descriptorSets{};std::vector<VkDescriptorPoolSize> descriptorCapacity;
- struct FrameEntry {Texture *texture;VkRenderPass render;uint32_t level;VkFramebuffer frame;};
+ struct FrameEntry {std::array<Texture *,8> textures;VkRenderPass render;std::array<uint32_t,8> levels;VkFramebuffer frame;};
  struct ViewEntry {Texture *texture;VkFormat format;std::array<uint32_t,4> components;uint32_t base,count;VkImageView view;};
  std::vector<FrameEntry> frameCache;std::vector<ViewEntry> viewCache;
  static constexpr size_t frameCacheLimit=128,viewCacheLimit=128;
@@ -93,7 +100,7 @@ class Backend {
  }
  void clearFrames(Texture *texture=nullptr,VkRenderPass render=VK_NULL_HANDLE) {
   for(auto i=frameCache.begin();i!=frameCache.end();) {
-   if((!texture && !render) || i->texture==texture || i->render==render){DestroyFramebuffer(device,i->frame,nullptr);i=frameCache.erase(i);}else ++i;
+   if((!texture && !render) || (texture && std::find(i->textures.begin(),i->textures.end(),texture)!=i->textures.end()) || (render && i->render==render)){DestroyFramebuffer(device,i->frame,nullptr);i=frameCache.erase(i);}else ++i;
   }
  }
  void clearViews(Texture *texture=nullptr) {
@@ -196,6 +203,9 @@ public:
     order.rasterizationOrderDepthAttachmentAccess=order.rasterizationOrderStencilAttachmentAccess=VK_FALSE;
     if(orderedColorAccess){enabledExtensions.push_back(VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME);di.pNext=&order;}
    }
+   VkPhysicalDeviceFeatures2 core{};core.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;GetPhysicalDeviceFeatures2(physical,&core);
+   VkPhysicalDeviceFeatures enables{};enables.independentBlend=core.features.independentBlend;di.pEnabledFeatures=&enables;
+   independentBlend=enables.independentBlend;maxColorAttachments=std::min(8u,props.limits.maxColorAttachments);
    fprintf(stderr,"FUXI MTL: ordered framebuffer fetch %s (input attachments)\n",orderedColorAccess?"enabled":"unavailable");
    if(hostImport) {
     VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp{};hp.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT;
@@ -428,7 +438,7 @@ public:
    if(p->setLayout)DestroyDescriptorSetLayout(device,p->setLayout,nullptr);
    for(auto sampler:p->bakedSamplers)if(sampler)DestroySampler(device,sampler,nullptr);
    for(auto *b:p->constantBlobs)destroyUnlocked(b);
-   for(auto &row:p->renders)for(auto render:row)if(render){clearFrames(nullptr,render);DestroyRenderPass(device,render,nullptr);}
+   for(auto entry:p->renders)if(auto render=entry.second){clearFrames(nullptr,render);DestroyRenderPass(device,render,nullptr);}
   }
   if(p->translation)Translator::get().free(p->translation);delete p;
  }
@@ -439,7 +449,7 @@ public:
  Pipeline *compilePipeline(void *v,const char *vn,void *f,const char *fn,const CompileOptions &options=CompileOptions{}) {
   std::unique_lock<std::mutex> guard(mutex);requireLive();Translation translated{};auto &tr=Translator::get();char error[2048]{};
   auto start=std::chrono::steady_clock::now();
-  auto enabledOptions=options;enabledOptions.orderedColorAccess=orderedColorAccess;
+  auto enabledOptions=options;enabledOptions.orderedColorAccess=orderedColorAccess;enabledOptions.independentBlend=independentBlend;
   uint8_t identity[32]{};
   if(!tr.identity(v,vn,f,fn,&enabledOptions,identity,error,sizeof(error)))throw std::runtime_error(error);
   std::string inputKey((const char *)identity,32);
@@ -465,6 +475,32 @@ public:
   fprintf(stderr,"FUXI MTL: pipeline cache MISS %.3f ms\n",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count());
   return p;
  }
+ VkRenderPass renderPass(Pipeline *p,const Operation *op) {
+  unsigned count=p->options.colorCount;uint32_t key=0;
+  for(unsigned i=0;i<count;++i){auto c=op?op->color(i):ColorTarget{};key|=(c.load*2+c.store)<<(i*3);}
+  for(auto e:p->renders)if(e.first==key)return e.second;
+  if(p->renders.size()>=256)throw std::runtime_error("render pass action variant bound 256");
+  VkAttachmentDescription attachments[8]{};VkAttachmentReference refs[8]{};unsigned used=0;
+  for(unsigned i=0;i<count;++i){if(!p->options.color(i).format){refs[i]={VK_ATTACHMENT_UNUSED,VK_IMAGE_LAYOUT_GENERAL};continue;}auto &a=attachments[used];auto c=op?op->color(i):ColorTarget{};
+   a.format=pixelFormat(p->options.color(i).format);a.samples=VK_SAMPLE_COUNT_1_BIT;
+   a.loadOp=c.load==2?VK_ATTACHMENT_LOAD_OP_CLEAR:c.load==1?VK_ATTACHMENT_LOAD_OP_LOAD:VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+   a.storeOp=c.store?VK_ATTACHMENT_STORE_OP_STORE:VK_ATTACHMENT_STORE_OP_DONT_CARE;
+   a.stencilLoadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE;a.stencilStoreOp=VK_ATTACHMENT_STORE_OP_DONT_CARE;
+   a.initialLayout=a.finalLayout=VK_IMAGE_LAYOUT_GENERAL;
+   refs[i]={used++,orderedColorAccess?VK_IMAGE_LAYOUT_GENERAL:VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+  }
+  VkSubpassDescription sub{};sub.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS;sub.colorAttachmentCount=count;sub.pColorAttachments=refs;
+  if(orderedColorAccess){sub.flags=VK_SUBPASS_DESCRIPTION_RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_BIT_EXT;sub.inputAttachmentCount=count;sub.pInputAttachments=refs;}
+  VkSubpassDependency deps[2]{};deps[0].srcSubpass=VK_SUBPASS_EXTERNAL;deps[0].dstSubpass=0;
+  deps[0].srcStageMask=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;deps[0].dstStageMask=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+  deps[0].srcAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;deps[0].dstAccessMask=VK_ACCESS_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+  deps[1].srcSubpass=0;deps[1].dstSubpass=VK_SUBPASS_EXTERNAL;deps[1].srcStageMask=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+  deps[1].dstStageMask=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;deps[1].srcAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;deps[1].dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
+  if(orderedColorAccess){deps[0].dstStageMask|=VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;deps[0].dstAccessMask|=VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;deps[1].srcStageMask|=VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;deps[1].srcAccessMask|=VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;}
+  VkRenderPassCreateInfo ri{};ri.sType=VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;ri.attachmentCount=used;ri.pAttachments=attachments;ri.subpassCount=1;ri.pSubpasses=&sub;ri.dependencyCount=2;ri.pDependencies=deps;
+  VkRenderPass render{};check(CreateRenderPass(device,&ri,nullptr,&render));
+  try{p->renders.push_back({key,render});}catch(...){DestroyRenderPass(device,render,nullptr);throw;}return render;
+ }
  Pipeline *createPipeline(Translation translated,const CompileOptions &options) {
   auto &tr=Translator::get();auto *p=new Pipeline{};p->options=options;VkShaderModule modules[2]{};
   auto cleanup=[&]{for(auto m:modules)if(m)DestroyShaderModule(device,m,nullptr);if(translated.handle)tr.free(translated.handle);};
@@ -472,34 +508,15 @@ public:
    p->retainedBytes=sizeof(Pipeline)+(translated.vertexCount+translated.fragmentCount)*4;
    for(unsigned i=0;i<translated.blobCount && i<2;++i)p->retainedBytes+=translated.blobs[i].length;
    if(!validFetchContract(orderedColorAccess,translated.orderedColorAccess,translated.fetchMask))throw std::runtime_error("ordered framebuffer fetch plan/device mismatch");
+   uint32_t presentMask=0;for(unsigned i=0;i<options.colorCount && i<8;++i)if(options.color(i).format)presentMask|=1u<<i;
+   if(translated.fetchMask&~presentMask)throw std::runtime_error("fetch references absent color attachment");
    p->fetchMask=translated.fetchMask;p->orderedColorAccess=orderedColorAccess;
-  VkFormatProperties features{};GetPhysicalDeviceFormatProperties(physical,pixelFormat(options.format),&features);
-   auto needed=VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT|(translated.blend?VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT:0);
-   if((features.optimalTilingFeatures&needed)!=(uint32_t)needed)throw std::runtime_error("attachment format/blend unavailable");
-   VkAttachmentDescription attachment{};attachment.format=pixelFormat(options.format);attachment.samples=VK_SAMPLE_COUNT_1_BIT;
-   attachment.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR;attachment.storeOp=VK_ATTACHMENT_STORE_OP_STORE;
-   attachment.stencilLoadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE;attachment.stencilStoreOp=VK_ATTACHMENT_STORE_OP_DONT_CARE;
-   attachment.initialLayout=VK_IMAGE_LAYOUT_GENERAL;attachment.finalLayout=VK_IMAGE_LAYOUT_GENERAL;
-   VkAttachmentReference ref{0,orderedColorAccess?VK_IMAGE_LAYOUT_GENERAL:VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};VkSubpassDescription sub{};sub.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS;sub.colorAttachmentCount=1;sub.pColorAttachments=&ref;
-   // Every pipeline/pass on this device shares the ordered subpass contract,
-   // including non-fetching draws. GENERAL is both the input and color layout.
-   if(orderedColorAccess){sub.flags=VK_SUBPASS_DESCRIPTION_RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_BIT_EXT;sub.inputAttachmentCount=1;sub.pInputAttachments=&ref;}
-   VkSubpassDependency deps[2]{};deps[0].srcSubpass=VK_SUBPASS_EXTERNAL;deps[0].dstSubpass=0;
-   deps[0].srcStageMask=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;deps[0].dstStageMask=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-   deps[0].srcAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;deps[0].dstAccessMask=VK_ACCESS_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-   deps[1].srcSubpass=0;deps[1].dstSubpass=VK_SUBPASS_EXTERNAL;deps[1].srcStageMask=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-   deps[1].dstStageMask=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;deps[1].srcAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;deps[1].dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
-   if(orderedColorAccess){
-    deps[0].dstStageMask|=VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;deps[0].dstAccessMask|=VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
-    deps[1].srcStageMask|=VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;deps[1].srcAccessMask|=VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
+   if(!options.colorCount || options.colorCount>maxColorAttachments)throw std::runtime_error("color attachment count exceeds device");
+   for(unsigned i=0;i<options.colorCount;++i){auto c=options.color(i);if(!c.format)continue;VkFormatProperties features{};GetPhysicalDeviceFormatProperties(physical,pixelFormat(c.format),&features);
+    auto needed=VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT|(translated.colors[i].blend?VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT:0);
+    if((features.optimalTilingFeatures&needed)!=(uint32_t)needed)throw std::runtime_error("attachment["+std::to_string(i)+"] format/blend unavailable");
    }
-   VkRenderPassCreateInfo ri{};ri.sType=VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;ri.attachmentCount=1;ri.pAttachments=&attachment;ri.subpassCount=1;ri.pSubpasses=&sub;ri.dependencyCount=2;ri.pDependencies=deps;
-   for(unsigned load=0;load<3;++load)for(unsigned store=0;store<2;++store) {
-    attachment.loadOp=load==2?VK_ATTACHMENT_LOAD_OP_CLEAR:load==1?VK_ATTACHMENT_LOAD_OP_LOAD:VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    attachment.storeOp=store?VK_ATTACHMENT_STORE_OP_STORE:VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    check(CreateRenderPass(device,&ri,nullptr,&p->renders[load][store]));
-   }
-   p->render=p->renders[2][1];
+   p->render=renderPass(p,nullptr);
    p->pushOffset=translated.pushOffset;p->pushSize=translated.pushSize;p->pushStages=translated.pushStages;memcpy(p->pushBytes,translated.pushBytes,128);
    // ABI 3 exposes both stage ranges. The translator limits each to the 128-byte Vulkan minimum.
    VkPushConstantRange ranges[2]{};if(translated.rangeCount>2)throw std::runtime_error("push ranges");
@@ -566,8 +583,11 @@ public:
    VkPipelineViewportStateCreateInfo vp{};vp.sType=VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;vp.viewportCount=1;vp.pViewports=&viewport;vp.scissorCount=1;vp.pScissors=&scissor;
    VkPipelineRasterizationStateCreateInfo raster{};raster.sType=VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;raster.polygonMode=VK_POLYGON_MODE_FILL;raster.cullMode=VK_CULL_MODE_NONE;raster.lineWidth=1;
    VkPipelineMultisampleStateCreateInfo ms{};ms.sType=VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;ms.rasterizationSamples=VK_SAMPLE_COUNT_1_BIT;
-   VkPipelineColorBlendAttachmentState blend{};blend.colorWriteMask=translated.mask;blend.blendEnable=translated.blend;
-   blend.srcColorBlendFactor=(VkBlendFactor)translated.factors[0];blend.dstColorBlendFactor=(VkBlendFactor)translated.factors[1];blend.colorBlendOp=(VkBlendOp)translated.factors[2];blend.srcAlphaBlendFactor=(VkBlendFactor)translated.factors[3];blend.dstAlphaBlendFactor=(VkBlendFactor)translated.factors[4];blend.alphaBlendOp=(VkBlendOp)translated.factors[5];VkPipelineColorBlendStateCreateInfo bs{};bs.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;bs.attachmentCount=1;bs.pAttachments=&blend;if(orderedColorAccess)bs.flags=VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT;
+   VkPipelineColorBlendAttachmentState blends[8]{};
+   for(unsigned i=0;i<options.colorCount;++i){auto &blend=blends[i];auto c=translated.colors[i];blend.colorWriteMask=c.mask;blend.blendEnable=c.blend;
+    blend.srcColorBlendFactor=(VkBlendFactor)c.factors[0];blend.dstColorBlendFactor=(VkBlendFactor)c.factors[1];blend.colorBlendOp=(VkBlendOp)c.factors[2];blend.srcAlphaBlendFactor=(VkBlendFactor)c.factors[3];blend.dstAlphaBlendFactor=(VkBlendFactor)c.factors[4];blend.alphaBlendOp=(VkBlendOp)c.factors[5];}
+   VkPipelineColorBlendStateCreateInfo bs{};bs.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;bs.attachmentCount=options.colorCount;bs.pAttachments=blends;if(orderedColorAccess)bs.flags=VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT;
+
    VkGraphicsPipelineCreateInfo gi{};gi.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;gi.stageCount=2;gi.pStages=stages;gi.pVertexInputState=&vertex;gi.pInputAssemblyState=&assembly;
    gi.pViewportState=&vp;gi.pRasterizationState=&raster;gi.pMultisampleState=&ms;gi.pColorBlendState=&bs;gi.layout=p->layout;gi.renderPass=p->render;
    VkDynamicState dynamicStates[]={VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR};VkPipelineDynamicStateCreateInfo dynamic{};dynamic.sType=VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;dynamic.dynamicStateCount=2;dynamic.pDynamicStates=dynamicStates;gi.pDynamicState=&dynamic;
@@ -590,10 +610,10 @@ public:
   std::lock_guard<std::mutex> guard(mutex);requireLive();
   // Empty completion participates in the same lock/order, but creates no BO or GPU fence.
   if(ops.empty()){++emptySubmits;if(scheduled)scheduled();return;}
-  bool submitted=false,completed=false;std::vector<VkImageView> sampleViews;std::vector<VkFramebuffer> frames;std::vector<Texture *> textures;
+  bool submitted=false,completed=false;std::vector<VkImageView> sampleViews;std::vector<VkFramebuffer> frames;std::vector<VkRenderPass> emptyRenders;std::vector<Texture *> textures;
   struct TextureState {Texture *texture;VkImageLayout layout;bool defined;uint32_t definedLevels;};std::vector<TextureState> oldTextures;
-  Buffer *neutralBuffer=nullptr;
-  auto cleanup=[&] {destroyUnlocked(neutralBuffer);for(auto v:sampleViews)DestroyImageView(device,v,nullptr);for(auto frame:frames)DestroyFramebuffer(device,frame,nullptr);};
+  size_t diagnosticOp=0;Buffer *neutralBuffer=nullptr;
+  auto cleanup=[&] {destroyUnlocked(neutralBuffer);for(auto v:sampleViews)DestroyImageView(device,v,nullptr);for(auto frame:frames)DestroyFramebuffer(device,frame,nullptr);for(auto render:emptyRenders)DestroyRenderPass(device,render,nullptr);};
   // Exclusive prepare phases: object API/cache time is subtracted from recording.
   uint64_t objectNanos=0,descriptorNanos=0;
   struct Measure {uint64_t &total;std::chrono::steady_clock::time_point start=std::chrono::steady_clock::now();~Measure(){total+=(uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();}};
@@ -602,7 +622,7 @@ public:
    std::vector<Buffer *> buffers;
    auto addBuffer=[&](Buffer *b){if(b && std::find(buffers.begin(),buffers.end(),b)==buffers.end())buffers.push_back(b);};
    auto addTexture=[&](Texture *t){if(t && std::find(textures.begin(),textures.end(),t)==textures.end())textures.push_back(t);};
-   for(size_t n=0;n<ops.size();++n){auto &op=ops[n];addBuffer(op.src);addBuffer(op.dst);addBuffer(op.indices);addTexture(op.texture);addTexture(op.sourceTexture);
+   for(size_t n=0;n<ops.size();++n){diagnosticOp=n;auto &op=ops[n];addBuffer(op.src);addBuffer(op.dst);addBuffer(op.indices);addTexture(op.texture);addTexture(op.sourceTexture);
     if(op.texture && op.dstLevel>=op.texture->levels)throw std::runtime_error("destination mip level");
     if(op.texture && op.srcLevel>=(op.sourceTexture?op.sourceTexture:op.texture)->levels)throw std::runtime_error("source mip level");
     if(op.generateMips){if(!op.texture || !op.mipCount || op.mipBase>=op.texture->levels || op.mipCount>op.texture->levels-op.mipBase || !op.texture->canGenerate)throw std::runtime_error("mipmap generation range/format");continue;}
@@ -621,17 +641,30 @@ public:
      if(op.upload && (!op.src || op.from%4 || op.from%pixel || op.from>op.src->length || bytes>op.src->length-op.from))throw std::runtime_error("upload bounds/alignment");
      if(!op.upload && !op.sourceTexture && (!op.dst || op.to%4 || op.to%pixel || op.to>op.dst->length || bytes>op.dst->length-op.to))throw std::runtime_error("readback bounds/alignment");
     }
+    if(op.pipeline || op.clearOnly){
+     if(!op.colorCount || op.colorCount>maxColorAttachments || !op.colorMask || (op.colorMask&~((1u<<op.colorCount)-1)) || (op.pipeline && op.colorCount!=op.pipeline->options.colorCount))throw std::runtime_error("draw/pass color count mismatch");
+     for(unsigned i=0;i<op.colorCount;++i){auto c=op.color(i);auto *t=c.texture;
+      if(!t){if(op.pipeline && op.pipeline->options.color(i).format)throw std::runtime_error("missing render attachment");continue;}addTexture(t);
+      if(!t || c.level>=t->levels || c.load>2 || c.store>1 || (op.pipeline && t->format!=op.pipeline->options.color(i).format))throw std::runtime_error("attachment["+std::to_string(i)+"] target/level/format/actions");
+      if(op.areaWidth>t->levelWidth(c.level) || op.areaHeight>t->levelHeight(c.level))throw std::runtime_error("render area exceeds attachment");
+      if(t->levelWidth(c.level)!=op.texture->levelWidth(op.dstLevel) || t->levelHeight(c.level)!=op.texture->levelHeight(op.dstLevel))throw std::runtime_error("attachment size mismatch");
+      if(orderedColorAccess && op.pipeline && !(t->usage&VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT))throw std::runtime_error("ordered target lacks INPUT_ATTACHMENT");
+      if(op.pipeline && (op.pipeline->fetchMask&(1u<<i)) && c.load==0)throw std::runtime_error("fetch from DontCare attachment");
+      if(op.pipeline && t->tiling==VK_IMAGE_TILING_LINEAR && op.pipeline->options.color(i).blend){VkFormatProperties props{};GetPhysicalDeviceFormatProperties(physical,t->vkFormat,&props);if(!(props.linearTilingFeatures&VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT))throw std::runtime_error("linear attachment blending unavailable");}
+      for(unsigned j=0;j<i;++j){auto other=op.color(j);if(!other.texture)continue;if(t->memory==other.texture->memory || hostRangesOverlap(t->mapped,t->allocated,other.texture->mapped,other.texture->allocated))throw std::runtime_error("render attachment alias");}
+      for(unsigned stage=0;stage<2;++stage)for(auto binding:op.buffers[stage])if(binding.buffer && (binding.buffer->memory==t->memory || hostRangesOverlap(binding.buffer->contents,binding.buffer->length,t->mapped,t->allocated)))throw std::runtime_error("attachment/buffer feedback");
+      for(unsigned slot=0;slot<resourceSlots;++slot){auto *sample=op.samples[slot];if(!slot && !sample)sample=op.sourceTexture;
+       if(sample && (sample->memory==t->memory || hostRangesOverlap(sample->mapped,sample->allocated,t->mapped,t->allocated)))throw std::runtime_error("attachment feedback");}
+     }
+    }
     if(op.clearOnly && (!op.texture || op.pipeline || op.load>2 || op.store>1))throw std::runtime_error("invalid empty render pass");
     if(!op.pipeline)continue;
-    if(orderedColorAccess && !(op.texture && (op.texture->usage&VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)))throw std::runtime_error("ordered render target lacks INPUT_ATTACHMENT usage");
-    if(op.pipeline->fetchMask && op.load==0)throw std::runtime_error("fetch from undefined DontCare attachment");
     if(op.vertices<3 || op.vertices>65536 || op.first>65536-op.vertices || (!op.strip && op.vertices%3))throw std::runtime_error("invalid primitive count/start");
-    if(!op.texture || op.texture->format!=op.pipeline->options.format || op.load>2 || op.store>1)throw std::runtime_error("invalid bounded draw target/actions");
+    if(!op.texture || op.load>2 || op.store>1)throw std::runtime_error("invalid bounded draw target/actions");
     const auto &v=op.viewport;const auto &r=op.scissor;
     if(!viewportFits(v.x,v.y+v.height,v.width,-v.height,v.minDepth,v.maxDepth,op.texture->levelWidth(op.dstLevel),op.texture->levelHeight(op.dstLevel)) || r.offset.x<0 || r.offset.y<0 ||
        op.areaWidth>op.texture->levelWidth(op.dstLevel) || op.areaHeight>op.texture->levelHeight(op.dstLevel) ||
        !scissorFits(r.offset.x,r.offset.y,r.extent.width,r.extent.height,op.areaWidth?op.areaWidth:op.texture->levelWidth(op.dstLevel),op.areaHeight?op.areaHeight:op.texture->levelHeight(op.dstLevel)))throw std::runtime_error("viewport/scissor target bounds");
-    if(op.texture->tiling==VK_IMAGE_TILING_LINEAR && op.pipeline->options.blend){VkFormatProperties props{};GetPhysicalDeviceFormatProperties(physical,op.texture->vkFormat,&props);if(!(props.linearTilingFeatures&VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT))throw std::runtime_error("linear attachment blending unavailable");}
     DrawInput input{};input.count=op.vertices;input.start=op.first;input.strip=op.strip;input.indexed=op.indices!=nullptr;input.indexLength=op.indices?op.indices->length:0;input.indexOffset=op.indexOffset;
     for(unsigned stage=0;stage<2;++stage)for(unsigned i=0;i<resourceSlots;++i){auto b=op.buffers[stage][i];if(b.buffer){if(b.buffer->memory==op.texture->memory || hostRangesOverlap(b.buffer->contents,b.buffer->length,op.texture->mapped,op.texture->allocated))throw std::runtime_error("attachment/buffer feedback");addBuffer(b.buffer);input.buffers[stage][i]={b.buffer->length,b.offset,b.bytes?1u:0u};}}
     for(unsigned i=0;i<resourceSlots;++i){auto *t=i==0 && !op.samples[i]?op.sourceTexture:op.samples[i];auto *sam=i==0 && !op.samplers[i]?op.sampler:op.samplers[i];
@@ -719,7 +752,7 @@ public:
     }else if(descriptorPool)check(ResetDescriptorPool(device,descriptorPool,0));
     submitPool=descriptorPool;
    }
-   for(size_t opIndex=0;opIndex<ops.size();++opIndex) {const auto &op=ops[opIndex];const auto &draw=draws[opIndex];
+   for(size_t opIndex=0;opIndex<ops.size();++opIndex) {diagnosticOp=opIndex;const auto &op=ops[opIndex];const auto &draw=draws[opIndex];
     for(unsigned slot=0;slot<resourceSlots;++slot)if(auto *t=op.samples[slot]){
      uint32_t base=op.sampleBase[slot],count=op.sampleCount[slot]?op.sampleCount[slot]:t->levels-base;
      if(base>=t->levels || !count || count>t->levels-base)throw std::runtime_error("sample mip range");
@@ -729,6 +762,7 @@ public:
     if(op.sourceTexture && !op.sourceTexture->isDefined(op.srcLevel))throw std::runtime_error("undefined source texture mip");
     if(op.sourceTexture)transition(op.sourceTexture,op.pipeline?VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:VK_IMAGE_LAYOUT_GENERAL);
     if(op.texture)transition(op.texture,VK_IMAGE_LAYOUT_GENERAL);
+    if(op.pipeline || op.clearOnly)for(unsigned i=0;i<op.colorCount;++i)if(auto *target=op.color(i).texture)if(target!=op.texture)transition(target,VK_IMAGE_LAYOUT_GENERAL);
     if(op.generateMips){auto *t=op.texture;
      if(!t->isDefined(op.mipBase))throw std::runtime_error("undefined mip generation source");
      for(uint32_t l=op.mipBase+1;l<op.mipBase+op.mipCount;++l){
@@ -740,21 +774,19 @@ public:
      }
     }else
     if(op.texture && op.pipeline) {
-     if(op.load==1 && !op.texture->isDefined(op.dstLevel))throw std::runtime_error("load undefined attachment");
-     // A stored draw defines its target even after a DontCare load: Metal leaves only
-     // the undrawn pixels unspecified (CA's offscreen passes cover their area fully).
-     op.texture->setDefined(op.dstLevel,op.store!=0);
-     auto render=op.pipeline->renders[op.load][op.store];
+     std::array<Texture *,8> targets{};std::array<uint32_t,8> levels{};VkImageView targetViews[8]{},compactViews[8]{};VkClearValue clears[8]{};unsigned used=0;
+     for(unsigned i=0;i<op.colorCount;++i){auto c=op.color(i);if(!c.texture)continue;if(c.load==1 && !c.texture->isDefined(c.level))throw std::runtime_error("load undefined attachment["+std::to_string(i)+"]");
+      c.texture->setDefined(c.level,c.store!=0);targets[i]=c.texture;levels[i]=c.level;targetViews[i]=attachmentView(c.texture,c.level);compactViews[used]=targetViews[i];memcpy(clears[used++].color.float32,c.clear,sizeof(c.clear));}
+     auto render=renderPass(op.pipeline,&op);
      VkFramebufferCreateInfo fi{};fi.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;fi.renderPass=render;
-     fi.attachmentCount=1;VkImageView targetView=attachmentView(op.texture,op.dstLevel);fi.pAttachments=&targetView;fi.width=op.texture->levelWidth(op.dstLevel);fi.height=op.texture->levelHeight(op.dstLevel);fi.layers=1;VkFramebuffer frame{};
-     {Measure measure{objectNanos};auto found=std::find_if(frameCache.begin(),frameCache.end(),[&](auto c){return c.texture==op.texture && c.render==render && c.level==op.dstLevel;});
+     fi.attachmentCount=used;fi.pAttachments=compactViews;fi.width=op.texture->levelWidth(op.dstLevel);fi.height=op.texture->levelHeight(op.dstLevel);fi.layers=1;VkFramebuffer frame{};
+     {Measure measure{objectNanos};auto found=std::find_if(frameCache.begin(),frameCache.end(),[&](auto c){return c.textures==targets && c.render==render && c.levels==levels;});
       if(found!=frameCache.end())frame=found->frame;
       else {check(CreateFramebuffer(device,&fi,nullptr,&frame));++reuseCounts.frames;++submitObjectCreates;++submitFrameCreates;
-       try {if(frameCache.size()<frameCacheLimit)frameCache.push_back({op.texture,render,op.dstLevel,frame});else frames.push_back(frame);}catch(...){DestroyFramebuffer(device,frame,nullptr);throw;}}
+       try {if(frameCache.size()<frameCacheLimit)frameCache.push_back({targets,render,levels,frame});else frames.push_back(frame);}catch(...){DestroyFramebuffer(device,frame,nullptr);throw;}}
      }
-     VkClearValue clear{};memcpy(clear.color.float32,op.clear,sizeof(op.clear));
      VkRenderPassBeginInfo ri{};ri.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;ri.renderPass=render;ri.framebuffer=frame;
-     ri.renderArea={{0,0},{op.areaWidth?op.areaWidth:op.texture->levelWidth(op.dstLevel),op.areaHeight?op.areaHeight:op.texture->levelHeight(op.dstLevel)}};ri.clearValueCount=1;ri.pClearValues=&clear;
+     ri.renderArea={{0,0},{op.areaWidth?op.areaWidth:op.texture->levelWidth(op.dstLevel),op.areaHeight?op.areaHeight:op.texture->levelHeight(op.dstLevel)}};ri.clearValueCount=used;ri.pClearValues=clears;
      CmdBeginRenderPass(cmd,&ri,VK_SUBPASS_CONTENTS_INLINE);CmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,op.strip?op.pipeline->stripPipeline:op.pipeline->pipeline);
      CmdSetViewport(cmd,0,1,&op.viewport);CmdSetScissor(cmd,0,1,&op.scissor);
      if(draw.descriptorCount) {
@@ -771,8 +803,8 @@ public:
         if(it==op.pipeline->descriptors.end() || d.slot>=op.pipeline->constantBlobs.size() || d.offset)throw std::runtime_error("planned constant blob mismatch");
         auto *b=op.pipeline->constantBlobs[d.slot];buffer={b->buffer,0,d.range};write.pBufferInfo=&buffer;
        }else if(d.type==VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT){
-        if(!op.pipeline->fetchMask || !op.pipeline->orderedColorAccess || d.slot || d.format!=(uint32_t)op.texture->vkFormat || d.stages!=VK_SHADER_STAGE_FRAGMENT_BIT)throw std::runtime_error("planned input attachment mismatch");
-        image={VK_NULL_HANDLE,targetView,VK_IMAGE_LAYOUT_GENERAL};write.pImageInfo=&image;
+        if(!op.pipeline->fetchMask || !op.pipeline->orderedColorAccess || d.slot>=op.colorCount || !(op.pipeline->fetchMask&(1u<<d.slot)) || d.format!=(uint32_t)op.color(d.slot).texture->vkFormat || d.stages!=VK_SHADER_STAGE_FRAGMENT_BIT)throw std::runtime_error("planned input attachment mismatch");
+        image={VK_NULL_HANDLE,targetViews[d.slot],VK_IMAGE_LAYOUT_GENERAL};write.pImageInfo=&image;
        }else if(d.type==VK_DESCRIPTOR_TYPE_SAMPLER){
         if(d.sampler>=resourceSlots)throw std::runtime_error("planned sampler slot");
         auto *sam=d.sampler==0 && !op.samplers[0]?op.sampler:op.samplers[d.sampler];if(!sam)throw std::runtime_error("planned unbound sampler");
@@ -797,11 +829,30 @@ public:
      for(unsigned i=0;i<draw.vertexCount;++i){auto b=op.buffers[0][draw.vertexSlots[i]].buffer;VkDeviceSize offset=draw.vertexOffsets[i];CmdBindVertexBuffers(cmd,draw.vertexBindings[i],1,&b->buffer,&offset);}
      if(draw.indexed){CmdBindIndexBuffer(cmd,op.indices->buffer,draw.indexOffset,VK_INDEX_TYPE_UINT16);CmdDrawIndexed(cmd,draw.count,1,draw.first,0,0);}else CmdDraw(cmd,draw.count,1,draw.first,0);
      CmdEndRenderPass(cmd);
+    } else if(op.texture && op.clearOnly && ((op.areaWidth && op.areaWidth!=op.texture->levelWidth(op.dstLevel)) || (op.areaHeight && op.areaHeight!=op.texture->levelHeight(op.dstLevel)))) {
+     // Empty partial passes still execute Metal load/store over the chosen area.
+     // A render pass CLEAR obeys renderArea; vkCmdClearColorImage cannot do so.
+     Pipeline pass{};pass.options.format=0;pass.options.colorCount=op.colorCount;
+     VkImageView views[8]{};VkClearValue clears[8]{};unsigned used=0;
+     for(unsigned i=0;i<op.colorCount;++i){auto c=op.color(i);if(!c.texture)continue;
+      if(c.load==1 && !c.texture->isDefined(c.level))throw std::runtime_error("load undefined partial empty attachment");
+      if(i)pass.options.colors[i-1].format=c.texture->format;else pass.options.format=c.texture->format;
+      views[used]=attachmentView(c.texture,c.level);memcpy(clears[used++].color.float32,c.clear,sizeof(c.clear));
+     }
+     auto render=renderPass(&pass,&op);try{emptyRenders.push_back(render);}catch(...){DestroyRenderPass(device,render,nullptr);throw;}
+     VkFramebufferCreateInfo fi{};fi.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;fi.renderPass=render;fi.attachmentCount=used;fi.pAttachments=views;fi.width=op.texture->levelWidth(op.dstLevel);fi.height=op.texture->levelHeight(op.dstLevel);fi.layers=1;
+     VkFramebuffer frame{};check(CreateFramebuffer(device,&fi,nullptr,&frame));try{frames.push_back(frame);}catch(...){DestroyFramebuffer(device,frame,nullptr);throw;}
+     ++reuseCounts.frames;++submitObjectCreates;++submitFrameCreates;
+     VkRenderPassBeginInfo ri{};ri.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;ri.renderPass=render;ri.framebuffer=frame;ri.renderArea={{0,0},{op.areaWidth?op.areaWidth:fi.width,op.areaHeight?op.areaHeight:fi.height}};ri.clearValueCount=used;ri.pClearValues=clears;
+     CmdBeginRenderPass(cmd,&ri,VK_SUBPASS_CONTENTS_INLINE);CmdEndRenderPass(cmd);
+     for(unsigned i=0;i<op.colorCount;++i){auto c=op.color(i);if(c.texture)c.texture->setDefined(c.level,c.store && (c.load==2 || (c.load==1 && c.texture->isDefined(c.level))));}
     } else if(op.texture && op.clearOnly) {
-     if((op.areaWidth && op.areaWidth!=op.texture->levelWidth(op.dstLevel)) || (op.areaHeight && op.areaHeight!=op.texture->levelHeight(op.dstLevel)))throw std::runtime_error("partial render area on an empty pass");
-     if(op.load==1 && !op.texture->isDefined(op.dstLevel))throw std::runtime_error("load undefined empty attachment");
-     if(op.load==2){VkClearColorValue clear{};memcpy(clear.float32,op.clear,sizeof(op.clear));VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT,op.dstLevel,1,0,1};CmdClearColorImage(cmd,op.texture->image,VK_IMAGE_LAYOUT_GENERAL,&clear,1,&range);}
-     op.texture->setDefined(op.dstLevel,op.store && (op.load==2 || (op.load==1 && op.texture->isDefined(op.dstLevel))));
+     for(unsigned i=0;i<op.colorCount;++i){auto c=op.color(i);auto *t=c.texture;if(!t)continue;
+      if((op.areaWidth && op.areaWidth!=t->levelWidth(c.level)) || (op.areaHeight && op.areaHeight!=t->levelHeight(c.level)))throw std::runtime_error("partial render area on an empty pass");
+      if(c.load==1 && !t->isDefined(c.level))throw std::runtime_error("load undefined empty attachment");
+      if(c.load==2){VkClearColorValue clear{};memcpy(clear.float32,c.clear,sizeof(c.clear));VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT,c.level,1,0,1};CmdClearColorImage(cmd,t->image,VK_IMAGE_LAYOUT_GENERAL,&clear,1,&range);}
+      t->setDefined(c.level,c.store && (c.load==2 || (c.load==1 && t->isDefined(c.level))));
+     }
     } else if(op.texture && op.sourceTexture) {
      if(!op.texture->isDefined(op.dstLevel) && (op.dstX || op.dstY || (op.width && op.width!=op.texture->levelWidth(op.dstLevel)) || (op.height && op.height!=op.texture->levelHeight(op.dstLevel)))){VkClearColorValue zero{};VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT,op.dstLevel,1,0,1};CmdClearColorImage(cmd,op.texture->image,VK_IMAGE_LAYOUT_GENERAL,&zero,1,&range);
       barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&barrier,0,nullptr,0,nullptr);}
@@ -834,6 +885,7 @@ public:
 #endif
    VkSubmitInfo si{};si.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO;si.commandBufferCount=1;si.pCommandBuffers=&cmd;
    // Any failure after attempting submission poisons ownership and avoids unsafe teardown.
+   requireLive(); // A concurrent frontend refusal must cancel prepared work too.
    submitted=true;submitQueued=std::chrono::steady_clock::now();submitPrepareNanos+=(uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(submitQueued-submitStart).count();
 #ifdef FUXI_MTL_HOST_TEST
    if(failQueueAttempt){failQueueAttempt=false;check(VK_ERROR_DEVICE_LOST);}
@@ -859,7 +911,9 @@ public:
    if(!reuseSubmitObjects){clearSubmitObjects();clearFrames();clearViews();}
 #endif
    ++submits;submitRetireNanos+=since(submitDone);
-  } catch(...) {if(submitted) poisoned=true;else {if(!completed)for(auto old:oldTextures){old.texture->layout=old.layout;old.texture->defined=old.defined;old.texture->definedLevels=old.definedLevels;}clearSubmitObjects();cleanup();}throw;}
+  } catch(...) {if(submitted) poisoned=true;else {if(!completed)for(auto old:oldTextures){old.texture->layout=old.layout;old.texture->defined=old.defined;old.texture->definedLevels=old.definedLevels;}clearSubmitObjects();cleanup();}
+   try{throw;}catch(const std::exception &e){if(diagnosticOp<ops.size() && !ops[diagnosticOp].diagnostic.empty())throw std::runtime_error(std::string(e.what())+" desc="+ops[diagnosticOp].diagnostic);throw;}
+  }
  }
 };
 }

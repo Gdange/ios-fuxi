@@ -39,8 +39,8 @@ int main() {@autoreleasepool {
  }
  { // A modeled missing entry exercises real nil/error wrappers exactly once.
   FuxiLibrary *library=[FuxiLibrary new];library->_device=[device retain];checkLabel(library);
-  NSError *lookupError=nil;uint64_t failures=fuxi_metal_failure_count();
-  assert(![library newFunctionWithName:@"fixture_missing" constantValues:nil error:&lookupError]);
+  id missing=nil;NSError *lookupError=nil;uint64_t failures=fuxi_metal_failure_count();
+  assert(![library newFunctionWithName:@"fixture_missing" constantValues:missing error:&lookupError]);
   assert([lookupError.localizedDescription isEqualToString:@"test entry missing: fixture_missing"]);
   assert(fuxi_metal_failure_count()==++failures);
   MTLFunctionDescriptor *fd=[MTLFunctionDescriptor functionDescriptor];fd.name=@"fixture_missing";
@@ -49,16 +49,16 @@ int main() {@autoreleasepool {
   assert(fuxi_metal_failure_count()==++failures);
   assert(![library newFunctionWithName:@"fixture_missing"]);
   assert(fuxi_metal_failure_count()==++failures);
-  assert(![library newFunctionWithName:@"fixture_exception" constantValues:nil error:&lookupError]);
+  assert(![library newFunctionWithName:@"fixture_exception" constantValues:missing error:&lookupError]);
   assert([lookupError.localizedDescription isEqualToString:@"lookup exception"]);
   assert(fuxi_metal_failure_count()==++failures);
-  assert(![library newFunctionWithName:nil constantValues:nil error:&lookupError] && lookupError);
+  assert(![library newFunctionWithName:missing constantValues:missing error:&lookupError] && lookupError);
   assert(fuxi_metal_failure_count()==++failures);
-  FuxiFunction *function=[library newFunctionWithName:@"fixture_fragment" constantValues:nil error:&lookupError];
+  FuxiFunction *function=(FuxiFunction *)[library newFunctionWithName:@"fixture_fragment" constantValues:missing error:&lookupError];
   assert(function && !lookupError && function.functionType==MTLFunctionTypeFragment);
   checkLabel(function);assert(fuxi_metal_failure_count()==failures);
   MTLFunctionDescriptor *roundtrip=[function functionDescriptor];assert([roundtrip.name isEqualToString:@"fixture_fragment"] && !roundtrip.constantValues && ![function options]);
-  __block bool called=false;[library newFunctionWithName:@"fixture_fragment" constantValues:nil completionHandler:^(id<MTLFunction> f,NSError *e){called=true;assert(f && !e && [f.name isEqualToString:@"fixture_fragment"]);}];assert(called);
+  __block bool called=false;[library newFunctionWithName:@"fixture_fragment" constantValues:missing completionHandler:^(id<MTLFunction> f,NSError *e){called=true;assert(f && !e && [f.name isEqualToString:@"fixture_fragment"]);}];assert(called);
   [function release];[library release];
  }
  MTLSamplerDescriptor *sd=[MTLSamplerDescriptor new];id<MTLSamplerState>sampler=[device newSamplerStateWithDescriptor:sd];
@@ -83,20 +83,19 @@ int main() {@autoreleasepool {
  pass.renderTargetHeight=257;refuses(c,^{[c renderCommandEncoderWithDescriptor:pass];});pass.renderTargetHeight=0;
  { // A smaller renderTargetWidth/Height is a top-left render area: default viewport/scissor, scissor bound.
   FuxiCommandBuffer *a=(id)queue.commandBuffer;pass.renderTargetWidth=53;pass.renderTargetHeight=40;
-  FuxiRender *area=[a renderCommandEncoderWithDescriptor:pass];pass.renderTargetWidth=0;pass.renderTargetHeight=0;
+  FuxiRender *area=(FuxiRender *)[a renderCommandEncoderWithDescriptor:pass];pass.renderTargetWidth=0;pass.renderTargetHeight=0;
   assert(area && area->_state.areaWidth==53 && area->_state.areaHeight==40);
   assert(area->_state.scissor.extent.width==53 && area->_state.scissor.extent.height==40 && area->_state.viewport.width==53 && area->_state.viewport.y==40);
   [area setScissorRect:(MTLScissorRect){10,10,43,30}];assert(!a->_rejected);
   refuses(a,^{[area setScissorRect:(MTLScissorRect){0,0,54,40}];});
-  // An empty pass cannot clear only part of the target yet.
-  refuses(a,^{[area endEncoding];});
+  [area endEncoding];assert(a->_ops.size()==1 && a->_ops[0].areaWidth==53 && a->_ops[0].areaHeight==40);
  }
  pass.depthAttachment.texture=(id)t;refuses(c,^{[c renderCommandEncoderWithDescriptor:pass];});pass.depthAttachment.texture=nil;
  pass.colorAttachments[7].resolveTexture=(id)t;refuses(c,^{[c renderCommandEncoderWithDescriptor:pass];});pass.colorAttachments[7].resolveTexture=nil;
  MTLRenderPassDescriptor *samplePass=[[pass copy] autorelease];
  MTLSamplePosition positions[4]={{0.25f,0.25f},{0.75f,0.25f},{0.25f,0.75f},{0.75f,0.75f}};[samplePass setSamplePositions:positions count:4];
  refuses(c,^{[c renderCommandEncoderWithDescriptor:samplePass];});
- FuxiRender *r=[c renderCommandEncoderWithDescriptor:pass];assert(r);
+ FuxiRender *r=(FuxiRender *)[c renderCommandEncoderWithDescriptor:pass];assert(r);
  checkLabel(c);checkLabel(r);assert(!c->_rejected && !c.error);
  refuses(c,^{[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];});
  refuses(c,^{[r setRenderPipelineState:(id)t];});[r setRenderPipelineState:(id)p];
@@ -118,7 +117,7 @@ int main() {@autoreleasepool {
  [r drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
  [r endEncoding];refuses(c,^{[r endEncoding];});
  checkLabel(r);checkLabel(c);assert(!c->_rejected && !c.error);
- FuxiBuffer *b=[device newBufferWithLength:262656 options:0];FuxiBlit *blit=[c blitCommandEncoder];
+ FuxiBuffer *b=(FuxiBuffer *)[device newBufferWithLength:262656 options:0];FuxiBlit *blit=(FuxiBlit *)[c blitCommandEncoder];
  refuses(c,^{[blit copyFromTexture:(id)t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(256,256,1)
  toBuffer:(id)b destinationOffset:0 destinationBytesPerRow:1000 destinationBytesPerImage:262144];});
  [blit copyFromTexture:(id)t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(256,256,1)
@@ -126,7 +125,7 @@ int main() {@autoreleasepool {
  assert(c->_ops.size()==3 && c->_ops[0].texture==t->_texture && c->_ops[0].pipeline==p->_pipeline && c->_ops[2].dst==b->_buffer);
  assert(c->_resources.count==6);
  // Recording snapshots the byte data and state; all bound buffers survive callers.
- FuxiBuffer *input=[device newBufferWithLength:128 options:0];
+ FuxiBuffer *input=(FuxiBuffer *)[device newBufferWithLength:128 options:0];
  pass.colorAttachments[0].loadAction=MTLLoadActionLoad;pass.colorAttachments[0].storeAction=MTLStoreActionDontCare;
  r=[c renderCommandEncoderWithDescriptor:pass];assert(r);[r setRenderPipelineState:(id)p];
  [r setVertexBuffer:input offset:16 atIndex:0];[r setFragmentBuffer:input offset:32 atIndex:3];

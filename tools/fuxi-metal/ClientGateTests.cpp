@@ -13,15 +13,20 @@ int main() {
   assert(parse(std::string("census ")+name+"\n",name)==M::deny);
  }
  assert(parse("fuxi-metal-smoke\n","backboardd")==M::deny);
+ assert(fuxi::backboardMode("x=1\tfuxibbgpu=2\nquiet")==2);
+ assert(fuxi::backboardMode("fuxibbgpu=1")==1);
+ assert(parse("backboardd\n","backboardd","fuxibbgpu=2")==M::allow);
+ assert(parse("census backboardd\n","backboardd","fuxibbgpu=2")==M::deny);
+ assert(parse("backboardd\n","SpringBoard","fuxibbgpu=2")==M::deny);
  const char *armed="other=1 fuxigpu=1 fuxibbgpu=1 quiet";
  assert(parse("backboardd\n","backboardd",armed)==M::allow);
  assert(parse("fuxi-ca-smoke\n","backboardd",armed)==M::deny);
  assert(parse("census backboardd\n","backboardd",armed)==M::deny);
  assert(parse("backboardd\ncensus backboardd\n","backboardd",armed)==M::deny);
- for(const char *args:{"", "fuxibbgpu=1-extra", "xfuxibbgpu=1", "fuxibbgpu=2", "fuxigpu=1",
+ for(const char *args:{"", "fuxibbgpu=1-extra", "xfuxibbgpu=1", "fuxibbgpu=3", "fuxibbgpu=02", "fuxibbgpu=2-extra", "fuxibbgpu=1 fuxibbgpu=2", "fuxibbgpu=2 fuxibbgpu=2", "fuxigpu=1",
      "fuxibbgpu=1 fuxibbgpu=0", "fuxibbgpu=0 fuxibbgpu=1", "fuxibbgpu=1 fuxibbgpu=1"})
   assert(parse("backboardd\n","backboardd",args)==M::deny);
- for(const char *config:{"SpringBoard\n","census SpringBoard\n"})assert(parse(config,"SpringBoard",armed)==M::deny);
+ for(const char *config:{"SpringBoard\n","census SpringBoard\n"}){assert(parse(config,"SpringBoard",armed)==M::deny);assert(parse(config,"SpringBoard","fuxibbgpu=2")==M::deny);}
  assert(parse("# comment\n\tfuxi-metal-smoke \r\n")==M::allow);
  assert(parse("census backboardd\n","backboardd")==M::deny);
  assert(parse("backboardd\ncensus backboardd\n","backboardd")==M::deny);

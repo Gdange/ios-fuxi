@@ -6,9 +6,9 @@
 #include <iostream>
 #include <iterator>
 #include <memory>
-static_assert(sizeof(fuxi::CompileOptions)==40100);
+static_assert(sizeof(fuxi::CompileOptions)==40360);
 static_assert(sizeof(fuxi::Descriptor)==64 && sizeof(fuxi::BakedSampler)==44);
-static_assert(sizeof(fuxi::DrawInput)==1056 && sizeof(fuxi::Translation)==2232);
+static_assert(sizeof(fuxi::DrawInput)==1056 && sizeof(fuxi::Translation)==2488);
 int main(int argc,char **argv) {
  std::cout.setf(std::ios::unitbuf);
  if(argc!=5 && argc!=6)return 2;

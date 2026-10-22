@@ -153,5 +153,5 @@ if __name__=='__main__':
     ap.add_argument('--translator',type=Path)
     ap.add_argument('--metallib',type=Path)
     ap.add_argument('--source',type=Path,help='external library corresponding source and licence archive')
-    ap.add_argument('--enable-backboardd',action='store_true',help='add backboardd allow entry and private storage; also requires boot arg fuxibbgpu=1')
+    ap.add_argument('--enable-backboardd',action='store_true',help='add backboardd allow entry and private storage; also requires boot arg fuxibbgpu=1 (2 is a diagnostic survey; may blank screen for ~20s)')
     a=ap.parse_args();stage(a.root,a.icd,a.bundle,a.smoke,a.conf,a.clients,a.translator,a.metallib,a.source,a.ca_smoke,a.ca_conf,a.enable_backboardd)

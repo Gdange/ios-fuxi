@@ -23,7 +23,7 @@ static VkResult VKAPI_CALL size(VkDevice,VkPipelineCache c,size_t *n,void *bytes
 int main() {
  assert(fuxi::validFetchContract(false,0,0) && fuxi::validFetchContract(true,1,0) && fuxi::validFetchContract(true,1,1));
  assert(!fuxi::validFetchContract(false,0,1) && !fuxi::validFetchContract(false,1,1));
- assert(!fuxi::validFetchContract(true,0,1) && !fuxi::validFetchContract(true,1,2));
+ assert(!fuxi::validFetchContract(true,0,1) && fuxi::validFetchContract(true,1,2));
  assert(!fuxi::validFetchContract(true,2,1) && !fuxi::validFetchContract(true,1,UINT32_MAX));
  assert(fuxi::bindingRange(0,16) && fuxi::bindingRange(16,0));
  assert(!fuxi::bindingRange(16,1) && !fuxi::bindingRange(std::numeric_limits<size_t>::max(),2));

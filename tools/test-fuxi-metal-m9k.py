@@ -34,13 +34,13 @@ def main():
             return
         # The ABI guard runs before any other bridge symbol is consumed.
         (d/'guard.cpp').write_text('#include "fuxi-metal/Translator.hpp"\n#include <string>\nint main(){try{(void)fuxi::Translator::get();return 2;}catch(const std::exception &e){return std::string(e.what())=="metal2vulkan C ABI mismatch"?0:3;}}\n')
-        for version in (None, 6, 8):
+        for version in (None, 7, 9):
             (d/'old.cpp').write_text('int unused;' if version is None else 'extern "C" unsigned fuxi_m2v_abi(){return '+str(version)+';}')
             subprocess.run(['clang++','-shared','-fPIC',str(d/'old.cpp'),'-o',str(d/'old.so')],check=True)
             subprocess.run(['clang++','-std=c++17','-Wall','-Wextra','-Werror','-I'+str(ROOT/'tools'),
                 '-DFUXI_MTL_TRANSLATOR="'+str(d/'old.so')+'"',str(d/'guard.cpp'),'-ldl','-pthread','-o',str(d/'guard')],check=True)
             subprocess.run([str(d/'guard')],check=True,timeout=10)
-        print('PASS: missing, ABI-6 and future bridge refused before symbol consumption')
+        print('PASS: missing, ABI-7 and future bridge refused before symbol consumption')
         p = subprocess.run([str(d/'test'), str(d/'control.bc')], env=dict(os.environ, ASAN_OPTIONS='detect_leaks=0', LP_NUM_THREADS='2'),
                            text=True, capture_output=True, timeout=120)
         assert p.returncode == 0, p.stderr[-6000:]

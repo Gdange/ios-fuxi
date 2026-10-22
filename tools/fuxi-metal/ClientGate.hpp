@@ -19,15 +19,17 @@ static inline bool systemString(const char *key,char *out,size_t capacity) {
  (void)key;if(capacity)out[0]=0;return false;
 #endif
 }
-static inline bool backboardArmed(const char *args) {
- if(!args)return false;unsigned keys=0;bool armed=false;
+static inline unsigned backboardMode(const char *args) {
+ if(!args)return 0;unsigned keys=0,mode=0;
  for(const char *p=args;*p;) {
   p+=strspn(p," \t\r\n");size_t n=strcspn(p," \t\r\n");
-  if(n>=10 && !strncmp(p,"fuxibbgpu=",10)) {++keys;armed=n==11 && !memcmp(p,"fuxibbgpu=1",11);}
+  if(n>=10 && !strncmp(p,"fuxibbgpu=",10)) {++keys;mode=n==11 && (p[10]=='1' || p[10]=='2')?unsigned(p[10]-'0'):0;}
   p+=n;
  }
- return keys==1 && armed;
+ return keys==1?mode:0;
 }
+static inline bool backboardArmed(const char *args){return backboardMode(args)!=0;}
+static inline unsigned systemBackboardMode(){char args[4096]={};systemString("kern.bootargs",args,sizeof(args));return backboardMode(args);}
 static inline bool clientName(const char *s) {
  size_t n=strlen(s);if(!n || n>63)return false;
  for(size_t i=0;i<n;++i)if(!((s[i]>='a'&&s[i]<='z')||(s[i]>='A'&&s[i]<='Z')||

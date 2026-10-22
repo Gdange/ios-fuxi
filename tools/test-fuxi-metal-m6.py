@@ -34,7 +34,7 @@ static std::vector<uint32_t> shader(const char *name) {
 }
 struct Product {std::vector<uint32_t> v,f;};
 extern "C" int fuxi_m2v_sampler(void *,uint32_t,fuxi::BakedSampler *out,char *,size_t){*out={};return 1;}
-extern "C" uint32_t fuxi_m2v_abi(){return 7;}
+extern "C" uint32_t fuxi_m2v_abi(){return 8;}
 extern "C" void *fuxi_m2v_open(const uint8_t *,size_t,char *,size_t){return nullptr;}
 extern "C" void fuxi_m2v_close(void *){}
 extern "C" int fuxi_m2v_function(void *,const char *,char *,size_t){return 0;}

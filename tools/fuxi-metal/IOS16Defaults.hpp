@@ -30,7 +30,7 @@
  auto d=[MTLRenderPassDescriptor renderPassDescriptor];
  d.visibilityResultBuffer=nil;d.renderTargetArrayLength=0;d.imageblockSampleLength=0;d.tileWidth=0;d.tileHeight=0;
  d.threadgroupMemoryLength=0;d.defaultRasterSampleCount=0;d.rasterizationRateMap=nil;d.renderTargetWidth=0;d.renderTargetHeight=0;
- [d setSamplePositions:nullptr count:0];
+ MTLSamplePosition ignoredPosition{};[d setSamplePositions:&ignoredPosition count:0];
  d.depthAttachment.texture=nil;d.stencilAttachment.texture=nil;d.depthAttachment.resolveTexture=nil;d.stencilAttachment.resolveTexture=nil;
  for(unsigned i=0;i<8;++i) {
   auto a=d.colorAttachments[i];a.texture=nil;a.level=0;a.slice=0;a.depthPlane=0;a.resolveTexture=nil;

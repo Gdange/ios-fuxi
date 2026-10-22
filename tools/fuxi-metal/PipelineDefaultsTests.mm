@@ -19,11 +19,11 @@ int main(int argc,char **argv) {assert(argc==2);@autoreleasepool {
  FuxiOwner *state=[FuxiOwner new];state->backend=new fuxi::Backend;state->registry=123;
  id device=[cls alloc];objc_setAssociatedObject(device,&ownerKey,state,OBJC_ASSOCIATION_RETAIN_NONATOMIC);[state release];
  NSError *error=nil;NSURL *url=[NSURL fileURLWithPath:[NSString stringWithUTF8String:argv[1]]];
- FuxiLibrary *vl=[device newLibraryWithURL:url error:&error];assert(vl && !error);
+ FuxiLibrary *vl=(FuxiLibrary *)[device newLibraryWithURL:url error:&error];assert(vl && !error);
  NSData *bytes=[NSData dataWithContentsOfURL:url];
  dispatch_data_t data=dispatch_data_create(bytes.bytes,bytes.length,dispatch_get_global_queue(0,0),DISPATCH_DATA_DESTRUCTOR_DEFAULT);
- FuxiLibrary *fl=[device newLibraryWithData:data error:&error];dispatch_release(data);assert(fl && !error);
- FuxiFunction *v=[vl newFunctionWithName:@"fuxi_vertex"],*f=[fl newFunctionWithName:@"fuxi_fragment"];
+ FuxiLibrary *fl=(FuxiLibrary *)[device newLibraryWithData:data error:&error];dispatch_release(data);assert(fl && !error);
+ FuxiFunction *v=(FuxiFunction *)[vl newFunctionWithName:@"fuxi_vertex"],*f=(FuxiFunction *)[fl newFunctionWithName:@"fuxi_fragment"];
  assert([v isKindOfClass:[FuxiFunction class]] && [f isKindOfClass:[FuxiFunction class]]);
  assert(v->_stage==1 && f->_stage==2 && [v device]==device && [f device]==device);
  assert([v functionType]==MTLFunctionTypeVertex && [f functionType]==MTLFunctionTypeFragment);
@@ -55,7 +55,7 @@ int main(int argc,char **argv) {assert(argc==2);@autoreleasepool {
  rejects(d,device,@"colorAttachments[0].pixelFormat",^(MTLRenderPipelineDescriptor *x){x.colorAttachments[0].pixelFormat=MTLPixelFormatRGBA32Float;});
  rejects(d,device,@"blend factor/operation",^(MTLRenderPipelineDescriptor *x){x.colorAttachments[0].blendingEnabled=YES;x.colorAttachments[0].sourceRGBBlendFactor=MTLBlendFactorSource1Color;});
  rejects(d,device,@"colorAttachments[0].writeMask",^(MTLRenderPipelineDescriptor *x){x.colorAttachments[0].writeMask=(MTLColorWriteMask)32;});
- rejects(d,device,@"colorAttachments[7].pixelFormat",^(MTLRenderPipelineDescriptor *x){x.colorAttachments[7].pixelFormat=MTLPixelFormatBGRA8Unorm;});
+ auto mrt=[[d copy] autorelease];mrt.colorAttachments[7].pixelFormat=MTLPixelFormatBGRA8Unorm;assert(!pipelineRejection(mrt,device));
  auto widened=[[d copy] autorelease];widened.colorAttachments[0].pixelFormat=MTLPixelFormatRGBA8Unorm;
  widened.colorAttachments[0].blendingEnabled=YES;widened.colorAttachments[0].destinationRGBBlendFactor=MTLBlendFactorOneMinusSourceAlpha;
  widened.colorAttachments[0].writeMask=MTLColorWriteMaskRed;assert(!pipelineRejection(widened,device));

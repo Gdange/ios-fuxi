@@ -13,14 +13,20 @@
 #define FUXI_MTL_TRANSLATOR "/usr/local/lib/libmetal2vulkan.dylib"
 #endif
 namespace fuxi {
-// ABI 7. All ordinals in the input are public Metal values; outputs are Vulkan values.
+// ABI 8. All ordinals in the input are public Metal values; outputs are Vulkan values.
 struct Constant {uint32_t index{},type{},size{};uint8_t bytes[16]{};char name[128]{};};
 struct Attribute {uint32_t format{},offset{},buffer{};};
+struct ColorOptions {
+ uint32_t format=0,blend=0,srcRGB=1,dstRGB=0,rgbOp=0,srcAlpha=1,dstAlpha=0,alphaOp=0,mask=15;
+};
+struct ColorBlend {uint32_t blend{},mask{},factors[6]{};};
 struct CompileOptions {
  uint32_t format=80,blend=0,srcRGB=1,dstRGB=0,rgbOp=0,srcAlpha=1,dstAlpha=0,alphaOp=0,mask=15,strip=0;
  Attribute attributes[8]{};uint32_t strides[4]{};uint32_t constantCount[2]{};Constant constants[2][maxFunctionConstants]{};
  // Actual VkDevice enables, supplied by Backend; never inferred from support.
  uint32_t orderedColorAccess{};
+ uint32_t independentBlend{};uint32_t colorCount=1;ColorOptions colors[7]{};
+ ColorOptions color(unsigned i) const {return i?colors[i-1]:ColorOptions{format,blend,srcRGB,dstRGB,rgbOp,srcAlpha,dstAlpha,alphaOp,mask};}
 };
 struct Descriptor {uint32_t binding{},type{},stages{},slot{},sampler{},format{},components[4]{};uint64_t offset{},range{};uint32_t set{},source{};};
 struct VertexBinding {uint32_t binding{},slot{},stride{};};
@@ -37,7 +43,7 @@ struct Translation {
  void *handle{}; const uint32_t *vertex{}; size_t vertexCount{}; const char *vertexEntry{};
  const uint32_t *fragment{}; size_t fragmentCount{}; const char *fragmentEntry{};
  uint32_t pushOffset{},pushSize{},pushStages{};uint8_t pushBytes[128]{};uint32_t descriptorCount{};Descriptor descriptors[16]{};uint32_t specCount{},specSize{};Specialization specs[32]{};uint8_t specData[256]{};
- uint32_t bindingCount{},attributeCount{};VertexBinding bindings[4]{};VertexAttribute attributes[8]{};uint32_t format{},blend{},mask{},factors[6]{};uint32_t rangeCount{};Range ranges[2]{};uint32_t fetchMask{},orderedColorAccess{};uint32_t blobCount{};Blob blobs[2]{};
+ uint32_t bindingCount{},attributeCount{};VertexBinding bindings[4]{};VertexAttribute attributes[8]{};uint32_t format{},blend{},mask{},factors[6]{};uint32_t rangeCount{};Range ranges[2]{};uint32_t fetchMask{},orderedColorAccess{};uint32_t blobCount{};Blob blobs[2]{};ColorBlend colors[8]{};
 };
 class Translator {
  void *dylib{};
@@ -56,7 +62,7 @@ public:
   dylib=dlopen(FUXI_MTL_TRANSLATOR,RTLD_NOW|RTLD_LOCAL);
   if(!dylib)throw std::runtime_error("dlopen external metal2vulkan failed");
   auto abi=(uint32_t (*)())dlsym(dylib,"fuxi_m2v_abi");
-  if(!abi || abi()!=7) {dlclose(dylib);throw std::runtime_error("metal2vulkan C ABI mismatch");}
+  if(!abi || abi()!=8) {dlclose(dylib);throw std::runtime_error("metal2vulkan C ABI mismatch");}
 #define LOAD(n) n=(decltype(n))dlsym(dylib,"fuxi_m2v_" #n);if(!n) {dlclose(dylib);throw std::runtime_error("missing translator " #n);}
   LOAD(open) LOAD(close) LOAD(function) LOAD(compile) LOAD(draw) LOAD(variant) LOAD(sampler) LOAD(identity) LOAD(product_hash) LOAD(free)
 #undef LOAD

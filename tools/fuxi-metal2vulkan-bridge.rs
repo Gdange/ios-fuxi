@@ -1,5 +1,5 @@
 // Original Fuxi adapter, compiled only into the separate external LGPL library.
-// No translator code is copied here. ABI v7: synchronous, owned handles, bounded input.
+// No translator code is copied here. ABI v8: synchronous, owned handles, bounded input.
 use std::{ffi::{c_char,c_void,CStr,CString}, panic::{catch_unwind,AssertUnwindSafe}};
 use std::{collections::VecDeque, sync::{Mutex,OnceLock}};
 use ash::vk::{self,Handle};
@@ -48,9 +48,18 @@ fn validate_vertex_descriptor(options:&CompileOptions)->Result<(),String> {
     Ok(())
 }
 #[repr(C)]
+#[derive(Clone,Copy,Debug,Default)]
+pub struct ColorOptions {format:u32,blend:u32,src_rgb:u32,dst_rgb:u32,rgb_op:u32,src_alpha:u32,dst_alpha:u32,alpha_op:u32,mask:u32}
+#[repr(C)]
+#[derive(Clone,Copy,Debug,Default)]
+pub struct ColorBlend {blend:u32,mask:u32,factors:[u32;6]}
+#[repr(C)]
 #[derive(Clone,Copy,Debug)]
 pub struct CompileOptions {format:u32,blend:u32,src_rgb:u32,dst_rgb:u32,rgb_op:u32,src_alpha:u32,dst_alpha:u32,alpha_op:u32,mask:u32,strip:u32,
- attributes:[Attribute;8],strides:[u32;4],constant_count:[u32;2],constants:[[Constant;128];2],ordered_color_access:u32}
+ attributes:[Attribute;8],strides:[u32;4],constant_count:[u32;2],constants:[[Constant;128];2],ordered_color_access:u32,independent_blend:u32,color_count:u32,colors:[ColorOptions;7]}
+impl CompileOptions {
+ fn color(&self,i:usize)->ColorOptions {if i>0 {self.colors[i-1]} else {ColorOptions{format:self.format,blend:self.blend,src_rgb:self.src_rgb,dst_rgb:self.dst_rgb,rgb_op:self.rgb_op,src_alpha:self.src_alpha,dst_alpha:self.dst_alpha,alpha_op:self.alpha_op,mask:self.mask}}}
+}
 #[repr(C)]
 #[derive(Clone,Copy,Debug,Default)]
 pub struct Descriptor {binding:u32,ty:u32,stages:u32,slot:u32,sampler:u32,format:u32,components:[u32;4],offset:u64,range:u64,set:u32,source:u32}
@@ -85,12 +94,12 @@ pub struct Blob {bytes:*const u8,len:usize,hash:[u8;32]}
 pub struct Translation {
  handle:*mut c_void,vertex:*const u32,vertex_count:usize,vertex_entry:*const c_char,fragment:*const u32,fragment_count:usize,fragment_entry:*const c_char,
  push_offset:u32,push_size:u32,push_stages:u32,push_bytes:[u8;128],descriptor_count:u32,descriptors:[Descriptor;16],spec_count:u32,spec_size:u32,specs:[Specialization;32],spec_data:[u8;256],
- binding_count:u32,attribute_count:u32,bindings:[VertexBinding;4],attributes:[VertexAttribute;8],format:u32,blend:u32,mask:u32,factors:[u32;6],range_count:u32,ranges:[Range;2],fetch_mask:u32,ordered_color_access:u32,blob_count:u32,blobs:[Blob;2],
+ binding_count:u32,attribute_count:u32,bindings:[VertexBinding;4],attributes:[VertexAttribute;8],format:u32,blend:u32,mask:u32,factors:[u32;6],range_count:u32,ranges:[Range;2],fetch_mask:u32,ordered_color_access:u32,blob_count:u32,blobs:[Blob;2],colors:[ColorBlend;8],
 }
 #[derive(Clone)]
 struct Product {blobs:Vec<Vec<u8>>,blob_hashes:Vec<[u8;32]>,vertex:Vec<u32>,fragment:Vec<u32>,vname:CString,fname:CString,
  push_offset:u32,push_size:u32,push_stages:u32,push_bytes:[u8;128],descriptors:Vec<Descriptor>,specs:Vec<Specialization>,spec_data:Vec<u8>,
- descriptor:RenderPipelineDescriptor,options:CompileOptions,variant:metal2vulkan::cache::VariantKey,device:Device,pipeline:metal2vulkan::pipeline::RenderPipeline,bindings:Vec<VertexBinding>,attributes:Vec<VertexAttribute>,format:u32,blend:u32,mask:u32,factors:[u32;6]}
+ descriptor:RenderPipelineDescriptor,options:CompileOptions,variant:metal2vulkan::cache::VariantKey,device:Device,pipeline:metal2vulkan::pipeline::RenderPipeline,bindings:Vec<VertexBinding>,attributes:Vec<VertexAttribute>,format:u32,blend:u32,mask:u32,factors:[u32;6],colors:[ColorBlend;8]}
 // Process-only, at most 8 entries / 16 MiB. No Apple inputs or derived code on disk.
 // The key includes AIR function hashes AND library hashes/names, device/driver UUID,
 // and all bounded compile options (the adapter itself is part of the process).
@@ -114,7 +123,7 @@ fn sampling_dependency(d:&RuntimeDependency)->bool {
     }
 }
 fn fetch_dependency(d:&RuntimeDependency,enabled:u32)->bool {
- enabled==1 && matches!((d.fact,d.mechanism),(RuntimeFact::FramebufferFetch{color:0},Mechanism::RenderPassContract))
+ enabled==1 && matches!((d.fact,d.mechanism),(RuntimeFact::FramebufferFetch{color:0..=7},Mechanism::RenderPassContract))
 }
 fn dependency_error(d:&RuntimeDependency)->String {
     // Debug dumps can be much larger than the console's line limit. Keep the
@@ -141,7 +150,7 @@ unsafe fn output(out:*mut Translation,product:Product) {
     *out=Translation{handle:std::ptr::null_mut(),vertex:product.vertex.as_ptr(),vertex_count:product.vertex.len(),vertex_entry:product.vname.as_ptr(),
         fragment:product.fragment.as_ptr(),fragment_count:product.fragment.len(),fragment_entry:product.fname.as_ptr(),
         push_offset:product.push_offset,push_size:product.push_size,push_stages:product.push_stages,push_bytes:product.push_bytes,
-        descriptor_count:product.descriptors.len() as u32,descriptors,spec_count:product.specs.len() as u32,spec_size:product.spec_data.len() as u32,specs,spec_data,binding_count:product.bindings.len() as u32,attribute_count:product.attributes.len() as u32,bindings,attributes,format:product.format,blend:product.blend,mask:product.mask,factors:product.factors,range_count:product.pipeline.layout.push_constants.len() as u32,ranges,fetch_mask:product.pipeline.graphics.input_attachments.iter().fold(0,|mask,a|mask|(1<<a.color_index)),ordered_color_access:product.options.ordered_color_access,blob_count:product.blobs.len() as u32,
+        colors:product.colors,descriptor_count:product.descriptors.len() as u32,descriptors,spec_count:product.specs.len() as u32,spec_size:product.spec_data.len() as u32,specs,spec_data,binding_count:product.bindings.len() as u32,attribute_count:product.attributes.len() as u32,bindings,attributes,format:product.format,blend:product.blend,mask:product.mask,factors:product.factors,range_count:product.pipeline.layout.push_constants.len() as u32,ranges,fetch_mask:product.pipeline.graphics.input_attachments.iter().fold(0,|mask,a|mask|(1<<a.color_index)),ordered_color_access:product.options.ordered_color_access,blob_count:product.blobs.len() as u32,
         blobs:std::array::from_fn(|i|match product.blobs.get(i){Some(b)=>Blob{bytes:b.as_ptr(),len:b.len(),hash:product.blob_hashes[i]},None=>Blob{bytes:std::ptr::null(),len:0,hash:[0;32]}})};
     (*out).handle=Box::into_raw(product).cast();
 }
@@ -161,7 +170,7 @@ unsafe fn name<'a>(p:*const c_char)->Result<&'a str,String> {
     if bytes.is_empty() || bytes.len()>127{return Err("function name length".into());}
     std::str::from_utf8(bytes).map_err(|e|e.to_string())
 }
-#[no_mangle] pub extern "C" fn fuxi_m2v_abi()->u32 {7}
+#[no_mangle] pub extern "C" fn fuxi_m2v_abi()->u32 {8}
 // Optional ABI-6 capability: invalidate persistent products on adapter or pin changes.
 // Hash source at compile time input; never expose paths, shader bytes or libraries.
 #[no_mangle] pub unsafe extern "C" fn fuxi_m2v_cache_identity(out:*mut u8)->i32 {
@@ -199,6 +208,8 @@ unsafe fn name<'a>(p:*const c_char)->Result<&'a str,String> {
         hash.update(format!("M9g/sample=1/{:?}/{:?}",a.content_hash(),b.content_hash()).as_bytes());
         for n in [name(vn)?,name(fn_)?]{hash.update((n.len() as u64).to_le_bytes());hash.update(n.as_bytes());}
         for field in [o.format,o.blend,o.src_rgb,o.dst_rgb,o.rgb_op,o.src_alpha,o.dst_alpha,o.alpha_op,o.mask,o.strip,o.ordered_color_access] {hash.update(field.to_le_bytes());}
+        hash.update(o.independent_blend.to_le_bytes());hash.update(o.color_count.to_le_bytes());
+        for c in o.colors {for field in [c.format,c.blend,c.src_rgb,c.dst_rgb,c.rgb_op,c.src_alpha,c.dst_alpha,c.alpha_op,c.mask]{hash.update(field.to_le_bytes());}}
         for attr in &o.attributes {for field in [attr.format,attr.offset,attr.buffer]{hash.update(field.to_le_bytes());}}
         for stride in o.strides {hash.update(stride.to_le_bytes());}
         for stage in 0..2 {let count=o.constant_count[stage] as usize;if count>128{return Err("identity constants bound".into());}
@@ -243,6 +254,8 @@ unsafe fn name<'a>(p:*const c_char)->Result<&'a str,String> {
         eprintln!("FUXI MTL: translation cache MISS");
         if options.ordered_color_access>1 {return Err("unknown device enables".into());}
         let mut enabled=EnableSet::new();
+        if options.independent_blend>1{return Err("independent blend enable".into());}
+        if options.independent_blend==1{enabled.features.insert(VkFeature::IndependentBlend);}
         if options.ordered_color_access!=0 {
             enabled.features.insert(VkFeature::RasterizationOrderColorAttachmentAccess);
             enabled.extensions.insert(VkExtension::ExtRasterizationOrderAttachmentAccess);
@@ -266,16 +279,19 @@ unsafe fn name<'a>(p:*const c_char)->Result<&'a str,String> {
         }
         let mut descriptor=RenderPipelineDescriptor::new(StageSource::Function(vertex));
         descriptor.fragment=Some(StageSource::Function(fragment));
-        let mut color=ColorAttachmentDescriptor::new(PixelFormat::try_from(options.format).map_err(|e|e.to_string())?);
-        color.blending_enabled=options.blend!=0;
-        color.source_rgb_blend_factor=metal2vulkan::metal::BlendFactor::try_from(options.src_rgb).map_err(|e|e.to_string())?;
-        color.destination_rgb_blend_factor=metal2vulkan::metal::BlendFactor::try_from(options.dst_rgb).map_err(|e|e.to_string())?;
-        color.source_alpha_blend_factor=metal2vulkan::metal::BlendFactor::try_from(options.src_alpha).map_err(|e|e.to_string())?;
-        color.destination_alpha_blend_factor=metal2vulkan::metal::BlendFactor::try_from(options.dst_alpha).map_err(|e|e.to_string())?;
-        color.rgb_blend_operation=metal2vulkan::metal::BlendOperation::try_from(options.rgb_op).map_err(|e|e.to_string())?;
-        color.alpha_blend_operation=metal2vulkan::metal::BlendOperation::try_from(options.alpha_op).map_err(|e|e.to_string())?;
-        color.write_mask=metal2vulkan::metal::ColorWriteMask::try_from(options.mask).map_err(|e|e.to_string())?;
-        descriptor.color_attachments[0]=Some(color);
+        if options.color_count==0 || options.color_count>8 {return Err("color attachment count".into());}
+        for i in 0..options.color_count as usize {let c=options.color(i);if c.format==0{continue;}
+        let mut color=ColorAttachmentDescriptor::new(PixelFormat::try_from(c.format).map_err(|e|e.to_string())?);
+        color.blending_enabled=c.blend!=0;
+        color.source_rgb_blend_factor=metal2vulkan::metal::BlendFactor::try_from(c.src_rgb).map_err(|e|e.to_string())?;
+        color.destination_rgb_blend_factor=metal2vulkan::metal::BlendFactor::try_from(c.dst_rgb).map_err(|e|e.to_string())?;
+        color.source_alpha_blend_factor=metal2vulkan::metal::BlendFactor::try_from(c.src_alpha).map_err(|e|e.to_string())?;
+        color.destination_alpha_blend_factor=metal2vulkan::metal::BlendFactor::try_from(c.dst_alpha).map_err(|e|e.to_string())?;
+        color.rgb_blend_operation=metal2vulkan::metal::BlendOperation::try_from(c.rgb_op).map_err(|e|e.to_string())?;
+        color.alpha_blend_operation=metal2vulkan::metal::BlendOperation::try_from(c.alpha_op).map_err(|e|e.to_string())?;
+        color.write_mask=metal2vulkan::metal::ColorWriteMask::try_from(c.mask).map_err(|e|e.to_string())?;
+        descriptor.color_attachments[i]=Some(color);
+        }
         let mut vd=metal2vulkan::pipeline::VertexDescriptor::new();
         for (i,a) in options.attributes.iter().enumerate().filter(|(_,a)|a.format!=0) {
             vd.attributes.insert(i as u32,metal2vulkan::pipeline::VertexAttributeDescriptor::new(metal2vulkan::metal::VertexFormat::try_from(a.format).map_err(|e|e.to_string())?,a.offset,a.buffer));
@@ -300,7 +316,7 @@ mod tests {
     #[test]
     fn vertex_profile_exact_widths_and_bounds() {
         use metal2vulkan::metal::{VertexFormat,vertex::vk_vertex_format};
-        let mut options:CompileOptions=unsafe{std::mem::zeroed()};
+        let mut options:CompileOptions=unsafe{std::mem::zeroed()};options.color_count=1;
         for format in 0..256 {
             let size=vertex_format_bytes(format);
             assert_eq!(size!=0,(1..=42).contains(&format) || (45..=54).contains(&format));
@@ -325,14 +341,14 @@ mod tests {
         options.strides[1]=16;options.strides[2]=257;assert!(validate_vertex_descriptor(&options).is_err());
     }
     #[test]
-    fn constant_abi7_layout_and_vectors() {
-        assert_eq!(fuxi_m2v_abi(),7);
+    fn constant_abi8_layout_and_vectors() {
+        assert_eq!(fuxi_m2v_abi(),8);
         assert_eq!(std::mem::size_of::<Descriptor>(),64);
         assert_eq!(std::mem::size_of::<BakedSampler>(),44);
         assert_eq!(std::mem::size_of::<DrawInput>(),1056);
-        assert_eq!(std::mem::size_of::<Translation>(),2232);
+        assert_eq!(std::mem::size_of::<Translation>(),2488);
         assert_eq!(std::mem::size_of::<Constant>(),156);
-        assert_eq!(std::mem::size_of::<CompileOptions>(),40100);
+        assert_eq!(std::mem::size_of::<CompileOptions>(),40360);
         assert_eq!(std::mem::offset_of!(CompileOptions,constants),160);
         for (base,width) in [(3,4),(16,2),(29,4),(33,4),(37,2),(41,2),(45,1),(49,1),(53,1)] {
             for lane in 0..4 {assert_eq!(constant_payload_size(base+lane),width*(lane+1));}
@@ -369,10 +385,10 @@ mod tests {
         assert!(!sampling_dependency(&RuntimeDependency::new(RuntimeFact::BufferRangeLimit{slot:texture},Mechanism::PlanTimeCheck)));
     }
     #[test]
-    fn ordered_fetch_dependency_is_exactly_color_zero_and_enabled() {
+    fn ordered_fetch_dependency_is_bounded_and_enabled() {
         let d=RuntimeDependency::new(RuntimeFact::FramebufferFetch{color:0},Mechanism::RenderPassContract);
         assert!(fetch_dependency(&d,1));assert!(!fetch_dependency(&d,0));assert!(!fetch_dependency(&d,2));
-        assert!(!fetch_dependency(&RuntimeDependency::new(RuntimeFact::FramebufferFetch{color:1},Mechanism::RenderPassContract),1));
+        assert!(fetch_dependency(&RuntimeDependency::new(RuntimeFact::FramebufferFetch{color:7},Mechanism::RenderPassContract),1));
         assert!(!fetch_dependency(&RuntimeDependency::new(RuntimeFact::FramebufferFetch{color:0},Mechanism::Specialization),1));
         assert!(!sampling_dependency(&d));
     }
@@ -447,12 +463,20 @@ fn make_product(device:Device,descriptor:RenderPipelineDescriptor,options:&Compi
         }
         let g=&pipeline.graphics;
         let blend=g.color_blend_attachments();
-        if blend.len()!=1 {return Err(format!("M6 blend attachments={}",blend.len()));}
+        if blend.len()!=options.color_count as usize {return Err(format!("M9l blend attachments={}",blend.len()));}
         macro_rules! reject_graphics {($bad:expr)=>{if $bad {return Err(concat!("M6 graphics ",stringify!($bad)).into());}};}
-        if g.color_attachments[0].as_ref().map(|a|a.format.as_raw() as u32)!=Some(match options.format {80=>44,81=>50,70=>37,94=>58,115=>97,10|1=>9,30=>16,_=>return Err("unsupported color format".into())}){return Err("planned attachment format mismatch".into());}
-        let mask=blend[0].0.as_raw();let mut factors=[0u32;6];let enabled=blend[0].1.is_some() as u32;
-        if let Some(b)=&blend[0].1 {factors=[b.src_color.as_raw() as u32,b.dst_color.as_raw() as u32,b.color_op.as_raw() as u32,b.src_alpha.as_raw() as u32,b.dst_alpha.as_raw() as u32,b.alpha_op.as_raw() as u32];
-            if factors[0]>9 || factors[1]>9 || factors[3]>9 || factors[4]>9 || factors[2]>4 || factors[5]>4{return Err("blend requires unsupported factors".into());}}
+        let mut colors=[ColorBlend::default();8];
+        for i in 0..options.color_count as usize {
+            let c=options.color(i);
+            if c.format==0 {if g.color_attachments[i].is_some(){return Err("unexpected planned attachment".into());}}
+            else if g.color_attachments[i].as_ref().map(|a|a.format.as_raw() as u32)!=Some(match c.format {80=>44,70=>37,94=>58,115=>97,10=>9,30=>16,_=>return Err("unsupported color format".into())}){return Err(format!("planned attachment[{i}] format mismatch"));}
+            colors[i].mask=blend[i].0.as_raw();colors[i].blend=blend[i].1.is_some() as u32;
+            if let Some(b)=&blend[i].1 {let factors=[b.src_color.as_raw() as u32,b.dst_color.as_raw() as u32,b.color_op.as_raw() as u32,b.src_alpha.as_raw() as u32,b.dst_alpha.as_raw() as u32,b.alpha_op.as_raw() as u32];
+                if factors[0]>9 || factors[1]>9 || factors[3]>9 || factors[4]>9 || factors[2]>4 || factors[5]>4{return Err("blend requires unsupported factors".into());}
+                colors[i].factors=factors;
+            }
+        }
+        let mask=colors[0].mask;let factors=colors[0].factors;let enabled=colors[0].blend;
 
         reject_graphics!(g.depth_format.is_some());
         reject_graphics!(g.stencil_format.is_some());
@@ -460,10 +484,10 @@ fn make_product(device:Device,descriptor:RenderPipelineDescriptor,options:&Compi
         reject_graphics!(g.alpha_to_coverage);
         reject_graphics!(g.alpha_to_one);
         reject_graphics!(g.rasterizer_discard);
-        // Consume only the ordered, single-color input-attachment form. Storage
-        // interlock, multisample and other attachment indices remain explicit errors.
-        reject_graphics!(g.input_attachments.len()>1);
-        reject_graphics!(g.input_attachments.iter().any(|a|a.color_index!=0 || a.input_attachment_index!=0));
+        // Color slots map to the same input-attachment indices, including holes.
+        // Storage interlock and multisample fetch remain explicit errors.
+        reject_graphics!(g.input_attachments.len()>8);
+        reject_graphics!(g.input_attachments.iter().any(|a|a.color_index>=options.color_count || a.input_attachment_index!=a.color_index));
         reject_graphics!(!g.input_attachments.is_empty() && (!g.rasterization_order_attachment_access || options.ordered_color_access!=1));
         reject_graphics!(g.rasterization_order_attachment_access && options.ordered_color_access!=1);
         reject_graphics!(g.declares_layer);
@@ -518,7 +542,7 @@ fn make_product(device:Device,descriptor:RenderPipelineDescriptor,options:&Compi
         Ok(Product{blobs,blob_hashes,vertex:a.spirv.to_vec(),fragment:b.spirv.to_vec(),
             vname:CString::new(a.entry_point.clone()).map_err(|e|e.to_string())?,
             fname:CString::new(b.entry_point.clone()).map_err(|e|e.to_string())?,
-            push_offset,push_size,push_stages,push_bytes,descriptors,specs,spec_data:plan.specialization.data.clone(),descriptor,options:*options,variant,device,pipeline:pipeline.clone(),bindings,attributes,format:options.format,blend:enabled,mask,factors})
+            push_offset,push_size,push_stages,push_bytes,descriptors,specs,spec_data:plan.specialization.data.clone(),descriptor,options:*options,variant,device,pipeline:pipeline.clone(),bindings,attributes,format:options.format,blend:enabled,mask,factors,colors})
 
 }
 fn product_size(p:&Product)->usize {(p.vertex.len()+p.fragment.len())*4+p.blobs.iter().map(Vec::len).sum::<usize>()}
@@ -567,8 +591,8 @@ fn check_plan(p:&metal2vulkan::bind::BindingPlan,expected:&metal2vulkan::cache::
     WriteSource::Neutral(kind)=>return Err(format!("unsupported neutral {kind:?}")),
     WriteSource::ConstantBlob{stage}=>{let flags=if *stage==Stage::Vertex{1}else{16};
      if d.source!=1 || d.stages!=flags || d.slot as usize>=p.blobs.len(){return Err("draw constant blob mismatch".into());}},
-    WriteSource::Attachment{color_index:0} if d.ty==10 && d.stages==16 && p.options.ordered_color_access==1
-        && p.pipeline.graphics.input_attachments.iter().any(|a|a.color_index==0 && a.input_attachment_index==0)=>{d.slot=0;d.format=p.pipeline.graphics.color_attachments[0].as_ref().ok_or("missing fetch target")?.format.as_raw() as u32;},
+    WriteSource::Attachment{color_index} if d.ty==10 && d.stages==16 && p.options.ordered_color_access==1
+        && p.pipeline.graphics.input_attachments.iter().any(|a|a.color_index==*color_index && a.input_attachment_index==*color_index)=>{d.slot=*color_index;d.format=p.pipeline.graphics.color_attachments[*color_index as usize].as_ref().ok_or("missing fetch target")?.format.as_raw() as u32;},
     WriteSource::Buffer{slot}|WriteSource::InlineBytes{slot}=>{if slot.index>=SLOTS || slot.class!=SlotClass::Buffer || !matches!(slot.stage,Stage::Vertex|Stage::Fragment){return Err(format!("M6 draw buffer {:?}/{:?}/slot{}",slot.stage,slot.class,slot.index));}
      let n=if slot.stage==Stage::Vertex{0}else{1};if i.buffers[n][slot.index as usize].length==0{return Err("unbound buffer".into());}
      if d.stages!=if n==0{1}else{16}{return Err("buffer stage".into());}d.slot=slot.index;
