@@ -178,7 +178,7 @@ static int compareBusy(const void *a,const void *b){const fuxiBusy *x=a,*y=b;
  double kx=x->ms+x->csw*0.01,ky=y->ms+y->csw*0.01;return (ky>kx)-(ky<kx);}
 // Who ran during the quiet second: CPU time (task times are mach units on arm64),
 // context switches and syscalls per process, plus processes started during it.
-static void procReport(unsigned na,unsigned nb){mach_timebase_info_data_t tb;mach_timebase_info(&tb);
+static void procReport(const char *label,unsigned na,unsigned nb){mach_timebase_info_data_t tb;mach_timebase_info(&tb);
  static fuxiBusy busy[1024];unsigned m=0,fresh=0;
  for(unsigned i=0;i<nb;++i){const fuxiProc *b=&procAfter[i];const fuxiProc *a=NULL;
   for(unsigned j=0;j<na;++j)if(procBefore[j].pid==b->pid){a=&procBefore[j];break;}
@@ -186,19 +186,19 @@ static void procReport(unsigned na,unsigned nb){mach_timebase_info_data_t tb;mac
    (b->mach-(a?a->mach:0))+(b->unix-(a?a->unix:0)),!a};
   fresh+=!a;if(x.ms>0.5||x.csw>20||x.fresh)busy[m++]=x;}
  qsort(busy,m,sizeof(*busy),compareBusy);
- printf("FUXI CA: quiet probe processes before=%u after=%u started=%u\n",na,nb,fresh);
+ printf("FUXI CA: quiet probe %s processes before=%u after=%u started=%u\n",label,na,nb,fresh);
  for(unsigned i=0;i<m&&i<12;++i){char name[64]="?";proc_name(busy[i].pid,name,sizeof(name));
-  printf("FUXI CA: quiet probe proc %s pid=%d cpu_ms=%.1f csw=%d syscalls=%d%s\n",name,busy[i].pid,busy[i].ms,busy[i].csw,busy[i].sys,busy[i].fresh?" started":"");}}
+  printf("FUXI CA: quiet probe %s proc %s pid=%d cpu_ms=%.1f csw=%d syscalls=%d%s\n",label,name,busy[i].pid,busy[i].ms,busy[i].csw,busy[i].sys,busy[i].fresh?" started":"");}}
 // One undisturbed second: the system's own interrupt rate per CPU (a cooling baseline).
-static void quietProbe(void){processor_cpu_stat_data_t a[8],b[8];unsigned np=procSnapshot(procBefore,1024);unsigned n=cpuStats(a,8);
+static void quietProbe(const char *label){processor_cpu_stat_data_t a[8],b[8];unsigned np=procSnapshot(procBefore,1024);unsigned n=cpuStats(a,8);
  CFTimeInterval t=CACurrentMediaTime();usleep(1000000);double wall=(CACurrentMediaTime()-t)*1000;
  unsigned nq=procSnapshot(procAfter,1024);
- if(!n||cpuStats(b,8)!=n){printf("FUXI CA: quiet probe cpu stats unavailable\n");return;}
- for(unsigned c=0;c<n;++c)printf("FUXI CA: quiet probe cpu%u in %.1f ms timer=%u ipi=%u irq=%u\n",c,wall,
+ if(!n||cpuStats(b,8)!=n){printf("FUXI CA: quiet probe %s cpu stats unavailable\n",label);return;}
+ for(unsigned c=0;c<n;++c)printf("FUXI CA: quiet probe %s cpu%u in %.1f ms timer=%u ipi=%u irq=%u\n",label,c,wall,
   b[c].timer_cnt-a[c].timer_cnt,b[c].ipi_cnt-a[c].ipi_cnt,b[c].irq_ex_cnt-a[c].irq_ex_cnt);
- procReport(np,nq);}
+ procReport(label,np,nq);}
 static void timerProbe(void){
- quietProbe();
+ quietProbe("boot");
  sleepProbe("idle");
  pthread_t t[8];unsigned n=0;atomic_store(&spinning,1);
  for(;n<8;++n)if(pthread_create(&t[n],NULL,spin,NULL))break;
@@ -428,6 +428,9 @@ int main(int argc,char **argv) {
   }}
   if(maximum==5){stage=5;displayStage(device,rendererClass,factory,*queueKey,*spaceKey,space,failures,draws,plugin);}
   stage=maximum;arm(10);CGColorSpaceRelease(space);[device release];dlclose(plugin);alarm(0);puts("FUXI CA: done PASS");
+  // Settled baseline for cooling: the stages run while boot is still busy, so measure
+  // again at about five minutes of uptime (the boot monitor captures ten).
+  {struct timespec up;clock_gettime(CLOCK_MONOTONIC,&up);if(up.tv_sec<300)sleep((unsigned)(300-up.tv_sec));quietProbe("settled");}
  }@catch(NSException *exception) {fail("exception %.96s",exception.name.UTF8String);}}
  return 0;
 }
