@@ -611,7 +611,9 @@ public:
     if(op.texture)transition(op.texture,VK_IMAGE_LAYOUT_GENERAL);
     if(op.texture && op.pipeline) {
      if(op.load==1 && !op.texture->defined)throw std::runtime_error("load undefined attachment");
-     op.texture->defined=op.store && (op.load==2 || (op.load==1 && op.texture->defined));
+     // A stored draw defines its target even after a DontCare load: Metal leaves only
+     // the undrawn pixels unspecified (CA's offscreen passes cover their area fully).
+     op.texture->defined=op.store!=0;
      auto render=op.pipeline->renders[op.load][op.store];
      VkFramebufferCreateInfo fi{};fi.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;fi.renderPass=render;
      fi.attachmentCount=1;fi.pAttachments=&op.texture->view;fi.width=op.texture->width;fi.height=op.texture->height;fi.layers=1;VkFramebuffer frame{};
