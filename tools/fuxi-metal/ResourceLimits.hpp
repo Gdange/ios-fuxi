@@ -18,6 +18,11 @@ struct ResourceLimits {
  bool rows(size_t w,size_t h,size_t pixel,size_t row,size_t offset,size_t length) const {
   return extent(w,h,pixel) && row>=w*pixel && row%pixel==0 && offset<=length && row<=single/h && row*h<=length-offset;
  }
+ // Buffer textures need only the used texels of the final padded row.
+ bool linearRows(size_t w,size_t h,size_t pixel,size_t row,size_t offset,size_t length) const {
+  return extent(w,h,pixel) && row>=w*pixel && row%pixel==0 && offset%pixel==0 &&
+   offset<=length && row<=single/h && (h-1)*row+w*pixel<=length-offset;
+ }
  void reserve(size_t bytes) {if(!bytes || bytes>single || bytes>budget-used)throw std::runtime_error("resource byte budget");used+=bytes;}
  void release(size_t bytes){used-=bytes;}
 };

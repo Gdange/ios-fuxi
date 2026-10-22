@@ -724,6 +724,15 @@ static bool textureDescriptorAccepted(MTLTextureDescriptor *d,uint32_t dimension
     row<r.size.width*pixel || row>SIZE_MAX/r.size.height || (image && image<row*r.size.height))invalid(@"texture CPU region/stride");
  auto *backend=owner(_device)->backend;fuxi::Buffer *staging=nullptr;
  try {
+  // Shared buffer textures and their views expose the same CPU rows. The GPU
+  // shadow is refreshed at use; CPU writes must precede commit, never race it.
+  if(FuxiBuffer *backing=(FuxiBuffer *)[self buffer]){
+   std::lock_guard<std::mutex> guard(backend->mutex);backend->requireLive();
+   auto *base=(uint8_t *)backing->_buffer->contents+[self bufferOffset]+r.origin.y*[self bufferBytesPerRow]+r.origin.x*pixel;
+   for(size_t y=0;y<r.size.height;++y){auto *cpu=(uint8_t *)bytes+y*row;auto *buffer=base+y*[self bufferBytesPerRow];
+    if(write)memmove(buffer,cpu,r.size.width*pixel);else memmove(cpu,buffer,r.size.width*pixel);}
+   return;
+  }
   staging=backend->allocate(width*height*pixel);fuxi::Operation op{};op.texture=_texture;op.srcLevel=op.dstLevel=absolute;
   bool full=!r.origin.x && !r.origin.y && r.size.width==width && r.size.height==height;
   if(!write || (!full && _texture->isDefined(absolute))){op.dst=staging;backend->submit({op});}
@@ -1000,11 +1009,13 @@ static thread_local FuxiCommandBuffer *completionCommand;
  [self active];if(!_pipeline || !_pipeline->_pipeline){fuxi::dropPipelineDraw();return;}
  // Metal ignores an empty draw.
  if(!count)return;
- if((t!=MTLPrimitiveTypeTriangle && t!=MTLPrimitiveTypeTriangleStrip) || count>65536 || start>65536-count)
+ if((t!=MTLPrimitiveTypeTriangle && t!=MTLPrimitiveTypeTriangleStrip && t!=MTLPrimitiveTypeLine && t!=MTLPrimitiveTypeLineStrip) || count>65536 || start>65536-count)
   invalid([NSString stringWithFormat:@"draw bounds/topology type=%lu start=%lu count=%lu indexed=%d",(unsigned long)t,(unsigned long)start,(unsigned long)count,indices!=nil]);
+ if(t==MTLPrimitiveTypeLine)count&=~NSUInteger(1);
+ if(!count || (t==MTLPrimitiveTypeLineStrip && count<2))return;
  if(indices && (![indices isKindOfClass:[FuxiBuffer class]] || [indices device]!=_command->_queue->_device || (offset&1) || offset>[indices length] || count*2>[indices length]-offset))invalid(@"index bounds/device");
  DescriptorContext context(_passText);
- fuxi::Operation op=_state;op.renderDraw=true;op.diagnostic=[NSString stringWithFormat:@"%@ %@",_passText,_pipeline->_descriptorText?:@"pipeline=model"].UTF8String;op.texture=_target->_texture;op.pipeline=_pipeline->_pipeline;op.vertices=(uint32_t)count;op.first=(uint32_t)start;op.strip=t==MTLPrimitiveTypeTriangleStrip;
+ fuxi::Operation op=_state;op.renderDraw=true;op.diagnostic=[NSString stringWithFormat:@"%@ %@",_passText,_pipeline->_descriptorText?:@"pipeline=model"].UTF8String;op.texture=_target->_texture;op.pipeline=_pipeline->_pipeline;op.vertices=(uint32_t)count;op.first=(uint32_t)start;op.topology=t==MTLPrimitiveTypeLine?fuxi::Topology::Line:t==MTLPrimitiveTypeLineStrip?fuxi::Topology::LineStrip:t==MTLPrimitiveTypeTriangleStrip?fuxi::Topology::TriangleStrip:fuxi::Topology::Triangle;
  op.indices=indices?((FuxiBuffer *)indices)->_buffer:nullptr;op.indexOffset=offset;
  // CA smoke diagnostic: for a textured draw, every vertex binding and its first vertices (stride 48 floats).
  bool textured=false;for(size_t i=0;i<fuxi::resourceSlots;++i)textured|=_samples[i]!=nil;

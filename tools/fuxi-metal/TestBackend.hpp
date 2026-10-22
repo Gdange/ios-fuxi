@@ -17,6 +17,7 @@
 #include "ObjectCache.hpp"
 #include "Translator.hpp"
 #include "DrawSafety.hpp"
+#include "BackboardGate.hpp"
 namespace fuxi {
 struct Buffer {void *contents;size_t length,allocated;};
 struct Texture : TextureLevels {size_t allocated{},charged{};uint32_t format=80;std::vector<uint8_t> pixels{};
@@ -33,7 +34,7 @@ struct Operation {
  Texture *texture{};Pipeline *pipeline{};float clear[4]{};bool renderDraw=false;
  Texture *sourceTexture{};Sampler *sampler{};uint32_t vertices=3;bool upload=false,clearOnly=false;
  uint32_t srcX{},srcY{},dstX{},dstY{},width{},height{};size_t rowBytes{};
- Texture *samples[resourceSlots]{};Sampler *samplers[resourceSlots]{};BufferBind buffers[2][resourceSlots]{};Buffer *indices{};uint64_t indexOffset{};uint32_t first{},strip{},load=2,store=1;
+ Texture *samples[resourceSlots]{};Sampler *samplers[resourceSlots]{};BufferBind buffers[2][resourceSlots]{};Buffer *indices{};uint64_t indexOffset{};uint32_t first{},load=2,store=1;Topology topology=Topology::Triangle;
  Viewport viewport{0,256,256,-256,0,1};Rect scissor{{0,0},{256,256}};
  uint32_t areaWidth{},areaHeight{};
  uint32_t srcLevel{},dstLevel{},sampleBase[resourceSlots]{},sampleCount[resourceSlots]{};bool generateMips=false;uint32_t mipBase{},mipCount{};
@@ -52,6 +53,7 @@ public:
  static inline std::atomic<uint64_t> submitObjectsNanos{0},submitDescriptorsNanos{0},submitRecordNanos{0},shadowCopyNanos{0},submitFlushNanos{0},submitInvalidateNanos{0},flushCalls{0},invalidateCalls{0},emptySubmits{0},submitObjectCreates{0},submitPoolCreates{0},submitFrameCreates{0},submitViewCreates{0};
  static inline std::atomic<uint64_t> submits{0},submitPrepareNanos{0},submitWaitNanos{0},submitRetireNanos{0};
  static inline bool modelPipelines=false;
+ void requireLive(){if(poisoned || backboardGate.refusesResources())throw std::runtime_error("device poisoned or backboardd failure latched");}
  uint32_t maxTextureDimension() const{return limits.dimension;}
  size_t resourceBytes() const{return limits.used;}
  ~Backend(){objects.clear([&](Pipeline *p){destroy(p);});}
@@ -74,7 +76,11 @@ public:
   limits.reserve(bytes);auto *t=new Texture{};t->width=width;t->height=height;t->allocated=t->charged=bytes;t->defined=true;return t;
  }
  Buffer *importBuffer(void *,size_t) {throw std::runtime_error("no modeled host buffer import");}
- Texture *linearTexture(Buffer *,uint32_t,uint32_t,uint32_t,uint32_t,size_t,size_t) {throw std::runtime_error("no modeled linear texture");}
+ Texture *linearTexture(Buffer *b,uint32_t format,uint32_t usage,uint32_t width,uint32_t height,size_t offset,size_t row) {
+  requireLive();auto pixel=texelBytes(format);
+  if(!b || usage!=1 || !limits.linearRows(width,height,pixel,row,offset,b->length))throw std::runtime_error("linear texture descriptor/extent/stride");
+  return allocateTexture(format,usage,width,height);
+ }
  Sampler *allocateSampler(bool,bool,uint32_t=0,float=0,float=0) {return new Sampler{};}
  void destroy(Sampler *s) {delete s;}
  Texture *allocateTexture(uint32_t format=80,uint32_t usage=5,uint32_t width=256,uint32_t height=256,uint32_t levels=1,uint32_t type=2) {

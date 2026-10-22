@@ -591,7 +591,9 @@ fn check_plan(p:&metal2vulkan::bind::BindingPlan,expected:&metal2vulkan::cache::
  attempt(err,cap,|| {
   if product.is_null() || input.is_null() || out.is_null(){return Err("nil draw argument".into());}
   let p=&*(product as *const Product);let i=&*input;
-  if i.count<3 || i.count>65536 || i.start>65536-i.count || (i.indexed!=0 && i.start!=0){return Err("bounded draw count/start".into());}
+  // The consumer validates topology and trims incomplete line-list vertices.
+  // Draw planning also serves two-vertex lines; it is independent of topology.
+  if i.count==0 || i.count>65536 || i.start>65536-i.count || (i.indexed!=0 && i.start!=0){return Err("bounded draw count/start".into());}
   let mut state=draw_state(i)?;reflect_textures(&p.pipeline,&mut state,false)?;
   let plan=p.pipeline.plan(&p.device,&state.shape()).map_err(|e|e.to_string())?;check_plan(&plan,&p.variant)?;
   if plan.specialization.data!=p.spec_data || plan.specialization.entries.iter().map(|e|(e.constant_id,e.offset,e.size as u32)).collect::<Vec<_>>()!=p.specs.iter().map(|e|(e.id,e.offset,e.size)).collect::<Vec<_>>() {return Err("draw requires different specialization".into());}

@@ -83,15 +83,18 @@ int main(int argc,char **argv){try {
  b.destroy(smallRead);b.destroy(small);
  // DontCare store makes later load/read fail, with all state restored.
  bad=base;bad.store=0;refused({bad,read});
- bad=base;bad.load=0;refused({bad,read}); // Conservatively undefined after DontCare load.
+ // A full opaque draw defines a DontCare attachment; only fetch from a
+ // DontCare attachment is refused (tested above). Check the actual stored pixels.
+ bad=base;bad.load=0;b.submit({bad,read});
+ for(unsigned y=0;y<256;++y)for(unsigned x=0;x<256;++x){uint8_t want[4];fuxiM7Texel(0,x,y,want);require(!memcmp((uint8_t *)readback->contents+256+4*(y*256+x),want,4),"DontCare full draw pixels");}
  fuxi::Operation overwrite{};overwrite.dst=indices;overwrite.size=4;refused({overwrite,base});
  // Indexed strips share the same linked pipeline; restart-free four-vertex quad.
- const uint16_t strip[]={0,1,2,3};memcpy((uint8_t *)indices->contents+4,strip,sizeof(strip));base.strip=overlay.strip=1;base.vertices=overlay.vertices=4;b.submit({base,overlay,read});
+ const uint16_t strip[]={0,1,2,3};memcpy((uint8_t *)indices->contents+4,strip,sizeof(strip));base.topology=overlay.topology=fuxi::Topology::TriangleStrip;base.vertices=overlay.vertices=4;b.submit({base,overlay,read});
  for(unsigned y=0;y<256;++y)for(unsigned x=0;x<256;++x){uint8_t want[4];fuxiM7Reference(x,y,want);require(!memcmp((uint8_t *)readback->contents+256+4*(y*256+x),want,4),"strip pixels");}
  // Four independently planned texture/sampler slots; none may be omitted.
  memcpy((uint8_t *)indices->contents+4,fuxiM7Indices,sizeof(fuxiM7Indices));
  auto fourOptions=options;fourOptions.blend=0;auto *four=b.compilePipeline(lib,"fuxi_layer_vertex",lib,"fuxi_four_fragment",fourOptions);
- auto draw=base;draw.pipeline=four;draw.strip=0;draw.vertices=6;draw.buffers[1][1]={};
+ auto draw=base;draw.pipeline=four;draw.topology=fuxi::Topology::Triangle;draw.vertices=6;draw.buffers[1][1]={};
  fuxi::Texture *inputs[4]{};fuxi::Sampler *samplers[4]{};auto *uploadBuffer=b.allocate(262144);
  for(unsigned slot=0;slot<4;++slot){inputs[slot]=b.allocateTexture();samplers[slot]=b.allocateSampler(false,false);auto *raw=(uint8_t *)uploadBuffer->contents;
   for(unsigned i=0;i<65536;++i){raw[4*i]=32+32*slot;raw[4*i+1]=48+32*slot;raw[4*i+2]=64+32*slot;raw[4*i+3]=255;}
@@ -108,7 +111,7 @@ int main(int argc,char **argv){try {
   for(unsigned i=0;i<65536;++i)memcpy((uint8_t *)bytes->contents+256+i*pixelSize,format==115?(const void *)texel16:(const void *)texel8,pixelSize);
   fuxi::Operation upload{};upload.src=bytes;upload.from=256;upload.texture=src;upload.upload=true;b.submit({upload});
   auto formatOptions=options;formatOptions.format=format;formatOptions.blend=0;auto *formatPipeline=b.compilePipeline(lib,"fuxi_layer_vertex",lib,"fuxi_layer_fragment",formatOptions);
-  auto sample=base;sample.pipeline=formatPipeline;sample.strip=0;sample.vertices=6;sample.texture=dst;sample.samples[0]=src;
+  auto sample=base;sample.pipeline=formatPipeline;sample.topology=fuxi::Topology::Triangle;sample.vertices=6;sample.texture=dst;sample.samples[0]=src;
   auto copy=read;copy.texture=dst;copy.dst=bytes;
   // Different allocations exercise ordinary buffer uniforms and residual offsets.
   auto *uniform=b.allocate(48);memcpy((uint8_t *)uniform->contents+16,full->contents,16);sample.buffers[1][1]={uniform,16,false};sample.buffers[0][2]={uniform,16,false};
@@ -123,7 +126,7 @@ int main(int argc,char **argv){try {
  for(bool byName:{false,true}){
   if(byName)strcpy(constantOptions.constants[1][0].name,"fuxi_m7_uniform");
   auto *off=b.compilePipeline(lib,"fuxi_layer_vertex",lib,"fuxi_layer_fragment",constantOptions);
-  auto draw=base;draw.pipeline=off;draw.strip=0;draw.vertices=6;b.submit({draw,read});
+  auto draw=base;draw.pipeline=off;draw.topology=fuxi::Topology::Triangle;draw.vertices=6;b.submit({draw,read});
   for(unsigned y=0;y<256;++y)for(unsigned x=0;x<256;++x){uint8_t expected[4];fuxiM7Texel(0,x,y,expected);expected[0]=expected[1]=0;
    require(!memcmp((uint8_t *)readback->contents+256+4*(y*256+x),expected,4),"false function constant");}
   b.destroy(off);
@@ -138,7 +141,7 @@ int main(int argc,char **argv){try {
  // A8 is sampled through the plan's R8 -> (0,0,0,R) component mapping.
  auto *alpha=b.allocateTexture(1,1);auto *alphaBytes=b.allocate(65536);memset(alphaBytes->contents,128,65536);
  fuxi::Operation upload{};upload.texture=alpha;upload.src=alphaBytes;upload.upload=true;b.submit({upload});
- draw=base;draw.strip=0;draw.vertices=6;draw.samples[0]=alpha;
+ draw=base;draw.topology=fuxi::Topology::Triangle;draw.vertices=6;draw.samples[0]=alpha;
  auto unblended=options;unblended.blend=0;auto *plain=b.compilePipeline(lib,"fuxi_layer_vertex",lib,"fuxi_layer_fragment",unblended);draw.pipeline=plain;b.submit({draw,read});
  for(unsigned i=0;i<65536;++i){const uint8_t want[]={0,0,0,128};require(!memcmp((uint8_t *)readback->contents+256+4*i,want,4),"A8 planned swizzle");}
  b.destroy(alpha);b.destroy(alphaBytes);puts("PASS: A8 sampled swizzle; A8 rendering/missing or mistyped constants/dual-source refused");
@@ -148,7 +151,7 @@ int main(int argc,char **argv){try {
  puts("PASS: sRGB profile deferred/refused");
  // Metal's Red bit is 8; Vulkan's is 1. Preserve the clear in other channels.
  auto maskedOptions=unblended;maskedOptions.mask=8;auto *masked=b.compilePipeline(lib,"fuxi_layer_vertex",lib,"fuxi_layer_fragment",maskedOptions);
- draw=base;draw.pipeline=masked;draw.strip=0;draw.vertices=6;draw.clear[0]=draw.clear[1]=draw.clear[2]=draw.clear[3]=1;
+ draw=base;draw.pipeline=masked;draw.topology=fuxi::Topology::Triangle;draw.vertices=6;draw.clear[0]=draw.clear[1]=draw.clear[2]=draw.clear[3]=1;
  draw.viewport={32,224,192,-192,0,1};draw.scissor={{48,56},{160,144}};b.submit({draw,read});
  for(unsigned y=0;y<256;++y)for(unsigned x=0;x<256;++x){uint8_t want[]={255,255,255,255};
   if(x>=48 && x<208 && y>=56 && y<200){uint8_t texel[4];fuxiM7Texel(0,(x-32)*256/192,(y-32)*256/192,texel);want[2]=texel[2];}
@@ -158,7 +161,7 @@ int main(int argc,char **argv){try {
  const unsigned pairs[][2]={{1,0},{1,1},{9,1},{8,0},{0,4},{9,0},{0,5},{8,5},{9,4}};
  for(auto &pair:pairs){auto blendOptions=options;blendOptions.srcRGB=blendOptions.srcAlpha=pair[0];blendOptions.dstRGB=blendOptions.dstAlpha=pair[1];
   auto *blended=b.compilePipeline(lib,"fuxi_layer_vertex",lib,"fuxi_layer_fragment",blendOptions);
-  draw=base;draw.pipeline=blended;draw.strip=0;draw.vertices=6;draw.samples[0]=t[1];draw.buffers[1][1]={half,0,true};
+  draw=base;draw.pipeline=blended;draw.topology=fuxi::Topology::Triangle;draw.vertices=6;draw.samples[0]=t[1];draw.buffers[1][1]={half,0,true};
   draw.clear[0]=1;draw.clear[1]=0;draw.clear[2]=1;draw.clear[3]=1;b.submit({draw,read});
   auto factor=[](unsigned f){switch(f){case 0:return 0u;case 1:case 8:return 255u;case 4:return 127u;case 5:return 128u;case 9:return 0u;default:throw std::logic_error("factor oracle");}};
   for(unsigned y=0;y<256;++y)for(unsigned x=0;x<256;++x){uint8_t src[4],want[4];fuxiM7Texel(1,x,y,src);const unsigned dst[]={255,0,255,255};
@@ -172,7 +175,7 @@ int main(int argc,char **argv){try {
  auto *floatBuffer=b.allocate(sizeof(floatVertices));memcpy(floatBuffer->contents,floatVertices,sizeof(floatVertices));
  auto floatOptions=unblended;floatOptions.attributes[2].format=31;floatOptions.strides[0]=32;
  auto *floatPipeline=b.compilePipeline(lib,"fuxi_layer_vertex",lib,"fuxi_layer_fragment",floatOptions);
- draw=base;draw.pipeline=floatPipeline;draw.strip=0;draw.vertices=6;draw.buffers[0][0]={floatBuffer,0,false};b.submit({draw,read});
+ draw=base;draw.pipeline=floatPipeline;draw.topology=fuxi::Topology::Triangle;draw.vertices=6;draw.buffers[0][0]={floatBuffer,0,false};b.submit({draw,read});
  for(unsigned y=0;y<256;++y)for(unsigned x=0;x<256;++x){uint8_t want[4];fuxiM7Texel(0,x,y,want);require(!memcmp((uint8_t *)readback->contents+256+4*(y*256+x),want,4),"float4 attribute");}
  b.destroy(floatPipeline);b.destroy(floatBuffer);puts("PASS: Float4 vertex color fetch");
  // M9d: exact-width half coordinates plus a separate tightly sized color
@@ -192,7 +195,7 @@ int main(int argc,char **argv){try {
   auto widened=unblended;widened.attributes[0]={25,0,0};widened.attributes[1]={25,4,0};
   widened.attributes[2]={format,0,1};widened.strides[0]=8;widened.strides[1]=size;
   auto *pipeline=b.compilePipeline(lib,"fuxi_layer_vertex",lib,"fuxi_layer_fragment",widened);
-  draw=base;draw.pipeline=pipeline;draw.strip=0;draw.vertices=6;draw.buffers[0][0]={coordinates,0,false};draw.buffers[0][1]={colors,0,false};
+  draw=base;draw.pipeline=pipeline;draw.topology=fuxi::Topology::Triangle;draw.vertices=6;draw.buffers[0][0]={coordinates,0,false};draw.buffers[0][1]={colors,0,false};
   b.submit({draw,read});
   for(unsigned y=0;y<256;++y)for(unsigned x=0;x<256;++x){uint8_t want[4];fuxiM7Texel(0,x,y,want);want[0]=want[1]=0;
    require(!memcmp((uint8_t *)readback->contents+256+4*(y*256+x),want,4),"M9d half/multiple-buffer vertex pixels");}
