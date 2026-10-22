@@ -609,6 +609,14 @@ public:
     CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT|VK_PIPELINE_STAGE_HOST_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,1,&ib);t->layout=next;
    };
    // Layouts are committed only on successful completion; restore on pre-submit errors.
+   // One descriptor pool per submit: Turnip backs each pool with its own kernel BO and a
+   // client holds at most 64, so a pool per draw exhausted them at display size.
+   VkDescriptorPool submitPool{};
+   {std::vector<VkDescriptorPoolSize> sizes;uint32_t sets=0;
+    for(size_t i=0;i<ops.size();++i){if(!ops[i].texture || !ops[i].pipeline || !draws[i].descriptorCount)continue;++sets;
+     for(unsigned j=0;j<draws[i].descriptorCount;++j){auto ty=(VkDescriptorType)draws[i].descriptors[j].type;auto it=std::find_if(sizes.begin(),sizes.end(),[&](const VkDescriptorPoolSize &z){return z.type==ty;});if(it==sizes.end())sizes.push_back({ty,1});else ++it->descriptorCount;}}
+    if(sets){VkDescriptorPoolCreateInfo pci{};pci.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;pci.maxSets=sets;pci.poolSizeCount=sizes.size();pci.pPoolSizes=sizes.data();
+     check(CreateDescriptorPool(device,&pci,nullptr,&submitPool));descriptorPools.push_back(submitPool);}}
    for(size_t opIndex=0;opIndex<ops.size();++opIndex) {const auto &op=ops[opIndex];const auto &draw=draws[opIndex];
     for(auto *t:op.samples)if(t){if(!t->defined)throw std::runtime_error("undefined sampled texture");transition(t,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);}
     if(op.sourceTexture && !op.sourceTexture->defined)throw std::runtime_error("undefined source texture");
@@ -629,11 +637,7 @@ public:
      CmdBeginRenderPass(cmd,&ri,VK_SUBPASS_CONTENTS_INLINE);CmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,op.strip?op.pipeline->stripPipeline:op.pipeline->pipeline);
      CmdSetViewport(cmd,0,1,&op.viewport);CmdSetScissor(cmd,0,1,&op.scissor);
      if(draw.descriptorCount) {
-      std::vector<VkDescriptorPoolSize> sizes;
-      for(unsigned i=0;i<draw.descriptorCount;++i){auto ty=(VkDescriptorType)draw.descriptors[i].type;auto it=std::find_if(sizes.begin(),sizes.end(),[&](const VkDescriptorPoolSize &s){return s.type==ty;});if(it==sizes.end())sizes.push_back({ty,1});else ++it->descriptorCount;}
-      VkDescriptorPoolCreateInfo pci{};pci.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;pci.maxSets=1;pci.poolSizeCount=sizes.size();pci.pPoolSizes=sizes.data();
-      VkDescriptorPool poolForDraw{};check(CreateDescriptorPool(device,&pci,nullptr,&poolForDraw));descriptorPools.push_back(poolForDraw);
-      VkDescriptorSetAllocateInfo sai{};sai.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;sai.descriptorPool=poolForDraw;sai.descriptorSetCount=1;sai.pSetLayouts=&op.pipeline->setLayout;
+      VkDescriptorSetAllocateInfo sai{};sai.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;sai.descriptorPool=submitPool;sai.descriptorSetCount=1;sai.pSetLayouts=&op.pipeline->setLayout;
       VkDescriptorSet set{};check(AllocateDescriptorSets(device,&sai,&set));
       for(unsigned i=0;i<draw.descriptorCount;++i){const auto &d=draw.descriptors[i];
        VkWriteDescriptorSet write{};write.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;write.dstSet=set;write.dstBinding=d.binding;write.descriptorCount=1;write.descriptorType=(VkDescriptorType)d.type;
