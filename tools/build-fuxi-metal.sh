@@ -34,10 +34,13 @@ cp tools/fuxi-metal/LICENSE.NativeMetal "$bundle/LICENSE.NativeMetal"
 cp tools/ca-smoke.conf "$out/ca-smoke.conf"
 cp tools/metal-clients.conf "$out/metal-clients.conf"
 cp tools/metal-smoke.conf "$out/metal-smoke.conf"
-for binary in "$bundle" "$out/fuxi-metal-smoke" "$out/fuxi-ca-smoke"; do
+for binary in "$bundle" "$out/fuxi-metal-smoke"; do
  codesign -f -s - "$binary"
  codesign --verify --strict "$binary"
 done
+# The CA smoke samples busy daemons' stacks (task_for_pid) for the cooling work.
+codesign -f -s - --entitlements tools/fuxi-ca-smoke.entitlements "$out/fuxi-ca-smoke"
+codesign --verify --strict "$out/fuxi-ca-smoke"
 python3 tools/audit-fuxi-metal.py "$bundle/FuxiMetal" "$out/fuxi-metal-smoke" "$out/fuxi-ca-smoke" "$out/libmetal2vulkan.dylib"
 codesign --verify --strict "$bundle"
 shasum -a 256 "$bundle/FuxiMetal" "$bundle/Info.plist" "$bundle/LICENSE.NativeMetal" "$bundle/_CodeSignature/CodeResources" \

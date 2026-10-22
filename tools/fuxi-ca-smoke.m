@@ -173,6 +173,7 @@ static unsigned procSnapshot(fuxiProc *out,unsigned max){int pids[1024];int n=pr
   out[k++]=(fuxiProc){pids[i],t.user+t.sys,t.sys,t.csw,t.mach,t.unix};}
  return k;}
 static fuxiProc procBefore[1024],procAfter[1024];
+static void sampleProcess(const char *label,int pid,const char *proc);
 typedef struct{int pid;double ms,kernelMs;int32_t csw,sys;int fresh;}fuxiBusy;
 struct fuxiThreadInfo{uint64_t user,sys;int32_t usage,policy,state,flags,sleep,curpri,priority,maxpri;char name[64];};
 typedef struct{double ms;int32_t state,curpri;char name[64];}fuxiThread;
@@ -205,8 +206,51 @@ static void procReport(const char *label,unsigned na,unsigned nb){mach_timebase_
  printf("FUXI CA: quiet probe %s processes before=%u after=%u started=%u\n",label,na,nb,fresh);
  for(unsigned i=0;i<m&&i<12;++i){char name[64]="?";proc_name(busy[i].pid,name,sizeof(name));
   printf("FUXI CA: quiet probe %s proc %s pid=%d cpu_ms=%.1f kernel_ms=%.1f csw=%d syscalls=%d%s\n",label,name,busy[i].pid,busy[i].ms,busy[i].kernelMs,busy[i].csw,busy[i].sys,busy[i].fresh?" started":"");
-  if(i<3&&busy[i].pid>0)threadReport(label,busy[i].pid,name,1e-6);}}
+  if(i<3&&busy[i].pid>0)threadReport(label,busy[i].pid,name,1e-6);
+  if(i<2&&busy[i].pid>0&&!strcmp(label,"settled"))sampleProcess(label,busy[i].pid,name);}}
 // One undisturbed second: the system's own interrupt rate per CPU (a cooling baseline).
+// Sample a busy process's hottest thread: suspend it ~100 times, read pc/lr and walk
+// the frame-pointer chain. The dyld shared cache has one slide system-wide, so
+// dladdr() here names frames in system libraries of the other process.
+typedef struct{char key[480];unsigned count;}fuxiStack;
+static void frameName(uintptr_t pc,char *out,size_t n){Dl_info d;
+ if(pc&&dladdr((void *)pc,&d)&&d.dli_sname)snprintf(out,n,"%s",d.dli_sname);
+ else if(pc&&d.dli_fname){const char *b=strrchr(d.dli_fname,'/');snprintf(out,n,"%s+0x%lx",b?b+1:d.dli_fname,(unsigned long)(pc-(uintptr_t)d.dli_fbase));}
+ else snprintf(out,n,"0x%lx",(unsigned long)pc);}
+static void sampleProcess(const char *label,int pid,const char *proc){mach_port_t task=MACH_PORT_NULL;
+ kern_return_t kr=task_for_pid(mach_task_self(),pid,&task);
+ if(kr){printf("FUXI CA: quiet probe %s sample %s task_for_pid kr=%d\n",label,proc,kr);return;}
+ thread_act_array_t threads;mach_msg_type_number_t nt=0;
+ if(task_threads(task,&threads,&nt)||!nt){mach_port_deallocate(mach_task_self(),task);return;}
+ thread_act_t hot=MACH_PORT_NULL;double best=-1;
+ for(unsigned i=0;i<nt;++i){thread_basic_info_data_t b;mach_msg_type_number_t c=THREAD_BASIC_INFO_COUNT;
+  if(thread_info(threads[i],THREAD_BASIC_INFO,(thread_info_t)&b,&c))continue;
+  double t=b.user_time.seconds+b.system_time.seconds+(b.user_time.microseconds+b.system_time.microseconds)*1e-6;
+  if(t>best){best=t;hot=threads[i];}}
+ static fuxiStack stacks[64];unsigned ns=0,samples=0,failed=0;
+ for(unsigned k=0;k<100&&hot;++k){usleep(10000);
+  if(thread_suspend(hot)){++failed;continue;}
+  arm_thread_state64_t st;mach_msg_type_number_t c=ARM_THREAD_STATE64_COUNT;
+  kern_return_t g=thread_get_state(hot,ARM_THREAD_STATE64,(thread_state_t)&st,&c);
+  uintptr_t frames[10];unsigned nf=0;
+  if(!g){frames[nf++]=(uintptr_t)arm_thread_state64_get_pc(st);frames[nf++]=(uintptr_t)arm_thread_state64_get_lr(st);
+   uint64_t fp=arm_thread_state64_get_fp(st);
+   while(fp&&nf<10){uint64_t pair[2];vm_size_t got=0;
+    if(vm_read_overwrite(task,(vm_address_t)fp,sizeof(pair),(vm_address_t)pair,&got)||got!=sizeof(pair))break;
+    frames[nf++]=(uintptr_t)pair[1];if(pair[0]<=fp)break;fp=pair[0];}}
+  thread_resume(hot);
+  if(g){++failed;continue;}
+  ++samples;char key[480]="";size_t used=0;
+  for(unsigned f=0;f<nf&&used<sizeof(key)-80;++f){char name[96];frameName(frames[f],name,sizeof(name));
+   used+=snprintf(key+used,sizeof(key)-used,"%s%s",f?" < ":"",name);}
+  unsigned j=0;for(;j<ns;++j)if(!strcmp(stacks[j].key,key)){++stacks[j].count;break;}
+  if(j==ns&&ns<64){snprintf(stacks[ns].key,sizeof(stacks[ns].key),"%s",key);stacks[ns++].count=1;}}
+ for(unsigned i=0;i<nt;++i)mach_port_deallocate(mach_task_self(),threads[i]);
+ vm_deallocate(mach_task_self(),(vm_address_t)threads,nt*sizeof(*threads));mach_port_deallocate(mach_task_self(),task);
+ printf("FUXI CA: quiet probe %s sample %s threads=%u samples=%u failed=%u\n",label,proc,nt,samples,failed);
+ for(unsigned r=0;r<4;++r){unsigned m=0;for(unsigned j=1;j<ns;++j)if(stacks[j].count>stacks[m].count)m=j;
+  if(!ns||!stacks[m].count)break;
+  printf("FUXI CA: quiet probe %s stack %s %u/%u %s\n",label,proc,stacks[m].count,samples,stacks[m].key);stacks[m].count=0;}}
 static void quietProbe(const char *label){processor_cpu_stat_data_t a[8],b[8];unsigned np=procSnapshot(procBefore,1024);unsigned n=cpuStats(a,8);
  CFTimeInterval t=CACurrentMediaTime();usleep(1000000);double wall=(CACurrentMediaTime()-t)*1000;
  unsigned nq=procSnapshot(procAfter,1024);
