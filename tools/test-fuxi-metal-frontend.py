@@ -18,7 +18,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         d=Path(tmp);conf=d/'smoke.conf'
         compiler=['xcrun','clang++'] if os.uname().sysname=='Darwin' else ['clang++']
-        for name in ('ClientGateTests','BackboardGateTests'):
+        for name in ('ClientGateTests','BackboardGateTests','TextureLevelsTests'):
             subprocess.run([*compiler,'-std=c++17','-Wall','-Wextra','-Werror','-pthread',
                             '-fsanitize=address,undefined',str(ROOT/'tools/fuxi-metal'/(name+'.cpp')),
                             '-o',str(d/name)],check=True)
@@ -48,10 +48,15 @@ def main():
         frameworks=['-framework','Foundation','-framework','Metal','-framework','IOSurface']
         def call(command):subprocess.run(command,check=True)
         if a.compile_only:
-            for name in ['ConstantFrontendTests','FrontendTests','PipelineFrontendTests','CAFrontendTests','GateFrontendTests','CensusTests']:
+            for name in ['ConstantFrontendTests','FrontendTests','PipelineFrontendTests','CAFrontendTests','MipFrontendTests','GateFrontendTests','CensusTests']:
                 call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal'/(name+'.mm')),*frameworks,'-o',str(d/name)])
             print('PASS: compile-only frontend tests; no test executables run')
             return
+        call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/MipFrontendTests.mm'),*frameworks,'-o',str(d/'mips')])
+        mip=subprocess.run([str(d/'mips')],env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0'),text=True,capture_output=True,check=True,timeout=15)
+        rejects=[line for line in mip.stderr.splitlines() if 'FUXI MTL: texture reject ' in line]
+        assert len(rejects)>=7 and all('desc=' in line and 'mips=' in line and 'usage=' in line and 'swizzle=' in line for line in rejects),mip.stderr
+        print(mip.stdout,end='')
         call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/CAFrontendTests.mm'),*frameworks,'-o',str(d/'ca-frontend')])
         subprocess.run([str(d/'ca-frontend')],env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0'),check=True,timeout=15)
         call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/ConstantFrontendTests.mm'),*frameworks,'-o',str(d/'constant-frontend')])

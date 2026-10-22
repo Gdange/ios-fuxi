@@ -51,7 +51,8 @@ int main() {
   assert(!unsupportedSize.size && !unsupportedSize.align); // Missing struct ABI too.
   assert(![(FuxiTestBase *)device dangerousInheritedSelector]);
   assert(![device newBufferWithLength:0 options:0]);
-  assert(![device newBufferWithLength:4 options:MTLResourceStorageModePrivate]);
+  id<MTLBuffer> privateBuffer=[device newBufferWithLength:4 options:MTLResourceStorageModePrivate];
+  assert(privateBuffer && privateBuffer.storageMode==MTLStorageModePrivate && !privateBuffer.contents);[privateBuffer release];
   assert(![device newLibraryWithSource:@"kernel void x(){}" options:nil error:nil]);
   id<MTLCommandQueue>q=[device newCommandQueue];
   checkLabel((id)q);

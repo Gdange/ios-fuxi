@@ -64,7 +64,7 @@ int main() {@autoreleasepool {
  MTLSamplerDescriptor *sd=[MTLSamplerDescriptor new];id<MTLSamplerState>sampler=[device newSamplerStateWithDescriptor:sd];
  assert(sampler && sampler.device==device);checkLabel((id)sampler);[sampler release];sd.maxAnisotropy=2;
  assert(![device newSamplerStateWithDescriptor:sd]);[sd release];
- FuxiTexture *t=[FuxiTexture new];t->_device=[device retain];t->_texture=new fuxi::Texture{262144};t->_usage=MTLTextureUsageRenderTarget;
+ FuxiTexture *t=[FuxiTexture new];t->_device=[device retain];t->_texture=new fuxi::Texture{};t->_texture->allocated=262144;t->_usage=MTLTextureUsageRenderTarget;
  FuxiPipeline *p=[FuxiPipeline new];p->_device=[device retain];p->_pipeline=new fuxi::Pipeline{};
  checkLabel(t);checkLabel(p);
  NSError *error=nil;assert(![device newLibraryWithData:dispatch_data_empty error:&error] && error);
@@ -150,7 +150,7 @@ int main() {@autoreleasepool {
  refuses(c,^{[r setFragmentBuffers:nullptr offsets:nullptr withRange:NSMakeRange(NSUIntegerMax,2)];});
  [r setFragmentBytes:uniform length:sizeof(uniform) atIndex:0];
  refuses(c,^{[r setFragmentBufferOffset:4 atIndex:0];});
- FuxiTexture *sample=[FuxiTexture new];sample->_device=[device retain];sample->_texture=new fuxi::Texture{262144};sample->_usage=MTLTextureUsageShaderRead;
+ FuxiTexture *sample=[FuxiTexture new];sample->_device=[device retain];sample->_texture=new fuxi::Texture{};sample->_texture->allocated=262144;sample->_usage=MTLTextureUsageShaderRead;
  sd=[MTLSamplerDescriptor new];sampler=[device newSamplerStateWithDescriptor:sd];[sd release];
  [r setFragmentTexture:(id)sample atTextureIndex:2 samplerState:sampler atSamplerIndex:3];
  assert(r->_samples[2]==sample && r->_samplers[3]==(id)sampler);

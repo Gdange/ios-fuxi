@@ -13,7 +13,7 @@
 #define FUXI_MTL_TRANSLATOR "/usr/local/lib/libmetal2vulkan.dylib"
 #endif
 namespace fuxi {
-// ABI 6. All ordinals in the input are public Metal values; outputs are Vulkan values.
+// ABI 7. All ordinals in the input are public Metal values; outputs are Vulkan values.
 struct Constant {uint32_t index{},type{},size{};uint8_t bytes[16]{};char name[128]{};};
 struct Attribute {uint32_t format{},offset{},buffer{};};
 struct CompileOptions {
@@ -26,7 +26,7 @@ struct Descriptor {uint32_t binding{},type{},stages{},slot{},sampler{},format{},
 struct VertexBinding {uint32_t binding{},slot{},stride{};};
 struct VertexAttribute {uint32_t location{},binding{},format{},offset{};};
 struct BoundBuffer {uint64_t length{},offset{};uint32_t bytes{};};
-struct DrawInput {BoundBuffer buffers[2][resourceSlots]{};uint32_t formats[resourceSlots]{},filters[resourceSlots]{};uint32_t count{},start{},indexed{},strip{};uint64_t indexLength{},indexOffset{};};
+struct DrawInput {BoundBuffer buffers[2][resourceSlots]{};uint32_t formats[resourceSlots]{},filters[resourceSlots]{};float lodMin[resourceSlots]{},lodMax[resourceSlots]{};uint32_t count{},start{},indexed{},strip{};uint64_t indexLength{},indexOffset{};};
 struct Push {uint32_t offset{},size{},stages{};uint8_t bytes[128]{};};
 struct DrawOutput {uint32_t descriptorCount{},pushCount{},vertexCount{},indexed{},count{},first{};uint64_t indexOffset{};Descriptor descriptors[16]{};Push pushes[2]{};uint32_t vertexBindings[4]{},vertexSlots[4]{};uint64_t vertexOffsets[4]{};};
 struct Specialization {uint32_t id{},offset{},size{};};
@@ -56,7 +56,7 @@ public:
   dylib=dlopen(FUXI_MTL_TRANSLATOR,RTLD_NOW|RTLD_LOCAL);
   if(!dylib)throw std::runtime_error("dlopen external metal2vulkan failed");
   auto abi=(uint32_t (*)())dlsym(dylib,"fuxi_m2v_abi");
-  if(!abi || abi()!=6) {dlclose(dylib);throw std::runtime_error("metal2vulkan C ABI mismatch");}
+  if(!abi || abi()!=7) {dlclose(dylib);throw std::runtime_error("metal2vulkan C ABI mismatch");}
 #define LOAD(n) n=(decltype(n))dlsym(dylib,"fuxi_m2v_" #n);if(!n) {dlclose(dylib);throw std::runtime_error("missing translator " #n);}
   LOAD(open) LOAD(close) LOAD(function) LOAD(compile) LOAD(draw) LOAD(variant) LOAD(sampler) LOAD(identity) LOAD(product_hash) LOAD(free)
 #undef LOAD

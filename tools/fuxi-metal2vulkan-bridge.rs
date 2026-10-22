@@ -1,5 +1,5 @@
 // Original Fuxi adapter, compiled only into the separate external LGPL library.
-// No translator code is copied here. ABI v6: synchronous, owned handles, bounded input.
+// No translator code is copied here. ABI v7: synchronous, owned handles, bounded input.
 use std::{ffi::{c_char,c_void,CStr,CString}, panic::{catch_unwind,AssertUnwindSafe}};
 use std::{collections::VecDeque, sync::{Mutex,OnceLock}};
 use ash::vk::{self,Handle};
@@ -7,7 +7,7 @@ use sha2::{Digest,Sha256};
 const SLOTS:u32=16;
 use metal2vulkan::{library::Library, device::{Device,DeviceDescription,DevicePolicy,EnableSet,ApiVersion,VkFeature,VkExtension},
     pipeline::{RenderPipelineDescriptor,StageSource,FunctionDescriptor,ColorAttachmentDescriptor},
-    metal::{PixelFormat,TextureType,SamplerMinMagFilter,sampler::OpaqueBlackBorder},
+    metal::{PixelFormat,TextureType,SamplerMinMagFilter,SamplerMipFilter,sampler::OpaqueBlackBorder},
     pipeline::{Stage,SlotClass,RuntimeDependency,RuntimeFact,Mechanism},
     bind::{BindState,DrawCall,NeutralResource,BoundTexture,TextureFacts,BoundSampler,SamplerDescriptor,StageTable,WriteSource,ImageSource,SamplerSource},Budget};
 // Public Metal scalar/vector ordinals, packed payload (vector3 padding omitted).
@@ -64,7 +64,7 @@ pub struct VertexAttribute {location:u32,binding:u32,format:u32,offset:u32}
 #[derive(Clone,Copy,Debug,Default)]
 pub struct BufferInput {length:u64,offset:u64,bytes:u32}
 #[repr(C)]
-pub struct DrawInput {buffers:[[BufferInput;SLOTS as usize];2],formats:[u32;SLOTS as usize],filters:[u32;SLOTS as usize],count:u32,start:u32,indexed:u32,strip:u32,index_length:u64,index_offset:u64}
+pub struct DrawInput {buffers:[[BufferInput;SLOTS as usize];2],formats:[u32;SLOTS as usize],filters:[u32;SLOTS as usize],lod_min:[f32;SLOTS as usize],lod_max:[f32;SLOTS as usize],count:u32,start:u32,indexed:u32,strip:u32,index_length:u64,index_offset:u64}
 #[repr(C)]
 #[derive(Clone,Copy)]
 pub struct Push {offset:u32,size:u32,stages:u32,bytes:[u8;128]}
@@ -161,7 +161,7 @@ unsafe fn name<'a>(p:*const c_char)->Result<&'a str,String> {
     if bytes.is_empty() || bytes.len()>127{return Err("function name length".into());}
     std::str::from_utf8(bytes).map_err(|e|e.to_string())
 }
-#[no_mangle] pub extern "C" fn fuxi_m2v_abi()->u32 {6}
+#[no_mangle] pub extern "C" fn fuxi_m2v_abi()->u32 {7}
 // Optional ABI-6 capability: invalidate persistent products on adapter or pin changes.
 // Hash source at compile time input; never expose paths, shader bytes or libraries.
 #[no_mangle] pub unsafe extern "C" fn fuxi_m2v_cache_identity(out:*mut u8)->i32 {
@@ -325,11 +325,11 @@ mod tests {
         options.strides[1]=16;options.strides[2]=257;assert!(validate_vertex_descriptor(&options).is_err());
     }
     #[test]
-    fn constant_abi6_layout_and_vectors() {
-        assert_eq!(fuxi_m2v_abi(),6);
+    fn constant_abi7_layout_and_vectors() {
+        assert_eq!(fuxi_m2v_abi(),7);
         assert_eq!(std::mem::size_of::<Descriptor>(),64);
         assert_eq!(std::mem::size_of::<BakedSampler>(),44);
-        assert_eq!(std::mem::size_of::<DrawInput>(),928);
+        assert_eq!(std::mem::size_of::<DrawInput>(),1056);
         assert_eq!(std::mem::size_of::<Translation>(),2232);
         assert_eq!(std::mem::size_of::<Constant>(),156);
         assert_eq!(std::mem::size_of::<CompileOptions>(),40100);
@@ -388,8 +388,23 @@ mod tests {
         }
     }
     #[test]
+    fn mip_sampler_shape_and_lod_validation() {
+        let mut i:DrawInput=unsafe{std::mem::zeroed()};
+        i.formats[0]=94;
+        for mip in 0..=2 {
+            i.filters[0]=1|(mip<<3);i.lod_min[0]=1.25;i.lod_max[0]=2.5;
+            assert!(draw_state(&i).is_ok());
+        }
+        i.filters[0]=25;assert!(draw_state(&i).is_err());
+        i.filters[0]=33;assert!(draw_state(&i).is_err());
+        i.filters[0]=9;i.lod_min[0]=f32::NAN;assert!(draw_state(&i).is_err());
+        i.lod_min[0]=-1.0;assert!(draw_state(&i).is_err());
+        i.lod_min[0]=3.0;assert!(draw_state(&i).is_err());
+        i.lod_min[0]=0.0;i.lod_max[0]=f32::INFINITY;assert!(draw_state(&i).is_err());
+    }
+    #[test]
     fn draw_shape_refuses_unrepresentable_inline_offsets_and_srgb() {
-        // DrawInput is an integer-only C record; all-zero means all slots unbound.
+        // DrawInput is a plain C record; all-zero means all slots unbound.
         let mut i:DrawInput=unsafe{std::mem::zeroed()};
         i.buffers[1][1]=BufferInput{length:48,offset:16,bytes:0};assert!(draw_state(&i).is_ok());
         i.buffers[1][1].bytes=1;assert!(draw_state(&i).is_err());
@@ -434,7 +449,7 @@ fn make_product(device:Device,descriptor:RenderPipelineDescriptor,options:&Compi
         let blend=g.color_blend_attachments();
         if blend.len()!=1 {return Err(format!("M6 blend attachments={}",blend.len()));}
         macro_rules! reject_graphics {($bad:expr)=>{if $bad {return Err(concat!("M6 graphics ",stringify!($bad)).into());}};}
-        if g.color_attachments[0].as_ref().map(|a|a.format.as_raw() as u32)!=Some(match options.format {80=>44,81=>50,70=>37,115=>97,10|1=>9,30=>16,_=>return Err("unsupported color format".into())}){return Err("planned attachment format mismatch".into());}
+        if g.color_attachments[0].as_ref().map(|a|a.format.as_raw() as u32)!=Some(match options.format {80=>44,81=>50,70=>37,94=>58,115=>97,10|1=>9,30=>16,_=>return Err("unsupported color format".into())}){return Err("planned attachment format mismatch".into());}
         let mask=blend[0].0.as_raw();let mut factors=[0u32;6];let enabled=blend[0].1.is_some() as u32;
         if let Some(b)=&blend[0].1 {factors=[b.src_color.as_raw() as u32,b.dst_color.as_raw() as u32,b.color_op.as_raw() as u32,b.src_alpha.as_raw() as u32,b.dst_alpha.as_raw() as u32,b.alpha_op.as_raw() as u32];
             if factors[0]>9 || factors[1]>9 || factors[3]>9 || factors[4]>9 || factors[2]>4 || factors[5]>4{return Err("blend requires unsupported factors".into());}}
@@ -619,7 +634,14 @@ fn draw_state(i:&DrawInput)->Result<BindState,String> {
    // explicitly outside M7 rather than accepting only incidental plan shapes.
    if n==1 && i.formats[slot]==81{return Err("M7 sRGB sampling deferred".into());}
    if n==1 && i.formats[slot]!=0 {table.textures.insert(slot as u32,BoundTexture::Texture{facts:TextureFacts::new(TextureType::Type2D,PixelFormat::try_from(i.formats[slot]).map_err(|e|e.to_string())?),resource_id:None});}
-   if n==1 && i.filters[slot]!=0 {let mut d=SamplerDescriptor::new();d.min_filter=if i.filters[slot]&2!=0{SamplerMinMagFilter::Linear}else{SamplerMinMagFilter::Nearest};d.mag_filter=if i.filters[slot]&4!=0{SamplerMinMagFilter::Linear}else{SamplerMinMagFilter::Nearest};table.samplers.insert(slot as u32,BoundSampler::new(d));}
+   if n==1 && i.filters[slot]!=0 {let mut d=SamplerDescriptor::new();d.min_filter=if i.filters[slot]&2!=0{SamplerMinMagFilter::Linear}else{SamplerMinMagFilter::Nearest};d.mag_filter=if i.filters[slot]&4!=0{SamplerMinMagFilter::Linear}else{SamplerMinMagFilter::Nearest};
+    let bits=i.filters[slot];
+    if bits&!31!=0 || bits&1==0{return Err("sampler filter bits".into());}
+    d.mip_filter=match (bits>>3)&3 {0=>SamplerMipFilter::NotMipmapped,1=>SamplerMipFilter::Nearest,2=>SamplerMipFilter::Linear,_=>return Err("sampler mip filter".into())};
+    let lo=i.lod_min[slot];let hi=i.lod_max[slot];
+    if !lo.is_finite() || !hi.is_finite() || lo<0.0 || hi<lo{return Err("sampler LOD clamps".into());}
+    d.lod_min_clamp=lo;d.lod_max_clamp=hi;
+    table.samplers.insert(slot as u32,BoundSampler::new(d));}
    }state.stages.insert(stage,table);
   }
  Ok(state)
