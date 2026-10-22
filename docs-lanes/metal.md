@@ -1185,6 +1185,9 @@ initialization but no hardware submission. The M2 report above qualifies enumera
 
 ### Exact inputs and patch order
 
+The following records the historical M2 build. For the current nine-patch
+baseline, retained overlays and release profile, use [Turnip T1](turnip-t1.md).
+
 - Mesa commit `85fda3b36405bcaea8bffc64aa4f2651dc90770d`, base tree
   `b72ff1eb2138026ed6aba524770899faabf7d7c8` (Mesa `26.2.0-devel`).
 - UniXNU commit `7b52e7968c76453cdc18b5aa174fc368d5293b91`,

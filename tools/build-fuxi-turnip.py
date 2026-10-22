@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build/sign the pinned Turnip ICD, no-submit probe and staged smoke tool on an Apple Silicon Mac.
 
-Supply external Mesa and UniXNU checkouts; source/build caches must stay out of
+Supply external Mesa sources and pinned UniXNU text patches; caches must stay out of
 this repository. See docs-lanes/metal.md for pins, setup and audit limitations.
 """
 import argparse
@@ -14,13 +14,17 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 MESA = '85fda3b36405bcaea8bffc64aa4f2651dc90770d'
-UNIXNU = '7b52e7968c76453cdc18b5aa174fc368d5293b91'
+UNIXNU = 'fb6aad6ab1f50199a4d99d2da1d0ca403b067633'
 PATCHES = {
     'freedreno-tools-nir.patch': '77e966b6e9a725892d10889a4d8deeefb03a32ae3a007904868132e56350191f',
     'ir3-darwin-build-id.patch': 'be3ca7840a16cb7696d8d7e67195c8d097cf0e38a3b5011edc674a5aed9c6975',
     'ir3-portable-asm-roundtrip.patch': 'bfc5552bc2bd6e1668d75773cce7bf62fd19065e6281bf7da49f9ddfc2e79339',
     'offline-adreno-compiler-probe.patch': 'b7d7a113beb5ef99edea24858d906194d4b4755c987520545ad2f7f3136bb4fb',
-    'turnip-darwin-kmd.patch': 'dcf6a88890995243516f5fd06a41b4ff91117f25ca08e7dc4fc7b90836b11e37',
+    'turnip-darwin-kmd.patch': 'f3bc6d470f8e0bde1b1d0d370175ec105ee45fe50075e43279581e61b1455c2b',
+    'turnip-graphics-cache-feedback.patch': '07f397e38d9acfb0085db4c19567c84fd8a3bcd63d6fd05192857abfbde5aed2',
+    'turnip-empty-scissor.patch': 'dec657626dcd8e8d3f1447e44574f31e4afb8c90b6ebf7d589ba10ee0f8b6461',
+    'turnip-builtin-shader-pack.patch': '3c606dc99643c3ca3e4736c5783348cd85cbff3fbc55161e53226ab459f34473',
+    'turnip-host-import-images.patch': '8bc141db41848a59b16493b4ca8a359e0f18f1cad5f14147ff18d15f79c0c3c4',
 }
 
 
@@ -57,11 +61,10 @@ def main():
         if hashlib.sha256(patch.read_bytes()).hexdigest() != digest:
             ap.error('patch hash mismatch: '+name)
         ordered.append(patch)
-    ordered += [ROOT/'tools/patches/mesa-fuxi-ios16.patch', ROOT/'tools/patches/mesa-fuxi-smoke.patch',
-                ROOT/'tools/patches/mesa-fuxi-hostimport.patch', ROOT/'tools/patches/mesa-fuxi-hostimage.patch',
-                ROOT/'tools/patches/mesa-fuxi-empty-scissor.patch']
-    # Accept only an exact known prefix, including a previously completed M3
-    # cache. Reverse-checking an upstream added file fails after a local overlay.
+    ordered += [ROOT/'tools/patches/mesa-fuxi-smoke.patch',
+                ROOT/'tools/patches/mesa-fuxi-hostimport.patch']
+    # Accept only an exact prefix of this stack, including a completed cache.
+    # Reverse-checking an upstream added file fails after a local overlay.
     with tempfile.TemporaryDirectory() as tmp:
         git_env=dict(os.environ,GIT_INDEX_FILE=str(Path(tmp)/'prefix.index'))
         run(['git','-C',source,'read-tree',MESA],env=git_env)
@@ -102,12 +105,16 @@ def main():
                      '[properties]\nneeds_exe_wrapper = true\n[built-in options]\n'+
                      ''.join('%s = %r\n'%(k,flags) for k in
                              ('c_args','cpp_args','objc_args','c_link_args','cpp_link_args','objc_link_args')))
+    # Empty pack options also clear an old cache's embedded-pack configuration.
+    # Release keeps mesa_logi (including the smoke submit oracle) and TU_DEBUG.
     options = ['-Dgallium-drivers=', '-Dvulkan-drivers=freedreno', '-Dfreedreno-kmds=darwin',
                '-Dtu-darwin-abi-dir='+str(ROOT/'xnu/fuxi-adreno'), '-Dplatforms=macos', '-Dglx=disabled',
                '-Degl=disabled','-Dgbm=disabled','-Dopengl=false','-Dgles1=disabled','-Dgles2=disabled',
                '-Dllvm=disabled','-Dshared-glapi=disabled','-Dxmlconfig=disabled','-Dshader-cache=disabled',
                '-Dtools=','-Dbuild-tests=false','-Dvideo-codecs=','-Dvulkan-layers=',
-               '-Dlibunwind=disabled','-Dlmsensors=disabled','-Dvalgrind=disabled','-Dexpat=disabled','-Dzstd=disabled']
+               '-Dlibunwind=disabled','-Dlmsensors=disabled','-Dvalgrind=disabled','-Dexpat=disabled','-Dzstd=disabled',
+               '-Dbuildtype=release','-Db_ndebug=true',
+               '-Dtu-builtin-source-id=','-Dtu-builtin-pack-header=']
     env = {k:v for k,v in os.environ.items() if not k.startswith(('IR3_','FD_MESA_','NIR_','MESA_SHADER_','TU_'))}
     env.update(CC=find('clang'), CXX=find('clang++'), CFLAGS='', CXXFLAGS='', CPPFLAGS='', LDFLAGS='')
     setup = [args.meson,'setup',build,source,'--cross-file',cross,'--wrap-mode=nodownload']

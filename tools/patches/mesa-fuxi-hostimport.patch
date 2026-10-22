@@ -1,6 +1,6 @@
 --- a/src/freedreno/vulkan/tu_device.cc
 +++ b/src/freedreno/vulkan/tu_device.cc
-@@ -1164,8 +1164,8 @@
+@@ -1165,8 +1165,8 @@
           : pdevice->info->props.max_storage_buffer_range_bytes;
     props->maxPushConstantsSize = MAX_PUSH_CONSTANTS_SIZE;
     props->maxMemoryAllocationCount = UINT32_MAX;
@@ -11,7 +11,7 @@
     props->maxSamplerAllocationCount = 64 * 1024;
     props->bufferImageGranularity = 64;          /* A cache line */
     props->sparseAddressSpaceSize = pdevice->va_size;
-@@ -3706,8 +3706,11 @@
+@@ -3712,8 +3712,11 @@
        vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_HOST_POINTER_INFO_EXT);
  
     if (host_info && host_info->handleType) {
@@ -25,7 +25,7 @@
           result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
        } else {
           result = tu_bo_init_host(device, &mem->bo, host_info->pHostPointer,
-@@ -3844,11 +3847,14 @@
+@@ -3850,11 +3853,14 @@
                                       VkMemoryHostPointerPropertiesEXT *pMemoryHostPointerProperties)
  {
     VK_FROM_HANDLE(tu_device, device, _device);
@@ -61,7 +61,7 @@
  
  #include "util/os_time.h"
  #include "util/timespec.h"
-@@ -308,7 +310,11 @@
+@@ -418,7 +420,11 @@
  static VkResult
  darwin_bo_init_host(struct tu_device *dev, struct tu_bo **out_bo, void *pointer, uint64_t size)
  {
@@ -72,8 +72,8 @@
 +       (((uintptr_t)pointer | size) & (NativeAdrenoAbiHostPageBytes - 1)) ||
 +       (uintptr_t)pointer > UINTPTR_MAX - size)
        return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
-    uint64_t iova;
-    VkResult result = darwin_allocate_iova(dev, size, 0, TU_BO_ALLOC_NO_FLAGS, &iova);
+    VkResult collected = darwin_collect_retired(dev);
+    if (collected != VK_SUCCESS)
 --- a/src/freedreno/vulkan/tu_formats.cc
 +++ b/src/freedreno/vulkan/tu_formats.cc
 @@ -745,6 +745,10 @@

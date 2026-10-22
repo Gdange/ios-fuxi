@@ -260,11 +260,13 @@ metal() {
 mesa() {
     mesa_source
     mkdir -p "$work/patches" "$out/patches" "$out/tools"
-    # Fetch only five text patches, never the UniXNU tree (which may contain
+    # Fetch only nine text patches, never the UniXNU tree (which may contain
     # unrelated firmware or precompiled inputs). Build recipe checks hashes.
     local name
     for name in freedreno-tools-nir.patch ir3-darwin-build-id.patch \
-        ir3-portable-asm-roundtrip.patch offline-adreno-compiler-probe.patch turnip-darwin-kmd.patch; do
+        ir3-portable-asm-roundtrip.patch offline-adreno-compiler-probe.patch turnip-darwin-kmd.patch \
+        turnip-graphics-cache-feedback.patch turnip-empty-scissor.patch \
+        turnip-builtin-shader-pack.patch turnip-host-import-images.patch; do
         fetch "https://raw.githubusercontent.com/UniXNU/UniXNU/$UNIXNU_SHA/patches/mesa/$name" \
             "$downloads/$UNIXNU_SHA-$name"
         cp "$downloads/$UNIXNU_SHA-$name" "$work/patches/$name"

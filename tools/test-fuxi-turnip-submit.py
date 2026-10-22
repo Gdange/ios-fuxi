@@ -38,7 +38,8 @@ struct tu_darwin_queue_submit {struct util_dynarray commands;};
 #define util_dynarray_element(p,t,i) ((p)->data+(i))
 static struct {pthread_mutex_t lock;unsigned inflight_count;uint32_t inflight[8];} dw={PTHREAD_MUTEX_INITIALIZER,0,{}};
 static uint64_t clock_ns=1000000000,slice_seen,reply_fence=7;
-static unsigned submits,polls;static int response=kIOReturnTimeout;
+static unsigned submits,polls,collections;static int response=kIOReturnTimeout,collect_result=VK_SUCCESS;
+static VkResult darwin_collect_retired(tu_device *) {collections++;return collect_result;}
 static uint64_t os_time_get_nano() {return clock_ns;}
 static int vk_device_set_lost(vk_device *,const char *,...) {return VK_ERROR_DEVICE_LOST;}
 static VkResult dw_status_to_vk(tu_device *,int rc,const char *) {return rc==kIOReturnTimeout?VK_TIMEOUT:VK_ERROR_DEVICE_LOST;}
@@ -62,9 +63,13 @@ int main() {
  assert(dw_wait_fence_locked_free(&dev,1,clock_ns+500000)==VK_TIMEOUT && slice_seen==500000 && polls==1);
  assert(dw_wait_fence_locked_free(&dev,1,0)==VK_TIMEOUT && slice_seen==0 && polls==2);
  response=KERN_SUCCESS;assert(dw_wait_fence_locked_free(&dev,1,0)==VK_SUCCESS);
+ assert(collections==1);
+ collect_result=VK_ERROR_DEVICE_LOST;
+ assert(dw_wait_fence_locked_free(&dev,1,0)==VK_ERROR_DEVICE_LOST && collections==2);
+ collect_result=VK_SUCCESS;
  response=99;assert(dw_wait_fence_locked_free(&dev,1,0)==VK_ERROR_DEVICE_LOST);
  response=KERN_SUCCESS;clock_ns=1000000000;
- assert(darwin_queue_wait_fence(&queue,1,UINT64_MAX-1)==VK_SUCCESS && slice_seen==1000000 && polls==5);
+ assert(darwin_queue_wait_fence(&queue,1,UINT64_MAX-1)==VK_SUCCESS && slice_seen==1000000 && polls==6);
  // Saturating the relative deadline must not wrap to an immediate zero poll.
  clock_ns=1000000000;
  vk_darwin_sync syncs[2]={{{},DARWIN_SYNC_UNSIGNALED,0},{{},DARWIN_SYNC_FENCE,1}};
@@ -106,7 +111,7 @@ def main():
         d=Path(tmp);source=d/'src/freedreno/vulkan/tu_knl_darwin.cc';source.parent.mkdir(parents=True);source.write_text(original)
         subprocess.run(['patch','-s','-p1','--fuzz=0','-i',str(ROOT/'tools/patches/mesa-fuxi-smoke.patch')],cwd=d,check=True)
         text=source.read_text()
-        names=('dw_wait_fence_locked_free','darwin_queue_wait_fence','vk_darwin_sync_wait_many','darwin_submit_chunk','darwin_queue_submit')
+        names=('dw_wait_fence_raw','dw_wait_fence_locked_free','darwin_queue_wait_fence','vk_darwin_sync_wait_many','darwin_submit_chunk','darwin_queue_submit')
         model=d/'kmd.cpp';model.write_text(PREFIX+'\n'.join(function(text,n) for n in names)+TEST)
         subprocess.run(['clang++','-std=c++17','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-I'+str(ROOT/'xnu/fuxi-adreno'),str(model),'-o',str(d/'kmd')],check=True)
         subprocess.run([str(d/'kmd')],check=True,timeout=5)

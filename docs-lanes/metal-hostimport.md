@@ -75,8 +75,11 @@ The existing CI entry points remain:
   patches, which apply in the builder's lexical order. 0098 carries ABI 2;
   0100's tracing/discovery delta was regenerated against it.
 * `tools/ci/build.sh mesa`: build-fuxi-turnip.py applies the five hash-verified
-  upstream patches, then ios16, smoke and hostimport overlays, on Mesa
-  `85fda3b36405bcaea8bffc64aa4f2651dc90770d`. Mesa remains external.
+  upstream patches at this increment. [Turnip T1](turnip-t1.md) supersedes that
+  baseline with nine hash-verified UniXNU patches, then smoke and hostimport
+  overlays, on the same Mesa `85fda3b36405bcaea8bffc64aa4f2651dc90770d`.
+  The duplicate ios16, hostimage and empty-scissor overlays are removed.
+  Mesa remains external.
 * `tools/ci/build.sh metal`: builds FuxiMetal with the shared ABI header. Output
   names and artifact allowlists are unchanged. `--verify-inputs-only` for the
   Turnip recipe also runs on Linux; actual builds still require macOS.
