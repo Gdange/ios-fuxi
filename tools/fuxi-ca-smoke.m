@@ -14,6 +14,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <mach/thread_policy.h>
@@ -129,6 +131,20 @@ static void displayPosition(CALayer *root,unsigned frame) {
  CALayer *moving=[root.sublayers objectAtIndex:7];moving.position=CGPointMake(36+3*252+108+(frame%16),48+348+144);
 }
 static int compareDouble(const void *a,const void *b){double x=*(const double *)a,y=*(const double *)b;return (x>y)-(x<y);}
+// Timer probe: 20 sleeps of 4 ms with the CPUs free to idle, then 20 with spinners
+// keeping every core busy. Overshoot that vanishes under load points at idle wake-up.
+static atomic_int spinning;
+static void *spin(void *arg){(void)arg;while(atomic_load(&spinning)){}return NULL;}
+static void sleepProbe(const char *label){double o[20];
+ for(unsigned i=0;i<20;++i){CFTimeInterval t=CACurrentMediaTime();usleep(4000);o[i]=(CACurrentMediaTime()-t)*1000-4;}
+ qsort(o,20,sizeof(double),compareDouble);
+ printf("FUXI CA: timer probe %s usleep(4ms) overshoot min/median/max=%.3f/%.3f/%.3f ms\n",label,o[0],o[10],o[19]);}
+static void timerProbe(void){
+ sleepProbe("idle");
+ pthread_t t[8];unsigned n=0;atomic_store(&spinning,1);
+ for(;n<8;++n)if(pthread_create(&t[n],NULL,spin,NULL))break;
+ sleepProbe("busy");atomic_store(&spinning,0);for(unsigned i=0;i<n;++i)pthread_join(t[i],NULL);
+ printf("FUXI CA: timer probe spinners=%u\n",n);}
 static void displayStage(id<MTLDevice> device,Class rendererClass,SEL factory,NSString *queueKey,NSString *spaceKey,CGColorSpaceRef space,
                          uint64_t (*failures)(void),uint64_t (*draws)(void),void *plugin) {
  uint64_t (*gpu)(void)=(uint64_t(*)(void))dlsym(plugin,"fuxi_metal_gpu_nanoseconds");
@@ -171,6 +187,7 @@ static void displayStage(id<MTLDevice> device,Class rendererClass,SEL factory,NS
    thread_time_constraint_policy_data_t rt={(uint32_t)(ms*50/3),(uint32_t)(ms*10),(uint32_t)(ms*50/3),FALSE};
    kern_return_t kr=thread_policy_set(mach_thread_self(),THREAD_TIME_CONSTRAINT_POLICY,(thread_policy_t)&rt,THREAD_TIME_CONSTRAINT_POLICY_COUNT);
    printf("FUXI CA: display time-constraint policy period=16.667 computation=10 constraint=16.667 ms kr=%d\n",kr);}
+  timerProbe();
   CFTimeInterval epoch=0;
   for(unsigned frame=0;frame<60;++frame){
    arm(60); // Keep each cold frame bounded; never increase the existing jetsam limit.
