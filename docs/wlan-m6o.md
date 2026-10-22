@@ -94,7 +94,25 @@ containment: **no RPMh enable=0 or voltage commands**. KIWI power control uses
 WLAN_EN low/high with the same 10-ms low and 10-ms high dwell periods.
 `cyclerails` restores the original six-vote off/on experiment and implies
 `cycle`. It **froze the SoC once on device**; do not treat it as the default
-comparison. No new device result is claimed for the revised sequence.
+comparison.
+
+The revised plain `cycle` (rails retained, a line before each action) then
+reproduced the freeze on device with the rails untouched. The last line was
+`begin wait 0x60000080 mask 0x20000000 expected 0 limit 100 ms`, printed
+right after PERST low and LTSSM off. So the freeze is the **DBI Link Status
+read itself**, not rail disable. In that state PARF stays readable: PM_STTS
+`+0x24` and LTSSM `+0x1b0` were read without trouble just before.
+
+The cycle now makes no PCIe0 access (`0x60000000`-`0x63ffffff`: DBI/ELBI,
+config, BAR windows) from link down until PARF reports L0 again. Link down is
+a 1 ms dwell followed by a PARF LTSSM read; downstream polls nothing there
+either. Link up waits up to 1 s for PARF LTSSM `[5:0]`=`0x11` (L0, observed
+`0x111` after initial training on device), then checks DBI DLLLA. The ELBI
+PME_TURNOFF clear write is gone, since that bit self-clears (read back 0 on
+device). `fw_access` and `wl_contain_wr` enforce the rule, so an abort or undo
+while the link is down logs `PA ... refused while the PCIe link is down`
+instead of touching it. The host model asserts the same rule: no PCIe0
+access after a trained link has PERST low and LTSSM off.
 
 The chronology comes from [C probe/off](https://github.com/MiCode/vendor_qcom_opensource_wlan/blob/518147fd7e0199758efe9bd96a22c9c2ea30bcd9/platform/cnss2/pci.c#L5952),
 [C suspend/resume](https://github.com/MiCode/vendor_qcom_opensource_wlan/blob/518147fd7e0199758efe9bd96a22c9c2ea30bcd9/platform/cnss2/pci.c#L1177),
@@ -115,9 +133,8 @@ After initial enumeration/BAR setup and validation of BHI offsets, step 17:
 3. Write DBI ELBI SYS_CTRL `+0xf24=0x10` (PME_TURNOFF); poll PARF PM_STTS
    `+0x24` bit5 for up to 100 ms. As downstream, a missing
    L23_READY is logged and suspension continues; an access fault still aborts.
-   Assert PERST GPIO94 OUT=0; clear PARF LTSSM `+0x1b0` bit8; announce and
-   require **local root** Link Status DLLLA=0 within 100 ms (address justified
-   below).
+   Assert PERST GPIO94 OUT=0; clear PARF LTSSM `+0x1b0` bit8; dwell 1 ms
+   with no PCIe0 access (see above).
 4. Drive WLAN_EN GPIO80 OUT=0; **retain all six rails**, wait 10 ms. Only with
    `cyclerails`, send enable=0 before that dwell in reverse downstream order:
    S4G, S6G, S4E, S2G, S5G, L15B. After the dwell, only `cyclerails` sends
@@ -126,8 +143,9 @@ After initial enumeration/BAR setup and validation of BHI offsets, step 17:
    Each command is announced before submission and must complete through
    the existing bounded RSC transport. Resource addresses are checked against
    the six existing cmd-db results before use.
-5. GPIO80 OUT=1, wait 10 ms (X PCIe0 EP latency); clear ELBI SYS_CTRL, deassert PERST, wait 1 ms,
-   enable LTSSM, require DLLLA=1 within 1 s and PCI ID `17cb:1107`. PMCSR D0,
+5. GPIO80 OUT=1, wait 10 ms (X PCIe0 EP latency); deassert PERST, wait 1 ms,
+   enable LTSSM, require PARF L0 within 1 s, then DLLLA=1 within 100 ms and
+   PCI ID `17cb:1107`. PMCSR D0,
    wait 10 ms, enable MEMORY/disable INTx, restore saved BARs/controls and
    COMMAND with MASTER clear. Revalidate BHIOFF/BHIEOFF and PBL EE.
 6. At the end of step 18, after existing optional pre-BHI work, install an
@@ -136,20 +154,12 @@ After initial enumeration/BAR setup and validation of BHI offsets, step 17:
    (MEMORY|MASTER|INTx-disable) before MHI contexts/RX preparation. New owned
    DMA leaves are published and TLB faults invalidated at step 20.
 
-The Link Status register remains DBI `+0x80` (`0x60000080`), bit29 DLLLA.
-This is a local controller register, accessible without an endpoint link
-while controller clocks remain enabled. [X PCIe0 resources](https://github.com/MiCode/kernel_devicetree/blob/5647c799a064dfec73332a4fe2ef7aa3fb2f4887/qcom/kalama-pcie.dtsi#L7-L13)
+The Link Status register is DBI `+0x80` (`0x60000080`), bit29 DLLLA. [X PCIe0 resources](https://github.com/MiCode/kernel_devicetree/blob/5647c799a064dfec73332a4fe2ef7aa3fb2f4887/qcom/kalama-pcie.dtsi#L7-L13)
 map `dm_core` at `0x60000000` separately from the endpoint `conf` window at
-`0x60100000`. [K DLLLA helper](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/pci/controller/pci-msm.c#L1456-L1480)
-reads `dm_core + PCIE20_CAP_LINKCTRLSTATUS` (`0x70+0x10`), before any optional
-endpoint presence check. Our [initial step 11](../shim/fuxi-probe/wlan.c)
-also uses this root register to wait for a previously down link. The cycle
-uses this same register for both down/up waits, never endpoint Link Status
-while down, and logs before the first read. The controller clocks, PHY and
-apertures remain enabled. This source evidence establishes the intended local
-access path; a software polling timeout cannot recover an interconnect
-transaction that itself never returns. A future freeze's last pre-action
-line will distinguish that read from subsequent GPIO or RPMh operations.
+`0x60100000`, and [K DLLLA helper](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/pci/controller/pci-msm.c#L1456-L1480)
+reads it. Our [initial step 11](../shim/fuxi-probe/wlan.c) polls it safely
+before the first LTSSM enable. After a trained link is taken down, however,
+reading it froze the SoC (above), so the cycle reads it only after PARF L0.
 
 This is the WLAN_EN/PERST/L23 chronology experiment; `cyclerails` additionally
 cycles the supply votes. It **retains the controller clocks, PHY and outbound

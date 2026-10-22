@@ -130,7 +130,9 @@ static uint64_t next_pa = 0x8c0000000ull;
 static void record(char k, uint64_t pa, uint32_t v) {
     assert(ne < 8192); events[ne++] = (struct ev){k,pa,v};
 }
+static bool wl_link_refused(uint64_t pa);
 static uint32_t wl_prd(uint64_t pa) {
+    if (wl_link_refused(pa)) {fw_faults++; return 0;}
     if(track_reads) { assert(nreads<4096); reads[nreads++]=pa; }
     if (read_fault_pa && pa==read_fault_pa) {fw_faults++; return ~0u;}
     uint32_t v=0;
@@ -183,7 +185,7 @@ static void raw_pwr(uint64_t pa, uint32_t v) {
         setreg(WL_BAR0+0x128,2);
     }
 }
-static void wl_pwr(uint64_t pa, uint32_t v) { if (!fw_faults) raw_pwr(pa,v); }
+static void wl_pwr(uint64_t pa, uint32_t v) { if (wl_link_refused(pa)) {fw_faults++; return;} if (!fw_faults) raw_pwr(pa,v); }
 static uintptr_t fw_va(uint64_t pa) { return pa; }
 static unsigned fuxi_gpu_access(uintptr_t pa, uint64_t *v, unsigned wr, unsigned unused) {
     if(wr) raw_pwr(pa,(uint32_t)*v); else *v=wl_prd(pa);
@@ -266,7 +268,7 @@ static void init(void) {
     memset(&wl_tables,0,sizeof(wl_tables)); wl_owned=wl_enabled=wl_route_owned=wl_route_installed=false;
     old_iova_arg=0; old_iova_present=false; probe_arg=NULL; aspm_arg=0;
     pre_arg=bhi_arg=vec_arg=fw_arg=cnss_arg=seq_arg=NULL;
-    wl_seq_undos=wl_eq_bank=wl_msi_cap=wl_pm_cap=0; wl_cycle_attempted=wl_cycle_powered=wl_msi_pvm=false;
+    wl_seq_undos=wl_eq_bank=wl_msi_cap=wl_pm_cap=0; wl_cycle_attempted=wl_cycle_powered=wl_msi_pvm=wl_link_off=false;
     memset(&wl_msi_sink,0,sizeof(wl_msi_sink));
     wl_pdc_attempted=false; wl_pdc_acks=0;
     memset(&wl_rddm,0,sizeof(wl_rddm)); memset(&wl_rxvectors,0,sizeof(wl_rxvectors));

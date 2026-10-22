@@ -20,6 +20,19 @@ static uint32_t special_mask[128];
 static bool cycle_peer=true, l23_peer=true, reset_peer=true, reset_stuck;
 static uint32_t eqvec[2], eqfmdc[2];
 static unsigned fail_nth_alloc;
+/* The device froze on a DBI read after the trained link was taken down
+ * (PERST low and LTSSM off). Initial bring-up programs DBI before the first
+ * LTSSM enable, and earlier aborts read config with PERST low but LTSSM on;
+ * both were fine on device. */
+static bool link_was_up;
+static uint32_t regs_peek(uint64_t pa) {
+    for (unsigned i=0;i<nr;i++) if(regs[i].pa==pa) return regs[i].v;
+    return 0;
+}
+static void pcie_dead_check(uint64_t pa) {
+    bool perst_low=!(regs_peek(TS_TLMM+0x1000*94+4)&2), ltssm_off=!(regs_peek(WL_PARF+0x1b0)&0x100);
+    if(link_was_up && perst_low && ltssm_off && pa>=0x60000000ull && pa<0x64000000ull) {fprintf(stderr,"DEAD pa %#llx perst_low %d ltssm_off %d after: %s\n",(unsigned long long)pa,perst_low,ltssm_off,logbuf+(loglen>300?loglen-300:0)); abort();}
+}
 static const char *last_log_line(void) {
     size_t start=loglen;
     if(start && logbuf[start-1]=='\n') start--;
@@ -49,6 +62,7 @@ static void model_write(uint64_t pa, uint32_t v) {
         else assert(strstr(last_log_line(),"begin cycle WLAN_EN low") ||
                     strstr(last_log_line(),"cycle undo begin WLAN_EN low"));
     }
+    pcie_dead_check(pa);
     uint32_t requested=v;
     if(pa==WL_DBI+0x154 || pa==WL_DBI+0x188) assert(wl_prd(WL_DBI+0x8bc)&1);
     raw_pwr(pa,v);
@@ -59,9 +73,14 @@ static void model_write(uint64_t pa, uint32_t v) {
         if(pa==WL_DBI+0x8ac) eqfmdc[bank]=v;
         setreg(WL_DBI+0x8a8,eqvec[bank]); setreg(WL_DBI+0x8ac,eqfmdc[bank]);
     }
+    if(pa==WL_PARF+0x1b0 && (v&0x100)) link_was_up=true;
+    /* A dead peer never retrains: no L0 and no DLLLA after LTSSM resume. */
+    if(pa==WL_PARF+0x1b0) {
+        bool up=(v&0x100) && cycle_peer;
+        setreg(WL_DBI+0x80,up?1u<<29:0); setreg(WL_PARF+0x1b0,(v&~0x3fu)|(up?0x11u:0));
+    }
     if(cycle_peer) {
         if(pa==WL_DBI+0xf24 && v==0x10 && l23_peer) setreg(WL_PARF+0x24,0x20);
-        if(pa==WL_PARF+0x1b0) setreg(WL_DBI+0x80,(v&0x100)?1u<<29:0);
         if(pa==TS_TLMM+0x1000*94+4 && !(v&2)) {
             /* A real probe cycle loses EP state: restore must be substantive. */
             setreg(WL_EPCFG+0x10,4); setreg(WL_EPCFG+0x14,0);
@@ -108,6 +127,8 @@ static void setup(const char *arg) {
     setreg(WL_EPCFG+0x5c,0x20); setreg(WL_EPCFG+0x70,0x00020010);
     setreg(WL_EPCFG+0x78,0x1234); setreg(WL_EPCFG+0x80,0x4567);
     setreg(TS_TLMM+0x1000*80+4,2);
+    /* Steps 10-11 left PERST high and the link trained in L0. */
+    setreg(TS_TLMM+0x1000*94+4,2); setreg(WL_PARF+0x1b0,0x111); link_was_up=true;
     const unsigned rails[]={0x40a00,0x40200,0x40400,0x40500,0x44000,0x40600};
     for(unsigned i=0;i<6;i++) wl3_report[20+i]=rails[i];
 }
@@ -208,13 +229,13 @@ int main(void) {
 
     /* Plain cycle leaves all votes intact through success, abort and containment. */
     setup("cycle"); fail_rail=1; wl3_report[20]=0x1234;
-    assert(!wl5_step(17) && !nrail && sleeps==41);
+    assert(!wl5_step(17) && !nrail && sleeps==42);
     assert(wl_cycle_attempted && !wl_m6o_rails(false) && !wl_m6o_rails(true) && !nrail);
     assert(strstr(logbuf,"cycle retains all six rails; WLAN_EN only"));
     assert(wl_m6o_cycle() && !nrail); cleanup(17); assert(!nrail);
     /* Exact regulator commands are reserved for the explicit cyclerails opt-in. */
     setup("cyclerails"); assert(wl_seq_flags==(WL_O_CYCLE|WL_O_CYCLERAILS));
-    assert(!wl5_step(17) && nrail==18 && sleeps==41);
+    assert(!wl5_step(17) && nrail==18 && sleeps==42);
     const unsigned addr[]={0x40504,0x40604,0x40204,0x40404,0x44004,0x40a04,0x40a00,0x40a04,0x44000,0x44004,0x40400,0x40404,0x40200,0x40204,0x40600,0x40604,0x40500,0x40504};
     const unsigned data[]={0,0,0,0,0,0,1800,1,1000,1,980,1,950,1,1900,1,1350,1};
     for(unsigned i=0;i<18;i++) assert(rail_addr[i]==addr[i] && rail_data[i]==data[i]);
@@ -231,15 +252,18 @@ int main(void) {
     /* A dead link still aborts before any rail command. */
     setup("cycle"); cycle_peer=false; assert(wl5_step(17)==0x6f && !nrail); cleanup(17);
     /* A missing L23_READY alone is logged and the power cycle continues, as downstream. */
-    setup("cycle"); l23_peer=false; assert(!wl5_step(17) && !nrail && sleeps==141); cleanup(17); assert(!nrail);
+    setup("cycle"); l23_peer=false; assert(!wl5_step(17) && !nrail && sleeps==142); cleanup(17); assert(!nrail);
     setup("cyclerails"); l23_peer=false; assert(!wl5_step(17) && nrail==18); cleanup(17);
     setup("cyclerails"); wl3_report[20]=0x1234; assert(wl5_step(17)==0x6f); cleanup(17);
-    /* A local root-status read fault is announced before the access, before GPIO/rails. */
-    setup("cycle"); read_fault_pa=WL_DBI+0x80;
-    assert(wl5_step(17)==0x6f && !nrail && !writes(TS_TLMM+0x1000*80+4));
-    assert(strstr(logbuf,"cycle root Link Status local DBI DLLLA wait down") &&
-           strstr(logbuf,"begin wait 0x60000080 mask 0x20000000 expected 0 limit 100 ms"));
-    read_fault_pa=0; cleanup(17); assert(!nrail);
+    /* Link down is a dwell with no DBI access; DBI waits for PARF L0. */
+    setup("cycle"); assert(!wl5_step(17));
+    assert(strstr(logbuf,"cycle link down dwell 1 ms, no DBI access") &&
+           strstr(logbuf,"begin wait 0x1c001b0 mask 0x3f expected 0x11 limit 1000 ms") &&
+           !strstr(logbuf,"expected 0 limit 100 ms") && !strstr(logbuf,"PME_TURNOFF clear"));
+    cleanup(17);
+    /* No L0: abort, and the undo refuses DBI entries instead of touching a dead link. */
+    setup("cycle,dbi"); cycle_peer=false; assert(wl5_step(17)==0x6f && !nrail);
+    cleanup(17); assert(!nrail && strstr(logbuf,"refused while the PCIe link is down"));
     setup("cycle"); read_fault_pa=TS_TLMM+0x1000*80+4;
     assert(wl5_step(17)==0x6f && !nrail && !writes(read_fault_pa));
     assert(strstr(last_log_line(),"begin cycle WLAN_EN low"));
@@ -329,6 +353,10 @@ def main():
     preamble = m6.PREAMBLE.replace('static void wl_pwr(', 'static void raw_wl_pwr(')
     preamble = preamble.replace('static unsigned fuxi_gpu_access(', 'static void model_write(uint64_t,uint32_t);\nstatic unsigned fuxi_gpu_access(')
     preamble = preamble.replace('if(wr) raw_pwr(pa,(uint32_t)*v);', 'if(wr) model_write(pa,(uint32_t)*v);')
+    preamble = preamble.replace('static bool wl_link_refused(uint64_t pa);\n', 'static bool wl_link_refused(uint64_t pa);\nstatic void pcie_dead_check(uint64_t);\n', 1)
+    preamble = preamble.replace('{fw_faults++; return;} if (!fw_faults) raw_pwr(pa,v); }', '{fw_faults++; return;} pcie_dead_check(pa); if (!fw_faults) raw_pwr(pa,v); }', 1)
+    preamble = preamble.replace('else *v=wl_prd(pa);', 'else {pcie_dead_check(pa); *v=wl_prd(pa);}')
+    preamble = preamble.replace('    if (wl_link_refused(pa)) {fw_faults++; return 0;}\n', '    if (wl_link_refused(pa)) {fw_faults++; return 0;}\n    pcie_dead_check(pa);\n', 1)
     preamble = preamble.replace('static unsigned rh_send(unsigned t, unsigned addr, unsigned data) { return 0; }', 'static unsigned test_rh_send(unsigned,unsigned,unsigned);\nstatic unsigned rh_send(unsigned t, unsigned addr, unsigned data) { return test_rh_send(t,addr,data); }')
     # Failure injection keeps the production allocation/error handling intact.
     preamble = preamble.replace('static int kmem_alloc(', 'static unsigned fail_nth_alloc;\nstatic int kmem_alloc(')

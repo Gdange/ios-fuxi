@@ -150,9 +150,16 @@ fw_va(uint64_t pa)
 	return 0;
 }
 
+/* M6o link-down guard, defined with the cycle below. */
+static bool wl_link_refused(uint64_t pa);
+
 static unsigned
 fw_access(uint64_t pa, uint64_t *v, unsigned wr)
 {
+	if (wl_link_refused(pa)) {
+		fw_faults++;
+		return 1;
+	}
 	uintptr_t va = fw_va(pa);
 	if (!va || (pa & 3)) {
 		if (fw_unmapped++ < 4) {
@@ -2209,16 +2216,38 @@ wl_m6o_config_restore(const struct wl_seq_config *cfg)
 	return wl_m6o_write("restore command", WL_EPCFG+4, (cfg->value[0]&~4u)|0x402, 0xffff);
 }
 
-/* X PCIe0 dm_core is 0x60000000, distinct from conf at 0x60100000.
- * K msm_pcie_dll_link_active reads dm_core + CAP_LINKCTRLSTATUS (0x80),
- * also used by our initial link training in shim/wlan.c. This is local RC
- * DLLLA, not an endpoint CFG0 transaction requiring a live link. Controller
- * clocks/PHY/apertures stay on throughout this cycle. See docs/wlan-m6o.md. */
+/* PCIe0 dm_core, config and memory apertures (0x60000000-0x63ffffff). Every
+ * kernel access (fw_access, wl_contain_wr) is refused from link down until
+ * PARF reports L0 again. */
+static bool wl_link_off;
+
+static bool
+wl_link_refused(uint64_t pa)
+{
+	if (!wl_link_off || pa < 0x60000000ull || pa >= 0x64000000ull) { return false; }
+	printf("FUXI WLAN: PA %#llx refused while the PCIe link is down\n", pa);
+	return true;
+}
+
+/* With PERST low and LTSSM disabled, a dm_core (DBI) read froze the SoC on
+ * device: no FUXI WLAN line after "begin wait 0x60000080". PARF stays readable
+ * (L23_READY and LTSSM were read in that state). So no DBI access between
+ * PERST low and L0: down is a fixed dwell, as downstream, which polls nothing
+ * there; up waits for PARF LTSSM L0 (0x11) before the DBI DLLLA check. */
 static int
 wl_m6o_cycle_link(bool up)
 {
-	printf("FUXI WLAN: M6o cycle root Link Status local DBI DLLLA wait %s\n", up ? "up" : "down");
-	return wl_m6o_wait(WL_DBI+0x80, 1u<<29, up ? 1u<<29 : 0, up ? 1000 : 100);
+	if (!up) {
+		wl_link_off = true;
+		printf("FUXI WLAN: M6o cycle link down dwell 1 ms, no DBI access\n");
+		wl_sleep(1);
+		printf("FUXI WLAN: M6o cycle PARF LTSSM %#x after link down\n", wl_prd(WL_PARF+0x1b0));
+		return fw_faults ? 1 : 0;
+	}
+	printf("FUXI WLAN: M6o cycle wait PARF LTSSM L0 before DBI\n");
+	if (wl_m6o_wait(WL_PARF+0x1b0, 0x3f, 0x11, 1000)) { return 1; }
+	wl_link_off = false;
+	return wl_m6o_wait(WL_DBI+0x80, 1u<<29, 1u<<29, 100);
 }
 
 static int
@@ -2256,8 +2285,8 @@ wl_m6o_cycle(void)
 	wl_sleep(10); /* X PCIe0 ep-latency before PERST release */
 	/* Keep controller clocks/PHY and outbound apertures: L23/PERST is the
 	 * link boundary. This isolates the WLAN probe cycle from PHY recipes. */
-	if (wl_m6o_write("cycle PME_TURNOFF clear", WL_DBI+0xf24, 0, ~0u) ||
-	    wl_m6o_write("cycle PERST high", TS_TLMM+0x1000ull*94+4, 2, 2)) { return 1; }
+	/* PME_TURNOFF self-clears (read back 0 on device); no DBI write here. */
+	if (wl_m6o_write("cycle PERST high", TS_TLMM+0x1000ull*94+4, 2, 2)) { return 1; }
 	printf("FUXI WLAN: M6o cycle begin PERST high dwell 1 ms\n");
 	wl_sleep(1); wl_perst_done = mach_absolute_time();
 	if (wl_m6o_write("cycle LTSSM resume", WL_PARF+0x1b0, 0x100, 0x100) ||
@@ -2827,7 +2856,7 @@ static int
 wl_contain_wr(uint64_t pa, uint32_t value)
 {
 	uintptr_t va = fw_va(pa); uint64_t v = value;
-	if (!va) { return 1; }
+	if (!va || wl_link_refused(pa)) { return 1; }
 	__asm__ volatile("dsb sy" ::: "memory");
 	return (int)fuxi_gpu_access(va, &v, 1, 0);
 }
