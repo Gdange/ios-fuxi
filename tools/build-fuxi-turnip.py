@@ -58,7 +58,8 @@ def main():
             ap.error('patch hash mismatch: '+name)
         ordered.append(patch)
     ordered += [ROOT/'tools/patches/mesa-fuxi-ios16.patch', ROOT/'tools/patches/mesa-fuxi-smoke.patch',
-                ROOT/'tools/patches/mesa-fuxi-hostimport.patch']
+                ROOT/'tools/patches/mesa-fuxi-hostimport.patch', ROOT/'tools/patches/mesa-fuxi-hostimage.patch',
+                ROOT/'tools/patches/mesa-fuxi-empty-scissor.patch']
     # Accept only an exact known prefix, including a previously completed M3
     # cache. Reverse-checking an upstream added file fails after a local overlay.
     with tempfile.TemporaryDirectory() as tmp:
