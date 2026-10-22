@@ -74,6 +74,10 @@ static void censusLog(id object,SEL selector,bool implemented) {
 static std::atomic<uint64_t> failureCount{0},completedDraws{0};
 extern "C" uint64_t fuxi_metal_failure_count() {return failureCount.load();}
 extern "C" uint64_t fuxi_metal_completed_draws() {return completedDraws.load();}
+extern "C" uint64_t fuxi_metal_pipeline_cache_hits() {return fuxi::Backend::pipelineHits.load();}
+extern "C" uint64_t fuxi_metal_pipeline_cache_misses() {return fuxi::Backend::pipelineMisses.load();}
+extern "C" uint64_t fuxi_metal_gpu_nanoseconds() {return fuxi::Backend::gpuNanos.load();}
+extern "C" uint64_t fuxi_metal_gpu_samples() {return fuxi::Backend::gpuSamples.load();}
 static void failureLog(const char *format,...) {
  uint64_t n=failureCount.fetch_add(1);if(n>=64)return;
  va_list args;va_start(args,format);vfprintf(stderr,format,args);va_end(args);
@@ -578,7 +582,7 @@ static bool identitySwizzle(MTLTextureSwizzleChannels s) {
  if(caTrace() && d)fprintf(stderr,"FUXI MTL: trace linearTexture %lux%lu offset %lu row %lu image %lu format %lu usage %lu length %lu\n",(unsigned long)d.width,(unsigned long)d.height,(unsigned long)offset,(unsigned long)row,(unsigned long)image,(unsigned long)d.pixelFormat,(unsigned long)d.usage,(unsigned long)_wrappedLength);
  if(!d || d.textureType!=MTLTextureType2D || d.storageMode!=MTLStorageModeShared || d.cpuCacheMode!=MTLCPUCacheModeDefaultCache ||
     (d.hazardTrackingMode!=MTLHazardTrackingModeDefault && d.hazardTrackingMode!=MTLHazardTrackingModeTracked) ||
-    d.depth!=1 || d.arrayLength!=1 || d.mipmapLevelCount!=1 || d.sampleCount!=1 || !identitySwizzle(d.swizzle) || !row || d.width>256 || d.height>256 || (image && (d.height>SIZE_MAX/row || image<row*d.height))){unsupported(self,_cmd);return nil;}
+    d.depth!=1 || d.arrayLength!=1 || d.mipmapLevelCount!=1 || d.sampleCount!=1 || !identitySwizzle(d.swizzle) || !row || !d.width || !d.height || d.width>owner(_device)->backend->maxTextureDimension() || d.height>owner(_device)->backend->maxTextureDimension() || (image && (d.height>SIZE_MAX/row || image<row*d.height))){unsupported(self,_cmd);return nil;}
  FuxiTexture *t=[FuxiTexture new];t->_device=[_device retain];t->_usage=d.usage;t->_shared=YES;
  try {t->_texture=owner(_device)->backend->linearTexture(_buffer,(uint32_t)d.pixelFormat,(uint32_t)d.usage,(uint32_t)d.width,(uint32_t)d.height,offset,row);}
  catch(const std::exception &e){failureLog("FUXI MTL: linear texture FAIL %s\n",e.what());[t release];return nil;}
@@ -801,10 +805,10 @@ static thread_local FuxiCommandBuffer *completionCommand;
 - (void)setVertexBytes:(const void *)bytes length:(NSUInteger)n atIndex:(NSUInteger)i {@try {CENSUS();[self setBytes:bytes length:n index:i stage:0];} @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
 - (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)n atIndex:(NSUInteger)i {@try {CENSUS();[self setBytes:bytes length:n index:i stage:1];} @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
 - (void)setViewport:(MTLViewport)v {@try {CENSUS();[self active];
- if(!std::isfinite(v.originX) || !std::isfinite(v.originY) || !std::isfinite(v.width) || !std::isfinite(v.height) || !std::isfinite(v.znear) || !std::isfinite(v.zfar) || v.originX<0 || v.originY<0 || v.width<=0 || v.height<=0 || v.originX+v.width>256 || v.originY+v.height>256 || v.znear<0 || v.zfar>1 || v.znear>v.zfar)invalid(@"viewport bounds");
+ if(!fuxi::viewportFits(v.originX,v.originY,v.width,v.height,v.znear,v.zfar,[_target width],[_target height]))invalid(@"viewport bounds");
  _state.viewport={(float)v.originX,(float)(v.originY+v.height),(float)v.width,(float)-v.height,(float)v.znear,(float)v.zfar};
 } @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
-- (void)setScissorRect:(MTLScissorRect)r {@try {CENSUS();[self active];if(r.x>256 || r.y>256 || r.width>256-r.x || r.height>256-r.y)invalid(@"scissor bounds");
+- (void)setScissorRect:(MTLScissorRect)r {@try {CENSUS();[self active];if(!fuxi::scissorFits(r.x,r.y,r.width,r.height,[_target width],[_target height]))invalid(@"scissor bounds");
  _state.scissor={{(int32_t)r.x,(int32_t)r.y},{(uint32_t)r.width,(uint32_t)r.height}};
 } @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
 - (void)record:(MTLPrimitiveType)t start:(NSUInteger)start count:(NSUInteger)count indices:(id)indices offset:(NSUInteger)offset {
@@ -1136,8 +1140,8 @@ static thread_local FuxiCommandBuffer *completionCommand;
 - (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes {CENSUS();return 256;}
 - (NSUInteger)maxFragmentTextures {CENSUS();return fuxi::resourceSlots;}
 - (NSUInteger)maxFragmentSamplers {CENSUS();return fuxi::resourceSlots;}
-- (NSUInteger)maxTextureWidth2D {CENSUS();return 256;}
-- (NSUInteger)maxTextureHeight2D {CENSUS();return 256;}
+- (NSUInteger)maxTextureWidth2D {CENSUS();return owner(self)->backend?owner(self)->backend->maxTextureDimension():0;}
+- (NSUInteger)maxTextureHeight2D {CENSUS();return owner(self)->backend?owner(self)->backend->maxTextureDimension():0;}
 - (NSUInteger)maxColorAttachments {CENSUS();return 1;}
 - (NSString *)vendorName {CENSUS();return @"Qualcomm";}
 - (BOOL)supportsYCBCRFormats {CENSUS();return NO;}
@@ -1243,7 +1247,7 @@ static thread_local FuxiCommandBuffer *completionCommand;
 #define CHECK(field,value,accepted) do {__typeof__(value) actual=(value);if(!stage4Value("texture",field,(uint64_t)actual,(accepted)))return nil;}while(0)
  CHECK("descriptor",d,actual!=nil);
  CHECK("textureType",d.textureType,actual==MTLTextureType2D);CHECK("pixelFormat",d.pixelFormat,actual==80 || actual==70 || actual==115 || actual==10 || actual==1 || actual==30);
- CHECK("width",d.width,actual && actual<=256);CHECK("height",d.height,actual && actual<=256);CHECK("depth",d.depth,actual==1);
+ CHECK("width",d.width,actual && actual<=owner(self)->backend->maxTextureDimension());CHECK("height",d.height,actual && actual<=owner(self)->backend->maxTextureDimension());CHECK("depth",d.depth,actual==1);
  CHECK("mipmapLevelCount",d.mipmapLevelCount,actual==1);CHECK("arrayLength",d.arrayLength,actual==1);CHECK("sampleCount",d.sampleCount,actual==1);CHECK("swizzle.identity",identitySwizzle(d.swizzle),actual);
  CHECK("storageMode",d.storageMode,actual==MTLStorageModePrivate || actual==MTLStorageModeShared);CHECK("cpuCacheMode",d.cpuCacheMode,actual==MTLCPUCacheModeDefaultCache);
  CHECK("hazardTrackingMode",d.hazardTrackingMode,actual==MTLHazardTrackingModeDefault || actual==MTLHazardTrackingModeTracked);
@@ -1255,22 +1259,22 @@ static thread_local FuxiCommandBuffer *completionCommand;
 }
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane {CENSUS();
  if(clientMode==fuxi::ClientMode::census)return nil;
- // Scope is deliberately one BGRA plane, 256 square, no external producer/fence.
+ // One BGRA plane within device bounds; no external producer/fence.
  if(!owner(self)->backend->supportsHostImport()) {
   unsupported(self,_cmd);failureLog("FUXI MTL: IOSurface import FAIL NativeAdreno HostImport / VK_EXT_external_memory_host unavailable\n");return nil;
  }
  if(!d || !surface || plane || IOSurfaceGetPlaneCount(surface)!=0 || IOSurfaceGetPixelFormat(surface)!=0x42475241 ||
-    IOSurfaceGetWidth(surface)!=256 || IOSurfaceGetHeight(surface)!=256 || IOSurfaceGetBytesPerElement(surface)!=4 ||
-    d.width!=256 || d.height!=256 || d.depth!=1 || d.textureType!=MTLTextureType2D || d.pixelFormat!=MTLPixelFormatBGRA8Unorm ||
+    !d.width || !d.height || d.width>owner(self)->backend->maxTextureDimension() || d.height>owner(self)->backend->maxTextureDimension() ||
+    IOSurfaceGetWidth(surface)!=d.width || IOSurfaceGetHeight(surface)!=d.height || IOSurfaceGetBytesPerElement(surface)!=4 || d.depth!=1 || d.textureType!=MTLTextureType2D || d.pixelFormat!=MTLPixelFormatBGRA8Unorm ||
     d.mipmapLevelCount!=1 || d.arrayLength!=1 || d.sampleCount!=1 || !identitySwizzle(d.swizzle) || d.storageMode!=MTLStorageModeShared ||
     d.cpuCacheMode!=MTLCPUCacheModeDefaultCache || (d.hazardTrackingMode!=MTLHazardTrackingModeDefault && d.hazardTrackingMode!=MTLHazardTrackingModeTracked) ||
     !d.usage || (d.usage&~(MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget))) {unsupported(self,_cmd);return nil;}
  if(IOSurfaceLock(surface,kIOSurfaceLockAvoidSync,nullptr)!=0) {unsupported(self,_cmd);return nil;}
  FuxiTexture *t=[FuxiTexture new];t->_device=[self retain];t->_usage=d.usage;
  t->_surface=(IOSurfaceRef)CFRetain(surface);IOSurfaceIncrementUseCount(surface);
- try {t->_texture=owner(self)->backend->importTexture(IOSurfaceGetBaseAddress(surface),IOSurfaceGetAllocSize(surface),IOSurfaceGetBytesPerRow(surface));}
+ try {t->_texture=owner(self)->backend->importTexture(IOSurfaceGetBaseAddress(surface),IOSurfaceGetAllocSize(surface),IOSurfaceGetBytesPerRow(surface),(uint32_t)d.width,(uint32_t)d.height);}
  catch(const std::exception &e) {unsupported(self,_cmd);failureLog("FUXI MTL: IOSurface import FAIL %s\n",e.what());[t release];return nil;}
- fprintf(stderr,"FUXI MTL: IOSurface import PASS BGRA8 256x256 same-memory\n");return t;
+ fprintf(stderr,"FUXI MTL: IOSurface import PASS BGRA8 %lux%lu same-memory\n",(unsigned long)d.width,(unsigned long)d.height);return t;
 }
 - (id)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)d {CENSUS();
  if(clientMode==fuxi::ClientMode::census)return nil;

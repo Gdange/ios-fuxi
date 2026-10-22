@@ -8,11 +8,14 @@
 #include <vector>
 #include <functional>
 #include <unistd.h>
+#include <atomic>
+#include "ResourceLimits.hpp"
+#include "ObjectCache.hpp"
 #include "Translator.hpp"
 namespace fuxi {
 struct Buffer {void *contents;size_t length,allocated;};
 struct Texture {size_t allocated{};uint32_t format=80,width=256,height=256;bool defined=false;std::vector<uint8_t> pixels{};};
-struct Pipeline {bool sampled=false;};
+struct Pipeline {bool sampled=false;size_t references=1;};
 struct Sampler {};
 struct Viewport {float x,y,width,height,minDepth,maxDepth;};
 struct Rect {struct {int32_t x,y;}offset;struct {uint32_t width,height;}extent;};
@@ -27,7 +30,12 @@ struct Operation {
 };
 class Backend {
 public:
- static constexpr size_t maxBufferLength=16*1024*1024;
+ ResourceLimits limits;ObjectCache<Pipeline> objects;
+ static constexpr size_t maxBufferLength=ResourceLimits::single;
+ static inline std::atomic<uint64_t> pipelineHits{0},pipelineMisses{0},gpuNanos{0},gpuSamples{0};
+ static inline bool modelPipelines=false;
+ uint32_t maxTextureDimension() const{return limits.dimension;}
+ ~Backend(){objects.clear([&](Pipeline *p){destroy(p);});}
  static inline bool modelTextures=false;
  static inline int live=0,submissions=0,constructed=0;bool poisoned=false;
  Backend() {++constructed;}
@@ -39,18 +47,26 @@ public:
  static size_t texelBytes(uint32_t f){return f==115?8:(f==1 || f==10)?1:f==30?2:4;}
  bool supportsOrderedColorAccess() const {return false;}
  bool supportsHostImport() const {return false;}
- Texture *importTexture(void *,size_t,size_t) {throw std::runtime_error("no modeled host import");}
+ Texture *importTexture(void *,size_t,size_t,uint32_t=256,uint32_t=256) {throw std::runtime_error("no modeled host import");}
  Buffer *importBuffer(void *,size_t) {throw std::runtime_error("no modeled host buffer import");}
  Texture *linearTexture(Buffer *,uint32_t,uint32_t,uint32_t,uint32_t,size_t,size_t) {throw std::runtime_error("no modeled linear texture");}
  Sampler *allocateSampler(bool,bool) {return new Sampler{};}
  void destroy(Sampler *s) {delete s;}
  Texture *allocateTexture(uint32_t format=80,uint32_t=5,uint32_t width=256,uint32_t height=256) {
   if(!modelTextures)throw std::runtime_error("M4 CPU model has no rendering");
+  if(!limits.extent(width,height,texelBytes(format)))throw std::runtime_error("extent");
   auto *t=new Texture{};t->format=format;t->width=width;t->height=height;t->allocated=width*height*texelBytes(format);t->pixels.resize(t->allocated);return t;
  }
- Pipeline *compilePipeline(void *,const char *,void *,const char *,const CompileOptions &options=CompileOptions{}) {(void)options;throw std::runtime_error("M4 CPU model has no translation");}
+ Pipeline *compilePipeline(void *,const char *v,void *,const char *f,const CompileOptions &options=CompileOptions{}) {
+  if(!modelPipelines)throw std::runtime_error("M4 CPU model has no translation");
+  // The ABI input consists only of initialized 32-bit fields/byte arrays.
+  static_assert(sizeof(CompileOptions)==40100);
+  std::string key=std::string(v)+"/"+f+"/";key.append((const char *)&options,sizeof(options));
+  if(auto *p=objects.acquire(key)){++pipelineHits;return p;}
+  ++pipelineMisses;auto *p=new Pipeline{};objects.insert(key,key,p,sizeof(Pipeline),[&](Pipeline *old){destroy(old);});return p;
+ }
  bool destroy(Texture *t) {delete t;return !poisoned;}
- void destroy(Pipeline *p) {delete p;}
+ void destroy(Pipeline *p) {if(p && !--p->references)delete p;}
  bool requiresSampling(const Pipeline *p) const {return p->sampled;}
  void submit(const std::vector<Operation>& ops,const std::function<void()> &scheduled={}) {
   if(getenv("FUXI_TEST_LOST")) {poisoned=true;throw std::runtime_error("modeled device loss");}

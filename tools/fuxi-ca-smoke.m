@@ -33,7 +33,7 @@
 extern int memorystatus_control(uint32_t,int32_t,uint32_t,void *,size_t);
 struct FuxiMemlimit {int32_t active;uint32_t active_attr;int32_t inactive;uint32_t inactive_attr;};
 static unsigned stage;
-static const char *names[]={"solid","opacity","rounded-clip","image","transform"};
+static const char *names[]={"solid","opacity","rounded-clip","image","transform","display"};
 static char timeoutLine[192],abortLine[192];static size_t timeoutLength,abortLength;
 static void expired(int sig) {
  const char *line=sig==SIGALRM?timeoutLine:abortLine;size_t n=sig==SIGALRM?timeoutLength:abortLength;
@@ -53,7 +53,7 @@ static unsigned configuration(void) {
  char raw[32];size_t n=fread(raw,1,sizeof(raw),f);int bad=ferror(f);fclose(f);
  if(bad || n==sizeof(raw))fail("config length/read");
  size_t i=0;while(i<n && raw[i] && strchr(" \t\r\n",raw[i]))++i;
- if(i==n || raw[i]<'0' || raw[i]>'4')fail("config expected max stage 0..4");
+ if(i==n || raw[i]<'0' || raw[i]>'5')fail("config expected max stage 0..5");
  unsigned result=(unsigned)(raw[i++]-'0');while(i<n && raw[i] && strchr(" \t\r\n",raw[i]))++i;
  if(i!=n)fail("config trailing data");return result;
 }
@@ -94,6 +94,105 @@ static void finish(id<MTLCommandBuffer>command) {
  if(!command)fail("nil completion command");[command commit];[command waitUntilCompleted];
  if(command.status!=MTLCommandBufferStatusCompleted || command.error)fail("completion status=%lu error=%ld",(unsigned long)command.status,(long)command.error.code);
 }
+// Display scene: root + 24 panels + 3 clipped children + 2 pictures = 30 layers.
+// Geometry stays in target pixels; contentsScale=3 also exercises CA's backing
+// allocations. CPU pictures use the same documented bottom-up contents oracle.
+static void displayPicture(CALayer *root,CGColorSpaceRef space,BOOL mirror,unsigned width,unsigned height,CGRect frame,BOOL transform) {
+ size_t row=(size_t)width*4;uint8_t *bytes=malloc(row*height);if(!bytes)fail("display image allocation");
+ for(unsigned y=0;y<height;++y)for(unsigned x=0;x<width;++x){uint8_t *p=bytes+(mirror?height-1-y:y)*row+x*4;
+  p[0]=x<width/2?32:224;p[1]=y<height/2?192:48;p[2]=x<width/4?208:64;p[3]=255;}
+ CGContextRef ctx=CGBitmapContextCreate(bytes,width,height,8,row,space,kCGBitmapByteOrder32Little|kCGImageAlphaPremultipliedFirst);
+ if(!ctx)fail("display image context");CGImageRef image=CGBitmapContextCreateImage(ctx);if(!image)fail("display image snapshot");
+ CALayer *picture=[CALayer layer];picture.frame=frame;picture.contents=(id)image;picture.contentsScale=3;
+ picture.contentsGravity=kCAGravityResize;picture.minificationFilter=kCAFilterNearest;picture.magnificationFilter=kCAFilterNearest;
+ if(transform)picture.transform=CATransform3DMakeAffineTransform(CGAffineTransformMake(0,1,-1,0,0,0));
+ [root addSublayer:picture];CGImageRelease(image);CGContextRelease(ctx);free(bytes);
+}
+static CALayer *displayScene(CGColorSpaceRef space,BOOL mirror) {
+ CALayer *root=[CALayer layer];root.frame=CGRectMake(0,0,1080,2400);root.contentsScale=3;
+ CGColorRef bg=color(space,0.125,0.25,0.5);root.backgroundColor=bg;CGColorRelease(bg);
+ for(unsigned i=0;i<24;++i){CALayer *panel=[CALayer layer];panel.contentsScale=3;
+  panel.frame=CGRectMake(36+(i%4)*252,48+(i/4)*348,216,288);
+  CGColorRef c=color(space,(i%3+1)*0.25,0.5,(i%2+1)*0.25);panel.backgroundColor=c;CGColorRelease(c);
+  if(i%4==1)panel.opacity=0.5;
+  if(i<3){panel.cornerRadius=24;panel.masksToBounds=YES;CALayer *child=[CALayer layer];child.contentsScale=3;
+   child.frame=CGRectMake(-12,144,240,180);CGColorRef c2=color(space,0.25,0.875,0.5);child.backgroundColor=c2;CGColorRelease(c2);[panel addSublayer:child];}
+  [root addSublayer:panel];
+ }
+ displayPicture(root,space,mirror,512,320,CGRectMake(60,2160,384,192),NO);
+ displayPicture(root,space,mirror,128,128,CGRectMake(600,2112,320,192),YES);return root;
+}
+static void displayPosition(CALayer *root,unsigned frame) {
+ CALayer *moving=[root.sublayers objectAtIndex:7];moving.position=CGPointMake(36+3*252+108+(frame%16),48+348+144);
+}
+static int compareDouble(const void *a,const void *b){double x=*(const double *)a,y=*(const double *)b;return (x>y)-(x<y);}
+static void displayStage(id<MTLDevice> device,Class rendererClass,SEL factory,NSString *queueKey,NSString *spaceKey,CGColorSpaceRef space,
+                         uint64_t (*failures)(void),uint64_t (*draws)(void),void *plugin) {
+ uint64_t (*gpu)(void)=(uint64_t(*)(void))dlsym(plugin,"fuxi_metal_gpu_nanoseconds");
+ uint64_t (*samples)(void)=(uint64_t(*)(void))dlsym(plugin,"fuxi_metal_gpu_samples");
+ uint64_t (*hits)(void)=(uint64_t(*)(void))dlsym(plugin,"fuxi_metal_pipeline_cache_hits");
+ uint64_t (*misses)(void)=(uint64_t(*)(void))dlsym(plugin,"fuxi_metal_pipeline_cache_misses");
+ if(!gpu || !samples || !hits || !misses)fail("display diagnostic exports");
+ arm(60);uint64_t startDraws=draws(),startHits=hits(),startMisses=misses();double times[60],wall[60];unsigned late=0;
+ // Let IOSurface choose the padded row (1080*4 need not be a Vulkan row pitch).
+ IOSurfaceRef surface=IOSurfaceCreate((CFDictionaryRef)@{(id)kIOSurfaceWidth:@1080,(id)kIOSurfaceHeight:@2400,
+  (id)kIOSurfaceBytesPerElement:@4,(id)kIOSurfacePixelFormat:@0x42475241});
+ if(!surface || IOSurfaceLock(surface,0,NULL))fail("display IOSurface allocation/lock");
+ size_t row=IOSurfaceGetBytesPerRow(surface),length=IOSurfaceGetAllocSize(surface);void *base=IOSurfaceGetBaseAddress(surface);
+ if(!base || row<4320 || row>SIZE_MAX/2400 || row*2400>length)fail("display IOSurface mapping/stride");
+ memset(base,0x39,row*2400);if(IOSurfaceUnlock(surface,0,NULL))fail("display producer unlock");
+ uint8_t *reference=calloc(1080*2400,4);if(!reference)fail("display reference allocation");
+ @autoreleasepool {
+  MTLTextureDescriptor *td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:1080 height:2400 mipmapped:NO];
+  td.storageMode=MTLStorageModeShared;td.usage=MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget;
+  id<MTLTexture> texture=[device newTextureWithDescriptor:td iosurface:surface plane:0];id<MTLCommandQueue> queue=[device newCommandQueue];
+  if(!texture || !queue)fail("display IOSurface texture/queue");
+  id<FuxiOffscreenRenderer> renderer=((id(*)(id,SEL,id,id))objc_msgSend)(rendererClass,factory,texture,@{queueKey:queue,spaceKey:(id)space});
+  if(!renderer)fail("display renderer");
+  [CATransaction begin];[CATransaction setDisableActions:YES];CALayer *root=displayScene(space,NO);
+  [renderer setLayer:root];[renderer setBounds:CGRectMake(0,0,1080,2400)];[CATransaction commit];[CATransaction flush];
+  CFTimeInterval epoch=0;
+  for(unsigned frame=0;frame<60;++frame){
+   arm(60); // Keep each cold frame bounded; never increase the existing jetsam limit.
+   CFTimeInterval begin=CACurrentMediaTime();uint64_t beforeGPU=gpu(),beforeSamples=samples(),beforeDraws=draws();
+   @autoreleasepool {
+    [CATransaction begin];[CATransaction setDisableActions:YES];displayPosition(root,frame);[CATransaction commit];[CATransaction flush];
+    [renderer beginFrameAtTime:begin timeStamp:NULL];[renderer addUpdateRect:CGRectMake(0,0,1080,2400)];
+    [renderer render];[renderer endFrame];finish(queue.commandBuffer);
+   } // Include per-frame resource/autorelease retirement in wall time.
+   CFTimeInterval end=CACurrentMediaTime();
+   if(failures() || draws()==beforeDraws || samples()==beforeSamples)fail("display frame=%u errors/draws/timestamps",frame);
+   times[frame]=(double)(gpu()-beforeGPU)/1e6;wall[frame]=(end-begin)*1000;
+   if(!(times[frame]>0))fail("display frame=%u nonpositive GPU time",frame);
+   // Cold frame 0 is measured separately; the following 59 frames target 60 Hz.
+   if(!frame)epoch=end;
+   else if(wall[frame]>1000.0/60.0 || end>epoch+(frame+1)/60.0)++late;
+   if(frame<59){CFTimeInterval deadline=epoch+(frame+1)/60.0,now=CACurrentMediaTime();
+    if(deadline>now)usleep((useconds_t)((deadline-now)*1e6));}
+  }
+  [CATransaction begin];[CATransaction setDisableActions:YES];CALayer *expected=displayScene(space,YES);displayPosition(expected,59);[CATransaction commit];
+  CGContextRef cpu=CGBitmapContextCreate(reference,1080,2400,8,4320,space,kCGBitmapByteOrder32Little|kCGImageAlphaPremultipliedFirst);
+  if(!cpu)fail("display CPU context");CGContextTranslateCTM(cpu,0,2400);CGContextScaleCTM(cpu,1,-1);[expected renderInContext:cpu];CGContextRelease(cpu);
+  [renderer setLayer:nil];renderer=nil;[texture release];[queue release];
+ }
+ if(IOSurfaceLock(surface,kIOSurfaceLockReadOnly,NULL))fail("display consumer lock");
+ base=IOSurfaceGetBaseAddress(surface);struct FuxiCAComparison m=fuxiCACompareSize(base,row,reference,1080,2400);
+ if(IOSurfaceUnlock(surface,kIOSurfaceLockReadOnly,NULL))fail("display consumer unlock");
+ for(unsigned i=0;i<60;++i)printf("FUXI CA: display frame=%u gpu_ms=%.3f wall_ms=%.3f\n",i,times[i],wall[i]);
+ double cold=times[0];qsort(times,60,sizeof(double),compareDouble);
+ double warm[59];for(unsigned i=0;i<59;++i)warm[i]=wall[i+1];qsort(warm,59,sizeof(double),compareDouble);
+ printf("FUXI CA: display GPU min/median/max=%.3f/%.3f/%.3f ms cold=%.3f ms frames=60 cache_hits=%llu cache_misses=%llu\n",
+  times[0],(times[29]+times[30])/2,times[59],cold,(unsigned long long)(hits()-startHits),(unsigned long long)(misses()-startMisses));
+ printf("FUXI CA: display warm wall min/median/max=%.3f/%.3f/%.3f ms late=%u/59 target_hz=60\n",warm[0],warm[29],warm[58],late);
+ if(!fuxiCAAcceptSize(m,1080,2400))fail("pixels=2592000 max=%u mean=%.4f bad=%u",m.max_error,m.mean_error,m.bad_pixels);
+ if(failures() || hits()==startHits)fail("display frontend errors/cache reuse missing");
+ // Pixel PASS alone cannot prove display rate. Require every warm frame's render
+ // and synchronous completion to fit the actual 60 Hz budget.
+ if(late)fail("display 60Hz deadline missed frames=%u/59",late);
+ printf("FUXI CA: stage 5 display PASS pixels=2592000 frames=60 max=%u mean=%.4f bad=%u gpu_draws=%llu\n",
+  m.max_error,m.mean_error,m.bad_pixels,(unsigned long long)(draws()-startDraws));
+ free(reference);CFRelease(surface);
+}
 int main(int argc,char **argv) {
  (void)argc;(void)argv;setvbuf(stdout,NULL,_IONBF,0);setvbuf(stderr,NULL,_IONBF,0);
  signal(SIGALRM,expired);signal(SIGABRT,expired);arm(30);
@@ -119,7 +218,7 @@ int main(int argc,char **argv) {
   NSString **spaceKey=(NSString **)dlsym(RTLD_DEFAULT,"kCARendererColorSpace");
   if(!queueKey || !*queueKey || !spaceKey || !*spaceKey)fail("CARenderer option keys unavailable");
   CGColorSpaceRef space=CGColorSpaceCreateWithName(kCGColorSpaceSRGB);if(!space)fail("sRGB CPU color space");
-  for(stage=0;stage<=maximum;++stage) {@autoreleasepool {
+  for(stage=0;stage<=maximum && stage<5;++stage) {@autoreleasepool {
    arm(60);uint64_t startDraws=draws();
    IOSurfaceRef surface=IOSurfaceCreate((CFDictionaryRef)@{(id)kIOSurfaceWidth:@256,(id)kIOSurfaceHeight:@256,
     (id)kIOSurfaceBytesPerElement:@4,(id)kIOSurfaceBytesPerRow:@1024,(id)kIOSurfacePixelFormat:@0x42475241});
@@ -200,6 +299,7 @@ int main(int argc,char **argv) {
    printf("FUXI CA: stage %u %s PASS pixels=65536 max=%u mean=%.4f bad=%u gpu_draws=%llu total_draws=%llu\n",stage,names[stage],m.max_error,m.mean_error,m.bad_pixels,(unsigned long long)rendered,(unsigned long long)(draws()-startDraws));
    free(reference);free(mirrored);CFRelease(surface);
   }}
+  if(maximum==5){stage=5;displayStage(device,rendererClass,factory,*queueKey,*spaceKey,space,failures,draws,plugin);}
   stage=maximum;arm(10);CGColorSpaceRelease(space);[device release];dlclose(plugin);alarm(0);puts("FUXI CA: done PASS");
  }@catch(NSException *exception) {fail("exception %.96s",exception.name.UTF8String);}}
  return 0;

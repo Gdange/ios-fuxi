@@ -77,6 +77,39 @@ int main(){@autoreleasepool {
  assert(!command.error);[texture getBytes:output bytesPerRow:40 fromRegion:MTLRegionMake2D(0,0,8,4) mipmapLevel:0];
  for(unsigned y=0;y<4;++y)for(unsigned x=0;x<8;++x){const uint8_t red[]={0,0,255,255};assert(!memcmp(output+y*40+x*4,red,4));}
  [texture release];assert(view.width==8);[view release];fuxi::Backend::modelTextures=false;
+ // M9g: real wrappers accept display-size descriptors and target-relative state.
+ fuxi::Backend::modelTextures=true;
+ td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:1080 height:2400 mipmapped:NO];
+ td.storageMode=MTLStorageModeShared;td.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;
+ texture=[device newTextureWithDescriptor:td];assert(texture && texture.width==1080 && texture.height==2400);
+ assert([(FuxiDeviceMethods *)device maxTextureWidth2D]==4096 && [(FuxiDeviceMethods *)device maxTextureHeight2D]==4096);
+ pass=ios16PassDefaults();pass.colorAttachments[0].texture=(id)texture;
+ pass.colorAttachments[0].loadAction=MTLLoadActionClear;pass.colorAttachments[0].storeAction=MTLStoreActionStore;
+ command=[queue commandBuffer];render=[command renderCommandEncoderWithDescriptor:pass];assert(render);
+ [render setViewport:(MTLViewport){0,0,1080,2400,0,1}];[render setScissorRect:(MTLScissorRect){1000,2300,80,100}];assert(!command->_rejected);
+ [render setScissorRect:(MTLScissorRect){1000,2300,81,100}];assert(command->_rejected);[render endEncoding];
+ command=[queue commandBuffer];render=[command renderCommandEncoderWithDescriptor:pass];
+ [render setViewport:(MTLViewport){0,0,1080,2401,0,1}];assert(command->_rejected);[render endEncoding];
+ [texture release];
+ // Metal SDK setters accept 4097 and sampleCount=2; do not install invalid
+ // enum ordinals or out-of-range descriptor-array indices (Mac Metal asserts).
+ td.width=4097;assert(![device newTextureWithDescriptor:td]);td.width=1080;td.sampleCount=2;assert(![device newTextureWithDescriptor:td]);
+ fuxi::Backend::modelTextures=false;
+ // Shared backend identity survives releasing either independently labeled wrapper.
+ fuxi::Backend::modelPipelines=true;
+ FuxiLibrary *library=[FuxiLibrary new];library->_device=[device retain];
+ FuxiFunction *vertex=[FuxiFunction new],*fragment=[FuxiFunction new];
+ vertex->_library=[library retain];vertex->_name=[@"cache_vertex" copy];vertex->_stage=1;
+ fragment->_library=[library retain];fragment->_name=[@"cache_fragment" copy];fragment->_stage=2;
+ MTLRenderPipelineDescriptor *pd=ios16PipelineDefaults();pd.vertexFunction=(id)vertex;pd.fragmentFunction=(id)fragment;
+ pd.colorAttachments[0].pixelFormat=MTLPixelFormatBGRA8Unorm;NSError *error=nil;
+ FuxiPipeline *one=[device newRenderPipelineStateWithDescriptor:pd error:&error];assert(one && !error);
+ pd.label=@"other wrapper";FuxiPipeline *two=[device newRenderPipelineStateWithDescriptor:pd error:&error];
+ assert(two && one!=two && one->_pipeline==two->_pipeline && two->_pipeline->references==3);
+ [one release];assert(two->_pipeline->references==2 && [two.label isEqualToString:@"other wrapper"]);
+ pd.colorAttachments[0].writeMask=MTLColorWriteMaskRed;
+ FuxiPipeline *different=[device newRenderPipelineStateWithDescriptor:pd error:&error];assert(different && different->_pipeline!=two->_pipeline);
+ [different release];[two release];[vertex release];[fragment release];[library release];fuxi::Backend::modelPipelines=false;
  [listener release];[event release];[fence release];dispatch_release(delivered);dispatch_release(callbacks);
  [queue release];[device release];assert(fuxi::Backend::live==0);
  puts("PASS: CA scheduling/completion routing, local events/listeners/fences, automatic heap lifetime/cache hints, texture regions/views/empty pass");

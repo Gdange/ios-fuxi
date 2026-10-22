@@ -48,11 +48,11 @@ def main():
                 try:stage();raise AssertionError('bad config accepted')
                 except ValueError:pass
             conf.write_bytes(b'4\n')
-            for raw in (b'',b'5',b'-1',b'4\0',b'4'*32):
+            for raw in (b'',b'6',b'-1',b'4\0',b'4'*32):
                 ca_conf.write_bytes(raw)
                 try:stage();raise AssertionError('bad CA config accepted')
                 except ValueError:pass
-            for maximum in range(5):
+            for maximum in range(6):
                 ca_conf.write_bytes(str(maximum).encode());stage()
             ca_conf.write_bytes(b'4\n')
             for raw in (b'x\0',b'census x y',b'census backboardd\nbackboardd',b'x'*8193,b'../bad',b'backboardd',b'SpringBoard',b'census backboardd',b'census SpringBoard'):

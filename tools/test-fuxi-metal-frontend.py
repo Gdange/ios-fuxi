@@ -30,6 +30,10 @@ def main():
                         '-fsanitize=address,undefined',str(ROOT/'tools/fuxi-metal/TimelineTests.cpp'),
                         '-o',str(d/'timeline')],check=True)
         if not a.compile_only:subprocess.run([str(d/'timeline')],check=True,timeout=15)
+        subprocess.run([*compiler,'-std=c++17','-Wall','-Wextra','-Werror',
+                        '-fsanitize=address,undefined',str(ROOT/'tools/fuxi-metal/ResourceCacheTests.cpp'),
+                        '-o',str(d/'resource-cache')],check=True)
+        if not a.compile_only:subprocess.run([str(d/'resource-cache')],check=True,timeout=30)
         if os.uname().sysname!='Darwin':
             print('SKIP: native Objective-C frontend/smoke tests require Mac Foundation/Metal')
             return

@@ -73,7 +73,7 @@ impl Default for Push {fn default()->Self {Self{offset:0,size:0,stages:0,bytes:[
 #[derive(Default)]
 pub struct DrawOutput {descriptor_count:u32,push_count:u32,vertex_count:u32,indexed:u32,count:u32,first:u32,index_offset:u64,descriptors:[Descriptor;16],pushes:[Push;2],vertex_bindings:[u32;4],vertex_slots:[u32;4],vertex_offsets:[u64;4]}
 #[repr(C)]
-#[derive(Clone,Copy,Default)]
+#[derive(Clone,Copy,Debug,Default)]
 pub struct Specialization {id:u32,offset:u32,size:u32}
 #[repr(C)]
 #[derive(Clone,Copy,Default)]
@@ -178,6 +178,38 @@ unsafe fn name<'a>(p:*const c_char)->Result<&'a str,String> {
         use metal2vulkan::library::FunctionStage as Stage;
         match info.stage {Stage::Vertex=>Ok(1),Stage::Fragment=>Ok(2),_=>Err("M6 supports vertex/fragment only".into())}
     }).unwrap_or(0)
+}
+// Device-local object-cache identities. Hash fields, never native struct padding
+// or handles. The backend owns a separate cache for each actual VkDevice.
+#[no_mangle] pub unsafe extern "C" fn fuxi_m2v_identity(v:*mut c_void,vn:*const c_char,f:*mut c_void,fn_:*const c_char,
+    options:*const CompileOptions,out:*mut u8,err:*mut c_char,cap:usize)->i32 {
+    attempt(err,cap,|| {
+        if v.is_null() || f.is_null() || options.is_null() || out.is_null(){return Err("nil identity argument".into());}
+        let a=&*(v as *const Library);let b=&*(f as *const Library);
+        let o=&*options;let mut hash=Sha256::new();
+        hash.update(format!("M9g/sample=1/{:?}/{:?}",a.content_hash(),b.content_hash()).as_bytes());
+        for n in [name(vn)?,name(fn_)?]{hash.update((n.len() as u64).to_le_bytes());hash.update(n.as_bytes());}
+        for field in [o.format,o.blend,o.src_rgb,o.dst_rgb,o.rgb_op,o.src_alpha,o.dst_alpha,o.alpha_op,o.mask,o.strip,o.ordered_color_access] {hash.update(field.to_le_bytes());}
+        for attr in &o.attributes {for field in [attr.format,attr.offset,attr.buffer]{hash.update(field.to_le_bytes());}}
+        for stride in o.strides {hash.update(stride.to_le_bytes());}
+        for stage in 0..2 {let count=o.constant_count[stage] as usize;if count>128{return Err("identity constants bound".into());}
+            hash.update((count as u32).to_le_bytes());
+            for c in &o.constants[stage][..count] {hash.update(c.index.to_le_bytes());hash.update(c.ty.to_le_bytes());hash.update(c.size.to_le_bytes());hash.update(c.bytes);hash.update(c.name);}
+        }
+        std::ptr::copy_nonoverlapping(hash.finalize().as_ptr(),out,32);Ok(1)
+    }).unwrap_or(0)
+}
+#[no_mangle] pub unsafe extern "C" fn fuxi_m2v_product_hash(handle:*mut c_void,out:*mut u8)->i32 {
+    if handle.is_null() || out.is_null(){return 0;}
+    let p=&*(handle as *const Product);let mut hash=Sha256::new();
+    // All executable bytes, specialization bytes, blob hashes and render state.
+    for words in [&p.vertex,&p.fragment] {hash.update((words.len() as u64).to_le_bytes());for w in words {hash.update(w.to_le_bytes());}}
+    hash.update(format!("{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}",
+        p.vname,p.fname,p.options,p.variant,p.descriptors,p.specs,p.spec_data,p.blob_hashes,p.bindings,p.attributes,p.format,p.blend,p.mask,p.factors).as_bytes());
+    hash.update(format!("{:?}",p.pipeline.layout).as_bytes());
+    for a in &p.pipeline.graphics.input_attachments {hash.update(a.color_index.to_le_bytes());}
+    for r in &p.pipeline.layout.push_constants {hash.update(r.offset.to_le_bytes());hash.update(r.size.to_le_bytes());hash.update(r.stages.as_raw().to_le_bytes());}
+    std::ptr::copy_nonoverlapping(hash.finalize().as_ptr(),out,32);1
 }
 #[no_mangle] pub unsafe extern "C" fn fuxi_m2v_compile(v:*mut c_void,vn:*const c_char,f:*mut c_void,fn_:*const c_char,
     gipa:*mut c_void,instance:u64,physical:u64,options:*const CompileOptions,out:*mut Translation,err:*mut c_char,cap:usize)->i32 {

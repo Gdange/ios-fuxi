@@ -53,7 +53,7 @@ def main():
             if p.returncode:
                 print(p.stderr[-6000:], end='')
             assert p.returncode == 0, 'M7 AIR control failed'
-            assert 'translation cache HIT' in p.stderr, 'cache path missing'
+            assert 'pipeline cache HIT' in p.stderr, 'cache path missing'
             assert 'AddressSanitizer' not in p.stderr and 'runtime error:' not in p.stderr
     if not a.ci_m7:
         print('UNVALIDATED: new Xcode stage-6 MSL; requires CI metallib rebuild and --ci-m7')

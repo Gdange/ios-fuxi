@@ -38,9 +38,9 @@ int main(int argc,char **argv) {
   phase="device";fuxi::Backend backend;
   phase="compile";auto *p=backend.compilePipeline(lib.get(),argv[2],fragmentLib.get(),argv[3],options);
   auto *cached=backend.compilePipeline(lib.get(),argv[2],fragmentLib.get(),argv[3],options);
-  if(cached->blobHashes!=p->blobHashes || cached->constantBlobs.size()!=p->constantBlobs.size())throw std::runtime_error("cached blob identity mismatch");
+  if(cached!=p || p->references<3 || cached->blobHashes!=p->blobHashes || cached->constantBlobs.size()!=p->constantBlobs.size())throw std::runtime_error("cached blob identity mismatch");
   for(size_t i=0;i<p->constantBlobs.size();++i){auto *a=p->constantBlobs[i],*b=cached->constantBlobs[i];
-   if(a==b || a->length!=b->length || memcmp(a->contents,b->contents,a->length))throw std::runtime_error("cached blob ownership/content mismatch");}
+   if(a!=b || a->length!=b->length || memcmp(a->contents,b->contents,a->length))throw std::runtime_error("cached blob ownership/content mismatch");}
   backend.destroy(p);p=cached;
   std::cout<<"counts "<<p->descriptors.size()<<' '<<p->constantBlobs.size()<<' '<<p->fetchMask<<'\n';
   for(const auto &d:p->descriptors)if(d.source==1)std::cout<<"blob_binding "<<d.set<<' '<<d.binding<<' '<<d.type<<' '<<d.stages<<' '<<d.range<<'\n';

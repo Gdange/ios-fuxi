@@ -49,6 +49,8 @@ public:
  int (*draw)(void *,const DrawInput *,DrawOutput *,char *,size_t){};
  int (*variant)(void *,const DrawInput *,Translation *,char *,size_t){};
  int (*sampler)(void *,uint32_t,BakedSampler *,char *,size_t){};
+ int (*identity)(void *,const char *,void *,const char *,const CompileOptions *,uint8_t *,char *,size_t){};
+ int (*product_hash)(void *,uint8_t *){};
  void (*free)(void *){};
  Translator() {
   dylib=dlopen(FUXI_MTL_TRANSLATOR,RTLD_NOW|RTLD_LOCAL);
@@ -56,7 +58,7 @@ public:
   auto abi=(uint32_t (*)())dlsym(dylib,"fuxi_m2v_abi");
   if(!abi || abi()!=6) {dlclose(dylib);throw std::runtime_error("metal2vulkan C ABI mismatch");}
 #define LOAD(n) n=(decltype(n))dlsym(dylib,"fuxi_m2v_" #n);if(!n) {dlclose(dylib);throw std::runtime_error("missing translator " #n);}
-  LOAD(open) LOAD(close) LOAD(function) LOAD(compile) LOAD(draw) LOAD(variant) LOAD(sampler) LOAD(free)
+  LOAD(open) LOAD(close) LOAD(function) LOAD(compile) LOAD(draw) LOAD(variant) LOAD(sampler) LOAD(identity) LOAD(product_hash) LOAD(free)
 #undef LOAD
  }
  ~Translator() {if(dylib)dlclose(dylib);}

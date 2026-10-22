@@ -65,7 +65,7 @@ int main(int argc,char **argv) {
  for(unsigned reopen=0;reopen<2;++reopen){fuxi::Backend backend;assert(backend.supportsOrderedColorAccess());
   fuxi::CompileOptions fetch{};fetch.attributes[0]={29,0,0};fetch.attributes[1]={29,8,0};fetch.attributes[2]={9,16,0};fetch.strides[0]=20;
   for(unsigned warm=0;warm<10;++warm){auto *p=backend.compilePipeline(fetchLib,"fuxi_layer_vertex",fetchLib,"fuxi_fetch_fragment",fetch);assert(p->fetchMask==1 && p->orderedColorAccess);backend.destroy(p);}}
- tr.close(fetchLib);tr.close(lib);puts("PASS: actual backend 40 pipeline pairs, ordered fetch priming, cache retirement and device reopen; no command buffers or submissions");
+ tr.close(fetchLib);tr.close(lib);puts("PASS: actual backend 40 requests / 4 shared pipeline pairs, ordered fetch priming, object reuse and device reopen; no command buffers or submissions");
 }
 ''')
         subprocess.run([a.llvm_as, str(ROOT / 'tools/shaders/metal-m7-control.ll'), '-o', str(d / 'fetch.bc')], check=True)
@@ -79,7 +79,7 @@ int main(int argc,char **argv) {
         p = subprocess.run([str(d / 'backend'), str(d / 'control.bc'), str(d / 'fetch.bc')], env=env,
                            capture_output=True, text=True, timeout=60)
         assert p.returncode == 0, p.stderr
-        assert p.stderr.count('Vulkan pipelines PASS') == 40 and p.stderr.count('cache=1') == 40
+        assert p.stderr.count('Vulkan pipelines PASS') == 4 and p.stderr.count('cache=1') == 4 and p.stderr.count('pipeline cache HIT') == 36
         assert 'AddressSanitizer' not in p.stderr and 'runtime error:' not in p.stderr
         print(p.stdout, end='')
 
