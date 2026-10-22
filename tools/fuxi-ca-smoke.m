@@ -166,14 +166,29 @@ extern int proc_pidinfo(int pid,int flavor,uint64_t arg,void *buffer,int buffers
 extern int proc_name(int pid,void *buffer,uint32_t buffersize);
 struct fuxiTaskInfo{uint64_t virt,resident,user,sys,threadsUser,threadsSys;
  int32_t policy,faults,pageins,cow,sent,received,mach,unix,csw,threads,running,priority;};
-typedef struct{int pid;uint64_t cpu;int32_t csw,mach,unix;}fuxiProc;
+typedef struct{int pid;uint64_t cpu,sys;int32_t csw,mach,unix;}fuxiProc;
 static unsigned procSnapshot(fuxiProc *out,unsigned max){int pids[1024];int n=proc_listallpids(pids,sizeof(pids));unsigned k=0;
  for(int i=0;i<n&&k<max;++i){struct fuxiTaskInfo t;
   if(proc_pidinfo(pids[i],4/*PROC_PIDTASKINFO*/,0,&t,sizeof(t))!=(int)sizeof(t))continue;
-  out[k++]=(fuxiProc){pids[i],t.user+t.sys,t.csw,t.mach,t.unix};}
+  out[k++]=(fuxiProc){pids[i],t.user+t.sys,t.sys,t.csw,t.mach,t.unix};}
  return k;}
 static fuxiProc procBefore[1024],procAfter[1024];
-typedef struct{int pid;double ms;int32_t csw,sys;int fresh;}fuxiBusy;
+typedef struct{int pid;double ms,kernelMs;int32_t csw,sys;int fresh;}fuxiBusy;
+struct fuxiThreadInfo{uint64_t user,sys;int32_t usage,policy,state,flags,sleep,curpri,priority,maxpri;char name[64];};
+typedef struct{double ms;int32_t state,curpri;char name[64];}fuxiThread;
+static int compareThread(const void *a,const void *b){const fuxiThread *x=a,*y=b;return (y->ms>x->ms)-(y->ms<x->ms);}
+// A busy process's most expensive threads (lifetime CPU; thread times are nanoseconds,
+// task times mach units), by name: names such as a
+// dispatch queue or an audio IO thread show which subsystem spins.
+static void threadReport(const char *label,int pid,const char *proc,double scale){uint64_t ids[256];
+ int bytes=proc_pidinfo(pid,6/*PROC_PIDLISTTHREADS*/,0,ids,sizeof(ids));if(bytes<=0)return;
+ static fuxiThread th[256];unsigned n=0;
+ for(unsigned i=0;i<(unsigned)bytes/sizeof(uint64_t);++i){struct fuxiThreadInfo t;
+  if(proc_pidinfo(pid,5/*PROC_PIDTHREADINFO*/,ids[i],&t,sizeof(t))!=(int)sizeof(t))continue;
+  th[n].ms=(double)(t.user+t.sys)*scale;th[n].state=t.state;th[n].curpri=t.curpri;memcpy(th[n].name,t.name,64);th[n].name[63]=0;++n;}
+ qsort(th,n,sizeof(*th),compareThread);
+ for(unsigned i=0;i<n&&i<4;++i)printf("FUXI CA: quiet probe %s thread %s/%s lifetime_ms=%.0f state=%d pri=%d\n",
+  label,proc,th[i].name[0]?th[i].name:"-",th[i].ms,th[i].state,th[i].curpri);}
 static int compareBusy(const void *a,const void *b){const fuxiBusy *x=a,*y=b;
  double kx=x->ms+x->csw*0.01,ky=y->ms+y->csw*0.01;return (ky>kx)-(ky<kx);}
 // Who ran during the quiet second: CPU time (task times are mach units on arm64),
@@ -182,13 +197,15 @@ static void procReport(const char *label,unsigned na,unsigned nb){mach_timebase_
  static fuxiBusy busy[1024];unsigned m=0,fresh=0;
  for(unsigned i=0;i<nb;++i){const fuxiProc *b=&procAfter[i];const fuxiProc *a=NULL;
   for(unsigned j=0;j<na;++j)if(procBefore[j].pid==b->pid){a=&procBefore[j];break;}
-  fuxiBusy x={b->pid,(double)(b->cpu-(a?a->cpu:0))*tb.numer/tb.denom/1e6,b->csw-(a?a->csw:0),
+  double scale=(double)tb.numer/tb.denom/1e6;
+  fuxiBusy x={b->pid,(double)(b->cpu-(a?a->cpu:0))*scale,(double)(b->sys-(a?a->sys:0))*scale,b->csw-(a?a->csw:0),
    (b->mach-(a?a->mach:0))+(b->unix-(a?a->unix:0)),!a};
   fresh+=!a;if(x.ms>0.5||x.csw>20||x.fresh)busy[m++]=x;}
  qsort(busy,m,sizeof(*busy),compareBusy);
  printf("FUXI CA: quiet probe %s processes before=%u after=%u started=%u\n",label,na,nb,fresh);
  for(unsigned i=0;i<m&&i<12;++i){char name[64]="?";proc_name(busy[i].pid,name,sizeof(name));
-  printf("FUXI CA: quiet probe %s proc %s pid=%d cpu_ms=%.1f csw=%d syscalls=%d%s\n",label,name,busy[i].pid,busy[i].ms,busy[i].csw,busy[i].sys,busy[i].fresh?" started":"");}}
+  printf("FUXI CA: quiet probe %s proc %s pid=%d cpu_ms=%.1f kernel_ms=%.1f csw=%d syscalls=%d%s\n",label,name,busy[i].pid,busy[i].ms,busy[i].kernelMs,busy[i].csw,busy[i].sys,busy[i].fresh?" started":"");
+  if(i<3&&busy[i].pid>0)threadReport(label,busy[i].pid,name,1e-6);}}
 // One undisturbed second: the system's own interrupt rate per CPU (a cooling baseline).
 static void quietProbe(const char *label){processor_cpu_stat_data_t a[8],b[8];unsigned np=procSnapshot(procBefore,1024);unsigned n=cpuStats(a,8);
  CFTimeInterval t=CACurrentMediaTime();usleep(1000000);double wall=(CACurrentMediaTime()-t)*1000;
