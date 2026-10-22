@@ -18,9 +18,9 @@ Both independent keys are required for the executable basename `backboardd`:
 1. A root-owned, non-group/world-writable
    `/usr/local/share/fuxi/metal-clients.conf` containing the plain allow line
    `backboardd`. A census entry does not qualify.
-2. The exact whitespace-delimited kernel boot argument **`fuxigpu=backboardd`**,
+2. The exact whitespace-delimited kernel boot argument **`fuxibbgpu=1`**,
    read using `sysctlbyname("kern.bootargs")`. Absent, unreadable, truncated,
-   malformed, prefix/suffix matches and duplicate `fuxigpu=` arguments deny.
+   malformed, prefix/suffix matches and duplicate `fuxibbgpu=` arguments deny.
 
 SpringBoard is denied unconditionally, including allow and census entries.
 Identity comes from dyld's executable path, never inherited daemon argv.
@@ -43,7 +43,7 @@ python3 tools/stage-fuxi-metal.py "$IOS_ROOT" \
 
 The flag adds the backboardd line to the installed copy and prepares storage;
 it does not modify the input conf or set any boot argument. Separately add
-`fuxigpu=backboardd` to the intended boot's existing kernel arguments. Preserve
+`fuxibbgpu=1` to the intended boot's existing kernel arguments. Preserve
 other arguments. Run the real backboardd job; do not exec-swap the render
 server or SpringBoard. Remove the isolated CA exec-swap for this experiment.
 Removing the boot argument suffices to select CPU on the next process/boot;
@@ -237,7 +237,7 @@ or device result is asserted here.
 For a separately authorized device experiment:
 
 1. First run the Mac frontend suite and build the normal matching bundle/bridge.
-   Default-stage and boot without `fuxigpu=backboardd`: require gate deny for
+   Default-stage and boot without `fuxibbgpu=1`: require gate deny for
    backboardd and SpringBoard and the existing working CPU home screen.
 2. Enable-stage, still omit the argument: require backboardd deny. Then boot
    with both keys and the real render-server job. Require armed, HostImport,

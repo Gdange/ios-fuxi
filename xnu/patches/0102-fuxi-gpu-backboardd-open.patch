@@ -13,12 +13,12 @@
   * name; it implements no Apple family/user-client ABI. The native root-only
   * ABI below remains the sole GPU connection contract. */
 +/* M9j: the render server backboardd runs as mobile, not root. Admit that one
-+ * non-root client only when the boot asks for it (fuxigpu=backboardd) and the
++ * non-root client only when the boot asks for it (fuxibbgpu=1) and the
 + * caller is the platform binary named backboardd opening for itself. FuxiMetal
 + * keeps its own two-key gate and crash fallback in userspace. */
 +static bool backboardClient(task_t task) {
-+ char arg[32]={};
-+ if (!PE_parse_boot_argn("fuxigpu",arg,sizeof(arg)) || strcmp(arg,"backboardd")) return false;
++ int arg=0;
++ if (!PE_parse_boot_argn("fuxibbgpu",&arg,sizeof(arg)) || arg!=1) return false;
 + if (task!=current_task()) return false;
 + char name[32]={};
 + proc_selfname(name,sizeof(name));

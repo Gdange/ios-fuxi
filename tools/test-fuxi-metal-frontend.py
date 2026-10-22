@@ -80,14 +80,14 @@ def main():
             return p
         compositor('backboardd','')
         compositor('backboardd','backboardd\n')
-        compositor('backboardd','','fuxigpu=backboardd')
-        compositor('SpringBoard','SpringBoard\n','fuxigpu=backboardd')
-        compositor('SpringBoard','census SpringBoard\n','fuxigpu=backboardd')
+        compositor('backboardd','','fuxibbgpu=1')
+        compositor('SpringBoard','SpringBoard\n','fuxibbgpu=1')
+        compositor('SpringBoard','census SpringBoard\n','fuxibbgpu=1')
         private=d/'backboardd';private.mkdir(mode=0o700)
-        p=compositor('backboardd','backboardd\n','fuxigpu=backboardd','allow',
+        p=compositor('backboardd','backboardd\n','fuxibbgpu=1','allow',
                      FUXI_TEST_GATE_DIR=str(private),FUXI_TEST_GATE_FAULT='1')
         assert 'backboardd gate good frames=120' in p.stderr and 'next-respawn=CPU persisted=1' in p.stderr,p.stderr
-        compositor('backboardd','backboardd\n','fuxigpu=backboardd',FUXI_TEST_GATE_DIR=str(private))
+        compositor('backboardd','backboardd\n','fuxibbgpu=1',FUXI_TEST_GATE_DIR=str(private))
         call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/CensusTests.mm'),*frameworks,'-o',str(d/'census')])
         census=subprocess.run([str(d/'census')],env=env,text=True,capture_output=True,check=True,timeout=15)
         assert census.stderr.count(' supportsFamily: implemented')==1,census.stderr

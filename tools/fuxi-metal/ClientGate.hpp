@@ -23,7 +23,7 @@ static inline bool backboardArmed(const char *args) {
  if(!args)return false;unsigned keys=0;bool armed=false;
  for(const char *p=args;*p;) {
   p+=strspn(p," \t\r\n");size_t n=strcspn(p," \t\r\n");
-  if(n>=8 && !strncmp(p,"fuxigpu=",8)) {++keys;armed=n==18 && !memcmp(p,"fuxigpu=backboardd",18);}
+  if(n>=10 && !strncmp(p,"fuxibbgpu=",10)) {++keys;armed=n==11 && !memcmp(p,"fuxibbgpu=1",11);}
   p+=n;
  }
  return keys==1 && armed;
