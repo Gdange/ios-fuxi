@@ -755,7 +755,7 @@ static bool textureDescriptorAccepted(MTLTextureDescriptor *d,uint32_t dimension
  CHECK("linear.storageMode",d.storageMode,actual==MTLStorageModeShared);
  CHECK("linear.mipmapLevelCount",d.mipmapLevelCount,actual==1);
  CHECK("linear.bytesPerRow",row,actual && d.height<=SIZE_MAX/actual);
- CHECK("linear.bytesPerImage",image,!actual || actual>=row*d.height);
+ CHECK("linear.bytesPerImage",image,fuxi::linearImageFits(actual,row,d.width,d.height,(uint32_t)d.pixelFormat));
 #undef CHECK
  FuxiTexture *t=[FuxiTexture new];t->_descriptorText=[textureDescriptorText(d) copy];t->_cacheMode=d.cpuCacheMode;t->_device=[_device retain];t->_usage=d.usage;t->_shared=YES;
  if(d.textureType!=MTLTextureType2D){failureLog("FUXI MTL: texture reject linearTextureType %lu desc=%s\n",(unsigned long)d.textureType,textureDescriptorText(d).UTF8String);[t release];return nil;}
@@ -998,7 +998,10 @@ static thread_local FuxiCommandBuffer *completionCommand;
 } @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
 - (void)record:(MTLPrimitiveType)t start:(NSUInteger)start count:(NSUInteger)count indices:(id)indices offset:(NSUInteger)offset {
  [self active];if(!_pipeline || !_pipeline->_pipeline){fuxi::dropPipelineDraw();return;}
- if((t!=MTLPrimitiveTypeTriangle && t!=MTLPrimitiveTypeTriangleStrip) || !count || count>65536 || start>65536-count)invalid(@"draw bounds/topology");
+ // Metal ignores an empty draw.
+ if(!count)return;
+ if((t!=MTLPrimitiveTypeTriangle && t!=MTLPrimitiveTypeTriangleStrip) || count>65536 || start>65536-count)
+  invalid([NSString stringWithFormat:@"draw bounds/topology type=%lu start=%lu count=%lu indexed=%d",(unsigned long)t,(unsigned long)start,(unsigned long)count,indices!=nil]);
  if(indices && (![indices isKindOfClass:[FuxiBuffer class]] || [indices device]!=_command->_queue->_device || (offset&1) || offset>[indices length] || count*2>[indices length]-offset))invalid(@"index bounds/device");
  DescriptorContext context(_passText);
  fuxi::Operation op=_state;op.renderDraw=true;op.diagnostic=[NSString stringWithFormat:@"%@ %@",_passText,_pipeline->_descriptorText?:@"pipeline=model"].UTF8String;op.texture=_target->_texture;op.pipeline=_pipeline->_pipeline;op.vertices=(uint32_t)count;op.first=(uint32_t)start;op.strip=t==MTLPrimitiveTypeTriangleStrip;

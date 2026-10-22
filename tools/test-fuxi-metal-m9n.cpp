@@ -8,6 +8,9 @@ static fuxi::Operation copy(fuxi::Texture *s,fuxi::Texture *d,uint32_t sx,uint32
 }
 int main(){
  fuxi::Backend b;auto baseline=b.resourceBytes();
+ // CA linear textures: 1x1 BGRA in a 64-byte row is 4 bytes; zero means "not given".
+ assert(fuxi::linearImageFits(4,64,1,1,80) && !fuxi::linearImageFits(3,64,1,1,80) && fuxi::linearImageFits(0,64,1,1,80));
+ assert(fuxi::linearImageFits(68,64,1,2,80) && !fuxi::linearImageFits(67,64,1,2,80));
  assert(b.pixelFormat(43)==VK_FORMAT_A1R5G5B5_UNORM_PACK16 && b.texelBytes(43)==2);
  for(auto f:{23u,25u,55u,105u}){
   VkFormat expected=f==23?VK_FORMAT_R16_UINT:f==25?VK_FORMAT_R16_SFLOAT:f==55?VK_FORMAT_R32_SFLOAT:VK_FORMAT_R32G32_SFLOAT;
@@ -71,5 +74,5 @@ int main(){
   b.destroy(a);b.destroy(alias);free(host);
  }
  b.destroy(t);b.destroy(other);b.destroy(up);b.destroy(out);assert(b.resourceBytes()==baseline);
- puts("PASS: M9n formats/packed channels, native 1D/mips, overlapping/disjoint/self/import aliases, padded buffer transfers, fill/generation, bounds/format/undefined refusal, rollback/budget");
+ puts("PASS: M9n formats/packed channels, native 1D/mips, overlapping/disjoint/self/import aliases, padded buffer transfers, fill/generation, bounds/format/undefined refusal, rollback/budget, tight linear image size");
 }

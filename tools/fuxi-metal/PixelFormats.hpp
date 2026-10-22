@@ -18,6 +18,10 @@ inline size_t metalTexelBytes(uint32_t format) {
 inline bool textureFormatAccepted(uint32_t format) {
  switch(format){case 1:case 10:case 23:case 25:case 30:case 43:case 55:case 70:case 80:case 94:case 105:case 115:return true;default:return false;}
 }
+// A 2D linear image reads only width*texel bytes from its last row; CA passes that tight size.
+inline bool linearImageFits(uint64_t image,uint64_t row,uint64_t width,uint64_t height,uint32_t format) {
+ return !image || (height && image>=row*(height-1)+width*metalTexelBytes(format));
+}
 // A 1D image must retain its dimension through image creation and shader views.
 // Height-one 2D storage alone cannot satisfy a SPIR-V Dim1D sampled image.
 inline bool textureShapeAccepted(uint32_t type,uint32_t height,uint32_t usage) {
