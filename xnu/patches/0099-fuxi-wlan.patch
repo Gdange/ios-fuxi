@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,3180 @@
+@@ -0,0 +1,3340 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -50,6 +50,8 @@
 + *   fuxiwlancnss=pdc  M6n AOP WLAN PDC setup before rails (default off)
 + *   fuxiwlanseq=cycle,parf,dbi,eq,hostirq,msi,por,prefix  M6o opt-ins
 + *   fuxiwlanseq=cyclerails  also cycle shared rails (froze the SoC once)
++ *   fuxiwlanstop22=1  retain the BHI-only diagnostic stop (default: continue)
++ *   fuxiwlankeep=1  retain DMA/device only after W10 AMSS + M0 success
 + * Steps 17..28 probe DMA safety and load rootfs firmware through BHI/BHIe.
 + * Completion is polled; M6o can enable MSI to a RAM sink. No channels/QMI;
 + * see docs-lanes/wlan-bt.md M6.
@@ -741,6 +743,18 @@
 +static bool wl_mhi_valid;
 +struct wl_dma { vm_offset_t va; vm_size_t size; uint64_t pa, iova; bool nc; };
 +static struct wl_dma wl_image, wl_vectors, wl_contexts, wl_tables;
++static struct wl_dma wl_amss; /* full file when BHI uses a separate prefix */
++static bool wl_stop22, wl_keep, wl_bhie_fired, wl_amss_reached;
++static bool wl_sbl_ready, wl_contexts_published, wl_sbl_m0;
++static uint32_t wl_bhie_seq;
++/* Register-layout facts, not imported loader code: OpenBSD if_qwz_pci.c
++ * MHI definitions (BSD/ISC), revision 1.13, and M4/W9 BAR observations.
++ * Full provenance and the READY -> contexts -> M0 -> FBC plan: wlan-w10.md.
++ * All BHIe offsets are relative to the discovered BHIEOFF, never absolute. */
++#define WL_BHIE_TXADDR 0x2cu
++#define WL_BHIE_TXSIZE 0x34u
++#define WL_BHIE_TXDB 0x3cu
++#define WL_BHIE_TXSTATUS 0x44u
 +static struct wl_dma wl_rddm, wl_rxvectors, wl_msi_sink;
 +#define WL_RDDM_SIZE 0x780000u /* ath12k WCN7850; crash sink only, never dumped */
 +static unsigned wl_pre, wl_full, wl_vec, wl_fw;
@@ -827,6 +841,13 @@
 +	wl_vec = wl_variant_arg("fuxiwlanvec", wl_vec_names, 3);
 +	wl_cnss = wl_variant_arg("fuxiwlancnss", wl_cnss_names, 2);
 +	wl_seq_configure();
++	int stop22 = 0, keep = 0;
++	(void)PE_parse_boot_argn("fuxiwlanstop22", &stop22, sizeof(stop22));
++	(void)PE_parse_boot_argn("fuxiwlankeep", &keep, sizeof(keep));
++	wl_stop22 = stop22 == 1; wl_keep = keep == 1;
++	wl_bhie_fired = wl_amss_reached = false;
++	wl_sbl_ready = wl_contexts_published = wl_sbl_m0 = false;
++	wl_bhie_seq = 0;
 +	if ((wl_seq_flags & WL_O_PREFIX) && (wl_full || wl_vec == 1)) { wl_variant_invalid = true; }
 +	wl_probe = WL_PROBE_OFF; wl_probe_fired = false;
 +	if (PE_parse_boot_argn("fuxiwlanprobe", arg, sizeof(arg))) {
@@ -842,14 +863,15 @@
 +	int retain = 0;
 +	(void)PE_parse_boot_argn("fuxiwlanaspm", &retain, sizeof(retain));
 +	if (wl_pre == 5 && retain == 1) { wl_variant_invalid = true; }
-+	printf("FUXI WLAN: M6o seq mask %#x valid=%u (default off; stop/contain at 22)\n",
++	printf("FUXI WLAN: W10 continue=%u keep=%u (stop22=1 retains BHI diagnostics; no data channels)\n", !wl_stop22, wl_keep);
++	printf("FUXI WLAN: M6o seq mask %#x valid=%u (selectors default off)\n",
 +	    wl_seq_flags, !wl_variant_invalid);
-+	printf("FUXI WLAN: M6l pre=%s bhi=%s vec=%s valid=%u (variants stop at 22)\n",
++	printf("FUXI WLAN: M6l pre=%s bhi=%s vec=%s valid=%u\n",
 +	    wl_pre_names[wl_pre], sizes[wl_full], wl_vec_names[wl_vec], !wl_variant_invalid);
-+	printf("FUXI WLAN: M6k probe=%s (one BHI doorbell; diagnostic modes stop at 22)\n", wl_probe_names[wl_probe]);
++	printf("FUXI WLAN: M6k probe=%s (one BHI doorbell; unmapped/pattern always stop at 22)\n", wl_probe_names[wl_probe]);
 +	printf("FUXI WLAN: M6m fw=%s l1ss=%u valid=%u (stock means supplied input, not verified provenance)\n",
 +	    wl_fw_names[wl_fw], wl_pre == 5, !wl_variant_invalid);
-+	printf("FUXI WLAN: M6n cnss=%s valid=%u (PDC before step 1; stop at 22)\n",
++	printf("FUXI WLAN: M6n cnss=%s valid=%u (PDC before step 1)\n",
 +	    wl_cnss_names[wl_cnss], !wl_variant_invalid);
 +}
 +#define WL_CNSS_IOVA 0xa0000000ull
@@ -1090,6 +1112,7 @@
 +	if (wl_probe != WL_PROBE_CIVAC) { return; }
 +	wl_dma_civac(&wl_image); wl_dma_civac(&wl_vectors);
 +	wl_dma_civac(&wl_contexts); wl_dma_civac(&wl_tables);
++	if (wl_amss.va) { wl_dma_civac(&wl_amss); }
 +	if (wl_rddm.va) { wl_dma_civac(&wl_rddm); wl_dma_civac(&wl_rxvectors); }
 +	printf("FUXI WLAN: M6k DC CIVAC + DSB SY image/vectors/contexts/tables before BHI doorbell\n");
 +}
@@ -1843,8 +1866,8 @@
 +static vm_offset_t
 +wl_owned_alias(uint64_t pa, unsigned bytes, bool tables_only)
 +{
-+	struct wl_dma *bufs[] = { &wl_tables, &wl_image, &wl_vectors, &wl_contexts, &wl_rddm, &wl_rxvectors, &wl_msi_sink };
-+	for (unsigned i = 0; i < (tables_only ? 1u : 7u); i++) {
++	struct wl_dma *bufs[] = { &wl_tables, &wl_image, &wl_vectors, &wl_contexts, &wl_rddm, &wl_rxvectors, &wl_msi_sink, &wl_amss };
++	for (unsigned i = 0; i < (tables_only ? 1u : sizeof(bufs)/sizeof(bufs[0])); i++) {
 +		struct wl_dma *d = bufs[i];
 +		for (vm_size_t off = 0; d->va && off < d->size; off += PAGE_SIZE) {
 +			uint64_t base = wl_phys(d->va + off);
@@ -1919,8 +1942,8 @@
 +	for (unsigned i = 0; i < l3_count; i++) {
 +		l2[((wl_iova_base >> 21) & 511) + i] = wl_pt_pa(2 + i) | 3;
 +	}
-+	struct wl_dma *bufs[] = { &wl_image, &wl_vectors, &wl_contexts, &wl_rddm, &wl_rxvectors, &wl_msi_sink };
-+	for (unsigned i = 0; i < 6; i++) {
++	struct wl_dma *bufs[] = { &wl_image, &wl_vectors, &wl_contexts, &wl_rddm, &wl_rxvectors, &wl_msi_sink, &wl_amss };
++	for (unsigned i = 0; i < sizeof(bufs)/sizeof(bufs[0]); i++) {
 +		struct wl_dma *d = bufs[i];
 +		if (d == &wl_image && wl_probe == WL_PROBE_UNMAPPED) { continue; }
 +		for (vm_size_t off = 0; off < d->size; off += 4096) {
@@ -2613,8 +2636,16 @@
 +	wl_fw_size = (uint32_t)a.va_data_size;
 +	unsigned read_bytes = (wl_seq_flags & WL_O_PREFIX) ? WL_CHUNK : wl_fw_size;
 +	if (wl_dma_alloc(&wl_image, read_bytes)) { e = 4; goto close; }
++	/* Keep the BHI prefix allocation independent, but read the full file once
++	 * from this vnode for W10. Allocate/map everything before the doorbells;
++	 * never reopen a possibly changed path after SBL starts. */
++	struct wl_dma *input = &wl_image;
++	if ((wl_seq_flags & WL_O_PREFIX) && !wl_stop22) {
++		if (wl_dma_alloc(&wl_amss, wl_fw_size)) { e = 4; goto close; }
++		input = &wl_amss; read_bytes = wl_fw_size;
++	}
 +	int resid = 0;
-+	e = vn_rdwr(UIO_READ, vp, (caddr_t)wl_image.va, (int)read_bytes, 0,
++	e = vn_rdwr(UIO_READ, vp, (caddr_t)input->va, (int)read_bytes, 0,
 +	    UIO_SYSSPACE, 0,
 +	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
 +	if (e || resid) {
@@ -2623,6 +2654,11 @@
 +	}
 +	/* Qualcomm images need not be native ARM ELFs. Check ident, header size,
 +	 * version and bounded program table; do not reject vendor e_machine. */
++	if (input == &wl_amss) {
++		memcpy((void *)wl_image.va, (const void *)wl_amss.va, WL_CHUNK);
++		wl_dma_clean(&wl_amss);
++		printf("FUXI WLAN: W10 prefix %#x bytes; full AMSS %u bytes retained from same file read\n", WL_CHUNK, wl_fw_size);
++	}
 +	const uint8_t *b = (const uint8_t *)wl_image.va;
 +	uint16_t ehsize, phsize, phnum;
 +	uint32_t version; memcpy(&version, b + 20, 4);
@@ -2670,7 +2706,7 @@
 +			printf("FUXI WLAN: M6m hash header version %u unparsed; authentication unverified\n", h[1]);
 +		}
 +	}
-+	if (wl_seq_flags & WL_O_PREFIX) {
++	if ((wl_seq_flags & WL_O_PREFIX) && wl_stop22) {
 +		printf("FUXI WLAN: M6o prefix separate coherent allocation %#x bytes, file %u; full image/FBC vectors deferred beyond BHI\n", WL_CHUNK, wl_fw_size);
 +	}
 +	wl_dma_clean(&wl_image);
@@ -2684,27 +2720,58 @@
 +	return e;
 +}
 +
-+/* Poll modes: BHI completion, READY, SBL/M0, BHIe completion, mission/M0.
-+ * Error envs are never treated as success merely because EE >= SBL. */
++/* Original bounded polling against public MHI register fields. BHI and BHIe
++ * have distinct owned sequences. Never infer completion from EE ordering. */
 +static int
 +wl_poll(unsigned mode)
 +{
++	uint32_t ee = 0, st = 0, bs = 0, es = 0, ctrl = 0;
++	bool mismatch_logged = false, amss_logged = false;
++	const char *why = "timeout";
++	int error = 2;
 +	for (unsigned i = 0; i <= 200; i++) {
-+		if (wl_owned && (wl_prd(wl_cb_addr(wl_cb) + 0x58) & 0xc00001fe)) { return 3; }
-+		uint32_t ee = wl_mrd(wl_bhi + 0x28), st = wl_mrd(0x48);
-+		uint32_t bs = wl_mrd(wl_bhi + 0x2c), es = wl_mrd(wl_bhie + 0x44);
-+		uint32_t ctrl = wl_mrd(0x38), state = (st >> 8) & 255;
-+		if (fw_faults || (st & 4) || state == 255 || (bs >> 30) == 3 ||
-+		    (mode >= 3 && (es >> 30) == 3) || ee == 3 || ee == 6 || ee == ~0u) { return 1; }
-+		if ((mode == 0 && ((bs >> 30) == 2 || ee == 1)) ||
-+		    (mode == 1 && !(ctrl & 2) && (st & 1)) ||
++		if (wl_owned && ((wl_prd(wl_cb_addr(wl_cb) + 0x58) & 0xc00001fe) ||
++		    ((wl_prd(WL_SMMU + 0x48) & 2) && (wl_prd(WL_SMMU + 0x54) & 0xffff) == 0x1401))) {
++			(void)wl_smmu_fault(22 + mode);
++			why = "SMMU fault"; error = 3; break;
++		}
++		ee = wl_mrd(wl_bhi + 0x28); st = wl_mrd(0x48);
++		bs = wl_mrd(wl_bhi + 0x2c); es = wl_mrd(wl_bhie + WL_BHIE_TXSTATUS);
++		ctrl = wl_mrd(0x38);
++		uint32_t state = (st >> 8) & 255;
++		if (fw_faults || ee == ~0u || st == ~0u || ctrl == ~0u) { why = "MMIO/access lost"; error = 1; break; }
++		if (ee == 3) { why = "RDDM requested (RX sink only; no dump/retry)"; error = 1; break; }
++		if (ee == 6) { why = "EDL error EE"; error = 1; break; }
++		if (ee != 0 && ee != 1 && ee != 2) { why = "unsupported EE (including WFW/FP)"; error = 1; break; }
++		if ((st & 4) || state == 255 || (ctrl & 2)) { why = "SYS_ERR/reset"; error = 1; break; }
++		if ((bs >> 30) == 3) { why = "BHI error"; error = 1; break; }
++		if (mode >= 3 && (es >> 30) == 3) { why = "BHIe TXSTATUS error"; error = 1; break; }
++		uint32_t status = mode >= 3 ? es : bs;
++		uint32_t seq = mode >= 3 ? wl_bhie_seq : wl_seq;
++		bool matched = (status >> 30) == 2 && (status & WL_SEQ_MASK) == seq && seq;
++		if ((status >> 30) == 2 && !matched && !mismatch_logged) {
++			printf("FUXI WLAN: W10 %s sequence mismatch raw %#x expected %#x; waiting for owned completion\n",
++			    mode >= 3 ? "BHIe TXSTATUS" : "BHI STATUS", status, seq);
++			mismatch_logged = true;
++		}
++		if (mode == 4 && ee == 2 && !amss_logged) {
++			printf("FUXI WLAN: W10 AMSS EE reached state %#x; waiting M0\n", state);
++			amss_logged = true;
++		}
++		if ((mode == 0 && matched && ee == 1 && state == 1 && (st & 1)) ||
++		    (mode == 1 && ee == 1 && state == 1 && (st & 1)) ||
 +		    (mode == 2 && ee == 1 && state == 2) ||
-+		    (mode == 3 && (es >> 30) == 2 && (es & WL_SEQ_MASK) == wl_seq) ||
-+		    (mode == 4 && (ee == 2 || ee == 4 || ee == 7) && state == 2)) { return 0; }
++		    (mode == 3 && matched && (ee == 1 || ee == 2)) ||
++		    (mode == 4 && matched && ee == 2 && state == 2)) {
++			printf("FUXI WLAN: W10 poll mode %u success EE %#x MHISTATUS %#x %s %#x seq %#x after %u ms\n",
++			    mode, ee, st, mode >= 3 ? "TXSTATUS" : "BHI STATUS", status, seq, i * 25);
++			return 0;
++		}
 +		if (i < 200) { wl_sleep(25); }
 +	}
-+	printf("FUXI WLAN: poll mode %u timeout 5000 ms\n", mode);
-+	return 2;
++	printf("FUXI WLAN: W10 poll mode %u %s EE %#x MHISTATUS %#x MHICTRL %#x BHI %#x TXSTATUS %#x expected seq %#x (limit 5000 ms)\n",
++	    mode, why, ee, st, ctrl, bs, es, mode >= 3 ? wl_bhie_seq : wl_seq);
++	return error;
 +}
 +
 +static void
@@ -2765,6 +2832,13 @@
 +}
 +
 +static int
++wl_w10_tx_refuse(unsigned code, const char *reason)
++{
++	printf("FUXI WLAN: W10 BHIe TX refused: %s (reason %u); contain, no retry\n", reason, code);
++	return (int)code;
++}
++
++static int
 +wl5_step(unsigned s)
 +{
 +	switch (s) {
@@ -2804,13 +2878,14 @@
 +		if (wl_mrd(wl_bhi + 0x28) != 0 || (wl_mrd(0x38) & 2) ||
 +		    ((wl_mrd(0x48) & 0xff04) && !((wl_seq_flags & WL_O_POR) &&
 +		    ((wl_mrd(0x48)>>8)&255) == 0xff)) || ((wl_prd(WL_EPCFG + 4) & 4) != (wl_m6o_early() ? 4u : 0u))) { return 1; }
-+		unsigned n = (wl_seq_flags & WL_O_PREFIX) ? 0 : (wl_fw_size + WL_CHUNK - 1) / WL_CHUNK;
++		struct wl_dma *amss = wl_amss.va ? &wl_amss : &wl_image;
++		unsigned n = ((wl_seq_flags & WL_O_PREFIX) && wl_stop22) ? 0 : (wl_fw_size + WL_CHUNK - 1) / WL_CHUNK;
 +		if ((n && wl_dma_alloc(&wl_vectors, n * sizeof(struct wl_vector))) ||
 +		    wl_dma_alloc(&wl_contexts, 16384)) { return 2; }
 +		struct wl_vector *v = (struct wl_vector *)wl_vectors.va;
 +		for (unsigned i = 0; i < n; i++) {
 +			unsigned off = i * WL_CHUNK;
-+			v[i].addr = wl_image.iova + off;
++			v[i].addr = amss->iova + off;
 +			v[i].size = MIN(WL_CHUNK, wl_fw_size - off);
 +		}
 +		struct wl_context *e = (struct wl_context *)(wl_contexts.va + WL_ECTX);
@@ -2935,7 +3010,10 @@
 +		return fw_faults ? 3 : 0;
 +	}
 +	case 22: {
-+		if (wl_probe != WL_PROBE_OFF || wl_variant_active()) { return wl_probe_observe(); }
++		if (wl_stop22 || wl_probe == WL_PROBE_UNMAPPED || wl_probe == WL_PROBE_PATTERN) {
++			printf("FUXI WLAN: W10 diagnostic stop at 22; no AMSS TX\n");
++			return wl_probe_observe();
++		}
 +		int e = wl_poll(0);
 +		uint32_t first = wl_bhi_diag(0);
 +		wl5_report[124] = wl5_report[67]; wl5_report[125] = wl5_report[68];
@@ -2955,37 +3033,109 @@
 +		/* A late error/EE loss in the repeat must not turn into step-22 OK. */
 +		if (!e && ((wl5_report[67] >> 30) == 3 || wl5_report[64] == 3 || wl5_report[64] == 6 ||
 +		    (wl5_report[65] & 4) || ((wl5_report[65] >> 8) & 255) == 255 || (wl5_report[66] & 2))) { return 1; }
++		if (!e && ((wl5_report[67] >> 30) != 2 || (wl5_report[67] & WL_SEQ_MASK) != wl_seq ||
++		    wl5_report[64] != 1 || (wl5_report[65] & 0xff01) != 0x101)) { return 1; }
++		if (!e) {
++			wl_sbl_ready = true;
++			printf("FUXI WLAN: W10 SBL READY success BHI STATUS %#x seq %#x; continue to AMSS\n", wl5_report[67], wl_seq);
++		}
 +		return e;
 +	}
-+	case 23: return wl_poll(1);
++	case 23: return wl_sbl_ready ? wl_poll(1) : 1;
 +	case 24: {
++		if (!wl_sbl_ready || wl_contexts_published || wl_poll(1)) { return 3; }
 +		uint32_t erdb = wl_mrd(0x20);
++		uint32_t chdb = wl_mrd(0x18);
 +		if ((erdb & 7) || erdb < 0x100 || erdb > 0x3ff0 ||
++		    (chdb & 7) || chdb < 0x100 || chdb > 0x3c00 ||
++		    (erdb < chdb + 128 * 8 && erdb + 16 > chdb) ||
 +		    (wl_mrd(0x10) & 255) != 128) { return 1; }
 +		wl_mwr64(0x58, wl_contexts.iova); wl_mwr64(0x60, wl_contexts.iova + WL_ECTX);
 +		wl_mwr64(0x68, wl_contexts.iova + WL_CCTX);
 +		wl_mwr64(0x80, 0); wl_mwr64(0x88, 0xffffffffull);
 +		wl_mwr64(0x98, 0); wl_mwr64(0xa0, 0xffffffffull);
 +		wl_mwr(0x10, (wl_mrd(0x10) & 0xffff) | (2u << 16));
++		const unsigned off[] = {0x58, 0x60, 0x68, 0x80, 0x88, 0x98, 0xa0};
++		const uint64_t val[] = {wl_contexts.iova, wl_contexts.iova + WL_ECTX,
++		    wl_contexts.iova + WL_CCTX, 0, 0xffffffffull, 0, 0xffffffffull};
++		for (unsigned i = 0; i < sizeof(off)/sizeof(off[0]); i++) {
++			if (wl_mrd(off[i]) != (uint32_t)val[i] ||
++			    wl_mrd(off[i]+4) != (uint32_t)(val[i]>>32) || fw_faults) { return 2; }
++		}
++		if (((wl_mrd(0x10)>>16)&255) != 2 || fw_faults) { return 2; }
++		/* Event ring doorbells only: channel contexts remain disabled and the
++		 * command ring empty. No channel (including wake) doorbell is rung. */
 +		wl_mwr64(erdb, wl_contexts.iova + WL_ER0 + 512 - 16);
 +		wl_mwr64(erdb + 8, wl_contexts.iova + WL_ER1 + 4096 - 16);
++		wl_contexts_published = !fw_faults;
++		printf("FUXI WLAN: W10 contexts published; event rings only, all 128 channels disabled\n");
 +		return fw_faults ? 2 : 0;
 +	}
-+	case 25:
++	case 25: {
++		if (!wl_contexts_published || wl_poll(1)) { return 1; }
 +		wl_mwr(0x38, (wl_mrd(0x38) & ~0xff00u) | 0x200);
-+		return wl_poll(2);
-+	case 26:
-+		wl_dma_clean(&wl_image); wl_dma_clean(&wl_vectors);
-+		wl_mwr64(wl_bhie + 0x2c, wl_vectors.iova);
-+		wl_mwr(wl_bhie + 0x34, wl5_report[19]);
-+		wl_seq = (wl_seq + 1) & WL_SEQ_MASK; if (!wl_seq) { wl_seq = 1; }
-+		wl_mwr(wl_bhie + 0x3c, (wl_mrd(wl_bhie + 0x3c) & ~WL_SEQ_MASK) | wl_seq);
-+		printf("FUXI WLAN: BHIe doorbell seq %#x full image %u vector bytes %u\n", wl_seq, wl_fw_size, wl5_report[19]);
-+		return fw_faults ? 1 : 0;
-+	case 27: return wl_poll(3);
++		int e = wl_poll(2);
++		wl_sbl_m0 = !e;
++		return e;
++	}
++	case 26: {
++		if (wl_bhie_fired || !wl_probe_fired || !wl_sbl_m0 || wl_stop22 ||
++		    !wl_enabled || wl_smmu_fault(26) || wl_rc_check() || fw_faults) {
++			return wl_w10_tx_refuse(1, "one-shot/ownership/SBL M0 guard");
++		}
++		if (wl_poll(2) || wl_mrd(0x28) != wl_bhi || wl_mrd(0x2c) != wl_bhie ||
++		    (wl_prd(WL_EPCFG+4)&0x406) != 0x406 || fw_faults) {
++			return wl_w10_tx_refuse(1, "SBL/discovery/bus-master state changed");
++		}
++		struct wl_dma *amss = wl_amss.va ? &wl_amss : &wl_image;
++		unsigned n = (wl_fw_size + WL_CHUNK - 1) / WL_CHUNK;
++		if (!wl_vectors.va || amss->size < wl_fw_size || !wl_fw_size ||
++		    wl5_report[19] != n * sizeof(struct wl_vector) || wl_vectors.size < wl5_report[19]) {
++			return wl_w10_tx_refuse(2, "missing/truncated full AMSS or vector table");
++		}
++		struct wl_vector *v = (struct wl_vector *)wl_vectors.va;
++		for (unsigned i = 0; i < n; i++) {
++			if (v[i].addr != amss->iova + i * WL_CHUNK ||
++			    v[i].size != MIN(WL_CHUNK, wl_fw_size - i * WL_CHUNK)) {
++				return wl_w10_tx_refuse(2, "vector does not cover owned full image");
++			}
++		}
++		wl_dma_clean(amss); wl_dma_clean(&wl_vectors); wl_dma_clean(&wl_tables);
++		if (wl_probe == WL_PROBE_CIVAC) { wl_dma_civac(amss); wl_dma_civac(&wl_vectors); wl_dma_civac(&wl_tables); }
++		wl_mwr(wl_bhie + WL_BHIE_TXSTATUS, 0);
++		wl_mwr64(wl_bhie + WL_BHIE_TXADDR, wl_vectors.iova);
++		wl_mwr(wl_bhie + WL_BHIE_TXSIZE, wl5_report[19]);
++		if (wl_mrd(wl_bhie + WL_BHIE_TXADDR) != (uint32_t)wl_vectors.iova ||
++		    wl_mrd(wl_bhie + WL_BHIE_TXADDR + 4) != (uint32_t)(wl_vectors.iova >> 32) ||
++		    wl_mrd(wl_bhie + WL_BHIE_TXSIZE) != wl5_report[19] ||
++		    wl_mrd(wl_bhie + WL_BHIE_TXSTATUS) || fw_faults) {
++			return wl_w10_tx_refuse(3, "TX tuple/status readback failed");
++		}
++		read_random(&wl_bhie_seq, sizeof(wl_bhie_seq));
++		wl_bhie_seq &= WL_SEQ_MASK;
++		if (!wl_bhie_seq || wl_bhie_seq == wl_seq) {
++			wl_bhie_seq = (wl_seq + 1) & WL_SEQ_MASK;
++			if (!wl_bhie_seq) { wl_bhie_seq = 1; }
++		}
++		uint32_t db = wl_mrd(wl_bhie + WL_BHIE_TXDB);
++		if (fw_faults || db == ~0u) { return wl_w10_tx_refuse(3, "TX doorbell unreadable"); }
++		printf("FUXI WLAN: W10 BHIe TX preflight table %#llx bytes %u vectors %u full AMSS %u; cache-clean + dsb sy\n",
++		    wl_vectors.iova, wl5_report[19], n, wl_fw_size);
++		if (wl_poll(2) || wl_smmu_fault(26) || fw_faults) {
++			return wl_w10_tx_refuse(1, "SBL/SMMU changed during TX prepare");
++		}
++		wl_bhie_fired = true; /* latch before the only TX attempt, even on fault */
++		wl_mwr(wl_bhie + WL_BHIE_TXDB, (db & ~WL_SEQ_MASK) | wl_bhie_seq);
++		printf("FUXI WLAN: W10 BHIe TX doorbell seq %#x (one shot)\n", wl_bhie_seq);
++		return fw_faults ? 4 : 0;
++	}
++	case 27: return wl_bhie_fired ? wl_poll(3) : 1;
 +	case 28: {
++		if (!wl_bhie_fired) { return 1; }
 +		int e = wl_poll(4);
-+		if (!e) { printf("FUXI WLAN: M6 mission mode M0 confirmed (READY observed at step 23); no channels/QMI; DMA buffers retained\n"); }
++		wl_amss_reached = !e;
++		if (!e) { printf("FUXI WLAN: W10 AMSS EE reached; M0 confirmed; no channels/QMI; %s\n",
++		    wl_keep ? "keep-running requested, DMA buffers retained" : "stop/contain"); }
 +		return e;
 +	}
 +	}
@@ -3040,11 +3190,20 @@
 +	if (!bm_bad && !perst_bad && !seq_bad && !wl_smmu_undo()) {
 +		wl_dma_free(&wl_msi_sink); wl_dma_free(&wl_tables);
 +		wl_dma_free(&wl_rxvectors); wl_dma_free(&wl_rddm);
-+		wl_dma_free(&wl_contexts); wl_dma_free(&wl_vectors); wl_dma_free(&wl_image);
++		wl_dma_free(&wl_contexts); wl_dma_free(&wl_vectors); wl_dma_free(&wl_amss); wl_dma_free(&wl_image);
 +		printf("FUXI WLAN: abort buffers freed\n");
 +	} else {
 +		printf("FUXI WLAN: abort buffers quarantined until reboot (containment or SMMU undo unproven)\n");
 +	}
++}
++
++static void
++wl_finish(unsigned limit)
++{
++	/* Keep requires a complete, fault-free AMSS/M0 run. Earlier stops always
++	 * contain, including fuxiwlan=22 with keep=1. Errors call abort directly. */
++	if ((limit >= 17 || (wl_seq_flags && limit >= 8)) &&
++	    !(limit == WL5_STEPS && wl_keep && wl_amss_reached && !fw_faults)) { wl5_abort(limit); }
 +}
 +
 +static void
@@ -3148,8 +3307,9 @@
 +		}
 +	}
 +	printf("FUXI WLAN: %u steps done\n", limit);
-+	/* A deliberate partial M5 run also shuts down before releasing memory. */
-+	if ((limit >= 17 || (wl_seq_flags && limit >= 8)) && limit < WL5_STEPS) { wl5_abort(limit); }
++	/* W10 contains successful full runs as well as partial runs. Only explicit
++	 * keep after verified AMSS/M0 retains the device and all DMA ownership. */
++	wl_finish(limit);
 +out:
 +	/* Shared GCC vote registers (touch and GPU also read-modify-write
 +	 * 0x52008/0x52000 without a common lock): show the final values. */

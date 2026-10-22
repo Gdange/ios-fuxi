@@ -41,6 +41,7 @@ static unsigned dbcount(uint32_t off) {
 static void set_soc(uint32_t off, uint32_t v) { setreg(0x200000000ull+off,v); }
 static void observe(unsigned frees_expected) {
     unsigned start=sleeps;
+    wl_stop22=true; /* explicitly exercise the retained BHI diagnostic */
     assert(wl5_step(22)==0x6c && sleeps-start==5000);
     assert(strstr(logbuf,"M6l result") && strstr(logbuf,"stop/contain"));
     assert(!dbcount(wl_bhie+0x3c)); /* never AMSS TX doorbell */

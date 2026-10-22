@@ -95,6 +95,7 @@ int main(void) {
         struct wl_vector *v=(void *)wl_vectors.va;
         assert(v[0].addr==wl_image.iova && v[0].size==WL_CHUNK && v[1].size==37);
         assert(wl_seq && !(wl_seq&~WL_SEQ_MASK));
+        wl_stop22=true; /* explicitly exercise the retained BHI diagnostic */
         assert(wl5_step(22)==0x6c && strstr(logbuf,"M6m result fw=stock"));
         assert(writes(WL_BAR0+0x118)==1 && !wl_mrd(wl_bhie+0x3c));
         assert(wl5_step(21)==0x6b && writes(WL_BAR0+0x118)==1);
@@ -108,6 +109,7 @@ int main(void) {
     int ep=findwrite(WL_EPCFG+0x108,0x123450,0), rc=findwrite(WL_DBI+0x108,0x543210,0);
     int bm=findwrite(WL_EPCFG+4,0x406,0), db=findwrite(WL_BAR0+0x118,wl_seq,0);
     assert(ep>=0 && rc>ep && bm>rc && db>bm);
+    wl_stop22=true; /* explicitly exercise the retained BHI diagnostic */
     assert(wl5_step(22)==0x6c && strstr(logbuf,"pre=l1ss"));
     fail_bm=fail_perst=true; wl5_abort(22); assert(!frees && wl_image.va);
     fail_bm=fail_perst=false; wl5_abort(22); assert(frees==4);

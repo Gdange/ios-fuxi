@@ -85,6 +85,7 @@ int main(void) {
             (events[i].pa>=WL_AOSS_QMP && events[i].pa<WL_AOSS_QMP+0xc4));
         unsigned n=ne; assert(wl_cnss_pdc() && ne==n); /* no second policy submission */
         for(unsigned s=17;s<=21;s++) assert(!wl5_step(s));
+        wl_stop22=true; /* explicitly exercise the retained BHI diagnostic */
         assert(wl5_step(22)==0x6c && countwrite(WL_BAR0+wl_bhie+0x3c)==1); /* clear only */
         assert(!wl_mrd(wl_bhie+0x3c)); /* no later AMSS doorbell */
         assert(countwrite(WL_BAR0+wl_bhi+0x18)==1);

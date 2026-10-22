@@ -161,7 +161,7 @@ static int firstwrite(uint64_t pa, uint32_t mask, uint32_t value) {
     return -1;
 }
 static void setup(const char *arg) {
-    init(); seq_arg=arg; wl_probe_configure();
+    init(); stop22_arg=1; seq_arg=arg; wl_probe_configure();
     nrail=fail_rail=special_writes=fault_special=drop_special=fail_nth_alloc=0;
     cycle_peer=l23_peer=reset_peer=true; reset_stuck=phy_stuck=dll_stuck=train_read_fault=false;
     core_asserted=core_reset=phy_asserted=phy_reset=phy_ready=train_started=false;

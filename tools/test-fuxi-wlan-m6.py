@@ -85,7 +85,7 @@ static unsigned nr, ne, sleeps, frees, allocations;
 static int old_iova_arg;
 static bool old_iova_present;
 static int clock_arg, iboff_arg;
-static int aspm_arg;
+static int aspm_arg, stop22_arg, keep_arg;
 static const char *probe_arg, *pre_arg, *bhi_arg, *vec_arg, *fw_arg, *cnss_arg, *seq_arg;
 static unsigned cache_attrs[32][1024];
 static bool cache_drop;
@@ -113,6 +113,8 @@ static bool PE_parse_boot_argn(const char *name, void *out, int size) {
     if(!strcmp(name,"fuxiwlanaspm")) { memcpy(out,&aspm_arg,size); return true; }
     if(!strcmp(name,"fuxiwlanclk")) { memcpy(out,&clock_arg,size); return true; }
     if(!strcmp(name,"fuxiwlaniboff")) { memcpy(out,&iboff_arg,size); return true; }
+    if(!strcmp(name,"fuxiwlanstop22")) { memcpy(out,&stop22_arg,size); return true; }
+    if(!strcmp(name,"fuxiwlankeep")) { memcpy(out,&keep_arg,size); return true; }
     assert(!strcmp(name,"fuxiwlanoldiova"));
     if(old_iova_present) memcpy(out,&old_iova_arg,size);
     return old_iova_present;
@@ -180,7 +182,7 @@ static void raw_pwr(uint64_t pa, uint32_t v) {
     if (pa==WL_BAR0+0x38 && v==2) setreg(pa,0);
     if (!progress) return;
     if (pa==WL_BAR0+0x118) {
-        setreg(WL_BAR0+0x12c, 2u<<30); setreg(WL_BAR0+0x48, 0x101);
+        setreg(WL_BAR0+0x12c, (2u<<30)|(v&0x3fffffff)); setreg(WL_BAR0+0x128,1); setreg(WL_BAR0+0x48, 0x101);
     }
     if (pa==WL_BAR0+0x38 && v==0x200) {
         setreg(WL_BAR0+0x128,1); setreg(WL_BAR0+0x48,0x200);
@@ -269,9 +271,9 @@ static void init(void) {
     memset(wl_cb_unusable,0,sizeof(wl_cb_unusable));
     memset(probe_block,0,sizeof(probe_block));
     probe_steal=probe_change_next=false; corrupt_write_pa=0; corrupt_write_mask=1; nread_masks=0;
-    memset(&wl_image,0,sizeof(wl_image)); memset(&wl_vectors,0,sizeof(wl_vectors));
+    memset(&wl_amss,0,sizeof(wl_amss)); memset(&wl_image,0,sizeof(wl_image)); memset(&wl_vectors,0,sizeof(wl_vectors));
     memset(&wl_tables,0,sizeof(wl_tables)); wl_owned=wl_enabled=wl_route_owned=wl_route_installed=false;
-    old_iova_arg=0; old_iova_present=false; probe_arg=NULL; aspm_arg=0;
+    old_iova_arg=0; old_iova_present=false; probe_arg=NULL; aspm_arg=stop22_arg=keep_arg=0;
     pre_arg=bhi_arg=vec_arg=fw_arg=cnss_arg=seq_arg=NULL;
     wl_seq_undos=wl_eq_bank=wl_msi_cap=wl_pm_cap=0; wl_cycle_attempted=wl_cycle_powered=wl_msi_pvm=wl_link_off=wl_dbi_ready=false; wl3_faults=0;
     memset(&wl_msi_sink,0,sizeof(wl_msi_sink));
@@ -296,7 +298,7 @@ static void init(void) {
     setreg(WL_BAR0+0x28,0x100); setreg(WL_BAR0+0x2c,0x224);
     setreg(WL_BAR0+0x80000,0x201); setreg(WL_BAR0+0x10,0x800080);
     setreg(WL_BAR0+0x268,0xcab04cf5); /* undefined before first BHIe DB */
-    setreg(WL_BAR0+0x20,0x700); setreg(WL_EPCFG+4,0x100002);
+    setreg(WL_BAR0+0x18,0x300); setreg(WL_BAR0+0x20,0x700); setreg(WL_EPCFG+4,0x100002);
     setreg(TS_TLMM+0x1000*94+4,2);
     setreg(WL_PARF+0x2c00,1); /* bypass: table may contain undefined reset data */
 }
@@ -968,7 +970,7 @@ int main(void) {
     setreg(WL_BAR0+0x128,3); assert(wl_poll(0)==1);
     setreg(WL_BAR0+0x128,6); assert(wl_poll(4)==1);
     setreg(WL_BAR0+0x128,0); setreg(WL_BAR0+0x48,4); assert(wl_poll(1)==1);
-    setreg(WL_BAR0+0x48,0); wl_seq=9;
+    setreg(WL_BAR0+0x48,0); setreg(WL_BAR0+0x128,1); wl_bhie_seq=9;
     setreg(WL_BAR0+0x268,(2u<<30)|8); assert(wl_poll(3)==2);
     setreg(WL_BAR0+0x268,(2u<<30)|9); assert(wl_poll(3)==0);
 

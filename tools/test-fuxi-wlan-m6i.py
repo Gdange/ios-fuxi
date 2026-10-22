@@ -117,6 +117,7 @@ static void wl5_status(unsigned s) { }
 static bool wl_smmu_fault(unsigned s) { return false; }
 static void fw_m3_summary(unsigned s) { }
 static void wl5_abort(unsigned s) { aborts++; }
+static void wl_finish(unsigned limit) { if(limit>=17) wl5_abort(limit); }
 static void fw_dump(const char *tag, const uint32_t *r, unsigned n) { }
 '''
 # Keep the fw_run mock's expectation visible before its definition.

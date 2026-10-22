@@ -31,7 +31,7 @@ static void test_civac(uintptr_t va) {
 
 TESTS = r'''
 static void select_probe(const char *arg) {
-    probe_arg=arg; wl_probe_configure(); memset(civac_lines,0,sizeof(civac_lines));
+    probe_arg=arg; stop22_arg=strcmp(arg,"off")!=0; wl_probe_configure(); memset(civac_lines,0,sizeof(civac_lines));
 }
 static void prepare(void) {
     for(unsigned s=17;s<=20;s++) assert(!wl5_step(s));
