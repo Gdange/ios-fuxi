@@ -63,8 +63,29 @@ int main(){@autoreleasepool {
  d.pixelFormat=MTLPixelFormatBGRA8Unorm_sRGB;assert(![device newTextureWithDescriptor:d]);d.pixelFormat=MTLPixelFormatDepth32Float;assert(![device newTextureWithDescriptor:d]);d.pixelFormat=MTLPixelFormatBGRA8Unorm;
  d.swizzle=MTLTextureSwizzleChannelsMake(MTLTextureSwizzleBlue,MTLTextureSwizzleGreen,MTLTextureSwizzleRed,MTLTextureSwizzleAlpha);assert(![device newTextureWithDescriptor:d]);d.swizzle=MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed,MTLTextureSwizzleGreen,MTLTextureSwizzleBlue,MTLTextureSwizzleAlpha);
  d.usage=MTLTextureUsageShaderWrite;assert(![device newTextureWithDescriptor:d]);d.usage=MTLTextureUsageShaderRead;
- IOSurfaceRef surface=IOSurfaceCreate((CFDictionaryRef)@{(id)kIOSurfaceWidth:@8,(id)kIOSurfaceHeight:@8,(id)kIOSurfaceBytesPerElement:@4,(id)kIOSurfacePixelFormat:@((unsigned)'BGRA')});
- assert(surface && ![device newTextureWithDescriptor:d iosurface:surface plane:1]);CFRelease(surface);
+ // Nonplanar plane 1 is invalid; one explicit BGRA plane uses its own offset
+ // and row stride while the entire surface allocation crosses HostImport.
+ d.width=8;d.height=8;d.mipmapLevelCount=1;
+ fuxi::Backend::modelHostImport=true;
+ IOSurfaceRef surface=IOSurfaceCreate((CFDictionaryRef)@{(id)kIOSurfaceWidth:@8,(id)kIOSurfaceHeight:@8,(id)kIOSurfaceBytesPerElement:@4,(id)kIOSurfacePixelFormat:@0x42475241});
+ assert(surface && ![device newTextureWithDescriptor:d iosurface:surface plane:1]);
+ FuxiTexture *st=(FuxiTexture *)[device newTextureWithDescriptor:d iosurface:surface plane:0];
+ assert(st && fuxi::Backend::importOffset==0 && fuxi::Backend::importRow==IOSurfaceGetBytesPerRow(surface));[st release];CFRelease(surface);
+ surface=IOSurfaceCreate((CFDictionaryRef)@{(id)kIOSurfaceWidth:@8,(id)kIOSurfaceHeight:@8,(id)kIOSurfacePixelFormat:@0x42475241,(id)kIOSurfaceAllocSize:@16384,
+  (id)kIOSurfacePlaneInfo:@[@{(id)kIOSurfacePlaneWidth:@8,(id)kIOSurfacePlaneHeight:@8,(id)kIOSurfacePlaneBytesPerElement:@4,
+   (id)kIOSurfacePlaneBytesPerRow:@128,(id)kIOSurfacePlaneOffset:@4096,(id)kIOSurfacePlaneSize:@1024}]});
+ assert(surface && IOSurfaceGetPlaneCount(surface)==1);
+ st=(FuxiTexture *)[device newTextureWithDescriptor:d iosurface:surface plane:0];
+ assert(st && st.iosurface==surface && st.iosurfacePlane==0);
+ assert(fuxi::Backend::importBase==IOSurfaceGetBaseAddress(surface) && fuxi::Backend::importBytes==IOSurfaceGetAllocSize(surface));
+ assert(fuxi::Backend::importOffset==4096 && fuxi::Backend::importRow==128);[st release];
+ assert(![device newTextureWithDescriptor:d iosurface:surface plane:1]);CFRelease(surface);
+ surface=IOSurfaceCreate((CFDictionaryRef)@{(id)kIOSurfaceWidth:@8,(id)kIOSurfaceHeight:@8,(id)kIOSurfacePixelFormat:@0x5f524234,(id)kIOSurfaceAllocSize:@16384,
+  (id)kIOSurfacePlaneInfo:@[@{(id)kIOSurfacePlaneWidth:@8,(id)kIOSurfacePlaneHeight:@8,(id)kIOSurfacePlaneBytesPerElement:@1,(id)kIOSurfacePlaneBytesPerRow:@64,(id)kIOSurfacePlaneOffset:@0,(id)kIOSurfacePlaneSize:@512},
+   @{(id)kIOSurfacePlaneWidth:@8,(id)kIOSurfacePlaneHeight:@8,(id)kIOSurfacePlaneBytesPerElement:@2,(id)kIOSurfacePlaneBytesPerRow:@64,(id)kIOSurfacePlaneOffset:@4096,(id)kIOSurfacePlaneSize:@512}]});
+ assert(surface && IOSurfaceGetPlaneCount(surface)==2);d.pixelFormat=(MTLPixelFormat)542;
+ assert(![device newTextureWithDescriptor:d iosurface:surface plane:0]);
+ assert(![device newTextureWithDescriptor:d iosurface:surface plane:1]);CFRelease(surface);
  [buffer release];[copy release];[nested release];[t release];assert(view.width==6);[view release];[q release];[device release];
  puts("PASS: native M9k descriptor/level transfers/views/blits/generation encoding/render attachment/private heap/purge/sampler/refusal controls");
 }}

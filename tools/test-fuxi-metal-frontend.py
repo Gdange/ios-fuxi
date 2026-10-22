@@ -18,7 +18,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         d=Path(tmp);conf=d/'smoke.conf'
         compiler=['xcrun','clang++'] if os.uname().sysname=='Darwin' else ['clang++']
-        for name in ('ClientGateTests','BackboardGateTests','TextureLevelsTests','SurveyTests'):
+        for name in ('ClientGateTests','BackboardGateTests','TextureLevelsTests','SurveyTests','ClientSetupTests'):
             subprocess.run([*compiler,'-std=c++17','-Wall','-Wextra','-Werror','-pthread',
                             '-fsanitize=address,undefined',str(ROOT/'tools/fuxi-metal'/(name+'.cpp')),
                             '-o',str(d/name)],check=True)
@@ -44,14 +44,18 @@ def main():
         if os.uname().sysname!='Darwin':
             print('SKIP: native Objective-C frontend/smoke tests require Mac Foundation/Metal')
             return
-        flags=['-O1','-g','-Wall','-Wextra','-Werror','-fno-objc-arc','-fblocks','-fsanitize=address,undefined']
+        flags=['-O1','-g','-Wall','-Wextra','-Werror','-Wmissing-field-initializers','-fno-objc-arc','-fblocks','-fsanitize=address,undefined']
         frameworks=['-framework','Foundation','-framework','Metal','-framework','IOSurface']
         def call(command):subprocess.run(command,check=True)
         if a.compile_only:
-            for name in ['ConstantFrontendTests','FrontendTests','PipelineFrontendTests','CAFrontendTests','MipFrontendTests','MRTFrontendTests','GateFrontendTests','CensusTests']:
+            for name in ['ConstantFrontendTests','FrontendTests','PipelineFrontendTests','CAFrontendTests','MipFrontendTests','MRTFrontendTests','GateFrontendTests','CensusTests','RenderServerFrontendTests']:
                 call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal'/(name+'.mm')),*frameworks,'-o',str(d/name)])
             print('PASS: compile-only frontend tests; no test executables run')
             return
+        call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/RenderServerFrontendTests.mm'),*frameworks,'-o',str(d/'server')])
+        server=subprocess.run([str(d/'server')],env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0'),text=True,capture_output=True,check=True,timeout=15)
+        assert server.stderr.count('draw dropped missing render pipeline')==1,server.stderr
+        print(server.stdout,end='')
         call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/MRTFrontendTests.mm'),*frameworks,'-o',str(d/'mrt')])
         mrt=subprocess.run([str(d/'mrt')],env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0'),text=True,capture_output=True,check=True,timeout=15)
         refusals=[line for line in mrt.stderr.splitlines() if 'renderPass reject ' in line]
@@ -61,6 +65,8 @@ def main():
         mip=subprocess.run([str(d/'mips')],env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0'),text=True,capture_output=True,check=True,timeout=15)
         rejects=[line for line in mip.stderr.splitlines() if 'FUXI MTL: texture reject ' in line]
         assert len(rejects)>=6 and all('desc=' in line and 'mips=' in line and 'usage=' in line and 'swizzle=' in line for line in rejects),mip.stderr
+        rgb=[line for line in rejects if 'fourcc0x5f524234' in line]
+        assert len(rgb)==2 and all('/planes2/' in line and 'p0=size8x8/element1/row64/offset0' in line and 'p1=size8x8/element2/row64/offset4096' in line for line in rgb),mip.stderr
         print(mip.stdout,end='')
         call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/CAFrontendTests.mm'),*frameworks,'-o',str(d/'ca-frontend')])
         subprocess.run([str(d/'ca-frontend')],env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0'),check=True,timeout=15)
@@ -86,8 +92,11 @@ def main():
             p=subprocess.run([str(d/'gate'),'SpringBoard','ignored'],env=dict(env,FUXI_TEST_GATE_ALLOW='1',
                 FUXI_TEST_PROCESS=process,FUXI_TEST_GATE_CONFIG=config,FUXI_TEST_BOOTARGS=args,
                 FUXI_TEST_GATE_EXPECT=expected,**extra),text=True,capture_output=True,check=True,timeout=10)
-            assert p.stderr.count('FUXI MTL: gate '+expected+' '+process)==1,p.stderr
+            label='allow' if expected in ('allow','census') else 'deny'
+            assert p.stderr.count('FUXI MTL: gate '+label+' '+process)==1,p.stderr
+            assert p.stderr.count('FUXI MTL: compression ')==(1 if expected=='allow' else 0),p.stderr
             return p
+        compositor('smoke','census smoke\n',expected='census')
         compositor('backboardd','')
         compositor('backboardd','backboardd\n')
         compositor('backboardd','','fuxibbgpu=1')

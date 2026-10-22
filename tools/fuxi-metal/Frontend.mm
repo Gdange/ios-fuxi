@@ -19,6 +19,8 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include "ClientGate.hpp"
+#include "ClientSetup.hpp"
+#include "DrawSafety.hpp"
 #include "BackboardGate.hpp"
 #include "Survey.hpp"
 #include "Translator.hpp"
@@ -62,6 +64,16 @@ static double surveyNow(){return FUXI_MTL_SURVEY_NOW();}
 static void finishSurvey(){if(backboardSurvey.finish(surveyNow())){fflush(stderr);FUXI_MTL_BACKBOARD_EXIT();}}
 static uint64_t observationMicros() {return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();}
 static std::atomic<uint64_t> clientCheckUs{0};
+#ifndef FUXI_MTL_SET_CA_PREFERENCE
+static void setCACompressionPreference(const char *name){
+ CFStringRef key=CFStringCreateWithCString(kCFAllocatorDefault,name,kCFStringEncodingUTF8);
+ if(key){CFPreferencesSetAppValue(key,kCFBooleanFalse,kCFPreferencesCurrentApplication);CFRelease(key);}
+}
+#define FUXI_MTL_SET_CA_PREFERENCE(name) setCACompressionPreference(name)
+#endif
+#ifndef FUXI_MTL_SET_ENV
+#define FUXI_MTL_SET_ENV(key,value,overwrite) setenv(key,value,overwrite)
+#endif
 static void checkClient() {
  static std::once_flag once;
  std::call_once(once,[]{
@@ -84,6 +96,13 @@ static void checkClient() {
      dispatch_source_set_event_handler(timer,^{fuxi::backboardGate.report();finishSurvey();});dispatch_resume(timer);}
    }
   }
+  // Constructor-time admission precedes CA framebuffer selection and discovery.
+  // Census/denied clients must not change the process's rendering preferences.
+  fuxi::setupMetalClient(clientMode==fuxi::ClientMode::allow,clientProcess,
+   [](const char *key,const char *value,int overwrite){return FUXI_MTL_SET_ENV(key,value,overwrite);},
+   [](const char *key){FUXI_MTL_SET_CA_PREFERENCE(key);});
+  if(clientMode==fuxi::ClientMode::allow)fprintf(stderr,"FUXI MTL: compression %s CAEnableIOSurfaceCompression=false%s\n",clientProcess,
+   !strcmp(clientProcess,"backboardd")?" CA_DISABLE_FRAMEBUFFER_COMPRESSION=1 CAEnableFramebufferCompression=false":"");
   clientCheckUs=observationMicros();
   fprintf(stderr,"FUXI MTL: gate %s %s\n",clientMode==fuxi::ClientMode::deny?"deny":"allow",clientProcess);
   if(clientMode==fuxi::ClientMode::census)fprintf(stderr,"FUXI MTL: census enabled %s (no GPU)\n",clientProcess);
@@ -110,6 +129,7 @@ static void censusLog(id object,SEL selector,bool implemented) {
 static std::atomic<uint64_t> failureCount{0},completedDraws{0};
 extern "C" uint64_t fuxi_metal_failure_count() {return failureCount.load();}
 extern "C" uint64_t fuxi_metal_completed_draws() {return completedDraws.load();}
+extern "C" uint64_t fuxi_metal_dropped_draws() {return fuxi::droppedDraws.load();}
 extern "C" uint64_t fuxi_metal_pipeline_cache_hits() {return fuxi::Backend::pipelineHits.load();}
 extern "C" uint64_t fuxi_metal_pipeline_cache_misses() {return fuxi::Backend::pipelineMisses.load();}
 extern "C" uint64_t fuxi_metal_pipeline_cache_load_result() {return fuxi::Backend::pipelineCacheLoadResult.load();}
@@ -840,6 +860,7 @@ static thread_local FuxiCommandBuffer *completionCommand;
 - (void)active {stage4Require("renderEncoder","ended",_ended,!_ended);stage4Require("renderEncoder","encoding",_command->_encoding,_command->_encoding);
  stage4Require("renderEncoder","commandStatus",_command->_status,_command->_status==MTLCommandBufferStatusNotEnqueued);}
 - (void)setRenderPipelineState:(id)p {@try {CENSUS();DescriptorContext descriptor(_passText);[self active];
+ if(!p){[_pipeline release];_pipeline=nil;return;}
  if(!stage4Class("renderEncoder","pipeline.class",p,[FuxiPipeline class]))invalid(@"renderEncoder pipeline.class");
  stage4Require("renderEncoder","pipeline.device",(uint64_t)[p device],[p device]==_command->_queue->_device);
  [p retain];[_pipeline release];_pipeline=p;
@@ -946,10 +967,11 @@ static thread_local FuxiCommandBuffer *completionCommand;
  _state.scissor={{(int32_t)r.x,(int32_t)r.y},{(uint32_t)r.width,(uint32_t)r.height}};
 } @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
 - (void)record:(MTLPrimitiveType)t start:(NSUInteger)start count:(NSUInteger)count indices:(id)indices offset:(NSUInteger)offset {
- [self active];if(!_pipeline || (t!=MTLPrimitiveTypeTriangle && t!=MTLPrimitiveTypeTriangleStrip) || !count || count>65536 || start>65536-count)invalid(@"draw bounds/pipeline/topology");
+ [self active];if(!_pipeline || !_pipeline->_pipeline){fuxi::dropPipelineDraw();return;}
+ if((t!=MTLPrimitiveTypeTriangle && t!=MTLPrimitiveTypeTriangleStrip) || !count || count>65536 || start>65536-count)invalid(@"draw bounds/topology");
  if(indices && (![indices isKindOfClass:[FuxiBuffer class]] || [indices device]!=_command->_queue->_device || (offset&1) || offset>[indices length] || count*2>[indices length]-offset))invalid(@"index bounds/device");
  DescriptorContext context(_passText);
- fuxi::Operation op=_state;op.diagnostic=[NSString stringWithFormat:@"%@ %@",_passText,_pipeline->_descriptorText?:@"pipeline=model"].UTF8String;op.texture=_target->_texture;op.pipeline=_pipeline->_pipeline;op.vertices=(uint32_t)count;op.first=(uint32_t)start;op.strip=t==MTLPrimitiveTypeTriangleStrip;
+ fuxi::Operation op=_state;op.renderDraw=true;op.diagnostic=[NSString stringWithFormat:@"%@ %@",_passText,_pipeline->_descriptorText?:@"pipeline=model"].UTF8String;op.texture=_target->_texture;op.pipeline=_pipeline->_pipeline;op.vertices=(uint32_t)count;op.first=(uint32_t)start;op.strip=t==MTLPrimitiveTypeTriangleStrip;
  op.indices=indices?((FuxiBuffer *)indices)->_buffer:nullptr;op.indexOffset=offset;
  // CA smoke diagnostic: for a textured draw, every vertex binding and its first vertices (stride 48 floats).
  bool textured=false;for(size_t i=0;i<fuxi::resourceSlots;++i)textured|=_samples[i]!=nil;
@@ -1023,6 +1045,8 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
 - (void)setFineGrainedBackgroundVisibilityEnabled:(BOOL)enabled {CENSUS();(void)enabled;}
 - (BOOL)setGPUPriority:(NSUInteger)priority {CENSUS();(void)priority;return NO;}
 - (BOOL)setBackgroundGPUPriority:(NSUInteger)priority {CENSUS();(void)priority;return NO;}
+- (NSUInteger)getGPUPriority {CENSUS();return 1;}
+- (NSUInteger)getBackgroundGPUPriority {CENSUS();return 3;}
 @end
 @implementation FuxiCommandBuffer
 - (void)rejectSelector:(SEL)s {
@@ -1268,6 +1292,17 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
 @end
 /* Methods are copied onto a runtime subclass. No fixed private layout/ivars are
  * read, initialized, or freed through the private superclass implementation. */
+static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
+ if(!surface)return @"surface=absent";
+ NSMutableString *text=[NSMutableString stringWithFormat:@"surface=fourcc0x%08x/plane%lu/planes%lu/size%lux%lu/row%lu/bytes%lu",IOSurfaceGetPixelFormat(surface),(unsigned long)plane,
+  (unsigned long)IOSurfaceGetPlaneCount(surface),(unsigned long)IOSurfaceGetWidth(surface),(unsigned long)IOSurfaceGetHeight(surface),(unsigned long)IOSurfaceGetBytesPerRow(surface),(unsigned long)IOSurfaceGetAllocSize(surface)];
+ for(size_t i=0;i<std::min<size_t>(IOSurfaceGetPlaneCount(surface),8);++i){
+  uintptr_t base=(uintptr_t)IOSurfaceGetBaseAddress(surface),start=(uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,i);
+  [text appendFormat:@" p%lu=size%lux%lu/element%lu/row%lu/offset%llu",(unsigned long)i,(unsigned long)IOSurfaceGetWidthOfPlane(surface,i),(unsigned long)IOSurfaceGetHeightOfPlane(surface,i),
+   (unsigned long)IOSurfaceGetBytesPerElementOfPlane(surface,i),(unsigned long)IOSurfaceGetBytesPerRowOfPlane(surface,i),(unsigned long long)(start>=base?start-base:UINT64_MAX)];
+ }
+ return text;
+}
 @interface FuxiDeviceMethods : FuxiObject
 @end
 @implementation FuxiDeviceMethods
@@ -1311,6 +1346,10 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
 - (NSString *)name {CENSUS();return @"Fuxi Turnip Adreno 740 (M7 bounded offscreen)";}
 - (uint64_t)registryID {CENSUS();return owner(self)->registry;}
 - (NSUInteger)maxBufferLength {CENSUS();return fuxi::Backend::maxBufferLength;}
+- (uint64_t)dedicatedMemorySize {CENSUS();return 0;}
+- (uint64_t)sharedMemorySize {CENSUS();return NSProcessInfo.processInfo.physicalMemory;}
+- (uint64_t)recommendedMaxWorkingSetSize {CENSUS();return std::min<uint64_t>(fuxi::ResourceLimits::budget,[self sharedMemorySize]);}
+- (NSUInteger)currentAllocatedSize {CENSUS();auto *state=owner(self);return state && state->backend?state->backend->resourceBytes():0;}
 - (BOOL)hasUnifiedMemory {CENSUS();return YES;}
 - (BOOL)isLowPower {CENSUS();return NO;}
 - (BOOL)isHeadless {CENSUS();return YES;}
@@ -1460,13 +1499,23 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
 }
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane {CENSUS();
  if(clientMode==fuxi::ClientMode::census)return nil;
- if(!textureDescriptorAccepted(d,owner(self)->backend->maxTextureDimension()))return nil;
-#define CHECK(field,value,accepted) do {__typeof__(value) actual=(value);if(!(accepted)){failureLog("FUXI MTL: texture reject %s %llu desc=%s surface=present%u/plane%lu/planes%lu/fourcc%u/size%lux%lu/element%lu/row%lu/bytes%lu\n",field,(unsigned long long)actual,textureDescriptorText(d).UTF8String,surface!=nullptr,(unsigned long)plane,surface?(unsigned long)IOSurfaceGetPlaneCount(surface):0UL,surface?IOSurfaceGetPixelFormat(surface):0,surface?(unsigned long)IOSurfaceGetWidth(surface):0UL,surface?(unsigned long)IOSurfaceGetHeight(surface):0UL,surface?(unsigned long)IOSurfaceGetBytesPerElement(surface):0UL,surface?(unsigned long)IOSurfaceGetBytesPerRow(surface):0UL,surface?(unsigned long)IOSurfaceGetAllocSize(surface):0UL);return nil;}}while(0)
- CHECK("IOSurface.present",surface,actual!=nullptr);CHECK("IOSurface.plane",plane,actual==0);
- CHECK("IOSurface.planeCount",IOSurfaceGetPlaneCount(surface),actual==0);
+ // Inspect the surface before the descriptor: even RGB8_444_2P (542) refusals
+ // must include both planes' layout, rather than only an unknown Metal format.
+ NSString *layout=surfaceDescriptorText(surface,plane);
+#define CHECK(field,value,accepted) do {__typeof__(value) actual=(value);if(!(accepted)){failureLog("FUXI MTL: texture reject %s %llu desc=%s %s\n",field,(unsigned long long)actual,textureDescriptorText(d).UTF8String,layout.UTF8String);return nil;}}while(0)
+ CHECK("IOSurface.present",surface,actual!=nullptr);
+ size_t planes=IOSurfaceGetPlaneCount(surface);
+ // The pinned bridge has no two-plane RGB rendering/sampling contract. Never
+ // reinterpret _RB4 as BGRA or silently discard its red/blue plane.
+ CHECK("IOSurface.planeCount",planes,actual<=1);
+ CHECK("IOSurface.plane",plane,actual==0);
  CHECK("IOSurface.fourcc",IOSurfaceGetPixelFormat(surface),actual==0x42475241);
- CHECK("IOSurface.width",IOSurfaceGetWidth(surface),actual==d.width);CHECK("IOSurface.height",IOSurfaceGetHeight(surface),actual==d.height);
- CHECK("IOSurface.bytesPerElement",IOSurfaceGetBytesPerElement(surface),actual==4);
+ if(!textureDescriptorAccepted(d,owner(self)->backend->maxTextureDimension()))return nil;
+ size_t width=planes?IOSurfaceGetWidthOfPlane(surface,plane):IOSurfaceGetWidth(surface);
+ size_t height=planes?IOSurfaceGetHeightOfPlane(surface,plane):IOSurfaceGetHeight(surface);
+ size_t row=planes?IOSurfaceGetBytesPerRowOfPlane(surface,plane):IOSurfaceGetBytesPerRow(surface);
+ CHECK("IOSurface.width",width,actual==d.width);CHECK("IOSurface.height",height,actual==d.height);
+ CHECK("IOSurface.bytesPerElement",planes?IOSurfaceGetBytesPerElementOfPlane(surface,plane):IOSurfaceGetBytesPerElement(surface),actual==4);
  CHECK("IOSurface.pixelFormat",d.pixelFormat,actual==MTLPixelFormatBGRA8Unorm);
  CHECK("IOSurface.mipmapLevelCount",d.mipmapLevelCount,actual==1);CHECK("IOSurface.storageMode",d.storageMode,actual==MTLStorageModeShared);
  CHECK("IOSurface.hostImport",owner(self)->backend->supportsHostImport(),actual);
@@ -1474,9 +1523,13 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
 #undef CHECK
  FuxiTexture *t=[FuxiTexture new];t->_descriptorText=[textureDescriptorText(d) copy];t->_cacheMode=d.cpuCacheMode;t->_device=[self retain];t->_usage=d.usage;
  t->_surface=(IOSurfaceRef)CFRetain(surface);IOSurfaceIncrementUseCount(surface);
- try {t->_texture=owner(self)->backend->importTexture(IOSurfaceGetBaseAddress(surface),IOSurfaceGetAllocSize(surface),IOSurfaceGetBytesPerRow(surface),(uint32_t)d.width,(uint32_t)d.height);}
- catch(const std::exception &e) {failureLog("FUXI MTL: texture reject IOSurfaceImport 0 desc=%s reason=%s\n",textureDescriptorText(d).UTF8String,e.what());[t release];return nil;}
- fprintf(stderr,"FUXI MTL: IOSurface import PASS BGRA8 %lux%lu same-memory\n",(unsigned long)d.width,(unsigned long)d.height);return t;
+ try {
+  void *base=IOSurfaceGetBaseAddress(surface);void *start=planes?IOSurfaceGetBaseAddressOfPlane(surface,plane):base;
+  if(!base || !start || uintptr_t(start)<uintptr_t(base))throw std::runtime_error("IOSurface plane base address");
+  size_t offset=uintptr_t(start)-uintptr_t(base);
+  t->_texture=owner(self)->backend->importTexture(base,IOSurfaceGetAllocSize(surface),row,(uint32_t)width,(uint32_t)height,offset);
+ }catch(const std::exception &e) {failureLog("FUXI MTL: texture reject IOSurfaceImport 0 desc=%s %s reason=%s\n",textureDescriptorText(d).UTF8String,layout.UTF8String,e.what());[t release];return nil;}
+ fprintf(stderr,"FUXI MTL: IOSurface import PASS BGRA8 %lux%lu same-memory %s\n",(unsigned long)d.width,(unsigned long)d.height,layout.UTF8String);return t;
 }
 - (id)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)d {CENSUS();
  if(clientMode==fuxi::ClientMode::census)return nil;
@@ -1512,6 +1565,39 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  if(reflection)*reflection=nil;
  if(options!=MTLPipelineOptionNone)return metalError(error,"pipeline reflection/archive options deferred");
  return [self newRenderPipelineStateWithDescriptor:d error:error];
+}
+// The bounded frontend has no compute translator/encoder. Return the same
+// explicit error through every synchronous and completion-handler entry point.
+- (id)newComputePipelineStateWithFunction:(id<MTLFunction>)function error:(NSError **)error {CENSUS();(void)function;
+ return metalError(error,"compute pipelines deferred");
+}
+- (id)newComputePipelineStateWithFunction:(id<MTLFunction>)function options:(MTLPipelineOption)options reflection:(MTLComputePipelineReflection **)reflection error:(NSError **)error {CENSUS();(void)options;
+ if(reflection)*reflection=nil;return [self newComputePipelineStateWithFunction:function error:error];
+}
+- (id)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(MTLPipelineOption)options reflection:(MTLComputePipelineReflection **)reflection error:(NSError **)error {CENSUS();
+ return [self newComputePipelineStateWithFunction:d.computeFunction options:options reflection:reflection error:error];
+}
+// Deliberately inline: RenderBox/CI can observe handler side effects on return.
+// Balance the synchronous new-method ownership after the handler has seen it.
+- (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d completionHandler:(MTLNewRenderPipelineStateCompletionHandler)handler {CENSUS();
+ NSError *error=nil;id state=[self newRenderPipelineStateWithDescriptor:d error:&error];
+ @try {if(handler)handler((id<MTLRenderPipelineState>)state,error);}@finally{[state release];}
+}
+- (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d options:(MTLPipelineOption)options completionHandler:(MTLNewRenderPipelineStateWithReflectionCompletionHandler)handler {CENSUS();
+ NSError *error=nil;MTLRenderPipelineReflection *reflection=nil;id state=[self newRenderPipelineStateWithDescriptor:d options:options reflection:&reflection error:&error];
+ @try {if(handler)handler((id<MTLRenderPipelineState>)state,reflection,error);}@finally{[state release];}
+}
+- (void)newComputePipelineStateWithFunction:(id<MTLFunction>)function completionHandler:(MTLNewComputePipelineStateCompletionHandler)handler {CENSUS();
+ NSError *error=nil;id state=[self newComputePipelineStateWithFunction:function error:&error];
+ @try {if(handler)handler((id<MTLComputePipelineState>)state,error);}@finally{[state release];}
+}
+- (void)newComputePipelineStateWithFunction:(id<MTLFunction>)function options:(MTLPipelineOption)options completionHandler:(MTLNewComputePipelineStateWithReflectionCompletionHandler)handler {CENSUS();
+ NSError *error=nil;MTLComputePipelineReflection *reflection=nil;id state=[self newComputePipelineStateWithFunction:function options:options reflection:&reflection error:&error];
+ @try {if(handler)handler((id<MTLComputePipelineState>)state,reflection,error);}@finally{[state release];}
+}
+- (void)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(MTLPipelineOption)options completionHandler:(MTLNewComputePipelineStateWithReflectionCompletionHandler)handler {CENSUS();
+ NSError *error=nil;MTLComputePipelineReflection *reflection=nil;id state=[self newComputePipelineStateWithDescriptor:d options:options reflection:&reflection error:&error];
+ @try {if(handler)handler((id<MTLComputePipelineState>)state,reflection,error);}@finally{[state release];}
 }
 // MTLAddDevice on 16.7 calls these hooks. Capabilities come exclusively from
 // our overrides; no Apple family/limit table is installed in the base object.

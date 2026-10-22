@@ -13,6 +13,8 @@
 #include <atomic>
 #include <chrono>
 #include "ResourceLimits.hpp"
+#include "ClientSetup.hpp"
+#include "DrawSafety.hpp"
 #include "TextureLevels.hpp"
 #include "ObjectCache.hpp"
 #include <functional>
@@ -64,7 +66,7 @@ struct BufferBind {Buffer *buffer{};uint64_t offset{};bool bytes=false;};
 struct ColorTarget {Texture *texture{};uint32_t level{},load=2,store=1;float clear[4]{};};
 struct Operation {
  Buffer *src, *dst; size_t from, to, size; uint8_t value;
- Texture *texture{};Pipeline *pipeline{};float clear[4]{};
+ Texture *texture{};Pipeline *pipeline{};float clear[4]{};bool renderDraw=false;
  Texture *sourceTexture{};Sampler *sampler{};uint32_t vertices=3;bool upload=false,clearOnly=false;
  uint32_t srcX{},srcY{},dstX{},dstY{},width{},height{};size_t rowBytes{};
  Texture *samples[resourceSlots]{};Sampler *samplers[resourceSlots]{};BufferBind buffers[2][resourceSlots]{};Buffer *indices{};uint64_t indexOffset{};uint32_t first{},strip{},load=2,store=1;
@@ -122,7 +124,7 @@ class Backend {
  FUXI_VK_FUNCTIONS(FIELD)
 #undef FIELD
 public:
- std::mutex mutex;
+ mutable std::mutex mutex;
  bool poisoned=false;
  static constexpr size_t maxBufferLength=ResourceLimits::single;
  static inline std::atomic<uint64_t> pipelineHits{0},pipelineMisses{0},gpuNanos{0},gpuSamples{0};
@@ -143,11 +145,11 @@ public:
  void discardReuseForTest(){std::lock_guard<std::mutex> guard(mutex);requireLive();clearSubmitObjects();clearFrames();clearViews();}
 #endif
  uint32_t maxTextureDimension() const{return limits.dimension;}
- size_t resourceBytes() const{return limits.used;}
+ size_t resourceBytes() const{std::lock_guard<std::mutex> guard(mutex);return limits.used;}
  bool supportsTimestamps() const{return timestampBits && timestampPeriod>0;}
  explicit Backend(const char *client="unknown") {
   setenv("TU_DARWIN_SERVICE","NativeAdrenoGpuPublished",1);
-  setenv("TU_DARWIN_OPEN_TYPE","0",1);setenv("TU_DEBUG","nocb",1);setenv("MESA_LOG_LEVEL","debug",1);
+  setenv("TU_DARWIN_OPEN_TYPE","0",1);setupTurnip();setenv("MESA_LOG_LEVEL","debug",1);
   try {
    library=dlopen(FUXI_MTL_ICD,RTLD_NOW|RTLD_LOCAL);
    if(!library) throw std::runtime_error("dlopen Turnip failed");
@@ -348,13 +350,13 @@ public:
  // The caller retains/locks the IOSurface; ABI 2 pins its task pages and handles
  // non-coherent cache handoff inside kernel submit/retirement.
  // No staging copy: only an external host allocation with exactly matching linear layout.
- Texture *importTexture(void *base,size_t bytes,size_t row,uint32_t width=256,uint32_t height=256) {
+ Texture *importTexture(void *base,size_t bytes,size_t row,uint32_t width=256,uint32_t height=256,size_t offset=0) {
   std::unique_lock<std::mutex> guard(mutex);requireLive();
   if(!supportsHostImport())throw std::runtime_error("IOSurface same-memory import requires VK_EXT_external_memory_host / NativeAdreno HostImport");
   constexpr VkFormatFeatureFlags required=VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT|VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT|
    VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT|VK_FORMAT_FEATURE_TRANSFER_SRC_BIT|VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
   if((linearFeatures&required)!=required)throw std::runtime_error("IOSurface linear BGRA8 format features unavailable");
-  if(!base || !bytes || bytes>maxBufferLength || (uintptr_t(base)%hostAlignment) || bytes%hostAlignment || !limits.rows(width,height,4,row,0,bytes))
+  if(!base || !bytes || bytes>maxBufferLength || (uintptr_t(base)%hostAlignment) || bytes%hostAlignment || !limits.rows(width,height,4,row,offset,bytes))
    throw std::runtime_error("IOSurface host alignment/length/stride");
   VkPhysicalDeviceExternalImageFormatInfo external{};external.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO;
   external.handleType=VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
@@ -375,7 +377,7 @@ public:
    ii.extent={width,height,1};ii.mipLevels=1;ii.arrayLayers=1;ii.samples=VK_SAMPLE_COUNT_1_BIT;ii.tiling=info.tiling;ii.usage=info.usage;ii.initialLayout=t->layout;
    check(CreateImage(device,&ii,nullptr,&t->image));VkMemoryRequirements req{};GetImageMemoryRequirements(device,t->image,&req);
    VkImageSubresource sub{VK_IMAGE_ASPECT_COLOR_BIT,0,0};VkSubresourceLayout layout{};GetImageSubresourceLayout(device,t->image,&sub,&layout);
-   if(layout.offset || layout.rowPitch!=row || req.size>bytes || layout.size>bytes)throw std::runtime_error("IOSurface/Vulkan linear image layout mismatch");
+   if(!req.alignment || offset%req.alignment || layout.offset || layout.rowPitch!=row || req.size>bytes-offset || layout.size>bytes-offset)throw std::runtime_error("IOSurface/Vulkan linear image layout mismatch");
    VkMemoryHostPointerPropertiesEXT hp{};hp.sType=VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;
    check(GetMemoryHostPointerPropertiesEXT(device,external.handleType,base,&hp));
    uint32_t type=0;while(type<memory.memoryTypeCount && (!(req.memoryTypeBits&hp.memoryTypeBits&(1u<<type)) || !(memory.memoryTypes[type].propertyFlags&VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)))++type;
@@ -383,7 +385,8 @@ public:
    VkImportMemoryHostPointerInfoEXT hi{};hi.sType=VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;hi.handleType=external.handleType;hi.pHostPointer=base;
    VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.pNext=&hi;ai.allocationSize=bytes;ai.memoryTypeIndex=type;t->memoryType=type;
    limits.reserve(ai.allocationSize);t->charged=ai.allocationSize;
-   check(AllocateMemory(device,&ai,nullptr,&t->memory));++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;t->memoryBytes=ai.allocationSize;t->allocated=bytes;check(BindImageMemory(device,t->image,t->memory,0));
+   // Import/charge the whole surface, binding the image at its plane's offset.
+   check(AllocateMemory(device,&ai,nullptr,&t->memory));++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;t->memoryBytes=ai.allocationSize;t->allocated=bytes;check(BindImageMemory(device,t->image,t->memory,offset));
    check(MapMemory(device,t->memory,0,VK_WHOLE_SIZE,0,&t->mapped));
    VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=t->image;vi.viewType=VK_IMAGE_VIEW_TYPE_2D;vi.format=info.format;
    vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};check(CreateImageView(device,&vi,nullptr,&t->view));return t;
@@ -608,6 +611,10 @@ public:
   auto submitStart=std::chrono::steady_clock::now();auto submitQueued=submitStart,submitDone=submitStart;
   auto since=[](std::chrono::steady_clock::time_point t){return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-t).count();};
   std::lock_guard<std::mutex> guard(mutex);requireLive();
+  ops.erase(std::remove_if(ops.begin(),ops.end(),[](const Operation &op){
+   bool missing=op.pipeline?(!op.pipeline->translation || !(op.strip?op.pipeline->stripPipeline:op.pipeline->pipeline)):op.renderDraw;
+   if(missing)dropPipelineDraw();return missing;
+  }),ops.end());
   // Empty completion participates in the same lock/order, but creates no BO or GPU fence.
   if(ops.empty()){++emptySubmits;if(scheduled)scheduled();return;}
   bool submitted=false,completed=false;std::vector<VkImageView> sampleViews;std::vector<VkFramebuffer> frames;std::vector<VkRenderPass> emptyRenders;std::vector<Texture *> textures;

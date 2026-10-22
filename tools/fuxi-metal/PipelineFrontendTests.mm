@@ -97,7 +97,9 @@ int main() {@autoreleasepool {
  refuses(c,^{[c renderCommandEncoderWithDescriptor:samplePass];});
  FuxiRender *r=(FuxiRender *)[c renderCommandEncoderWithDescriptor:pass];assert(r);
  checkLabel(c);checkLabel(r);assert(!c->_rejected && !c.error);
- refuses(c,^{[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];});
+ {auto dropped=fuxi_metal_dropped_draws();size_t ops=c->_ops.size();
+  [r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+  assert(!c->_rejected && c->_ops.size()==ops && fuxi_metal_dropped_draws()==dropped+1);}
  refuses(c,^{[r setRenderPipelineState:(id)t];});[r setRenderPipelineState:(id)p];
  refuses(c,^{[r drawPrimitives:MTLPrimitiveTypeLine vertexStart:0 vertexCount:3];});
  refuses(c,^{[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:65535 vertexCount:3];});

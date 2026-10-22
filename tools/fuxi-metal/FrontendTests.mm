@@ -46,14 +46,14 @@ int main() {
    assert(![(id)device supportsRasterOrderGroups] && ![(id)device supportsYCBCRPackedFormats12]);
    assert(fuxi_metal_failure_count()==failures);
   }
-  assert(!device.currentAllocatedSize); // Missing public scalar returns typed zero.
+  assert(!device.currentAllocatedSize); // No live resources yet.
   MTLSizeAndAlign unsupportedSize=[device heapBufferSizeAndAlignWithLength:64 options:0];
   assert(!unsupportedSize.size && !unsupportedSize.align); // Missing struct ABI too.
   assert(![(FuxiTestBase *)device dangerousInheritedSelector]);
   assert(![device newBufferWithLength:0 options:0]);
   id<MTLBuffer> privateBuffer=[device newBufferWithLength:4 options:MTLResourceStorageModePrivate];
   assert(privateBuffer && privateBuffer.storageMode==MTLStorageModePrivate && !privateBuffer.contents);[privateBuffer release];
-  assert(![device newLibraryWithSource:@"kernel void x(){}" options:nil error:nil]);
+  assert(![device newLibraryWithSource:@"kernel void x(){}" options:nil error:nullptr]);
   id<MTLCommandQueue>q=[device newCommandQueue];
   checkLabel((id)q);
   assert([q commandBufferWithUnretainedReferences].retainedReferences);

@@ -14,6 +14,17 @@ static fuxi::ClientMode testPolicy(const char *,const char *process) {
 }
 static bool testAdmission(){const char *dir=getenv("FUXI_TEST_GATE_DIR");assert(dir);
  return fuxi::backboardGate.admit("aaaaaaaa-1111-2222-3333-444444444444",open(dir,O_RDONLY|O_DIRECTORY|O_NOFOLLOW));}
+static unsigned preferenceWrites,setupEnvironments;
+static void testPreference(const char *key){
+ assert(!strcmp(key,"CAEnableFramebufferCompression") || !strcmp(key,"CAEnableIOSurfaceCompression"));++preferenceWrites;
+}
+static int testEnvironment(const char *key,const char *value,int overwrite){
+ if(!strcmp(key,"TU_DEBUG")){assert(!strcmp(value,"sysmem,nocb") && !overwrite);}
+ else {assert(!strcmp(key,"CA_DISABLE_FRAMEBUFFER_COMPRESSION") && !strcmp(value,"1") && overwrite);}
+ ++setupEnvironments;return 0;
+}
+#define FUXI_MTL_SET_CA_PREFERENCE(key) testPreference(key)
+#define FUXI_MTL_SET_ENV(key,value,overwrite) testEnvironment(key,value,overwrite)
 #define FUXI_MTL_READ_CLIENTS testPolicy
 #define FUXI_MTL_BACKBOARD_ADMIT() testAdmission()
 #define FUXI_MTL_BACKBOARD_MODE() fuxi::backboardMode(getenv("FUXI_TEST_BOOTARGS"))
@@ -52,6 +63,8 @@ int main() {
    // backend constructor is reachable through the denied branch.
    assert(![[cls alloc] initWithAcceleratorPort:(getenv("FUXI_TEST_GATE_ALLOW")?0:1)]);
   }
+  unsigned expected=clientMode==fuxi::ClientMode::allow?(!strcmp(clientProcess,"backboardd")?2u:1u):0u;
+  assert(preferenceWrites==expected && setupEnvironments==expected);
   assert(policyReads==1 && fuxi::Backend::constructed==0 && fuxi::Backend::live==0 && fuxi::Backend::submissions==0);
   if(getenv("FUXI_TEST_GATE_EXPECT"))assert((clientMode==fuxi::ClientMode::allow)==!strcmp(getenv("FUXI_TEST_GATE_EXPECT"),"allow"));
   if(getenv("FUXI_TEST_GATE_SURVEY")){

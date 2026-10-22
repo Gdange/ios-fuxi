@@ -15,9 +15,10 @@
 #include "TextureLevels.hpp"
 #include "ObjectCache.hpp"
 #include "Translator.hpp"
+#include "DrawSafety.hpp"
 namespace fuxi {
 struct Buffer {void *contents;size_t length,allocated;};
-struct Texture : TextureLevels {size_t allocated{};uint32_t format=80;std::vector<uint8_t> pixels{};
+struct Texture : TextureLevels {size_t allocated{},charged{};uint32_t format=80;std::vector<uint8_t> pixels{};
  size_t offset(uint32_t level) const {size_t o=0;for(uint32_t l=0;l<level;++l)o+=levelWidth(l)*levelHeight(l)*(format==115?8:format==1 || format==10?1:format==30?2:4);return o;}
 };
 struct Pipeline {bool sampled=false;size_t references=1;};
@@ -28,7 +29,7 @@ struct BufferBind {Buffer *buffer{};uint64_t offset{};bool bytes=false;};
 struct ColorTarget {Texture *texture{};uint32_t level{},load=2,store=1;float clear[4]{};};
 struct Operation {
  Buffer *src, *dst; size_t from, to, size; uint8_t value;
- Texture *texture{};Pipeline *pipeline{};float clear[4]{};
+ Texture *texture{};Pipeline *pipeline{};float clear[4]{};bool renderDraw=false;
  Texture *sourceTexture{};Sampler *sampler{};uint32_t vertices=3;bool upload=false,clearOnly=false;
  uint32_t srcX{},srcY{},dstX{},dstY{},width{},height{};size_t rowBytes{};
  Texture *samples[resourceSlots]{};Sampler *samplers[resourceSlots]{};BufferBind buffers[2][resourceSlots]{};Buffer *indices{};uint64_t indexOffset{};uint32_t first{},strip{},load=2,store=1;
@@ -51,19 +52,26 @@ public:
  static inline std::atomic<uint64_t> submits{0},submitPrepareNanos{0},submitWaitNanos{0},submitRetireNanos{0};
  static inline bool modelPipelines=false;
  uint32_t maxTextureDimension() const{return limits.dimension;}
+ size_t resourceBytes() const{return limits.used;}
  ~Backend(){objects.clear([&](Pipeline *p){destroy(p);});}
  static inline bool modelTextures=false;
  static inline int live=0,submissions=0,constructed=0;bool poisoned=false;
  explicit Backend(const char * ="unknown") {++constructed;}
  Buffer *allocate(size_t n) {
   if(!n || n>maxBufferLength)throw std::runtime_error("length");
-  auto *b=new Buffer{calloc(1,n),n,n};++live;return b;
+  limits.reserve(n);auto *b=new Buffer{calloc(1,n),n,n};++live;return b;
  }
- void destroy(Buffer *b) {if(b){free(b->contents);delete b;--live;}}
+ void destroy(Buffer *b) {if(b){limits.release(b->allocated);free(b->contents);delete b;--live;}}
  static size_t texelBytes(uint32_t f){return f==115?8:(f==1 || f==10)?1:f==30?2:4;}
  bool supportsOrderedColorAccess() const {return false;}
- bool supportsHostImport() const {return false;}
- Texture *importTexture(void *,size_t,size_t,uint32_t=256,uint32_t=256) {throw std::runtime_error("no modeled host import");}
+ static inline bool modelHostImport=false;
+ static inline void *importBase=nullptr;static inline size_t importBytes=0,importRow=0,importOffset=0;
+ bool supportsHostImport() const {return modelHostImport;}
+ Texture *importTexture(void *base,size_t bytes,size_t row,uint32_t width=256,uint32_t height=256,size_t offset=0) {
+  if(!modelHostImport || !base || !limits.rows(width,height,4,row,offset,bytes))throw std::runtime_error("modeled host import bounds");
+  importBase=base;importBytes=bytes;importRow=row;importOffset=offset;
+  limits.reserve(bytes);auto *t=new Texture{};t->width=width;t->height=height;t->allocated=t->charged=bytes;t->defined=true;return t;
+ }
  Buffer *importBuffer(void *,size_t) {throw std::runtime_error("no modeled host buffer import");}
  Texture *linearTexture(Buffer *,uint32_t,uint32_t,uint32_t,uint32_t,size_t,size_t) {throw std::runtime_error("no modeled linear texture");}
  Sampler *allocateSampler(bool,bool,uint32_t=0,float=0,float=0) {return new Sampler{};}
@@ -71,7 +79,7 @@ public:
  Texture *allocateTexture(uint32_t format=80,uint32_t=5,uint32_t width=256,uint32_t height=256,uint32_t levels=1) {
   if(!modelTextures)throw std::runtime_error("M4 CPU model has no rendering");
   if(!limits.extent(width,height,texelBytes(format)))throw std::runtime_error("extent");
-  auto *t=new Texture{};t->format=format;t->width=width;t->height=height;t->levels=levels;t->allocated=t->offset(levels);t->pixels.resize(t->allocated);return t;
+  auto *t=new Texture{};t->format=format;t->width=width;t->height=height;t->levels=levels;t->allocated=t->offset(levels);limits.reserve(t->allocated);t->charged=t->allocated;t->pixels.resize(t->allocated);return t;
  }
  Pipeline *compilePipeline(void *,const char *v,void *,const char *f,const CompileOptions &options=CompileOptions{}) {
   if(!modelPipelines)throw std::runtime_error("M4 CPU model has no translation");
@@ -81,7 +89,7 @@ public:
   if(auto *p=objects.acquire(key)){++pipelineHits;return p;}
   ++pipelineMisses;auto *p=new Pipeline{};objects.insert(key,key,p,sizeof(Pipeline),[&](Pipeline *old){destroy(old);});return p;
  }
- bool destroy(Texture *t) {delete t;return !poisoned;}
+ bool destroy(Texture *t) {if(t){limits.release(t->charged);delete t;}return !poisoned;}
  void destroy(Pipeline *p) {if(p && !--p->references)delete p;}
  bool requiresSampling(const Pipeline *p) const {return p->sampled;}
  void submit(const std::vector<Operation>& ops,const std::function<void()> &scheduled={}) {
