@@ -79,7 +79,18 @@ int main() {@autoreleasepool {
  refuses(c,^{[c renderCommandEncoderWithDescriptor:pass];});pass.colorAttachments[0].loadAction=MTLLoadActionClear;
  pass.defaultRasterSampleCount=4;refuses(c,^{[c renderCommandEncoderWithDescriptor:pass];});pass.defaultRasterSampleCount=0;
  pass.renderTargetArrayLength=2;refuses(c,^{[c renderCommandEncoderWithDescriptor:pass];});pass.renderTargetArrayLength=0;
- pass.renderTargetWidth=128;refuses(c,^{[c renderCommandEncoderWithDescriptor:pass];});pass.renderTargetWidth=0;
+ pass.renderTargetWidth=257;refuses(c,^{[c renderCommandEncoderWithDescriptor:pass];});pass.renderTargetWidth=0;
+ pass.renderTargetHeight=257;refuses(c,^{[c renderCommandEncoderWithDescriptor:pass];});pass.renderTargetHeight=0;
+ { // A smaller renderTargetWidth/Height is a top-left render area: default viewport/scissor, scissor bound.
+  FuxiCommandBuffer *a=(id)queue.commandBuffer;pass.renderTargetWidth=53;pass.renderTargetHeight=40;
+  FuxiRender *area=[a renderCommandEncoderWithDescriptor:pass];pass.renderTargetWidth=0;pass.renderTargetHeight=0;
+  assert(area && area->_state.areaWidth==53 && area->_state.areaHeight==40);
+  assert(area->_state.scissor.extent.width==53 && area->_state.scissor.extent.height==40 && area->_state.viewport.width==53 && area->_state.viewport.y==40);
+  [area setScissorRect:(MTLScissorRect){10,10,43,30}];assert(!a->_rejected);
+  refuses(a,^{[area setScissorRect:(MTLScissorRect){0,0,54,40}];});
+  // An empty pass cannot clear only part of the target yet.
+  refuses(a,^{[area endEncoding];});
+ }
  pass.depthAttachment.texture=(id)t;refuses(c,^{[c renderCommandEncoderWithDescriptor:pass];});pass.depthAttachment.texture=nil;
  pass.colorAttachments[7].resolveTexture=(id)t;refuses(c,^{[c renderCommandEncoderWithDescriptor:pass];});pass.colorAttachments[7].resolveTexture=nil;
  MTLRenderPassDescriptor *samplePass=[[pass copy] autorelease];

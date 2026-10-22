@@ -27,6 +27,7 @@ struct Operation {
  uint32_t srcX{},srcY{},dstX{},dstY{},width{},height{};size_t rowBytes{};
  Texture *samples[resourceSlots]{};Sampler *samplers[resourceSlots]{};BufferBind buffers[2][resourceSlots]{};Buffer *indices{};uint64_t indexOffset{};uint32_t first{},strip{},load=2,store=1;
  Viewport viewport{0,256,256,-256,0,1};Rect scissor{{0,0},{256,256}};
+ uint32_t areaWidth{},areaHeight{};
 };
 class Backend {
 public:

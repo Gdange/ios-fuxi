@@ -56,6 +56,8 @@ struct Operation {
  uint32_t srcX{},srcY{},dstX{},dstY{},width{},height{};size_t rowBytes{};
  Texture *samples[resourceSlots]{};Sampler *samplers[resourceSlots]{};BufferBind buffers[2][resourceSlots]{};Buffer *indices{};uint64_t indexOffset{};uint32_t first{},strip{},load=2,store=1;
  VkViewport viewport{0,256,256,-256,0,1};VkRect2D scissor{{0,0},{256,256}};
+ // Metal renderTargetWidth/Height: the pass's top-left render area; 0 means the whole target.
+ uint32_t areaWidth{},areaHeight{};
 };
 class Backend {
  void *library{};
@@ -539,7 +541,8 @@ public:
     if(!op.texture || op.texture->format!=op.pipeline->options.format || op.load>2 || op.store>1)throw std::runtime_error("invalid bounded draw target/actions");
     const auto &v=op.viewport;const auto &r=op.scissor;
     if(!viewportFits(v.x,v.y+v.height,v.width,-v.height,v.minDepth,v.maxDepth,op.texture->width,op.texture->height) || r.offset.x<0 || r.offset.y<0 ||
-       !scissorFits(r.offset.x,r.offset.y,r.extent.width,r.extent.height,op.texture->width,op.texture->height))throw std::runtime_error("viewport/scissor target bounds");
+       op.areaWidth>op.texture->width || op.areaHeight>op.texture->height ||
+       !scissorFits(r.offset.x,r.offset.y,r.extent.width,r.extent.height,op.areaWidth?op.areaWidth:op.texture->width,op.areaHeight?op.areaHeight:op.texture->height))throw std::runtime_error("viewport/scissor target bounds");
     if(op.texture->tiling==VK_IMAGE_TILING_LINEAR && op.pipeline->options.blend){VkFormatProperties props{};GetPhysicalDeviceFormatProperties(physical,op.texture->vkFormat,&props);if(!(props.linearTilingFeatures&VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT))throw std::runtime_error("linear attachment blending unavailable");}
     DrawInput input{};input.count=op.vertices;input.start=op.first;input.strip=op.strip;input.indexed=op.indices!=nullptr;input.indexLength=op.indices?op.indices->length:0;input.indexOffset=op.indexOffset;
     for(unsigned stage=0;stage<2;++stage)for(unsigned i=0;i<resourceSlots;++i){auto b=op.buffers[stage][i];if(b.buffer){if(b.buffer->memory==op.texture->memory || hostRangesOverlap(b.buffer->contents,b.buffer->length,op.texture->mapped,op.texture->allocated))throw std::runtime_error("attachment/buffer feedback");addBuffer(b.buffer);input.buffers[stage][i]={b.buffer->length,b.offset,b.bytes?1u:0u};}}
@@ -615,7 +618,7 @@ public:
      check(CreateFramebuffer(device,&fi,nullptr,&frame));frames.push_back(frame);
      VkClearValue clear{};memcpy(clear.color.float32,op.clear,sizeof(op.clear));
      VkRenderPassBeginInfo ri{};ri.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;ri.renderPass=render;ri.framebuffer=frame;
-     ri.renderArea={{0,0},{op.texture->width,op.texture->height}};ri.clearValueCount=1;ri.pClearValues=&clear;
+     ri.renderArea={{0,0},{op.areaWidth?op.areaWidth:op.texture->width,op.areaHeight?op.areaHeight:op.texture->height}};ri.clearValueCount=1;ri.pClearValues=&clear;
      CmdBeginRenderPass(cmd,&ri,VK_SUBPASS_CONTENTS_INLINE);CmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,op.strip?op.pipeline->stripPipeline:op.pipeline->pipeline);
      CmdSetViewport(cmd,0,1,&op.viewport);CmdSetScissor(cmd,0,1,&op.scissor);
      if(draw.descriptorCount) {
@@ -657,6 +660,7 @@ public:
      if(draw.indexed){CmdBindIndexBuffer(cmd,op.indices->buffer,draw.indexOffset,VK_INDEX_TYPE_UINT16);CmdDrawIndexed(cmd,draw.count,1,draw.first,0,0);}else CmdDraw(cmd,draw.count,1,draw.first,0);
      CmdEndRenderPass(cmd);
     } else if(op.texture && op.clearOnly) {
+     if((op.areaWidth && op.areaWidth!=op.texture->width) || (op.areaHeight && op.areaHeight!=op.texture->height))throw std::runtime_error("partial render area on an empty pass");
      if(op.load==1 && !op.texture->defined)throw std::runtime_error("load undefined empty attachment");
      if(op.load==2){VkClearColorValue clear{};memcpy(clear.float32,op.clear,sizeof(op.clear));VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};CmdClearColorImage(cmd,op.texture->image,VK_IMAGE_LAYOUT_GENERAL,&clear,1,&range);}
      op.texture->defined=op.store && (op.load==2 || (op.load==1 && op.texture->defined));

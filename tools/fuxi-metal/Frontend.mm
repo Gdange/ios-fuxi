@@ -808,7 +808,7 @@ static thread_local FuxiCommandBuffer *completionCommand;
  if(!fuxi::viewportFits(v.originX,v.originY,v.width,v.height,v.znear,v.zfar,[_target width],[_target height]))invalid(@"viewport bounds");
  _state.viewport={(float)v.originX,(float)(v.originY+v.height),(float)v.width,(float)-v.height,(float)v.znear,(float)v.zfar};
 } @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
-- (void)setScissorRect:(MTLScissorRect)r {@try {CENSUS();[self active];if(!fuxi::scissorFits(r.x,r.y,r.width,r.height,[_target width],[_target height]))invalid(@"scissor bounds");
+- (void)setScissorRect:(MTLScissorRect)r {@try {CENSUS();[self active];if(!fuxi::scissorFits(r.x,r.y,r.width,r.height,_state.areaWidth,_state.areaHeight))invalid(@"scissor bounds");
  _state.scissor={{(int32_t)r.x,(int32_t)r.y},{(uint32_t)r.width,(uint32_t)r.height}};
 } @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
 - (void)record:(MTLPrimitiveType)t start:(NSUInteger)start count:(NSUInteger)count indices:(id)indices offset:(NSUInteger)offset {
@@ -846,6 +846,7 @@ static thread_local FuxiCommandBuffer *completionCommand;
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)count indexType:(MTLIndexType)type indexBuffer:(id)b indexBufferOffset:(NSUInteger)offset {@try {CENSUS();if(type!=MTLIndexTypeUInt16 || !b)invalid(@"index type/buffer");[self record:t start:0 count:count indices:b offset:offset];} @catch(NSException *e){(void)e;[self rejectSelector:_cmd];}}
 - (void)endEncoding {@try {CENSUS();[self active];
  if(!_drawn){fuxi::Operation op{};op.texture=_target->_texture;op.clearOnly=true;op.load=_load;op.store=_store;
+ if(_state.areaWidth!=[_target width] || _state.areaHeight!=[_target height]){failureLog("FUXI MTL: renderPass reject empty pass area %ux%u of %lux%lu\n",_state.areaWidth,_state.areaHeight,(unsigned long)[_target width],(unsigned long)[_target height]);invalid(@"partial render area on an empty pass");}
  op.clear[0]=_clear.red;op.clear[1]=_clear.green;op.clear[2]=_clear.blue;op.clear[3]=_clear.alpha;
  [_command->_resources addObject:_target];_command->_ops.push_back(op);
  }else _command->_ops[_lastOp].store=_store;_ended=YES;_command->_encoding=NO;} @catch(NSException *e) {(void)e;[self rejectSelector:_cmd];}}
@@ -908,7 +909,9 @@ static thread_local FuxiCommandBuffer *completionCommand;
  CHECK("imageblockSampleLength",d.imageblockSampleLength,!actual);CHECK("tileWidth",d.tileWidth,!actual);CHECK("tileHeight",d.tileHeight,!actual);
  CHECK("threadgroupMemoryLength",d.threadgroupMemoryLength,!actual);CHECK("defaultRasterSampleCount",d.defaultRasterSampleCount,actual<=1);
  CHECK("rasterizationRateMap",d.rasterizationRateMap,!actual);
- CHECK("renderTargetWidth",d.renderTargetWidth,!actual || actual==[t width]);CHECK("renderTargetHeight",d.renderTargetHeight,!actual || actual==[t height]);
+ // A nonzero renderTargetWidth/Height restricts the pass to a top-left area of the attachment.
+ CHECK("renderTargetWidth",d.renderTargetWidth,actual<=[t width]);CHECK("renderTargetHeight",d.renderTargetHeight,actual<=[t height]);
+ uint32_t areaW=(uint32_t)(d.renderTargetWidth?d.renderTargetWidth:[t width]),areaH=(uint32_t)(d.renderTargetHeight?d.renderTargetHeight:[t height]);
  CHECK("samplePositions.count",[d getSamplePositions:nullptr count:0],!actual);
  for(unsigned i=1;i<8;++i) {
   char field[80];snprintf(field,sizeof(field),"colorAttachments[%u].texture",i);CHECK(field,d.colorAttachments[i].texture,!actual);
@@ -919,7 +922,7 @@ static thread_local FuxiCommandBuffer *completionCommand;
   if(!std::isfinite(x) || x<0 || x>1) {failureLog("FUXI MTL: renderPass reject clearColor[%u] %.17g\n",component,x);invalid(@"clear colour outside 0..1");}++component;
  }
 #undef CHECK
- FuxiRender *e=[FuxiRender new];e->_state={};e->_command=[self retain];e->_target=[t retain];e->_clear=c;e->_load=(uint32_t)a.loadAction;e->_store=(uint32_t)a.storeAction;e->_state.viewport={0,(float)[t height],(float)[t width],-(float)[t height],0,1};e->_state.scissor={{0,0},{(uint32_t)[t width],(uint32_t)[t height]}};_encoding=YES;return [e autorelease];
+ FuxiRender *e=[FuxiRender new];e->_state={};e->_command=[self retain];e->_target=[t retain];e->_clear=c;e->_load=(uint32_t)a.loadAction;e->_store=(uint32_t)a.storeAction;e->_state.viewport={0,(float)areaH,(float)areaW,-(float)areaH,0,1};e->_state.scissor={{0,0},{areaW,areaH}};e->_state.areaWidth=areaW;e->_state.areaHeight=areaH;_encoding=YES;return [e autorelease];
 } @catch(NSException *e) {(void)e;[self rejectSelector:_cmd];return nil;}}
 - (void)addScheduledHandler:(MTLCommandBufferHandler)handler {CENSUS();
  if(!handler){[self rejectSelector:_cmd];return;}if(_scheduled){handler((id)self);return;}
