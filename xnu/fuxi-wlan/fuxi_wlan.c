@@ -16,8 +16,10 @@
  *   fuxiwlanbhi=full  M6l whole-file BHI size experiment
  *   fuxiwlanvec=early|rddm  M6l TX staging or RDDM RX experiment
  *   fuxiwlancnss=pdc  M6n AOP WLAN PDC setup before rails (default off)
+ *   fuxiwlanseq=cycle,parf,dbi,eq,hostirq,msi,por,prefix  M6o opt-ins
  * Steps 17..28 probe DMA safety and load rootfs firmware through BHI/BHIe.
- * No interrupts, channels or QMI are enabled; see docs-lanes/wlan-bt.md M6.
+ * Completion is polled; M6o can enable MSI to a RAM sink. No channels/QMI;
+ * see docs-lanes/wlan-bt.md M6.
  *
  * Steps 1..13 are the loader's milestone-3 sequence, compiled from an exact
  * copy of shim/fuxi-probe/wlan.c (bsd/dev/wlan.c, FUXI_WLAN_XNU). Every write
@@ -338,6 +340,8 @@ rh_send(unsigned t, uint32_t addr, uint32_t data)
 	return rh_send_request(t, &cmd, 1, true);
 }
 
+static bool wl_m6o_parf(void);
+static int wl_m6o_host(unsigned);
 #define FUXI_WLAN_XNU 1
 #include "wlan.c"
 
@@ -697,7 +701,7 @@ static const char *wl_fw_path;
 static bool wl_mhi_valid;
 struct wl_dma { vm_offset_t va; vm_size_t size; uint64_t pa, iova; bool nc; };
 static struct wl_dma wl_image, wl_vectors, wl_contexts, wl_tables;
-static struct wl_dma wl_rddm, wl_rxvectors;
+static struct wl_dma wl_rddm, wl_rxvectors, wl_msi_sink;
 #define WL_RDDM_SIZE 0x780000u /* ath12k WCN7850; crash sink only, never dumped */
 static unsigned wl_pre, wl_full, wl_vec, wl_fw;
 static unsigned wl_cnss;
@@ -722,7 +726,44 @@ wl_variant_arg(const char *name, const char *const *names, unsigned count)
 	return 0;
 }
 
-static bool wl_variant_active(void) { return wl_pre || wl_full || wl_vec || wl_fw || wl_cnss; }
+/* Independent default-off sequence deltas; register facts: docs/wlan-m6o.md. */
+enum { WL_O_CYCLE=1, WL_O_PARF=2, WL_O_DBI=4, WL_O_EQ=8,
+    WL_O_HOSTIRQ=16, WL_O_MSI=32, WL_O_POR=64, WL_O_PREFIX=128 };
+static unsigned wl_seq_flags;
+static bool wl_cycle_attempted, wl_seq_requested;
+static unsigned wl_msi_cap, wl_pm_cap;
+static const char *const wl_seq_names[] = {"cycle", "parf", "dbi", "eq", "hostirq", "msi", "por", "prefix"};
+static bool wl_m6o_parf(void) { return !!(wl_seq_flags & WL_O_PARF); }
+static bool wl_m6o_early(void) { return !!(wl_seq_flags & (WL_O_CYCLE | WL_O_MSI)); }
+static void
+wl_seq_configure(void)
+{
+	char arg[96] = {0};
+	wl_seq_flags = 0; wl_seq_requested = false;
+	if (!PE_parse_boot_argn("fuxiwlanseq", arg, sizeof(arg))) { return; }
+	wl_seq_requested = true;
+	/* A sentinel prevents a truncated comma-list from becoming valid. */
+	if (arg[sizeof(arg)-1]) { wl_variant_invalid = true; return; }
+	if (!strcmp(arg, "off")) { return; }
+	char *part = arg;
+	while (*part) {
+		char *end = part;
+		while (*end && *end != ',') { end++; }
+		bool more = *end == ','; *end = 0;
+		unsigned bit = 0;
+		for (unsigned i = 0; i < 8; i++) {
+			if (!strcmp(part, wl_seq_names[i])) { bit = 1u << i; break; }
+		}
+		if (!bit || (wl_seq_flags & bit)) { wl_variant_invalid = true; break; }
+		wl_seq_flags |= bit;
+		if (!more) { break; }
+		part = end + 1;
+		if (!*part) { wl_variant_invalid = true; }
+	}
+	if (!*arg) { wl_variant_invalid = true; }
+}
+
+static bool wl_variant_active(void) { return wl_pre || wl_full || wl_vec || wl_fw || wl_cnss || wl_seq_flags; }
 static unsigned wl_bhi_bytes(void) { return wl_full ? wl_fw_size : WL_CHUNK; }
 enum wl_probe_mode { WL_PROBE_OFF, WL_PROBE_UNMAPPED, WL_PROBE_PATTERN,
     WL_PROBE_CIVAC, WL_PROBE_NC, WL_PROBE_INVALID };
@@ -742,6 +783,8 @@ wl_probe_configure(void)
 	wl_full = wl_variant_arg("fuxiwlanbhi", sizes, 2);
 	wl_vec = wl_variant_arg("fuxiwlanvec", wl_vec_names, 3);
 	wl_cnss = wl_variant_arg("fuxiwlancnss", wl_cnss_names, 2);
+	wl_seq_configure();
+	if ((wl_seq_flags & WL_O_PREFIX) && (wl_full || wl_vec == 1)) { wl_variant_invalid = true; }
 	wl_probe = WL_PROBE_OFF; wl_probe_fired = false;
 	if (PE_parse_boot_argn("fuxiwlanprobe", arg, sizeof(arg))) {
 		arg[sizeof(arg) - 1] = 0;
@@ -756,6 +799,8 @@ wl_probe_configure(void)
 	int retain = 0;
 	(void)PE_parse_boot_argn("fuxiwlanaspm", &retain, sizeof(retain));
 	if (wl_pre == 5 && retain == 1) { wl_variant_invalid = true; }
+	printf("FUXI WLAN: M6o seq mask %#x valid=%u (default off; stop/contain at 22)\n",
+	    wl_seq_flags, !wl_variant_invalid);
 	printf("FUXI WLAN: M6l pre=%s bhi=%s vec=%s valid=%u (variants stop at 22)\n",
 	    wl_pre_names[wl_pre], sizes[wl_full], wl_vec_names[wl_vec], !wl_variant_invalid);
 	printf("FUXI WLAN: M6k probe=%s (one BHI doorbell; diagnostic modes stop at 22)\n", wl_probe_names[wl_probe]);
@@ -1755,8 +1800,8 @@ wl_pt_pa(unsigned table)
 static vm_offset_t
 wl_owned_alias(uint64_t pa, unsigned bytes, bool tables_only)
 {
-	struct wl_dma *bufs[] = { &wl_tables, &wl_image, &wl_vectors, &wl_contexts, &wl_rddm, &wl_rxvectors };
-	for (unsigned i = 0; i < (tables_only ? 1u : 6u); i++) {
+	struct wl_dma *bufs[] = { &wl_tables, &wl_image, &wl_vectors, &wl_contexts, &wl_rddm, &wl_rxvectors, &wl_msi_sink };
+	for (unsigned i = 0; i < (tables_only ? 1u : 7u); i++) {
 		struct wl_dma *d = bufs[i];
 		for (vm_size_t off = 0; d->va && off < d->size; off += PAGE_SIZE) {
 			uint64_t base = wl_phys(d->va + off);
@@ -1822,19 +1867,17 @@ wl_bhi_mapping_check(void)
 }
 
 static int
-wl_smmu_enable(void)
+wl_smmu_populate(void)
 {
-	if (wl_rc_check()) { return 3; }
 	unsigned l3_count = (unsigned)((wl_iova_end - wl_iova_base) >> 21);
-	if (wl_dma_alloc(&wl_tables, (2 + l3_count) * 4096)) { return 1; }
 	uint64_t *root = (uint64_t *)wl_tables.va;
 	uint64_t *l2 = (uint64_t *)(wl_tables.va + 4096);
 	root[wl_iova_base >> 30] = wl_pt_pa(1) | 3;
 	for (unsigned i = 0; i < l3_count; i++) {
 		l2[((wl_iova_base >> 21) & 511) + i] = wl_pt_pa(2 + i) | 3;
 	}
-	struct wl_dma *bufs[] = { &wl_image, &wl_vectors, &wl_contexts, &wl_rddm, &wl_rxvectors };
-	for (unsigned i = 0; i < 5; i++) {
+	struct wl_dma *bufs[] = { &wl_image, &wl_vectors, &wl_contexts, &wl_rddm, &wl_rxvectors, &wl_msi_sink };
+	for (unsigned i = 0; i < 6; i++) {
 		struct wl_dma *d = bufs[i];
 		if (d == &wl_image && wl_probe == WL_PROBE_UNMAPPED) { continue; }
 		for (vm_size_t off = 0; off < d->size; off += 4096) {
@@ -1846,6 +1889,25 @@ wl_smmu_enable(void)
 		}
 	}
 	wl_dma_clean(&wl_tables);
+	return fw_faults ? 1 : 0;
+}
+
+static int
+wl_smmu_enable(void)
+{
+	if (wl_rc_check()) { return 3; }
+	if (wl_enabled) {
+		/* M6o installed a fault-only/sink mapping before MASTER. Add only
+		 * owned buffers, publish leaves, invalidate cached faults, then prepare. */
+		if (wl_smmu_fault(20) || fw_faults ||
+		    wl_prd(WL_SMMU+0x800+4*wl_slot) != 0x80001401 ||
+		    wl_prd(WL_SMMU+0xc00+4*wl_slot) != wl_cb ||
+		    (wl_prd(wl_cb_addr(wl_cb))&WL_CB_SCTLR_MASK) != (WL_CB_SCTLR&WL_CB_SCTLR_MASK)) { return 5; }
+		return wl_smmu_populate() || wl_smmu_sync(false) || wl_smmu_fault(20) ? 5 : 0;
+	}
+	unsigned l3_count = (unsigned)((wl_iova_end - wl_iova_base) >> 21);
+	if (wl_dma_alloc(&wl_tables, (2 + l3_count) * 4096)) { return 1; }
+	if (wl_smmu_populate()) { return 2; }
 	/* Re-prove vacancy after allocations/VFS sleeps, immediately before writes. */
 	if (wl_prd(WL_SMMU + 0x800 + 4 * wl_slot) != wl_old_smr ||
 	    wl_prd(WL_SMMU + 0xc00 + 4 * wl_slot) != wl_old_s2cr ||
@@ -1894,7 +1956,7 @@ wl_smmu_enable(void)
 	wl_enabled = true;
 	printf("FUXI WLAN: SMMU owned stage1 SMR %u CB %u TTBR %#llx IOVA %#llx-%#llx readback verified\n",
 	    wl_slot, wl_cb, wl_pt_pa(0), wl_iova_base,
-	    wl_vec == 2 ? wl_rxvectors.iova + wl_rxvectors.size - 1 : wl_contexts.iova + wl_contexts.size - 1);
+	    wl_iova_next - 1);
 	printf("FUXI WLAN: M6g CB %u coherent walk TCR %#x IRGN0=1 ORGN0=1 SH0=3; DMA MAIR0 %#x SH=2; SCTLR %#x HUPCF=1 CFCFG=0 CFRE=0 CFIE=0\n",
 	    wl_cb, wl_prd(cb + 0x30), wl_prd(cb + 0x38), wl_prd(cb));
 	printf("FUXI WLAN: DMA self-test: no standalone BHI host-write cookie; step 21/22 BHI transfer + CB faults is first endpoint proof\n");
@@ -1976,6 +2038,337 @@ wl_disable_irqs(void)
 	return p || fw_faults ? 3 : 0;
 }
 
+/* M6o is original polling glue, using only the cited register constants.
+ * Journal only host configuration, never W1C/status, DMA doorbells or BME.
+ * Banked equalization entries carry their selector for bounded reverse undo. */
+struct wl_seq_undo { uint64_t pa; uint32_t old, mask; unsigned bank; };
+static struct wl_seq_undo wl_seq_undo[48];
+static unsigned wl_seq_undos, wl_eq_bank;
+static bool wl_cycle_powered;
+static uint32_t wl_msi_saved[5];
+static bool wl_msi_pvm;
+
+static int
+wl_m6o_write(const char *what, uint64_t pa, uint32_t value, uint32_t mask)
+{
+	uint32_t old = wl_prd(pa);
+	if (fw_faults || (old == ~0u && !(wl_msi_pvm && pa == WL_EPCFG+wl_msi_cap+16)) || wl_seq_undos >= 48) { return 1; }
+	uint32_t v = (old & ~mask) | (value & mask);
+	/* PCI command/control shares a dword with W1C status. */
+	if ((pa >= WL_EPCFG && pa < WL_EPCFG + 0x1000 && mask == 0xffff) ||
+	    pa == WL_EPCFG+4 || pa == WL_DBI+0x78 || (wl_pm_cap && pa == WL_EPCFG+wl_pm_cap+4)) { v &= 0xffff; }
+	if (wl_pm_cap && pa == WL_EPCFG+wl_pm_cap+4) { v &= ~0x8000u; } /* PME status W1C */
+	bool host = (pa >= WL_PARF && pa < WL_PARF + 0x4000) ||
+	    (pa >= WL_DBI && pa < WL_DBI + 0x1000);
+	/* Cycle link control is contained by PERST, not restored to running. */
+	if (host && pa != WL_PARF + 0x1b0 && pa != WL_DBI + 0xf24) {
+		wl_seq_undo[wl_seq_undos++] = (struct wl_seq_undo){pa, old, mask,
+		    pa == WL_DBI + 0x8a8 || pa == WL_DBI + 0x8ac || (pa == WL_DBI+0x890 && mask == 1) ? wl_eq_bank : 0};
+	}
+	wl_pwr(pa, v);
+	uint32_t rb = wl_prd(pa);
+	printf("FUXI WLAN: M6o %s offset %#llx write %#x read %#x mask %#x\n", what, pa, v, rb, mask);
+	return fw_faults || (rb & mask) != (v & mask);
+}
+
+static int
+wl_m6o_host(unsigned step)
+{
+	if (!wl_seq_flags) { return 0; }
+	if (wl_variant_invalid || fw_faults) { return 1; }
+	if (step == 8) {
+		if ((wl_seq_flags & WL_O_PARF) &&
+		    (wl_m6o_write("PARF DBI_BASE_ADDR", WL_PARF+0x350, 0, ~0u) ||
+		     wl_m6o_write("PARF SYS_CTRL", WL_PARF, 0x365e, ~0u) ||
+		     wl_m6o_write("PARF SLV_ADDR_SPACE_SIZE", WL_PARF+0x358, 0x04000000, ~0u))) { return 1; }
+		if ((wl_seq_flags & WL_O_HOSTIRQ) &&
+		    (wl_m6o_write("PARF INT_ALL_MASK zero", WL_PARF+0x22c, 0, ~0u) ||
+		     wl_m6o_write("PARF INT_ALL_MASK events", WL_PARF+0x22c, 0x3fc0d202, ~0u))) { return 1; }
+	}
+	if (step == 10 && (wl_seq_flags & WL_O_DBI)) {
+		if (wl_m6o_write("PARF CFG_BITS_3", WL_PARF+0x2c4, 0x100, 0x101) ||
+		    wl_m6o_write("DBI LANE_SKEW", WL_DBI+0x714, 0x20, 0x20)) { return 1; }
+	}
+	if (step == 12 && (wl_seq_flags & WL_O_DBI)) {
+		if (wl_m6o_write("DBI N_FTS", WL_DBI+0x70c, 0x8000, 0x8000) ||
+		    wl_m6o_write("DBI AUX_CLK_FREQ", WL_DBI+0xb40, 20, ~0u)) { return 1; }
+	}
+	if (step != 11) { return 0; }
+	if (wl_seq_flags & WL_O_EQ) {
+		unsigned speed = wl_prd(WL_DBI+0x7c) & 15;
+		if (fw_faults || speed < 3 || speed > 4) { return 1; }
+		if (wl_m6o_write("DBI GEN3_GEN2_CTRL", WL_DBI+0x80c, 0x100, 0x1f00)) { return 1; }
+		for (unsigned gen = 3; gen <= speed; gen++) {
+			wl_eq_bank = gen;
+			if (wl_m6o_write("DBI RATE_SHADOW_SEL", WL_DBI+0x890, (gen-3)<<24, 0x03000000) ||
+			    wl_m6o_write("DBI EQ preset vector", WL_DBI+0x8a8, 0, 0x00ffff00) ||
+			    wl_m6o_write("DBI ZRXDC", WL_DBI+0x890, 0, 1) ||
+			    wl_m6o_write("DBI EQ FMDC", WL_DBI+0x8ac, 0, 0x1f)) { return 1; }
+		}
+		wl_eq_bank = 0;
+		if (wl_m6o_write("DBI RO write enable", WL_DBI+0x8bc, 1, 1) ||
+		    wl_m6o_write("DBI Gen3 core preset", WL_DBI+0x154, 0x55555555, ~0u) ||
+		    (speed >= 4 && wl_m6o_write("DBI Gen4 core preset", WL_DBI+0x188, 0x55555555, ~0u)) ||
+		    wl_m6o_write("DBI RO write disable", WL_DBI+0x8bc, 0, 1)) { return 1; }
+	}
+	if ((wl_seq_flags & WL_O_DBI) &&
+	    wl_m6o_write("DBI MRRS 4096", WL_DBI+0x78, 0x5000, 0x7000)) { return 1; }
+	return 0;
+}
+
+/* Bounded standard PCI capability walk; reject malformed/cyclic lists. */
+static unsigned
+wl_m6o_cap(unsigned id)
+{
+	unsigned p = wl_prd(WL_EPCFG+0x34) & 255;
+	uint64_t seen = 0;
+	while (p) {
+		if (p < 0x40 || p > 0xfc || (p & 3) || (seen & (1ull << (p/4)))) { return 0; }
+		seen |= 1ull << (p/4);
+		uint32_t v = wl_prd(WL_EPCFG+p);
+		if (fw_faults || v == ~0u) { return 0; }
+		if ((v & 255) == id) { return p; }
+		p = (v >> 8) & 255;
+	}
+	return 0;
+}
+
+static int
+wl_m6o_wait(uint64_t pa, uint32_t mask, uint32_t expected, unsigned ms)
+{
+	for (unsigned i = 0; i <= ms; i++) {
+		uint32_t v = wl_prd(pa);
+		if (fw_faults || v == ~0u) { return 1; }
+		if ((v & mask) == expected) {
+			printf("FUXI WLAN: M6o wait %#llx read %#x mask %#x after %u ms\n", pa, v, mask, i);
+			return 0;
+		}
+		if (i < ms) { wl_sleep(1); }
+	}
+	printf("FUXI WLAN: M6o wait %#llx mask %#x expected %#x timeout %u ms\n", pa, mask, expected, ms);
+	return 1;
+}
+
+/* Only six existing WLAN votes; no PHY rail/clock recipe is changed. */
+static int
+wl_m6o_rails(bool on)
+{
+	static const unsigned idx[] = {0, 4, 2, 1, 5, 3};
+	static const unsigned mv[] = {1800, 1000, 980, 950, 1900, 1350};
+	for (unsigned n = 0; n < 6; n++) {
+		unsigned i = on ? n : 5-n, addr = wl3_report[20+idx[i]];
+		static const unsigned expected[] = {0x40a00, 0x44000, 0x40400, 0x40200, 0x40600, 0x40500};
+		if (addr != expected[i] || fw_faults) { return 1; }
+		unsigned e = on ? wl_vrm(addr, mv[i]) : rh_send(0, addr+4, 0);
+		printf("FUXI WLAN: M6o WLAN rail %#x %s mV %u completion %#x\n", addr, on ? "on" : "off", mv[i], e);
+		if (e) { return 1; }
+	}
+	return 0;
+}
+
+struct wl_seq_config { unsigned off[13]; uint32_t value[13]; };
+static int
+wl_m6o_config_save(struct wl_seq_config *cfg)
+{
+	unsigned pc = wl_m6o_cap(0x10);
+	if (!pc || pc > 0xcc || ((wl_prd(WL_EPCFG+pc)>>16)&15) < 2) { return 1; }
+	const unsigned off[] = {4, 0xc, 0x10, 0x14, 0x18, 0x1c, 0x20, 0x24, 0x3c,
+	    pc+8, pc+0x10, pc+0x28, pc+0x30};
+	for (unsigned i = 0; i < 13; i++) {
+		cfg->off[i] = off[i]; cfg->value[i] = wl_prd(WL_EPCFG+off[i]);
+		if (fw_faults || cfg->value[i] == ~0u) { return 1; }
+	}
+	return 0;
+}
+
+static int
+wl_m6o_config_restore(const struct wl_seq_config *cfg)
+{
+	/* BARs and controls first, saved command last, always MASTER clear. */
+	for (unsigned i = 1; i < 13; i++) {
+		uint32_t mask = i >= 9 ? 0xffff : i == 8 ? 255 : i == 1 ? 0xffff : ~0u;
+		if (wl_m6o_write("restore config", WL_EPCFG+cfg->off[i], cfg->value[i], mask)) { return 1; }
+	}
+	return wl_m6o_write("restore command", WL_EPCFG+4, (cfg->value[0]&~4u)|0x402, 0xffff);
+}
+
+static int
+wl_m6o_cycle(void)
+{
+	if (wl_cycle_attempted || fw_faults || wl_prd(WL_EPCFG) != 0x110717cb) { return 1; }
+	wl_cycle_attempted = true;
+	unsigned pm = wl_m6o_cap(1);
+	wl_pm_cap = pm;
+	if (!pm || pm > 0xf8 || wl_disable_irqs()) { return 1; }
+	struct wl_seq_config cfg;
+	if (wl_m6o_write("cycle clear MASTER", WL_EPCFG+4, 0, 4) || wl_m6o_config_save(&cfg)) { return 1; }
+	printf("FUXI WLAN: M6o cycle saved config after clear MASTER; disable function then D3hot\n");
+	if (wl_m6o_write("cycle disable function", WL_EPCFG+4, 0x400, 0xffff) ||
+	    wl_m6o_write("cycle D3hot", WL_EPCFG+pm+4, 3, 3)) { return 1; }
+	wl_sleep(10); /* PCI D3hot transition, before PME_TURNOFF */
+	if (wl_m6o_write("cycle PME_TURNOFF", WL_DBI+0xf24, 0x10, ~0u) ||
+	    wl_m6o_wait(WL_PARF+0x24, 0x20, 0x20, 100) ||
+	    wl_m6o_write("cycle PERST low", TS_TLMM+0x1000ull*94+4, 0, 2) ||
+	    wl_m6o_write("cycle LTSSM off", WL_PARF+0x1b0, 0, 0x100) ||
+	    wl_m6o_wait(WL_DBI+0x80, 1u<<29, 0, 100) ||
+	    wl_m6o_write("cycle WLAN_EN low", TS_TLMM+0x1000ull*80+4, 0, 2)) { return 1; }
+	wl_cycle_powered = true; /* partial vote sequence also requires off cleanup */
+	if (wl_m6o_rails(false)) { return 1; }
+	wl_sleep(10);
+	if (wl_m6o_rails(true) ||
+	    wl_m6o_write("cycle WLAN_EN high", TS_TLMM+0x1000ull*80+4, 2, 2)) { return 1; }
+	wl_sleep(10); /* X PCIe0 ep-latency before PERST release */
+	/* Keep controller clocks/PHY and outbound apertures: L23/PERST is the
+	 * link boundary. This isolates the WLAN probe cycle from PHY recipes. */
+	if (wl_m6o_write("cycle PME_TURNOFF clear", WL_DBI+0xf24, 0, ~0u) ||
+	    wl_m6o_write("cycle PERST high", TS_TLMM+0x1000ull*94+4, 2, 2)) { return 1; }
+	wl_sleep(1); wl_perst_done = mach_absolute_time();
+	if (wl_m6o_write("cycle LTSSM resume", WL_PARF+0x1b0, 0x100, 0x100) ||
+	    wl_m6o_wait(WL_DBI+0x80, 1u<<29, 1u<<29, 1000)) { return 1; }
+	wl_link_done = mach_absolute_time();
+	if (wl_prd(WL_EPCFG) != 0x110717cb ||
+	    wl_m6o_write("cycle D0", WL_EPCFG+pm+4, 0, 3)) { return 1; }
+	wl_sleep(10);
+	if (wl_m6o_write("cycle enable function", WL_EPCFG+4, 0x402, 0xffff)) { return 1; }
+	if (wl_m6o_config_restore(&cfg) ||
+	    wl_mrd(0x28) != wl_bhi || wl_mrd(0x2c) != wl_bhie ||
+	    wl_mrd(wl_bhi+0x28) != 0 || fw_faults) { return 1; }
+	printf("FUXI WLAN: M6o cycle resumed D0/config; MASTER follows owned SMMU install; WLAON skipped (KIWI DT gate absent)\n");
+	return 0;
+}
+
+static int
+wl_m6o_master(void)
+{
+	struct wl_seq_config cfg;
+	if (wl_m6o_config_save(&cfg)) { return 1; }
+	if (wl_seq_flags & WL_O_MSI) {
+		unsigned p = wl_m6o_cap(5);
+		uint32_t cap = p ? wl_prd(WL_EPCFG+p) : 0;
+		/* KIWI 64-bit MSI, >=32 messages. Require room for addr/data. */
+		if (!p || p > 0xe8 || !(cap & (1u<<23)) || ((cap>>17)&7) < 5 ||
+		    wl_disable_irqs() || wl_dma_alloc(&wl_msi_sink, PAGE_SIZE)) { return 1; }
+		wl_msi_pvm = !!(cap & (1u<<24));
+		for (unsigned i = 0; i < (wl_msi_pvm ? 5u : 4u); i++) { wl_msi_saved[i] = wl_prd(WL_EPCFG+p+4*i); }
+		wl_msi_saved[0] &= ~(1u<<16); /* cleanup never reenables inherited IRQs */
+		if (fw_faults) { return 1; }
+		wl_msi_cap = p;
+		wl_dma_clean(&wl_msi_sink);
+	}
+	if (wl_smmu_enable() || wl_fabric_prepare()) { return 1; }
+	unsigned pm = wl_m6o_cap(1);
+	wl_pm_cap = pm;
+	if (!pm || pm > 0xf8 || wl_m6o_write("power-up D0", WL_EPCFG+pm+4, 0, 3) ||
+	    wl_m6o_write("power-up enable MEMORY", WL_EPCFG+4, 0x402, 0xffff) ||
+	    wl_m6o_config_restore(&cfg) || wl_download_aspm()) { return 1; }
+	if (wl_seq_flags & WL_O_MSI) {
+		unsigned p = wl_msi_cap;
+		if (wl_m6o_write("MSI address high", WL_EPCFG+p+8, (uint32_t)(wl_msi_sink.iova>>32), ~0u) ||
+		    wl_m6o_write("MSI address low", WL_EPCFG+p+4, (uint32_t)wl_msi_sink.iova, ~0u) ||
+		    wl_m6o_write("MSI data base", WL_EPCFG+p+12, 0, 0xffff) ||
+		    (wl_msi_pvm && wl_m6o_write("MSI unmask sink vectors", WL_EPCFG+p+16, 0, ~0u)) ||
+		    wl_m6o_write("MSI 32 vectors enabled", WL_EPCFG+p, (5u<<20)|(1u<<16), 0x00710000)) { return 1; }
+		printf("FUXI WLAN: M6o MSI 32 vectors (MHI 0..2) sink IOVA %#llx, polling; no ITS/GIC changes\n", wl_msi_sink.iova);
+	}
+	if (wl_m6o_write("MASTER before MHI prepare", WL_EPCFG+4, 0x406, 0xffff)) { return 1; }
+	printf("FUXI WLAN: M6o D0/config valid MASTER on before contexts/RX prepare; unmapped DMA faults contained\n");
+	return 0;
+}
+
+static int
+wl_m6o_rx_clear(void)
+{
+	for (unsigned o = 0x60; o <= 0x78; o += 4) {
+		wl_mwr(wl_bhie+o, 0);
+		uint32_t rb = wl_mrd(wl_bhie+o);
+		printf("FUXI WLAN: M6o prepare RX zero offset %#x write 0 read %#x\n", o, rb);
+		if (rb || fw_faults) { return 1; }
+	}
+	return 0;
+}
+
+static int
+wl_m6o_prepare(void)
+{
+	uint64_t addr = wl_rxvectors.iova;
+	unsigned bytes = (WL_RDDM_SIZE/WL_CHUNK)*sizeof(struct wl_vector);
+	uint32_t seq; read_random(&seq, sizeof(seq)); seq &= WL_SEQ_MASK; if (!seq) { seq = 1; }
+	if (wl_m6o_write("prepare RX high", WL_BAR0+wl_bhie+0x64, addr>>32, ~0u) ||
+	    wl_m6o_write("prepare RX low", WL_BAR0+wl_bhie+0x60, (uint32_t)addr, ~0u) ||
+	    wl_m6o_write("prepare RX bytes", WL_BAR0+wl_bhie+0x68, bytes, ~0u) ||
+	    wl_m6o_write("prepare RX random DB", WL_BAR0+wl_bhie+0x70, seq, WL_SEQ_MASK) ||
+	    wl_m6o_write("POR INTVEC zero", WL_BAR0+wl_bhi+0x20, 0, ~0u)) { return 1; }
+	uint32_t ee = wl_mrd(wl_bhi+0x28), st = wl_mrd(0x48);
+	if (fw_faults || ee != 0 || st == ~0u) { return 1; }
+	if (((st>>8)&255) == 0xff) {
+		/* SYS_ERR only; never an unconditional cold reset. */
+		wl_mwr(0x38, 2);
+		unsigned i;
+		for (i = 0; i <= 40; i++) {
+			uint32_t ctrl = wl_mrd(0x38);
+			if (fw_faults || ctrl == ~0u) { return 1; }
+			if (!(ctrl & 2)) { break; }
+			if (i < 40) { wl_sleep(25); }
+		}
+		if (i > 40 || wl_m6o_write("POR INTVEC after reset", WL_BAR0+wl_bhi+0x20, 0, ~0u) ||
+		    wl_mrd(wl_bhi+0x28) != 0 || (wl_mrd(0x48)&0xff04) || fw_faults) { return 1; }
+	}
+	printf("FUXI WLAN: M6o prepare RX zero +60..78, high/low/size/random DB %#x; POR EE %#x state %#x INTVEC 0\n", seq, ee, st);
+	return 0;
+}
+
+/* Called only after BME clear, before PERST makes config inaccessible. */
+static int
+wl_m6o_msi_undo(void)
+{
+	if (!wl_msi_cap) { return 0; }
+	unsigned faults0 = fw_faults;
+	uint64_t pa = WL_EPCFG+wl_msi_cap;
+	if (wl_contain_wr(pa, wl_msi_saved[0]) ||
+	    (wl_prd(pa)&0x00710000) != (wl_msi_saved[0]&0x00710000)) { return 1; }
+	for (unsigned i = 1; i < (wl_msi_pvm ? 5u : 4u); i++) {
+		uint32_t mask = i == 3 ? 0xffff : ~0u;
+		if (wl_contain_wr(pa+4*i, wl_msi_saved[i]&mask) ||
+		    (wl_prd(pa+4*i)&mask) != (wl_msi_saved[i]&mask)) { return 1; }
+	}
+	if (fw_faults != faults0) { return 1; }
+	wl_msi_cap = 0;
+	printf("FUXI WLAN: M6o MSI disabled, saved address/data restored before PERST\n");
+	return 0;
+}
+
+static int
+wl_m6o_undo(bool contained)
+{
+	if (!contained) { return 1; }
+	unsigned faults0 = fw_faults;
+	int bad = 0;
+	while (wl_seq_undos) {
+		struct wl_seq_undo *u = &wl_seq_undo[wl_seq_undos-1];
+		if (u->bank) {
+			uint32_t v = wl_prd(WL_DBI+0x890);
+			if (v == ~0u || wl_contain_wr(WL_DBI+0x890, (v&~0x03000000u)|((u->bank-3)<<24)) ||
+			    (wl_prd(WL_DBI+0x890)&0x03000000) != (u->bank-3)<<24) { return 1; }
+		}
+		uint32_t v = wl_prd(u->pa);
+		uint32_t restore = (v&~u->mask)|(u->old&u->mask);
+		if (u->pa == WL_DBI+0x78) { restore &= 0xffff; }
+		if (v == ~0u || wl_contain_wr(u->pa, restore) ||
+		    (wl_prd(u->pa)&u->mask) != (u->old&u->mask)) { bad = 1; break; }
+		wl_seq_undos--;
+	}
+	if (wl_cycle_powered) {
+		bad |= wl_contain_wr(TS_TLMM+0x1000ull*80+4, 0);
+		bad |= !!(wl_prd(TS_TLMM+0x1000ull*80+4)&2);
+		bad |= wl_m6o_rails(false);
+		if (!bad) { wl_cycle_powered = false; }
+	}
+	bad |= fw_faults != faults0;
+	printf("FUXI WLAN: M6o undo host entries pending %u WLAN power %s result %s\n", wl_seq_undos,
+	    wl_cycle_powered ? "unconfirmed" : "contained", bad ? "unconfirmed; quarantine" : "done");
+	return bad;
+}
+
 static int
 wl_read_firmware(void)
 {
@@ -2002,9 +2395,10 @@ wl_read_firmware(void)
 		e = 3; goto close;
 	}
 	wl_fw_size = (uint32_t)a.va_data_size;
-	if (wl_dma_alloc(&wl_image, wl_fw_size)) { e = 4; goto close; }
+	unsigned read_bytes = (wl_seq_flags & WL_O_PREFIX) ? WL_CHUNK : wl_fw_size;
+	if (wl_dma_alloc(&wl_image, read_bytes)) { e = 4; goto close; }
 	int resid = 0;
-	e = vn_rdwr(UIO_READ, vp, (caddr_t)wl_image.va, (int)wl_fw_size, 0,
+	e = vn_rdwr(UIO_READ, vp, (caddr_t)wl_image.va, (int)read_bytes, 0,
 	    UIO_SYSSPACE, 0,
 	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
 	if (e || resid) {
@@ -2059,6 +2453,9 @@ wl_read_firmware(void)
 		} else {
 			printf("FUXI WLAN: M6m hash header version %u unparsed; authentication unverified\n", h[1]);
 		}
+	}
+	if (wl_seq_flags & WL_O_PREFIX) {
+		printf("FUXI WLAN: M6o prefix separate coherent allocation %#x bytes, file %u; full image/FBC vectors deferred beyond BHI\n", WL_CHUNK, wl_fw_size);
 	}
 	wl_dma_clean(&wl_image);
 	wl5_report[17] = wl_fw_size; wl5_report[18] = (uint32_t)wl_image.iova;
@@ -2132,6 +2529,10 @@ wl_probe_observe(void)
 	wl_host_diag("probe-completion");
 	if (!fw_faults && !(flags & WL_DIAG_TRANSPORT)) { wl_boot_logs(); }
 	if (wl_variant_active()) {
+		if (wl_seq_flags) {
+			printf("FUXI WLAN: M6o result seq mask %#x EE %#x STATUS %#x ERRCODE %#x; stop/contain at 22\n",
+			    wl_seq_flags, wl_mrd(wl_bhi + 0x28), wl_mrd(wl_bhi + 0x2c), wl_mrd(wl_bhi + 0x30));
+		}
 		if (wl_cnss) {
 			printf("FUXI WLAN: M6n result cnss=%s PDC consumed %u/13 EE %#x ERRCODE %#x; raw code, no security decode\n",
 			    wl_cnss_names[wl_cnss], wl_pdc_acks, wl_mrd(wl_bhi + 0x28), wl_mrd(wl_bhi + 0x30));
@@ -2160,6 +2561,7 @@ wl5_step(unsigned s)
 		if (wl_bhi < 0x40 || wl_bhi > 0x3fc0 || (wl_bhi & 3) ||
 		    wl_bhie < 0x40 || wl_bhie > 0x3f80 || (wl_bhie & 3)) { return 4; }
 		wl_mhi_valid = true;
+		if ((wl_seq_flags & WL_O_CYCLE) && wl_m6o_cycle()) { return 0x6f; }
 		return wl_smmu_probe();
 	case 18: {
 		uint32_t saved = wl_mrd(0x310c);
@@ -2177,15 +2579,17 @@ wl5_step(unsigned s)
 			printf("FUXI WLAN: M6m stock input selected major 2; no fallback or provenance claim\n");
 		}
 		printf("FUXI WLAN: TCSR_SOC_HW_VERSION %#x major %u minor %u firmware %s (CNSS kiwi major-version rule)\n", hw, (hw >> 8) & 15, hw & 255, wl_fw_path);
-		return wl_pre_bhi() ? 0x6c : 0;
+		if (wl_pre_bhi()) { return 0x6c; }
+		return wl_m6o_early() && wl_m6o_master() ? 0x6f : 0;
 	}
 	case 19: return wl_read_firmware();
 	case 20: {
-		if (wl_disable_irqs()) { return 4; }
+		if (!(wl_seq_flags & WL_O_MSI) && wl_disable_irqs()) { return 4; }
 		if (wl_mrd(wl_bhi + 0x28) != 0 || (wl_mrd(0x38) & 2) ||
-		    (wl_mrd(0x48) & 0xff04) || (wl_prd(WL_EPCFG + 4) & 4)) { return 1; }
-		unsigned n = (wl_fw_size + WL_CHUNK - 1) / WL_CHUNK;
-		if (wl_dma_alloc(&wl_vectors, n * sizeof(struct wl_vector)) ||
+		    ((wl_mrd(0x48) & 0xff04) && !((wl_seq_flags & WL_O_POR) &&
+		    ((wl_mrd(0x48)>>8)&255) == 0xff)) || ((wl_prd(WL_EPCFG + 4) & 4) != (wl_m6o_early() ? 4u : 0u))) { return 1; }
+		unsigned n = (wl_seq_flags & WL_O_PREFIX) ? 0 : (wl_fw_size + WL_CHUNK - 1) / WL_CHUNK;
+		if ((n && wl_dma_alloc(&wl_vectors, n * sizeof(struct wl_vector))) ||
 		    wl_dma_alloc(&wl_contexts, 16384)) { return 2; }
 		struct wl_vector *v = (struct wl_vector *)wl_vectors.va;
 		for (unsigned i = 0; i < n; i++) {
@@ -2202,7 +2606,8 @@ wl5_step(unsigned s)
 		c->base = c->rp = c->wp = wl_contexts.iova + WL_CR; c->len = 2048;
 		wl_dma_clean(&wl_contexts); wl_dma_clean(&wl_vectors);
 		wl5_report[19] = n * sizeof(struct wl_vector);
-		if (wl_vec == 2) {
+		if ((wl_seq_flags & WL_O_POR) && wl_m6o_rx_clear()) { return 0x6f; }
+		if (wl_vec == 2 || (wl_seq_flags & WL_O_POR)) {
 			unsigned rxn = WL_RDDM_SIZE / WL_CHUNK;
 			if (wl_dma_alloc(&wl_rddm, WL_RDDM_SIZE) ||
 			    wl_dma_alloc(&wl_rxvectors, rxn * sizeof(struct wl_vector))) { return 2; }
@@ -2213,8 +2618,11 @@ wl5_step(unsigned s)
 			wl_dma_clean(&wl_rddm); wl_dma_clean(&wl_rxvectors);
 		}
 		wl5_report[20] = (uint32_t)wl_vectors.iova; wl5_report[21] = (uint32_t)wl_contexts.iova;
-		printf("FUXI WLAN: prepared %u vectors (%u bytes), 44-byte contexts, channels disabled; bus master off\n", n, wl5_report[19]);
-		return fw_faults ? 3 : wl_smmu_enable();
+		printf("FUXI WLAN: prepared %u vectors (%u bytes), 44-byte contexts, channels disabled; BME follows selected sequence\n", n, wl5_report[19]);
+		if (fw_faults) { return 3; }
+		int setup = wl_smmu_enable();
+		if (!setup && (wl_seq_flags & WL_O_POR)) { setup = wl_m6o_prepare(); }
+		return setup;
 	}
 	case 21: {
 		if (wl_probe_fired) { return 0x6b; } /* never a second doorbell this boot */
@@ -2225,21 +2633,23 @@ wl5_step(unsigned s)
 		    wl_smmu_verify("CB_SCTLR pre-DMA", wl_cb_addr(wl_cb), WL_CB_SCTLR,
 		    wl_prd(wl_cb_addr(wl_cb)), WL_CB_SCTLR, WL_CB_SCTLR_MASK) ||
 		    (wl_prd(WL_PARF + 0x2c00) & 1) || wl_prd(WL_PARF + 0x234)) { return 6; }
-		if (wl_fabric_prepare()) {
+		if (!wl_m6o_early() && wl_fabric_prepare()) {
 			wl_host_diag("preflight-blocked");
 			return 10;
 		}
-		if (wl_download_aspm()) { return 11; }
+		if (!wl_m6o_early() && wl_download_aspm()) { return 11; }
 		/* ath12k_mhi_clear_vector: undefined reset status is not a result.
 		 * Only doorbells/status, no RDDM buffers and no retry. */
 		const unsigned clear[] = {0x3c, 0x44, 0x70, 0x78};
-		for (unsigned i = 0; i < 4; i++) { wl_mwr(wl_bhie + clear[i], 0); }
-		for (unsigned i = 0; i < 4; i++) {
+		unsigned clear_count = (wl_seq_flags & WL_O_POR) ? 2 : 4;
+		for (unsigned i = 0; i < clear_count; i++) { wl_mwr(wl_bhie + clear[i], 0); }
+		for (unsigned i = 0; i < clear_count; i++) {
 			if (wl_mrd(wl_bhie + clear[i]) || fw_faults) { return 9; }
 		}
-		printf("FUXI WLAN: M6f BHIe TX/RX doorbells/status cleared; %s\n",
-		    wl_vec == 2 ? "RX buffers prepared" : "no RX buffers");
-		if (wl_vec) {
+		printf("FUXI WLAN: M6f BHIe %s doorbells/status cleared; %s\n",
+		    (wl_seq_flags & WL_O_POR) ? "TX (prepared RX retained)" : "TX/RX",
+		    (wl_vec == 2 || (wl_seq_flags & WL_O_POR)) ? "RX buffers prepared" : "no RX buffers");
+		if (wl_vec && !(wl_seq_flags & WL_O_POR && wl_vec == 2)) {
 			bool rx = wl_vec == 2;
 			uint32_t off = rx ? 0x60 : 0x2c;
 			uint64_t addr = rx ? wl_rxvectors.iova : wl_vectors.iova;
@@ -2262,7 +2672,8 @@ wl5_step(unsigned s)
 			    rx ? "RDDM RX" : "AMSS TX", bytes, rx ? "RX doorbell armed; sink only" : "TX doorbell remains zero");
 		}
 		wl_probe_pattern();
-		wl_mwr(wl_bhi + 0x20, 0); wl_mwr(wl_bhi + 0x2c, 0);
+		if (!(wl_seq_flags & WL_O_POR)) { wl_mwr(wl_bhi + 0x20, 0); }
+		wl_mwr(wl_bhi + 0x2c, 0);
 		wl_mwr64(wl_bhi + 8, wl_image.iova); wl_mwr(wl_bhi + 0x10, wl_bhi_bytes());
 		wl_dma_clean(&wl_image);
 		if (wl_bhi_mapping_check()) { return 8; }
@@ -2276,9 +2687,18 @@ wl5_step(unsigned s)
 		if (fw_faults) { return 1; }
 		if (hi != (uint32_t)(wl_image.iova >> 32) || lo != (uint32_t)wl_image.iova ||
 		    size != wl_bhi_bytes() || ivec || status || ee != 0 || (wl_image.iova & 4095)) { return 7; }
-		/* Only now, immediately before the first image doorbell, allow DMA.
-		 * Disable legacy INTx; MSI/MSI-X remain unconfigured/disabled. */
-		wl_pwr(WL_EPCFG + 4, (wl_prd(WL_EPCFG + 4) & 0xffff) | 0x404);
+		/* Default enables BME here; M6o early-MASTER modes must retain it.
+		 * INTx stays disabled; MSI either disabled or targets the owned sink. */
+		if (wl_m6o_early() && !(wl_prd(WL_EPCFG+4)&4)) { return 0x6f; }
+		if (wl_seq_flags & WL_O_MSI) {
+			unsigned p = wl_msi_cap;
+			if (!p || (wl_prd(WL_EPCFG+p)&0x00710000) != 0x00510000 ||
+			    wl_prd(WL_EPCFG+p+4) != (uint32_t)wl_msi_sink.iova ||
+			    wl_prd(WL_EPCFG+p+8) != (uint32_t)(wl_msi_sink.iova>>32) ||
+			    (wl_prd(WL_EPCFG+p+12)&0xffff) ||
+			    (wl_msi_pvm && wl_prd(WL_EPCFG+p+16))) { return 0x6f; }
+		}
+		if (!wl_m6o_early()) { wl_pwr(WL_EPCFG + 4, (wl_prd(WL_EPCFG + 4) & 0xffff) | 0x404); }
 		if ((wl_prd(WL_EPCFG + 4) & 0x406) != 0x406 || fw_faults) { return 2; }
 		wl_host_diag("preflight");
 		/* Step 14 sets RC BME already. Prove it survived; do not silently
@@ -2388,6 +2808,7 @@ wl5_abort(unsigned step)
 	uint32_t cmd = wl_prd(WL_EPCFG + 4);
 	int bm_bad = wl_contain_wr(WL_EPCFG + 4, cmd & 0xffff & ~4u);
 	cmd = wl_prd(WL_EPCFG + 4); bm_bad |= cmd == ~0u || !!(cmd & 4);
+	if (!bm_bad && wl_seq_flags && wl_m6o_msi_undo()) { bm_bad = 1; }
 	/* gpio94 was configured as an output at step 5; clear only its OUT bit. */
 	uint64_t perst = TS_TLMM + 0x1000ull * 94 + 4;
 	uint32_t io = wl_prd(perst);
@@ -2399,8 +2820,9 @@ wl5_abort(unsigned step)
 	    reset_bad ? "unconfirmed" : "done", bm_bad ? "unconfirmed" : "yes", perst_bad ? "unconfirmed" : "yes");
 	/* No DMA buffer is ever returned to the allocator while containment is
 	 * unproven. This is a bounded leak on an MMIO fault, never a panic/UAF. */
-	if (!bm_bad && !perst_bad && !wl_smmu_undo()) {
-		wl_dma_free(&wl_tables);
+	int seq_bad = wl_seq_flags ? wl_m6o_undo(!perst_bad) : 0;
+	if (!bm_bad && !perst_bad && !seq_bad && !wl_smmu_undo()) {
+		wl_dma_free(&wl_msi_sink); wl_dma_free(&wl_tables);
 		wl_dma_free(&wl_rxvectors); wl_dma_free(&wl_rddm);
 		wl_dma_free(&wl_contexts); wl_dma_free(&wl_vectors); wl_dma_free(&wl_image);
 		printf("FUXI WLAN: abort buffers freed\n");
@@ -2467,6 +2889,7 @@ fw_run(unsigned limit)
 				printf("FUXI WLAN: M6n PDC blocked before WLAN power, consumed %u/13 reason %u; reboot to retry\n",
 				    wl_pdc_acks, (unsigned)e);
 			}
+			if (!e && s == 1 && wl_variant_invalid && wl_seq_requested) { e = 0x6f; }
 			if (!e) { e = wl_icc_step(s); } /* failure blocks link training / BHI */
 			if (!e) {
 				wlan_m3(s); /* runs only step s: earlier ones are in wl3_done */
@@ -2502,7 +2925,7 @@ fw_run(unsigned limit)
 		if (e) {
 			r4[3] = s << 8 | (unsigned)e;
 			wl5_report[3] = r4[3];
-			if (s >= 17) { wl5_abort(s); }
+			if (s >= 17 || (wl_seq_flags && s >= 8)) { wl5_abort(s); }
 			printf("FUXI WLAN: stopped at step %u reason %u ESR %#x FAR %#llx; reboot to retry\n",
 			    s, e, fw_fault_esr, fw_fault_far);
 			goto out;
@@ -2510,7 +2933,7 @@ fw_run(unsigned limit)
 	}
 	printf("FUXI WLAN: %u steps done\n", limit);
 	/* A deliberate partial M5 run also shuts down before releasing memory. */
-	if (limit >= 17 && limit < WL5_STEPS) { wl5_abort(limit); }
+	if ((limit >= 17 || (wl_seq_flags && limit >= 8)) && limit < WL5_STEPS) { wl5_abort(limit); }
 out:
 	/* Shared GCC vote registers (touch and GPU also read-modify-write
 	 * 0x52008/0x52000 without a common lock): show the final values. */

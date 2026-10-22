@@ -394,13 +394,22 @@ static int wl3_step(unsigned step)
   wl_clr(WL_GCC, 0x6b000, 1); delay(1000);
   wl_pwr(WL_PARF + 0x1000, 4);
   wl_pwr(WL_PARF + 0x40, wl_prd(WL_PARF + 0x40) & ~1u);
+#ifdef FUXI_WLAN_XNU
+  if (!wl_m6o_parf()) {
+#endif
   wl_pwr(WL_PARF + 0x350, 0x60000000u); wl_pwr(WL_PARF + 0x354, 0);
   wl_pwr(WL_PARF + 0x634, 0x60001000u); wl_pwr(WL_PARF + 0x638, 0);
   wl_pwr(WL_PARF + 0x358, 0); wl_pwr(WL_PARF + 0x35c, 0x80000000u);
   wl_pwr(WL_PARF + 0x0, wl_prd(WL_PARF + 0x0) & ~(1u << 29));
+#ifdef FUXI_WLAN_XNU
+  }
+#endif
   wl_pwr(WL_PARF + 0x174, wl_prd(WL_PARF + 0x174) | (1u << 4));
   wl_pwr(WL_PARF + 0x20, wl_prd(WL_PARF + 0x20) & ~(1u << 5));
   wl_pwr(WL_PARF + 0x1a8, wl_prd(WL_PARF + 0x1a8) | (1u << 31));
+#ifdef FUXI_WLAN_XNU
+  if (wl_m6o_host(8)) return 0x6f;
+#endif
   r[58] = wl_prd(WL_PARF + 0x1000); r[59] = wl_prd(WL_PARF + 0x40);
   r[60] = wl_prd(WL_PARF + 0x350); r[61] = wl_prd(WL_PARF + 0x634);
   return (wl3_faults || (r[58] & 0xf) != 4) ? 1 : 0;
@@ -423,6 +432,9 @@ static int wl3_step(unsigned step)
   return (r[63] & (1u << 6)) ? 2 : 0;
  }
  case 10: /* PERST# deassert */
+#ifdef FUXI_WLAN_XNU
+  if (wl_m6o_host(10)) return 0x6f;
+#endif
   delay(100000);
   ts_gpio(94, 0, 1, 2, 1);
   delay(1000);
@@ -433,6 +445,9 @@ static int wl3_step(unsigned step)
   uint64_t t0, seen0 = 0, seen1 = 0;
   r[67] = cap;
   if (!cap || wl3_faults) return 1;
+#ifdef FUXI_WLAN_XNU
+  if (wl_m6o_host(11)) return 0x6f;
+#endif
   wl_pwr(WL_PARF + 0x1b0, wl_prd(WL_PARF + 0x1b0) | (1u << 8));
   t0 = wl_now_us();
   for (;;) {
@@ -476,6 +491,9 @@ static int wl3_step(unsigned step)
   r[77] = wl_prd(0x60100008ull); r[78] = wl_prd(0x6010000cull);
   r[79] = wl_prd(0x6010002cull); r[80] = wl_prd(0x60100004ull);
   if (wl3_faults) return 2;
+#ifdef FUXI_WLAN_XNU
+  if (id == 0x110717cbu && wl_m6o_host(12)) return 0x6f;
+#endif
   return id == 0x110717cbu ? 0 : 3;
  }
  case 13: /* BAR sizing: r[81+b] original, r[87+b] all-ones readback */

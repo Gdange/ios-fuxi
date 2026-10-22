@@ -110,6 +110,8 @@ static void wl_mark(unsigned s) { }
 static int wl4_step(unsigned s) { return 0; }
 static int wl5_step(unsigned s) { if(s==21) bhi++; return 0; }
 static unsigned wl_pdc_acks, pdc_error;
+static unsigned wl_seq_flags;
+static bool wl_variant_invalid, wl_seq_requested;
 static int wl_cnss_pdc(void) { return pdc_error; } /* peer exercised by M6n suite */
 static void wl5_status(unsigned s) { }
 static bool wl_smmu_fault(unsigned s) { return false; }
@@ -325,6 +327,9 @@ int main(void) {
     fixture(); pdc_error=6; fw_run(22);
     assert(!triggers && !bhi && !nstages); /* policy failure precedes all power writes */
     pdc_error=0;
+    fixture(); wl_variant_invalid=wl_seq_requested=true; fw_run(22);
+    assert(!triggers && !bhi && !nstages); /* invalid M6o selector blocks before power */
+    wl_variant_invalid=wl_seq_requested=false;
     fixture(); fw_run(22); assert(triggers==8 && bhi==1 && aborts==1 && wl_icc_acks==2);
     for(unsigned phase=0;phase<2;phase++) for(unsigned group=1;group<=4;group++) {
         fixture(); fail_irq=1; fail_cstat=1; fail_trigger=phase*4+group; fw_run(22);

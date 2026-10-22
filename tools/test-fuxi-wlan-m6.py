@@ -67,7 +67,10 @@ typedef void *event_t;
 #define WL_DBI 0x60000000ull
 #define WL_PARF 0x1c00000ull
 #define TS_TLMM 0xf100000ull
-static uint32_t wl4_report[64], fw_faults;
+static uint32_t wl4_report[64], wl3_report[128], fw_faults;
+static unsigned rh_send(unsigned t, unsigned addr, unsigned data);
+static unsigned wl_vrm(unsigned addr, unsigned mv) { return rh_send(0,addr,mv) || rh_send(0,addr+4,1); }
+static unsigned rh_send(unsigned t, unsigned addr, unsigned data) { return 0; }
 static unsigned wl_icc_acks;
 struct reg { uint64_t pa; uint32_t v; };
 struct ev { char kind; uint64_t pa; uint32_t v; };
@@ -78,7 +81,7 @@ static int old_iova_arg;
 static bool old_iova_present;
 static int clock_arg, iboff_arg;
 static int aspm_arg;
-static const char *probe_arg, *pre_arg, *bhi_arg, *vec_arg, *fw_arg, *cnss_arg;
+static const char *probe_arg, *pre_arg, *bhi_arg, *vec_arg, *fw_arg, *cnss_arg, *seq_arg;
 static unsigned cache_attrs[32][1024];
 static bool cache_drop;
 static unsigned clock_delays;
@@ -95,8 +98,9 @@ static bool PE_parse_boot_argn(const char *name, void *out, int size) {
                       !strcmp(name,"fuxiwlanbhi") ? bhi_arg :
                       !strcmp(name,"fuxiwlanfw") ? fw_arg :
                       !strcmp(name,"fuxiwlancnss") ? cnss_arg :
+                      !strcmp(name,"fuxiwlanseq") ? seq_arg :
                       !strcmp(name,"fuxiwlanvec") ? vec_arg : NULL;
-    if(!strcmp(name,"fuxiwlanpre") || !strcmp(name,"fuxiwlanbhi") || !strcmp(name,"fuxiwlanvec") || !strcmp(name,"fuxiwlanfw") || !strcmp(name,"fuxiwlancnss")) {
+    if(!strcmp(name,"fuxiwlanpre") || !strcmp(name,"fuxiwlanbhi") || !strcmp(name,"fuxiwlanvec") || !strcmp(name,"fuxiwlanfw") || !strcmp(name,"fuxiwlancnss") || !strcmp(name,"fuxiwlanseq")) {
         if(arg) { strncpy(out,arg,size); return true; }
         return false;
     }
@@ -261,7 +265,9 @@ static void init(void) {
     memset(&wl_image,0,sizeof(wl_image)); memset(&wl_vectors,0,sizeof(wl_vectors));
     memset(&wl_tables,0,sizeof(wl_tables)); wl_owned=wl_enabled=wl_route_owned=wl_route_installed=false;
     old_iova_arg=0; old_iova_present=false; probe_arg=NULL; aspm_arg=0;
-    pre_arg=bhi_arg=vec_arg=fw_arg=cnss_arg=NULL;
+    pre_arg=bhi_arg=vec_arg=fw_arg=cnss_arg=seq_arg=NULL;
+    wl_seq_undos=wl_eq_bank=wl_msi_cap=wl_pm_cap=0; wl_cycle_attempted=wl_cycle_powered=wl_msi_pvm=false;
+    memset(&wl_msi_sink,0,sizeof(wl_msi_sink));
     wl_pdc_attempted=false; wl_pdc_acks=0;
     memset(&wl_rddm,0,sizeof(wl_rddm)); memset(&wl_rxvectors,0,sizeof(wl_rxvectors));
     cache_drop=false; memset(cache_attrs,0,sizeof(cache_attrs)); wl_iova_configure();
