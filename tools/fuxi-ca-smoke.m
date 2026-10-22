@@ -160,7 +160,14 @@ static void schedReport(const char *label){thread_extended_info_data_t i;mach_ms
  int bg=getpriority(PRIO_DARWIN_PROCESS,0);kern_return_t kr=thread_info(mach_thread_self(),THREAD_EXTENDED_INFO,(thread_info_t)&i,&n);
  printf("FUXI CA: display sched %s darwin_bg=%d policy=%d curpri=%d priority=%d kr=%d\n",label,bg,
   kr?-1:i.pth_policy,kr?-1:i.pth_curpri,kr?-1:i.pth_priority,kr);}
+// One undisturbed second: the system's own interrupt rate per CPU (a cooling baseline).
+static void quietProbe(void){processor_cpu_stat_data_t a[8],b[8];unsigned n=cpuStats(a,8);
+ CFTimeInterval t=CACurrentMediaTime();usleep(1000000);double wall=(CACurrentMediaTime()-t)*1000;
+ if(!n||cpuStats(b,8)!=n){printf("FUXI CA: quiet probe cpu stats unavailable\n");return;}
+ for(unsigned c=0;c<n;++c)printf("FUXI CA: quiet probe cpu%u in %.1f ms timer=%u ipi=%u irq=%u\n",c,wall,
+  b[c].timer_cnt-a[c].timer_cnt,b[c].ipi_cnt-a[c].ipi_cnt,b[c].irq_ex_cnt-a[c].irq_ex_cnt);}
 static void timerProbe(void){
+ quietProbe();
  sleepProbe("idle");
  pthread_t t[8];unsigned n=0;atomic_store(&spinning,1);
  for(;n<8;++n)if(pthread_create(&t[n],NULL,spin,NULL))break;
