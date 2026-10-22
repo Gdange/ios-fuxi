@@ -2374,30 +2374,42 @@ wl_m6o_cycle(void)
 	return 0;
 }
 
+/* Step 18 failed silently on device right after a successful cycle; name the stage. */
+static int
+wl_m6o_master_fail(const char *what)
+{
+	printf("FUXI WLAN: M6o power-up failed at %s (faults %u)\n", what, fw_faults);
+	return 1;
+}
+
 static int
 wl_m6o_master(void)
 {
 	struct wl_seq_config cfg;
-	if (wl_m6o_config_save(&cfg)) { return 1; }
+	if (wl_m6o_config_save(&cfg)) { return wl_m6o_master_fail("config save"); }
 	if (wl_seq_flags & WL_O_MSI) {
 		unsigned p = wl_m6o_cap(5);
 		uint32_t cap = p ? wl_prd(WL_EPCFG+p) : 0;
 		/* KIWI 64-bit MSI, >=32 messages. Require room for addr/data. */
 		if (!p || p > 0xe8 || !(cap & (1u<<23)) || ((cap>>17)&7) < 5 ||
-		    wl_disable_irqs() || wl_dma_alloc(&wl_msi_sink, PAGE_SIZE)) { return 1; }
+		    wl_disable_irqs() || wl_dma_alloc(&wl_msi_sink, PAGE_SIZE)) {
+			printf("FUXI WLAN: M6o MSI cap %#x at %#x sink %p\n", cap, p, (void *)wl_msi_sink.va);
+			return wl_m6o_master_fail("MSI capability/IRQ disable/sink");
+		}
 		wl_msi_pvm = !!(cap & (1u<<24));
 		for (unsigned i = 0; i < (wl_msi_pvm ? 5u : 4u); i++) { wl_msi_saved[i] = wl_prd(WL_EPCFG+p+4*i); }
 		wl_msi_saved[0] &= ~(1u<<16); /* cleanup never reenables inherited IRQs */
-		if (fw_faults) { return 1; }
+		if (fw_faults) { return wl_m6o_master_fail("MSI save fault"); }
 		wl_msi_cap = p;
 		wl_dma_clean(&wl_msi_sink);
 	}
-	if (wl_smmu_enable() || wl_fabric_prepare()) { return 1; }
+	if (wl_smmu_enable()) { return wl_m6o_master_fail("SMMU enable"); }
+	if (wl_fabric_prepare()) { return wl_m6o_master_fail("fabric prepare"); }
 	unsigned pm = wl_m6o_cap(1);
 	wl_pm_cap = pm;
 	if (!pm || pm > 0xf8 || wl_m6o_write("power-up D0", WL_EPCFG+pm+4, 0, 3) ||
 	    wl_m6o_write("power-up enable MEMORY", WL_EPCFG+4, 0x402, 0xffff) ||
-	    wl_m6o_config_restore(&cfg) || wl_download_aspm()) { return 1; }
+	    wl_m6o_config_restore(&cfg) || wl_download_aspm()) { return wl_m6o_master_fail("D0/config restore/ASPM"); }
 	if (wl_seq_flags & WL_O_MSI) {
 		unsigned p = wl_msi_cap;
 		if (wl_m6o_write("MSI address high", WL_EPCFG+p+8, (uint32_t)(wl_msi_sink.iova>>32), ~0u) ||
