@@ -2068,6 +2068,8 @@ wl_m6o_write(const char *what, uint64_t pa, uint32_t value, uint32_t mask)
 	wl_pwr(pa, v);
 	uint32_t rb = wl_prd(pa);
 	printf("FUXI WLAN: M6o %s offset %#llx write %#x read %#x mask %#x\n", what, pa, v, rb, mask);
+	/* PME_TURNOFF self-clears once the message is sent; PM_STTS is checked next. */
+	if (pa == WL_DBI + 0xf24) { return fw_faults ? 1 : 0; }
 	return fw_faults || (rb & mask) != (v & mask);
 }
 
