@@ -61,6 +61,8 @@ static uint64_t model_leaves[16384];
 static volatile uint64_t *fg_l2(void) { return model_l2; }
 #define G_PTR(pa) ((uintptr_t)((uint8_t *)model_leaves+(pa)-FG_SOURCE_TABLE))
 #define G_PTR_RANGE(pa, bytes) G_PTR(pa)
+static uint64_t fg_faults,fg_suspends;
+static unsigned fg_reset_held;
 static unsigned fg_state=1, fg_force, fg_seq, fg_access_failed, g3_wptr;
 static unsigned g3_slot[2]={1,2};
 static uint64_t fg_deadline, fg_submit_time, ticks;
@@ -77,7 +79,6 @@ static unsigned gbif, reset_held, faulted_sids;
 static uint8_t *source_buf, *panel;
 static unsigned expected_pages[4096], paddr_missing;
 static unsigned pdst[2400*1080], pdata[2400*1080];
-static void fg_fail(const char *why, unsigned code) { (void)why; (void)code; fg_state=2; }
 static unsigned fg_access(uint64_t pa, uint64_t *v, unsigned wr, unsigned wide)
 {
  assert(!wide);
@@ -208,6 +209,7 @@ static int g3_gw(unsigned reg,unsigned value)
 }
 static void reset(void)
 {
+ fg_faults=fg_suspends=fg_reset_held=0;
  fg_state=1; fg_force=fg_seq=fg_access_failed=mode=fail_tlb=tlbs=isolated=doorbells=0;
  g3_wptr=rptr=wptr=8190; fence=cache_clean=pending=gbif=reset_held=faulted_sids=paddr_missing=0;
  fg_busy=fg_magic=0; ticks=lookups=contiguous_pa=0; clean_bytes=0; memset(&times,0,sizeof(times)); memset(fg_generation,0,sizeof(fg_generation)); memset(model_l2,0,sizeof(model_l2)); memset(model_leaves,0,sizeof model_leaves); memset(panel,0x6b,4320*2400+64);
@@ -288,7 +290,9 @@ int main(void)
   if(m==3) continue;
   mode=m;
   int result=model_copy(0,1,(uintptr_t)source_buf,4320*10,4320,0,0,0,0,10,10,&times);
-  assert(result==(m==7 ? -1 : 0) && fg_state==2);
+  assert(result==(m==7 ? -1 : 0) && fg_state==2 && fg_faults==1);
+  fg_fail("repeat",0);assert(fg_faults==1);
+  assert(fg_suspends==(unsigned)!!isolated);
   assert(ticks<120000); /* six tick deadline + bounded isolation */
   if(doorbells) assert(isolated && gbif==2 && reset_held==1 && faulted_sids==2);
   unsigned before=doorbells;
@@ -305,6 +309,12 @@ int main(void)
  assert(!fuxi_gpu_poll(&times) && !times.sleeps && fg_busy);
  ticks+=200000;
  assert(fuxi_gpu_poll(&times)==1 && !fg_busy && !isolated);
+ // Actual shared fault/reset accounting: saturate, count an asserted
+ // containment reset once even if the bus drain is repeated.
+ reset();fg_faults=fg_suspends=UINT64_MAX;
+ fg_fail("saturated",0);assert(fg_faults==UINT64_MAX);
+ assert(fg_isolate() && fg_suspends==UINT64_MAX);
+ fg_suspends=5;assert(fg_isolate() && fg_suspends==5);
  /* Independent windows and generations; unmapping one preserves the others. */
  reset();
  for(unsigned slot=0;slot<4;slot++) {
@@ -345,7 +355,7 @@ def main():
         for b, m in windows[i+1:]:
             assert a + n <= b or b + m <= a, 'overlapping platform mappings'
     functions = ''.join(function(probe, n) for n in ('g3_parity', 'g3_pkt7', 'g4_pkt4', 'g4_reg', 'g4_event', 'g4_wfi', 'g4_setup', 'g4_end'))
-    functions += ''.join(function(adapter, n) for n in ('fg_isolate', 'fuxi_gpu_unmap', 'fuxi_gpu_map', 'fg_rect', 'fg_clean', 'fuxi_gpu_poll', 'fuxi_gpu_copy'))
+    functions += ''.join(function(adapter, n) for n in ('fg_fail', 'fg_isolate', 'fuxi_gpu_unmap', 'fuxi_gpu_map', 'fg_rect', 'fg_clean', 'fuxi_gpu_poll', 'fuxi_gpu_copy'))
     functions = re.sub(r'__asm__ volatile\([^;]*\);', ';', functions)
     constants = '\n'.join(line for line in sync.added_file('gpu-a740.h').splitlines() if line.startswith('#define G4_'))
     with tempfile.TemporaryDirectory() as d:

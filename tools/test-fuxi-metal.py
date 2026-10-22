@@ -147,8 +147,10 @@ static uint64_t counter(const char *name) {return strcmp(name,"cntfrq_el0")?tick
 static unsigned fg_access_failed,fg_busy,fg_client_busy,g3_wptr,g3_bank=2,g3_asid=3;
 static unsigned cacheClean,cacheInvalidate;
 static void host_cache(uintptr_t p,int complete) { assert(!(p&63)); if(complete) cacheInvalidate++; else cacheClean++; }
+static uint64_t fg_faults,fg_suspends;
 static unsigned state=1,drains,drainGood=1,fault,tlbs,failTlb,doorbells,enqueued;
 static uint32_t regs[0x10000],sregs[0x1000],ring[8192];
+static unsigned highReads,rollover;
 static unsigned readFault,sreadFault,writeFail,writeCount,logLines,dumpLines,hangLines;
 static char lastLog[256],hangLog[16][256];
 static int trace(const char *fmt,...) {
@@ -157,7 +159,11 @@ static int trace(const char *fmt,...) {
 }
 #define printf trace
 static unsigned g_cb(unsigned bank) {return bank*0x100;}
-static uint32_t g3_gr(unsigned reg) {assert(reg<0x10000);if(reg==readFault)fg_access_failed=1;return regs[reg];}
+static uint32_t g3_gr(unsigned reg) {assert(reg<0x10000);if(reg==readFault)fg_access_failed=1;if(reg==0x981) {
+  highReads++;
+  if(rollover && (rollover==2 || highReads==1))return highReads;
+ }
+ return regs[reg];}
 static int g3_gw(unsigned reg,uint32_t value) {if(++writeCount==writeFail) {fg_access_failed=1;return 0;} regs[reg]=value; if(reg==0x807) doorbells++; return 1;}
 static uint32_t g3_sr(unsigned reg) {if(sreadFault)fg_access_failed=1;return sregs[reg/4];}
 static int g3_sw(unsigned reg,uint32_t value) {assert(!fg_busy);sregs[reg/4]=value;return 1;}
@@ -166,8 +172,8 @@ static uint32_t g3_read(uint64_t pa) {return *(uint32_t *)G_PTR(pa);}
 static void g_wr(uint64_t pa,unsigned off,uint32_t value) {*(uint32_t *)G_PTR(pa+off)=value;}
 static int g3_faulted(void) {return fault;}
 static int g4_tlb(uint32_t *d) {(void)d;tlbs++;return failTlb;}
-static int fg_isolate(void) {assert(hangLines==16);drains++;return drainGood;}
-static void fg_fail(const char *why,unsigned code) {(void)why;(void)code;state=2;}
+static int fg_isolate(void) {assert(hangLines==16);drains++;if(fg_suspends!=UINT64_MAX)fg_suspends++;return drainGood;}
+static void fg_fail(const char *why,unsigned code) {(void)why;(void)code;if(state==1 && fg_faults!=UINT64_MAX)fg_faults++;state=2;}
 static int fuxi_gpu_ready(void) {return state==1;}
 static void g3_emit(uint32_t v) {ring[g3_wptr++&8191]=v;}
 static ppnum_t pmap_find_phys(unsigned map,uintptr_t va) {(void)map; return (unsigned)(0x200000+(va>>14)*3);}
@@ -182,6 +188,7 @@ static void seed(void) {
  sregs[SMMU_ID2/4]=0x5511;
  state=drainGood=1;fg_busy=fg_client_busy=fg_access_failed=0;g3_wptr=0;
  fg_abi_live=fg_abi_seq=fg_abi_completed=fg_abi_poisoned=fg_abi_timed_out=0;fg_abi_hang_dumped=0;
+ fg_faults=fg_suspends=highReads=rollover=0;
  ticks=tlbs=failTlb=doorbells=enqueued=drains=fault=cacheClean=cacheInvalidate=0;
  memset(fg_abi_imports,0,sizeof(fg_abi_imports));fg_abi_host_handoff=0;
  readFault=sreadFault=writeFail=writeCount=logLines=hangLines=0;
@@ -239,6 +246,30 @@ int main(void) {
  seed();regs[0xe0d]=0x12fffff;assert(fg_abi_init()); /* unrounded model also valid */
  puts("PASS: observed A740 page-granular addresses, every ignored offset bit, inclusive GMEM end and exact high/control checks");
  reset();
+ uint64_t timestamp=99,faults=99,suspends=99;
+ assert(!fuxi_gpu_abi_status(&faults,&suspends) && !faults && !suspends);
+ assert(fuxi_gpu_abi_timestamp(NULL)==-2);
+ regs[0x981]=0x123;regs[0x980]=0xfedcba98;
+ assert(!fuxi_gpu_abi_timestamp(&timestamp) && timestamp==0x123fedcba98ULL && highReads==2);
+ rollover=1;highReads=0;
+ assert(!fuxi_gpu_abi_timestamp(&timestamp) && timestamp==0x123fedcba98ULL && highReads==4);
+ rollover=2;highReads=0;
+ assert(fuxi_gpu_abi_timestamp(&timestamp)==-3 && !timestamp && highReads==16);
+ rollover=0;readFault=0x980;
+ assert(fuxi_gpu_abi_timestamp(&timestamp)==-2 && !timestamp);
+ assert(!fuxi_gpu_abi_status(&faults,&suspends) && faults==1 && suspends==1);
+ assert(fuxi_gpu_abi_timestamp(&timestamp)==-1 && !timestamp);
+ fg_abi_live=0;assert(fuxi_gpu_abi_status(&faults,&suspends)==-1 && !faults && !suspends);
+ reset();fault=1; // idle hardware fault also loses the context
+ assert(!fuxi_gpu_abi_status(&faults,&suspends) && faults==1 && suspends==1 && drains==1);
+ assert(!fuxi_gpu_abi_status(&faults,&suspends) && faults==1 && suspends==1 && drains==1);
+ reset();fg_faults=fg_suspends=UINT64_MAX;fault=1;
+ assert(!fuxi_gpu_abi_status(&faults,&suspends) && faults==UINT64_MAX && suspends==UINT64_MAX);
+ reset();state=2;fg_faults=1; // present failure is visible without client poisoning
+ assert(!fuxi_gpu_abi_status(&faults,&suspends) && faults==1 && !suspends && !drains);
+ fault=1;fg_abi_watch(NULL,NULL);assert(!drains && fuxi_gpu_abi_poll(0)==-1);
+ puts("PASS: CP ticks/rollover/retry bound/MMIO failure, idle faults, status after loss, monotonic counts and saturation");
+ reset();
  assert(writeCount==8 && !regs[G3_APERTURE_HOST] && !logLines);
  assert(*(uint64_t *)G_PTR(G3_PT)==0x5a5a5a5a5a5a5a5aULL);
  for(uint64_t pa=G5_META_PA;pa<FG_FW_BASE+3*FG_FW_SLOT;pa+=8)
@@ -286,6 +317,7 @@ int main(void) {
   ticks=100001;fg_abi_watch(NULL,NULL);
   assert(state==2 && drains==1 && !fg_client_busy && !fuxi_gpu_abi_available());
   assert(fuxi_gpu_abi_poll(fence)==(good?-3:-4));
+  assert(!fuxi_gpu_abi_status(&faults,&suspends) && faults==1 && suspends==1);
   assert(hangLines==16 && writeCount==beforeWrites);
   assert(strstr(hangLog[3],"CP_IB1_BASE_LO [0x928]=0x23450000"));
   assert(strstr(hangLog[5],"CP_IB1_REM_SIZE [0x92a]=0x90"));
@@ -296,6 +328,23 @@ int main(void) {
  reset();assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence));fault=1;
  assert(fuxi_gpu_abi_poll(fence)==-1 && drains==1 && state==2);
  reset();failTlb=1;assert(fuxi_gpu_abi_submit(addresses,sizes,1,&fence)==-1 && !doorbells && drains==1);
+ // Fill every import slot, refuse overflow without publishing a PTE, reuse
+ // a slot beyond the old 64-entry limit, then retire/cache and drain all 512.
+ reset();
+ for(unsigned i=0;i<FG_ABI_MAX_IMPORTS;i++)
+  assert(!fuxi_gpu_abi_map_import(0x20000000+i*16384,source+i*16384,16384,3));
+ assert(FG_ABI_MAX_IMPORTS>=512);
+ assert(fuxi_gpu_abi_map_import(0x30000000,source,16384,3)==-1 && !*fg_abi_leaf(0x30000000));
+ assert(!fuxi_gpu_abi_unmap(0x20000000+300*16384,16384));
+ assert(!fuxi_gpu_abi_map_import(0x20000000+300*16384,source,16384,3));
+ assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence));
+ assert(cacheClean==FG_ABI_MAX_IMPORTS*256);
+ complete();assert(!fuxi_gpu_abi_poll(fence) && cacheInvalidate==cacheClean);
+ for(unsigned i=0;i<FG_ABI_MAX_IMPORTS;i++) {
+  assert(!fuxi_gpu_abi_unmap(0x20000000+i*16384,16384));
+  assert(!fg_abi_imports[i].iova);
+ }
+ puts("PASS: all 512 import slots, overflow refusal, high-slot reuse, full cache retirement and unmap");
  // Indirectly referenced imported BOs must participate, even though the IB
  // itself lives in a different ordinary BO. Watchdog retires without WaitFence.
  reset();
@@ -374,6 +423,10 @@ def main():
             folder=HEADERS if name.startswith('fuxi_') else ROOT/'shim/fuxi-probe'
             assert (tree/'bsd/dev'/name).read_bytes()==(folder/name).read_bytes(),name
         print('PASS: clean 0098 + 0100 ABI/helper patch application and canonical source bytes')
+        subprocess.run(['patch','-s','-p1','--fuzz=0','-i', str(ROOT/'xnu/patches/0102-fuxi-gpu-backboardd-open.patch')],cwd=tree,check=True)
+        admitted=(tree/'iokit/Kernel/arm/FuxiAdrenoUserClient.cpp').read_text()
+        assert '!backboardClient(task)' in admitted and '!connected && fuxi_gpu_abi_available()' in admitted
+        print('PASS: unchanged 0102 admission patch applies after K1; single-connection guard retained')
 
 
 if __name__ == '__main__':

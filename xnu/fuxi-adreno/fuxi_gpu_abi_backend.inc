@@ -18,13 +18,13 @@ static thread_call_data_t fg_client_watchdog;
 /* Every mapped import can be referenced indirectly by PM4, not just the IB
  * list. Serialize cache handoff with the same GPU lock as submit/retirement.
  * The user client owns these prepared kernel mappings until successful unmap. */
-static struct { uint64_t iova, bytes; uintptr_t source; } fg_abi_imports[64];
+static struct { uint64_t iova, bytes; uintptr_t source; } fg_abi_imports[FG_ABI_MAX_IMPORTS];
 static unsigned fg_abi_host_handoff;
 static void fg_abi_import_cache(int complete)
 {
  if (complete && !fg_abi_host_handoff) return;
  __asm__ volatile("dsb sy" ::: "memory");
- for (unsigned i=0;i<64;i++) if (fg_abi_imports[i].iova) {
+ for (unsigned i=0;i<FG_ABI_MAX_IMPORTS;i++) if (fg_abi_imports[i].iova) {
   uintptr_t end=fg_abi_imports[i].source+fg_abi_imports[i].bytes;
   for (uintptr_t p=fg_abi_imports[i].source;p<end;p+=64) {
    if (complete) { __asm__ volatile("dc ivac, %0" :: "r"(p) : "memory"); }
@@ -93,8 +93,9 @@ static int fg_abi_fault(const char *why)
 static int fg_abi_observe(void)
 {
  if (fg_abi_poisoned) return fg_abi_timed_out ? (fg_abi_drained ? -3 : -4) : (fg_abi_drained ? -1 : -2);
- if (!fg_client_busy) return 0;
+ if (!fuxi_gpu_ready()) return -1;
  if (fg_access_failed || g3_faulted()) return fg_abi_fault("client GPU fault");
+ if (!fg_client_busy) return 0;
  if (g3_read(G3_FENCE_PA+FG_ABI_FENCE_OFF+4)==fg_abi_seq &&
      g3_gr(0x806)==g3_wptr && g3_gr(0x807)==g3_wptr && !(g3_gr(0x210)&~1u)) {
   if (!fg_abi_switch(G3_PT)) return fg_abi_fault("client restore TTBR");
@@ -220,6 +221,33 @@ int fuxi_gpu_abi_available(void)
  FG_GUARD;
  return fg_abi_live && fuxi_gpu_ready() && !fg_abi_poisoned;
 }
+int fuxi_gpu_abi_timestamp(uint64_t *ticks)
+{
+ FG_GUARD;
+ if (!ticks) return -2;
+ *ticks=0;
+ if (!fg_abi_live || !fuxi_gpu_ready() || fg_abi_poisoned) return -1;
+ /* A6XX/A7XX CP_ALWAYS_ON_COUNTER, dword indices (not CPU timer ticks).
+  * High/low/high avoids torn rollover; NativeAdrenoTimer uses eight tries. */
+ for (unsigned attempt=0;attempt<8;attempt++) {
+  uint32_t high=g3_gr(0x981), low=g3_gr(0x980), again=g3_gr(0x981);
+  if (fg_access_failed) { (void)fg_abi_fault("client timestamp MMIO"); return -2; }
+  if (high==again) { *ticks=((uint64_t)high<<32)|low; return 0; }
+ }
+ return -3;
+}
+int fuxi_gpu_abi_status(uint64_t *faults, uint64_t *suspends)
+{
+ FG_GUARD;
+ if (!faults || !suspends) return -1;
+ *faults=*suspends=0;
+ if (!fg_abi_live) return -1;
+ /* Observe even without WaitFence; after isolation never touch powered-down
+  * MMIO. Returning success with the changed count is Turnip's device loss. */
+ if (fuxi_gpu_ready()) (void)fg_abi_observe();
+ *faults=fg_faults; *suspends=fg_suspends;
+ return 0;
+}
 static int fg_abi_map_locked(uint64_t iova, uintptr_t source, uint64_t bytes,
     unsigned permissions, unsigned wb, unsigned sh)
 {
@@ -252,8 +280,8 @@ int fuxi_gpu_abi_map_import(uint64_t iova, uintptr_t source, uint64_t bytes, uns
  if (!source || !bytes || ((source|bytes)&(NativeAdrenoAbiHostPageBytes-1)) ||
      bytes>FG_ABI_MAX_BYTES || source+bytes<source) return -1;
  unsigned slot;
- for (slot=0;slot<64 && fg_abi_imports[slot].iova;slot++) {}
- if (slot==64) return -1;
+ for (slot=0;slot<FG_ABI_MAX_IMPORTS && fg_abi_imports[slot].iova;slot++) {}
+ if (slot==FG_ABI_MAX_IMPORTS) return -1;
  int s=fg_abi_map_locked(iova,source,bytes,permissions,0,2);
  if (!s) {
   fg_abi_imports[slot].source=source; fg_abi_imports[slot].bytes=bytes; fg_abi_imports[slot].iova=iova;
@@ -262,7 +290,7 @@ int fuxi_gpu_abi_map_import(uint64_t iova, uintptr_t source, uint64_t bytes, uns
 }
 static void fg_abi_import_remove(uint64_t iova, uint64_t bytes)
 {
- for (unsigned i=0;i<64;i++)
+ for (unsigned i=0;i<FG_ABI_MAX_IMPORTS;i++)
   if (fg_abi_imports[i].iova==iova && fg_abi_imports[i].bytes==bytes) fg_abi_imports[i].iova=0;
 }
 int fuxi_gpu_abi_unmap(uint64_t iova, uint64_t bytes)

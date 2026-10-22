@@ -70,7 +70,7 @@ static const char *abiStep(unsigned selector) {
 }
 class FuxiAdrenoUserClient : public IOUserClient {
  OSDeclareDefaultStructors(FuxiAdrenoUserClient)
- enum {MaxBos=64};
+ enum {MaxBos=FG_ABI_MAX_BOS};
  struct Bo {
   IOBufferMemoryDescriptor *memory;
   IOMemoryDescriptor *importMemory;
@@ -149,7 +149,8 @@ class FuxiAdrenoUserClient : public IOUserClient {
  IOReturn allocate(const NativeAdrenoAbiBoAlloc &r, NativeAdrenoAbiBoAllocReply &out) {
   if (!fg_abi_alloc_valid(r.bytes,r.align_log2,r.contiguous)) return kIOReturnBadArgument;
   uint64_t allocated=(r.bytes+16383)&~UINT64_C(16383);
-  if (allocated>FG_ABI_MAX_BYTES-wired_ || nextToken_==UINT32_MAX) return kIOReturnNoResources;
+  if (wired_>FG_ABI_MAX_WIRED_BYTES || allocated>FG_ABI_MAX_WIRED_BYTES-wired_ ||
+      nextToken_==UINT32_MAX || nextHandle_==UINT64_MAX) return kIOReturnNoResources;
   Bo *b=nullptr;
   for (auto &candidate:bos_) if (!candidate.handle) { b=&candidate; break; }
   if (!b) return kIOReturnNoResources;
@@ -191,7 +192,8 @@ class FuxiAdrenoUserClient : public IOUserClient {
  IOReturn importHost(const NativeAdrenoAbiBoImport &r, NativeAdrenoAbiBoAllocReply &out) {
   if (current_task()!=task_ || task_==kernel_task || !fg_abi_import_valid(r.address,r.bytes))
    return kIOReturnBadArgument;
-  if (r.bytes>FG_ABI_MAX_BYTES-wired_) return kIOReturnNoResources;
+  if (wired_>FG_ABI_MAX_WIRED_BYTES || r.bytes>FG_ABI_MAX_WIRED_BYTES-wired_ ||
+      nextHandle_==UINT64_MAX) return kIOReturnNoResources;
   Bo *b=nullptr;
   for (auto &candidate:bos_) if (!candidate.handle) { b=&candidate; break; }
   if (!b) return kIOReturnNoResources;
@@ -234,6 +236,14 @@ class FuxiAdrenoUserClient : public IOUserClient {
   }
   if (method==NativeAdrenoMethodWaitFence) {
    const auto &r=*static_cast<const NativeAdrenoAbiWaitFence *>(in); return wait(r.fence,r.timeout_ns);
+  }
+  if (method==NativeAdrenoMethodGetStatus) {
+   auto &reply=*static_cast<NativeAdrenoAbiStatus *>(out);
+   return fuxi_gpu_abi_status(&reply.faults,&reply.suspends) ? kIOReturnNotReady : kIOReturnSuccess;
+  }
+  if (method==NativeAdrenoMethodGetTimestamp) {
+   int s=fuxi_gpu_abi_timestamp(&static_cast<NativeAdrenoAbiTimestamp *>(out)->ticks);
+   return !s ? kIOReturnSuccess : s==-1 ? kIOReturnNotReady : s==-3 ? kIOReturnTimeout : kIOReturnIOError;
   }
   if (method==NativeAdrenoMethodBoCpuUnmap) {
    const auto &r=*static_cast<const NativeAdrenoAbiBoCpuUnmap *>(in);
@@ -299,8 +309,9 @@ class FuxiAdrenoUserClient : public IOUserClient {
    if (!b || r.reserved || r.bytes>64) return kIOReturnBadArgument;
    if (method==NativeAdrenoMethodSetMetadata) { bcopy(r.text,b->metadata,r.bytes); b->metadataBytes=r.bytes; }
    else {
+    if (r.bytes<b->metadataBytes) return kIOReturnBadArgument;
     auto &reply=*static_cast<NativeAdrenoAbiMetadata *>(out); reply={}; reply.handle=r.handle;
-    reply.bytes=r.bytes<b->metadataBytes ? r.bytes : b->metadataBytes;
+    reply.bytes=b->metadataBytes;
     bcopy(b->metadata,reply.text,reply.bytes);
    }
    return kIOReturnSuccess;

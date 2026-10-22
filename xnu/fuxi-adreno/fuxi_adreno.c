@@ -229,6 +229,10 @@ static volatile uint64_t *fg_l2(void)
  return (volatile uint64_t *)G_PTR_RANGE(root[1] & ~4095ULL,4096);
 }
 static volatile unsigned fg_state; /* 0 disabled/starting, 1 ready, 2 permanently failed */
+/* Serialized with the ring after startup. Counts survive client close/open;
+ * failure before ready is not a lost userspace context. No recovery yet. */
+static uint64_t fg_faults, fg_suspends;
+static unsigned fg_reset_held;
 static unsigned fg_started, fg_limit, fg_force, fg_seq;
 int fuxi_gpu_ready(void) { return __atomic_load_n(&fg_state, __ATOMIC_ACQUIRE) == 1; }
 static uint64_t fg_deadline, fg_submit_time;
@@ -236,6 +240,7 @@ static unsigned fg_busy, fg_magic;
 static int fg_expired(void) { return rsr("cntpct_el0") >= fg_deadline; }
 static void fg_fail(const char *reason, unsigned code)
 {
+ if (fuxi_gpu_ready() && fg_faults!=UINT64_MAX) ++fg_faults;
  __atomic_store_n(&fg_state, 2, __ATOMIC_RELEASE);
  printf("FUXI GPU: disabled permanently: %s (%#x), CPU present\n", reason, code);
 }
@@ -262,7 +267,11 @@ static int fg_isolate(void)
    if (fg_access(GPU_REG_BASE + 0x3c45*4, &v, 1, 0)) good = 0;
   }
  }
- v = 1; (void)fg_access(GPU_REG_BASE + 0x43*4, &v, 1, 0);
+ v = 1;
+ if (!fg_access(GPU_REG_BASE + 0x43*4, &v, 1, 0) && !fg_reset_held) {
+  fg_reset_held=1;
+  if (fg_suspends!=UINT64_MAX) ++fg_suspends;
+ }
  delay(100);
  for (unsigned i = 0; i < 2; i++) {
   v = 2u << 16; (void)fg_access(GPU_SMMU_BASE + SMMU_S2CR(g3_slot[i]), &v, 1, 0);

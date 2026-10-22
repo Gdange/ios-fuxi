@@ -18,6 +18,10 @@ int fuxi_gpu_abi_unmap(uint64_t iova, uint64_t bytes);
 int fuxi_gpu_abi_submit(const uint64_t *iovas, const uint64_t *sizes,
     unsigned count, uint64_t *fence);
 int fuxi_gpu_abi_poll(uint64_t fence);
+/* CP always-on ticks: 0 success, -1 not ready, -2 MMIO error, -3 rollover timeout. */
+int fuxi_gpu_abi_timestamp(uint64_t *ticks);
+/* Monotonic boot-wide counts remain readable after permanent GPU failure. */
+int fuxi_gpu_abi_status(uint64_t *faults, uint64_t *suspends);
 int fuxi_gpu_abi_available(void);
 void fuxi_gpu_abi_publish(void);
 #ifdef __cplusplus

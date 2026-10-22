@@ -77,9 +77,25 @@ static unsigned ib(uint32_t *w,uint32_t target,bool hang)
 static int round(io_connect_t c,bool hang)
 {
  int errors=0;
+ NativeAdrenoAbiTimestamp first{},second{};
+ NativeAdrenoAbiStatus before{},after{};
+ kern_return_t kr=call(c,7,nullptr,&first);
+ errors+=line(!kr,"GPU timestamp",kr);
+ usleep(1000);
+ kr=call(c,7,nullptr,&second);
+ errors+=line(!kr && second.ticks>first.ticks,"GPU always-on ticks advance",kr);
+ kr=call(c,8,nullptr,&before);
+ errors+=line(!kr,"GPU status baseline",kr);
  NativeAdrenoAbiBoAlloc alloc{65536,14,0}; NativeAdrenoAbiBoAllocReply bo{};
- kern_return_t kr=call(c,2,&alloc,&bo);
+ kr=call(c,2,&alloc,&bo);
  if (line(!kr && bo.handle,"BO alloc",kr)) return 1;
+ NativeAdrenoAbiMetadata meta{},metadata{};
+ meta.handle=bo.handle;meta.bytes=4;memcpy(meta.text,"K1BO",4);
+ kr=call(c,9,&meta,nullptr);errors+=line(!kr,"set metadata",kr);
+ meta.bytes=3;kr=call(c,10,&meta,&metadata);
+ errors+=line((uint32_t)kr==0xe00002c2u,"short metadata refused",kr); /* BadArgument */
+ meta.bytes=64;kr=call(c,10,&meta,&metadata);
+ errors+=line(!kr && metadata.bytes==4 && !memcmp(metadata.text,"K1BO",4),"full metadata",kr);
  NativeAdrenoAbiBoMap map{bo.handle,0x20000000,3,0,2,0}; NativeAdrenoAbiBoMapReply mapped{};
  kr=call(c,3,&map,&mapped);
  errors+=line(!kr && mapped.iova==map.iova,"BO GPU map",kr);
@@ -123,6 +139,54 @@ static int round(io_connect_t c,bool hang)
  if (address) errors+=line(!io.unmap(c,view.token,mach_task_self(),address),"CPU unmap");
  if (lease) { NativeAdrenoAbiBoCpuUnmap unmap{bo.handle,view.token,0}; kr=call(c,14,&unmap,nullptr); errors+=line(!kr,"CPU token release",kr); }
  NativeAdrenoAbiBoFree release{bo.handle}; kr=call(c,4,&release,nullptr); errors+=line(!kr,"BO free",kr);
+ kr=call(c,8,nullptr,&after);
+ errors+=line(!kr && (hang ? after.faults>before.faults :
+     after.faults==before.faults && after.suspends==before.suspends),
+     hang ? "status reports watchdog loss" : "healthy status unchanged",kr);
+ return errors;
+}
+/* Explicit resource stress uses only 16 MiB ordinary + 8 MiB imported backing,
+ * in separate phases. Never run automatically through exec-swap host argv. */
+static int limits(io_connect_t c)
+{
+ int errors=0;
+ uint64_t handles[FG_ABI_MAX_BOS]={};
+ unsigned count=0;
+ NativeAdrenoAbiBoAlloc alloc{16384,14,0};NativeAdrenoAbiBoAllocReply reply{};
+ kern_return_t kr=0;
+ for (;count<FG_ABI_MAX_BOS;count++) {
+  kr=call(c,2,&alloc,&reply);
+  if (kr || !reply.handle) break;
+  handles[count]=reply.handle;
+ }
+ errors+=line(count==FG_ABI_MAX_BOS,"1024 live BOs",kr);
+ if (!errors) { kr=call(c,2,&alloc,&reply);errors+=line(kr && !reply.handle,"BO table bound refuses overflow",kr); }
+ for (unsigned i=0;i<count;i++) {
+  NativeAdrenoAbiBoFree release{handles[i]};kr=call(c,4,&release,nullptr);
+  if (kr) errors+=line(false,"stress BO free",kr);
+ }
+ if (errors) return errors;
+ void *host=nullptr;
+ if (posix_memalign(&host,16384,FG_ABI_MAX_IMPORTS*16384)) return line(false,"import stress backing");
+ memset(host,0,FG_ABI_MAX_IMPORTS*16384);
+ count=0;
+ for (;count<FG_ABI_MAX_IMPORTS;count++) {
+  NativeAdrenoAbiBoImport import{(uint64_t)(uintptr_t)host+count*16384,16384};
+  kr=call(c,16,&import,&reply);
+  if (kr || !reply.handle) break;
+  handles[count]=reply.handle;
+  NativeAdrenoAbiBoMap map{reply.handle,FG_ABI_VA_START+count*16384,3,0,2,0};
+  NativeAdrenoAbiBoMapReply mapped{};kr=call(c,3,&map,&mapped);
+  if (kr || mapped.iova!=map.iova) { errors+=line(false,"stress import map",kr);++count;break; }
+ }
+ errors+=line(count==FG_ABI_MAX_IMPORTS && !kr && !errors,"512 mapped host imports",kr);
+ bool released=true;
+ for (unsigned i=0;i<count;i++) {
+  NativeAdrenoAbiBoFree release{handles[i]};kr=call(c,4,&release,nullptr);
+  if (kr) { released=false;errors+=line(false,"stress import free",kr); }
+ }
+ /* Keep the original allocation alive until close if a release failed. */
+ if (released) free(host);
  return errors;
 }
 /* Exec-swap preserves the host argv, including launchd-only switches.
@@ -134,6 +198,7 @@ static int test_arguments(int argc, char **argv)
  if (strcmp(slash ? slash+1 : name,"fuxi-gpu-abi-test")) return 0;
  if (argc==1) return 0;
  if (argc==2 && !strcmp(argv[1],"--watchdog")) return 1;
+ if (argc==2 && !strcmp(argv[1],"--k1-limits")) return 2;
  return -1;
 }
 int main(int argc,char **argv)
@@ -141,7 +206,7 @@ int main(int argc,char **argv)
  setbuf(stdout,nullptr); setbuf(stderr,nullptr);
  int mode=test_arguments(argc,argv);
  bool hang=mode==1;
- if (mode<0) { fprintf(stderr,"usage: %s [--watchdog]\n",argv[0]); return 2; }
+ if (mode<0) { fprintf(stderr,"usage: %s [--watchdog|--k1-limits]\n",argv[0]); return 2; }
  if (!load()) return 1;
  io_service_t service=0;
  for (unsigned i=0;i<60 && !service;i++) {
@@ -158,6 +223,7 @@ int main(int argc,char **argv)
   errors+=line(!kr && info.chip_id==0x43050a01 && info.gmem_bytes==3u*1024*1024 &&
       info.va_start==FG_ABI_VA_START && info.va_size==FG_ABI_VA_SIZE,"A740 device info",kr);
   if (!errors) errors+=round(c,hang);
+  if (mode==2 && !errors) errors+=limits(c);
   errors+=line(!io.close(c),"close");
   if (!hang && !errors) {
    /* Turnip probes, closes, then reopens; also catch stale BO TLB reuse. */

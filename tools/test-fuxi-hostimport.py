@@ -133,7 +133,7 @@ int main() {
  }
  fail=0;caller=8;assert(c.importHost(request,out)==kIOReturnBadArgument);empty();caller=7;
  c.task_=kernel_task;assert(c.importHost(request,out)==kIOReturnBadArgument);c.task_=7;
- c.wired_=FG_ABI_MAX_BYTES-16384;assert(c.importHost(request,out)==kIOReturnNoResources);c.wired_=0;
+ c.wired_=FG_ABI_MAX_WIRED_BYTES-16384;assert(c.importHost(request,out)==kIOReturnNoResources);c.wired_=0;
  for(auto &b:c.bos_)b.handle=1;
  assert(c.importHost(request,out)==kIOReturnNoResources);
  for(auto &b:c.bos_)b={};
@@ -157,6 +157,22 @@ int main() {
  unsigned before=completes;
  assert(!c.clientClose() && !c.live_ && descriptors==1 && maps==1 && completes==before);
  undrained=false;assert(!c.drop(b));empty();
+ // Exhaust the actual expanded BO table, then close drains every entry.
+ c.live_=connected=true;c.lastFence_=0;out={};
+ for(unsigned i=0;i<FG_ABI_MAX_BOS;i++)assert(!c.importHost(request,out) && out.handle==c.bos_[i].handle);
+ assert(FG_ABI_MAX_BOS>=1024 && c.wired_==FG_ABI_MAX_BOS*32768);
+ assert(c.importHost(request,out)==kIOReturnNoResources);
+ assert(!c.clientClose() && !c.wired_);empty();
+ // Three maximum-sized imports cross the old 256 MiB aggregate cap, reach
+ // exactly 768 MiB, and share the same quota as ordinary allocation.
+ c.live_=true;request.bytes=FG_ABI_MAX_BYTES;
+ for(unsigned i=0;i<3;i++)assert(!c.importHost(request,out));
+ assert(c.wired_==FG_ABI_MAX_WIRED_BYTES && c.wired_==(768ULL<<20));
+ request.bytes=16384;assert(c.importHost(request,out)==kIOReturnNoResources);
+ assert(!c.clientClose() && !c.wired_);empty();
+ c.wired_=FG_ABI_MAX_WIRED_BYTES+1;
+ assert(c.importHost(request,out)==kIOReturnNoResources);c.wired_=0;
+ c.nextHandle_=UINT64_MAX;assert(c.importHost(request,out)==kIOReturnNoResources);
  assert(prepares>completes); // prepare failure itself never calls complete
  puts("PASS: ABI2/16K/overflow/ownership/quota, actual import failure unwind, pin/map refs, busy free, task close, quarantine and idempotent release");
 }
@@ -169,7 +185,7 @@ def main():
     helper = helper[helper.index('bool fuxi_adreno_host_page_ok('):helper.index('#endif')]
     bo = source[source.index(' struct Bo {'):source.index(' task_t task_')]
     close = method(source, 'clientClose').replace(' override', '').replace('openLock);', '&openLock);')
-    model = PREFIX + helper + 'struct Client {\n enum {MaxBos=64};\n' + bo + r'''
+    model = PREFIX + helper + 'struct Client {\n enum {MaxBos=FG_ABI_MAX_BOS};\n' + bo + r'''
  task_t task_=7;uint64_t nextHandle_=1,wired_=0,lastFence_=1;
  int *lock_=&clientLock;bool live_=true;int pid_=0;
  void terminate(){}

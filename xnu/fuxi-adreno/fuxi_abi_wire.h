@@ -9,7 +9,11 @@
 #define FG_ABI_VA_SIZE UINT64_C(0x60000000)
 #define FG_ABI_PA_BITS 36u /* Fuxi ID2.OAS=1; existing present mapper has the same limit. */
 #define FG_ABI_MAX_BYTES (UINT64_C(1) << 28)
-/* Exact direct-selector wire lengths, including the unsupported methods. */
+/* Internal quotas, independent of the unchanged per-object wire limit. */
+#define FG_ABI_MAX_BOS 1024u
+#define FG_ABI_MAX_WIRED_BYTES (UINT64_C(768) << 20)
+#define FG_ABI_MAX_IMPORTS 512u
+/* Exact direct-selector wire lengths. */
 static inline unsigned fg_abi_input_size(unsigned method)
 {
  static const unsigned sizes[17] = {0,0,16,32,8,416,16,0,0,80,80,8,8,8,16,0,16};

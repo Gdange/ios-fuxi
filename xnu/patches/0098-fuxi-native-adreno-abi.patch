@@ -189,7 +189,7 @@
  #define G_RING_INDEX(w) ((w) & 8191u)
  static void fg_scm_call(uint64_t ret[4], unsigned slot, unsigned step,
      uint32_t fn, uint32_t info, uint64_t a, uint64_t b, uint64_t c);
-@@ -200,8 +225,8 @@
+@@ -200,10 +225,14 @@
  static ppnum_t fg_ppns[FG_SOURCE_BYTES/PAGE_SIZE+1];
  static volatile uint64_t *fg_l2(void)
  {
@@ -199,8 +199,35 @@
 + return (volatile uint64_t *)G_PTR_RANGE(root[1] & ~4095ULL,4096);
  }
  static volatile unsigned fg_state; /* 0 disabled/starting, 1 ready, 2 permanently failed */
++/* Serialized with the ring after startup. Counts survive client close/open;
++ * failure before ready is not a lost userspace context. No recovery yet. */
++static uint64_t fg_faults, fg_suspends;
++static unsigned fg_reset_held;
  static unsigned fg_started, fg_limit, fg_force, fg_seq;
-@@ -265,6 +290,7 @@
+ int fuxi_gpu_ready(void) { return __atomic_load_n(&fg_state, __ATOMIC_ACQUIRE) == 1; }
+ static uint64_t fg_deadline, fg_submit_time;
+@@ -211,6 +240,7 @@
+ static int fg_expired(void) { return rsr("cntpct_el0") >= fg_deadline; }
+ static void fg_fail(const char *reason, unsigned code)
+ {
++ if (fuxi_gpu_ready() && fg_faults!=UINT64_MAX) ++fg_faults;
+  __atomic_store_n(&fg_state, 2, __ATOMIC_RELEASE);
+  printf("FUXI GPU: disabled permanently: %s (%#x), CPU present\n", reason, code);
+ }
+@@ -237,7 +267,11 @@
+    if (fg_access(GPU_REG_BASE + 0x3c45*4, &v, 1, 0)) good = 0;
+   }
+  }
+- v = 1; (void)fg_access(GPU_REG_BASE + 0x43*4, &v, 1, 0);
++ v = 1;
++ if (!fg_access(GPU_REG_BASE + 0x43*4, &v, 1, 0) && !fg_reset_held) {
++  fg_reset_held=1;
++  if (fg_suspends!=UINT64_MAX) ++fg_suspends;
++ }
+  delay(100);
+  for (unsigned i = 0; i < 2; i++) {
+   v = 2u << 16; (void)fg_access(GPU_SMMU_BASE + SMMU_S2CR(g3_slot[i]), &v, 1, 0);
+@@ -265,6 +299,7 @@
   * new generation. No PFN scan or TLB invalidation on a cache hit. */
  int fuxi_gpu_unmap(unsigned slot, struct fg_times *t)
  {
@@ -208,7 +235,7 @@
   if (slot >= FG_CACHE_SLOTS || fg_busy) return 0;
   uint64_t start = mach_absolute_time();
   volatile uint64_t *l2 = fg_l2();
-@@ -285,10 +311,11 @@
+@@ -285,10 +320,11 @@
  int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,
      uint64_t length, struct fg_times *t)
  {
@@ -221,7 +248,7 @@
   volatile uint64_t *l2 = fg_l2();
   unsigned first = ((FG_SOURCE_VA >> 21) & 511) + slot*FG_SOURCE_L3;
   unsigned pages = (length+(source&4095)+4095)/4096;
-@@ -341,6 +368,7 @@
+@@ -341,6 +377,7 @@
   t->misses++;
   return 1;
  }
@@ -229,7 +256,7 @@
  static thread_call_data_t fg_init_call;
  static void fg_thread(thread_call_param_t arg, thread_call_param_t result)
  {
-@@ -359,7 +387,7 @@
+@@ -359,7 +396,7 @@
   }
   kern_return_t kr = fg_map_windows();
   if (kr != KERN_SUCCESS) { fg_fail("uncached mapping failed", kr); goto out; }
@@ -238,7 +265,7 @@
   if (h->magic != FG_MAGIC || h->version != 1 || h->bytes != sizeof(*h) || h->reserved ||
       h->base != FG_SCRATCH || h->size != FG_SCRATCH_SIZE) {
    fg_fail("missing/invalid cold firmware handoff", 3); goto out;
-@@ -367,7 +395,7 @@
+@@ -367,7 +404,7 @@
   for (unsigned i = 0; i < 3; i++) {
    unsigned n = h->fw_size[i];
    if (!n || n > FG_FW_SLOT || (n & 3) ||
@@ -247,7 +274,7 @@
     fg_fail("firmware size/checksum", i); goto out;
    }
   }
-@@ -393,7 +421,13 @@
+@@ -393,7 +430,13 @@
   uint32_t tlb[128] = {0};
   if (g4_tlb(tlb) || fg_access_failed) { fg_fail("initial TLB sync", 5); goto out; }
   printf("FUXI GPU: ready, BGRA strided rects + one fence, 4 cached backings, 220 MHz, async one-in-flight, no timer sleep\n");
@@ -261,7 +288,7 @@
   out: return;
  }
  void fuxi_gpu_start(uint64_t fb, unsigned width, unsigned height, unsigned pitch)
-@@ -402,6 +436,12 @@
+@@ -402,6 +445,12 @@
   (void)PE_parse_boot_argn("fuxigpu", &enable, sizeof(enable));
   if (enable != 1 || fg_started) return;
   fg_started = 1; fg_limit = 17;
@@ -274,7 +301,7 @@
   (void)PE_parse_boot_argn("fuxigpu_stage", &fg_limit, sizeof(fg_limit));
   (void)PE_parse_boot_argn("fuxigpu_fail", &fg_force, sizeof(fg_force));
   if ((fg_limit != 13 && fg_limit != 16 && fg_limit != 17) ||
-@@ -455,6 +495,7 @@
+@@ -455,6 +504,7 @@
   * A completed fence wins over a late timer/deadline. */
  int fuxi_gpu_poll(struct fg_times *t)
  {
@@ -282,7 +309,7 @@
   if (!fg_busy) return 1;
   int err = fg_access_failed || g3_faulted();
   if (!err && g3_read(G3_FENCE_PA+64) == fg_magic && g3_gr(0x806) == g3_wptr &&
-@@ -475,7 +516,8 @@
+@@ -475,7 +525,8 @@
      unsigned pitch, unsigned sx, unsigned sy, unsigned dx, unsigned dy,
      unsigned width, unsigned height, struct fg_times *t)
  {
@@ -292,7 +319,7 @@
   if (!width || !height || width > 1080 || height > 2400 || dx > 1080-width || dy > 2400-height ||
       (source & 3) || (pitch & 3) || pitch > 131008 || ((uint64_t)sx+width)*4 > pitch ||
       length+(source&4095) > FG_SOURCE_BYTES ||
-@@ -512,4 +554,5 @@
+@@ -512,4 +563,5 @@
   fg_busy = 1;
   return 2; /* submitted; source is owned until poll retires this fence */
  }
@@ -689,7 +716,7 @@
 +#endif
 --- a/bsd/dev/fuxi_gpu_abi_backend.inc
 +++ b/bsd/dev/fuxi_gpu_abi_backend.inc
-@@ -0,0 +1,323 @@
+@@ -0,0 +1,351 @@
 +/* Built into fuxi_adreno.c, with access to its proven SMMU/ring helpers.
 + * Single privileged diagnostic client, not a security boundary for PM4.
 + * Its root has no scanout or surface-cache mappings. The kernel-only runtime
@@ -710,13 +737,13 @@
 +/* Every mapped import can be referenced indirectly by PM4, not just the IB
 + * list. Serialize cache handoff with the same GPU lock as submit/retirement.
 + * The user client owns these prepared kernel mappings until successful unmap. */
-+static struct { uint64_t iova, bytes; uintptr_t source; } fg_abi_imports[64];
++static struct { uint64_t iova, bytes; uintptr_t source; } fg_abi_imports[FG_ABI_MAX_IMPORTS];
 +static unsigned fg_abi_host_handoff;
 +static void fg_abi_import_cache(int complete)
 +{
 + if (complete && !fg_abi_host_handoff) return;
 + __asm__ volatile("dsb sy" ::: "memory");
-+ for (unsigned i=0;i<64;i++) if (fg_abi_imports[i].iova) {
++ for (unsigned i=0;i<FG_ABI_MAX_IMPORTS;i++) if (fg_abi_imports[i].iova) {
 +  uintptr_t end=fg_abi_imports[i].source+fg_abi_imports[i].bytes;
 +  for (uintptr_t p=fg_abi_imports[i].source;p<end;p+=64) {
 +   if (complete) { __asm__ volatile("dc ivac, %0" :: "r"(p) : "memory"); }
@@ -785,8 +812,9 @@
 +static int fg_abi_observe(void)
 +{
 + if (fg_abi_poisoned) return fg_abi_timed_out ? (fg_abi_drained ? -3 : -4) : (fg_abi_drained ? -1 : -2);
-+ if (!fg_client_busy) return 0;
++ if (!fuxi_gpu_ready()) return -1;
 + if (fg_access_failed || g3_faulted()) return fg_abi_fault("client GPU fault");
++ if (!fg_client_busy) return 0;
 + if (g3_read(G3_FENCE_PA+FG_ABI_FENCE_OFF+4)==fg_abi_seq &&
 +     g3_gr(0x806)==g3_wptr && g3_gr(0x807)==g3_wptr && !(g3_gr(0x210)&~1u)) {
 +  if (!fg_abi_switch(G3_PT)) return fg_abi_fault("client restore TTBR");
@@ -912,6 +940,33 @@
 + FG_GUARD;
 + return fg_abi_live && fuxi_gpu_ready() && !fg_abi_poisoned;
 +}
++int fuxi_gpu_abi_timestamp(uint64_t *ticks)
++{
++ FG_GUARD;
++ if (!ticks) return -2;
++ *ticks=0;
++ if (!fg_abi_live || !fuxi_gpu_ready() || fg_abi_poisoned) return -1;
++ /* A6XX/A7XX CP_ALWAYS_ON_COUNTER, dword indices (not CPU timer ticks).
++  * High/low/high avoids torn rollover; NativeAdrenoTimer uses eight tries. */
++ for (unsigned attempt=0;attempt<8;attempt++) {
++  uint32_t high=g3_gr(0x981), low=g3_gr(0x980), again=g3_gr(0x981);
++  if (fg_access_failed) { (void)fg_abi_fault("client timestamp MMIO"); return -2; }
++  if (high==again) { *ticks=((uint64_t)high<<32)|low; return 0; }
++ }
++ return -3;
++}
++int fuxi_gpu_abi_status(uint64_t *faults, uint64_t *suspends)
++{
++ FG_GUARD;
++ if (!faults || !suspends) return -1;
++ *faults=*suspends=0;
++ if (!fg_abi_live) return -1;
++ /* Observe even without WaitFence; after isolation never touch powered-down
++  * MMIO. Returning success with the changed count is Turnip's device loss. */
++ if (fuxi_gpu_ready()) (void)fg_abi_observe();
++ *faults=fg_faults; *suspends=fg_suspends;
++ return 0;
++}
 +static int fg_abi_map_locked(uint64_t iova, uintptr_t source, uint64_t bytes,
 +    unsigned permissions, unsigned wb, unsigned sh)
 +{
@@ -944,8 +999,8 @@
 + if (!source || !bytes || ((source|bytes)&(NativeAdrenoAbiHostPageBytes-1)) ||
 +     bytes>FG_ABI_MAX_BYTES || source+bytes<source) return -1;
 + unsigned slot;
-+ for (slot=0;slot<64 && fg_abi_imports[slot].iova;slot++) {}
-+ if (slot==64) return -1;
++ for (slot=0;slot<FG_ABI_MAX_IMPORTS && fg_abi_imports[slot].iova;slot++) {}
++ if (slot==FG_ABI_MAX_IMPORTS) return -1;
 + int s=fg_abi_map_locked(iova,source,bytes,permissions,0,2);
 + if (!s) {
 +  fg_abi_imports[slot].source=source; fg_abi_imports[slot].bytes=bytes; fg_abi_imports[slot].iova=iova;
@@ -954,7 +1009,7 @@
 +}
 +static void fg_abi_import_remove(uint64_t iova, uint64_t bytes)
 +{
-+ for (unsigned i=0;i<64;i++)
++ for (unsigned i=0;i<FG_ABI_MAX_IMPORTS;i++)
 +  if (fg_abi_imports[i].iova==iova && fg_abi_imports[i].bytes==bytes) fg_abi_imports[i].iova=0;
 +}
 +int fuxi_gpu_abi_unmap(uint64_t iova, uint64_t bytes)
@@ -1207,7 +1262,7 @@
 +#endif
 --- a/bsd/dev/fuxi_abi_wire.h
 +++ b/bsd/dev/fuxi_abi_wire.h
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,97 @@
 +/* SPDX-License-Identifier: MIT
 + * A7xx framing adapted from UniXNU NativeAdrenoRing.cpp.
 + * Copyright (c) 2026 NativeAdreno contributors. See LICENSE.NativeAdreno.
@@ -1219,7 +1274,11 @@
 +#define FG_ABI_VA_SIZE UINT64_C(0x60000000)
 +#define FG_ABI_PA_BITS 36u /* Fuxi ID2.OAS=1; existing present mapper has the same limit. */
 +#define FG_ABI_MAX_BYTES (UINT64_C(1) << 28)
-+/* Exact direct-selector wire lengths, including the unsupported methods. */
++/* Internal quotas, independent of the unchanged per-object wire limit. */
++#define FG_ABI_MAX_BOS 1024u
++#define FG_ABI_MAX_WIRED_BYTES (UINT64_C(768) << 20)
++#define FG_ABI_MAX_IMPORTS 512u
++/* Exact direct-selector wire lengths. */
 +static inline unsigned fg_abi_input_size(unsigned method)
 +{
 + static const unsigned sizes[17] = {0,0,16,32,8,416,16,0,0,80,80,8,8,8,16,0,16};
@@ -1303,7 +1362,7 @@
 +#endif
 --- a/bsd/dev/fuxi_gpu_abi.h
 +++ b/bsd/dev/fuxi_gpu_abi.h
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,30 @@
 +/* NativeAdrenoABI platform bridge. All operations serialize with presents. */
 +#ifndef FUXI_GPU_ABI_H
 +#define FUXI_GPU_ABI_H
@@ -1324,6 +1383,10 @@
 +int fuxi_gpu_abi_submit(const uint64_t *iovas, const uint64_t *sizes,
 +    unsigned count, uint64_t *fence);
 +int fuxi_gpu_abi_poll(uint64_t fence);
++/* CP always-on ticks: 0 success, -1 not ready, -2 MMIO error, -3 rollover timeout. */
++int fuxi_gpu_abi_timestamp(uint64_t *ticks);
++/* Monotonic boot-wide counts remain readable after permanent GPU failure. */
++int fuxi_gpu_abi_status(uint64_t *faults, uint64_t *suspends);
 +int fuxi_gpu_abi_available(void);
 +void fuxi_gpu_abi_publish(void);
 +#ifdef __cplusplus
@@ -1530,7 +1593,7 @@
 +#endif
 --- a/iokit/Kernel/arm/fuxi_abi_wire.h
 +++ b/iokit/Kernel/arm/fuxi_abi_wire.h
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,97 @@
 +/* SPDX-License-Identifier: MIT
 + * A7xx framing adapted from UniXNU NativeAdrenoRing.cpp.
 + * Copyright (c) 2026 NativeAdreno contributors. See LICENSE.NativeAdreno.
@@ -1542,7 +1605,11 @@
 +#define FG_ABI_VA_SIZE UINT64_C(0x60000000)
 +#define FG_ABI_PA_BITS 36u /* Fuxi ID2.OAS=1; existing present mapper has the same limit. */
 +#define FG_ABI_MAX_BYTES (UINT64_C(1) << 28)
-+/* Exact direct-selector wire lengths, including the unsupported methods. */
++/* Internal quotas, independent of the unchanged per-object wire limit. */
++#define FG_ABI_MAX_BOS 1024u
++#define FG_ABI_MAX_WIRED_BYTES (UINT64_C(768) << 20)
++#define FG_ABI_MAX_IMPORTS 512u
++/* Exact direct-selector wire lengths. */
 +static inline unsigned fg_abi_input_size(unsigned method)
 +{
 + static const unsigned sizes[17] = {0,0,16,32,8,416,16,0,0,80,80,8,8,8,16,0,16};
@@ -1626,7 +1693,7 @@
 +#endif
 --- a/iokit/Kernel/arm/fuxi_gpu_abi.h
 +++ b/iokit/Kernel/arm/fuxi_gpu_abi.h
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,30 @@
 +/* NativeAdrenoABI platform bridge. All operations serialize with presents. */
 +#ifndef FUXI_GPU_ABI_H
 +#define FUXI_GPU_ABI_H
@@ -1647,6 +1714,10 @@
 +int fuxi_gpu_abi_submit(const uint64_t *iovas, const uint64_t *sizes,
 +    unsigned count, uint64_t *fence);
 +int fuxi_gpu_abi_poll(uint64_t fence);
++/* CP always-on ticks: 0 success, -1 not ready, -2 MMIO error, -3 rollover timeout. */
++int fuxi_gpu_abi_timestamp(uint64_t *ticks);
++/* Monotonic boot-wide counts remain readable after permanent GPU failure. */
++int fuxi_gpu_abi_status(uint64_t *faults, uint64_t *suspends);
 +int fuxi_gpu_abi_available(void);
 +void fuxi_gpu_abi_publish(void);
 +#ifdef __cplusplus

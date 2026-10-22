@@ -55,7 +55,9 @@ typedef struct { void (*func)(void *,void *); } thread_call_data_t;
 #define NSEC_PER_SEC 1000000000u
 #define kSuccess 0
 typedef int DTEntry;
+static uint64_t fg_faults;
 static unsigned fg_state, fg_started, fg_limit, fg_force, fg_access_failed;
+static int fuxi_gpu_ready(void) {return fg_state==1;}
 static unsigned g_bank, g3_bank, g3_asid, g3_next, gpu_stage;
 static uint32_t gpu_report[128], gpu_extra[16][128];
 #define G3_PT (FG_SCRATCH+0x1200000)

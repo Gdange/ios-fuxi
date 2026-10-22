@@ -93,6 +93,8 @@ int main() {
   char *args[]={const_cast<char *>(names[i]),const_cast<char *>("--watchdog"),nullptr};
   assert(test_arguments(1,args)==0);
   assert(test_arguments(2,args)==(i<2 ? 1 : 0));
+  args[1]=const_cast<char *>("--k1-limits");
+  assert(test_arguments(2,args)==(i<2 ? 2 : 0));
   args[1]=const_cast<char *>("--launchd_boot");
   assert(test_arguments(2,args)==(i<2 ? -1 : 0));
   args[2]=args[1];args[1]=const_cast<char *>("--watchdog");
