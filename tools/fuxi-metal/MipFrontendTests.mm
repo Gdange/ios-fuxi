@@ -51,7 +51,7 @@ int main(){@autoreleasepool {
  }
  d.pixelFormat=MTLPixelFormatBGRA8Unorm;d.usage=MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget;
  MTLHeapDescriptor *hd=[MTLHeapDescriptor new];hd.storageMode=MTLStorageModePrivate;hd.size=4096;
- FuxiHeap *heap=[device newHeapWithDescriptor:hd];FuxiTexture *ht=[heap newTextureWithDescriptor:d];
+ FuxiHeap *heap=(FuxiHeap *)[device newHeapWithDescriptor:hd];FuxiTexture *ht=[heap newTextureWithDescriptor:d];
  id<MTLBuffer> hb=[heap newBufferWithLength:64 options:MTLResourceStorageModePrivate];assert(heap && ht && hb && !hb.contents && hb.storageMode==MTLStorageModePrivate);
  assert(ht.heap==heap && heap.usedSize==ht.allocatedSize+hb.allocatedSize);[ht release];[hb release];assert(!heap.usedSize);[heap release];[hd release];
  for(MTLSamplerMipFilter filter:{MTLSamplerMipFilterNotMipmapped,MTLSamplerMipFilterNearest,MTLSamplerMipFilterLinear}){MTLSamplerDescriptor *sd=[MTLSamplerDescriptor new];sd.mipFilter=filter;sd.lodMinClamp=1;sd.lodMaxClamp=2.5f;id sampler=[device newSamplerStateWithDescriptor:sd];assert(sampler);[sampler release];[sd release];}
@@ -63,7 +63,8 @@ int main(){@autoreleasepool {
  d.pixelFormat=MTLPixelFormatBGRA8Unorm_sRGB;assert(![device newTextureWithDescriptor:d]);d.pixelFormat=MTLPixelFormatDepth32Float;assert(![device newTextureWithDescriptor:d]);d.pixelFormat=MTLPixelFormatBGRA8Unorm;
  d.swizzle=MTLTextureSwizzleChannelsMake(MTLTextureSwizzleBlue,MTLTextureSwizzleGreen,MTLTextureSwizzleRed,MTLTextureSwizzleAlpha);assert(![device newTextureWithDescriptor:d]);d.swizzle=MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed,MTLTextureSwizzleGreen,MTLTextureSwizzleBlue,MTLTextureSwizzleAlpha);
  d.usage=MTLTextureUsageShaderWrite;assert(![device newTextureWithDescriptor:d]);d.usage=MTLTextureUsageShaderRead;
- assert(![device newTextureWithDescriptor:d iosurface:nullptr plane:1]);
+ IOSurfaceRef surface=IOSurfaceCreate((CFDictionaryRef)@{(id)kIOSurfaceWidth:@8,(id)kIOSurfaceHeight:@8,(id)kIOSurfaceBytesPerElement:@4,(id)kIOSurfacePixelFormat:@((unsigned)'BGRA')});
+ assert(surface && ![device newTextureWithDescriptor:d iosurface:surface plane:1]);CFRelease(surface);
  [buffer release];[copy release];[nested release];[t release];assert(view.width==6);[view release];[q release];[device release];
  puts("PASS: native M9k descriptor/level transfers/views/blits/generation encoding/render attachment/private heap/purge/sampler/refusal controls");
 }}
