@@ -195,6 +195,8 @@ def main():
         '-fobjc-arc', '-fblocks', '-dynamiclib', '-I'+str(args.headers.resolve()), '-I'+str(ROOT/'tools/fuxi-metal'),
         native/'NativeAdrenoMetalPlugin.mm', native/'NativeBridgeMetalFrontend.mm', bridge,
         '-Wl,-install_name,/System/Library/Extensions/FuxiNativeMetal.bundle/FuxiNativeMetal',
+        # The bridge lives in /usr/local/lib, which a shared-cache-eligible image may not link.
+        '-Wl,-not_for_dyld_shared_cache',
         '-framework', 'Foundation', '-framework', 'Metal', '-framework', 'IOSurface', '-o', bundle/'FuxiNativeMetal')
     run('codesign', '-f', '-s', '-', bundle)
     run('codesign', '--verify', '--strict', bundle)
