@@ -37,6 +37,9 @@ static char clientProcess[64]="unknown";
 #ifndef FUXI_MTL_READ_CLIENTS
 #define FUXI_MTL_READ_CLIENTS fuxi::readClients
 #endif
+#ifndef FUXI_MTL_BACKBOARD_EXIT
+#define FUXI_MTL_BACKBOARD_EXIT() _exit(75)
+#endif
 #ifndef FUXI_MTL_BACKBOARD_ADMIT
 #define FUXI_MTL_BACKBOARD_ADMIT() fuxi::backboardGate.admit()
 #endif
@@ -117,9 +120,16 @@ extern "C" uint64_t fuxi_metal_submit_frame_creates() {return fuxi::Backend::sub
 extern "C" uint64_t fuxi_metal_submit_view_creates() {return fuxi::Backend::submitViewCreates.load();}
 static void failureLog(const char *format,...) {
  fuxi::backboardGate.fault();
- uint64_t n=failureCount.fetch_add(1);if(n>=64)return;
- va_list args;va_start(args,format);vfprintf(stderr,format,args);va_end(args);
- if(n==63)fprintf(stderr,"FUXI MTL: failure log limit 64 (counter continues)\n");
+ uint64_t n=failureCount.fetch_add(1);
+ if(n<64) {
+  va_list args;va_start(args,format);vfprintf(stderr,format,args);va_end(args);
+  if(n==63)fprintf(stderr,"FUXI MTL: failure log limit 64 (counter continues)\n");
+ }
+ // A latched backboardd would stay alive refusing every frame (a frozen
+ // screen). Exit instead: launchd respawns it and the gate sends it to CPU.
+ if(fuxi::backboardGate.blocked()) {
+  fprintf(stderr,"FUXI MTL: backboardd gate exit for CPU respawn\n");fflush(stderr);FUXI_MTL_BACKBOARD_EXIT();
+ }
 }
 static void unsupported(id object, SEL selector) {
  if(clientMode==fuxi::ClientMode::census) {censusLog(object,selector,false);return;}

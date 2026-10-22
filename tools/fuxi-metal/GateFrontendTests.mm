@@ -15,6 +15,8 @@ static bool testAdmission(){const char *dir=getenv("FUXI_TEST_GATE_DIR");assert(
  return fuxi::backboardGate.admit("aaaaaaaa-1111-2222-3333-444444444444",open(dir,O_RDONLY|O_DIRECTORY|O_NOFOLLOW));}
 #define FUXI_MTL_READ_CLIENTS testPolicy
 #define FUXI_MTL_BACKBOARD_ADMIT() testAdmission()
+static unsigned backboardExits;
+#define FUXI_MTL_BACKBOARD_EXIT() (void)++backboardExits
 #define _NSGetExecutablePath testExecutablePath
 #define FUXI_MTL_FRONTEND_TEST
 #define FUXI_MTL_BACKEND_HEADER "TestBackend.hpp"
@@ -59,6 +61,8 @@ int main() {
    [texture release];[queue release];[device release];
    // Even a failure after qualification and beyond the ordinary log cap latches.
    failureCount=64;failureLog("test failure after good\n");assert(fuxi::backboardGate.blocked());
+   // A latched render server exits so launchd respawns it on the CPU path.
+   assert(backboardExits==1);
   }
  }
  puts("PASS: gated init, 64 attempts one policy read/log, executable identity independent of argv");

@@ -52,6 +52,7 @@ def validate_clients(path,enable_backboardd=False):
 
 def backboard_account(root):
     """Resolve target launchd metadata, never the staging host's account database."""
+    root=Path(root).resolve()  # the staging root may itself sit below a host symlink
     path=root/'System/Library/LaunchDaemons/com.apple.backboardd.plist'
     if path.is_symlink() or not path.resolve().is_relative_to(root):raise ValueError('linked backboardd job')
     job=plistlib.loads(path.read_bytes())
@@ -70,6 +71,7 @@ def backboard_account(root):
 
 
 def prepare_backboard_storage(root,account):
+    root=Path(root).resolve()
     uid,gid=account;parent=root/'private/var/db/fuxi-metal';client=parent/('backboardd-%u'%uid)
     # Validate before mutation. A root-only M9i directory can be made traversable;
     # caches/strike files stay inside private client directories, never writable by others.

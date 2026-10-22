@@ -42,7 +42,7 @@ def policy_storage_tests():
             directory=root/'private/var/db/fuxi-metal'
             assert directory.stat().st_mode&0o7777==0o755
             assert (directory/'backboardd-501').stat().st_mode&0o7777==0o700
-            assert any(c.args==(directory/'backboardd-501',501,502) for c in chown.call_args_list)
+            assert any((Path(c.args[0]).resolve(),*c.args[1:])==((directory/'backboardd-501').resolve(),501,502) for c in chown.call_args_list)
         # Existing unsafe directories are refused, never made world writable/repaired.
         directory.chmod(0o777)
         try:m.prepare_backboard_storage(root,(501,502));raise AssertionError('unsafe parent accepted')
