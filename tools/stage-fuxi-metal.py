@@ -7,6 +7,7 @@ import plistlib
 import re
 import shutil
 import struct
+import stat
 
 
 def macho(path,kind):
@@ -28,7 +29,7 @@ def macho(path,kind):
     if pos!=32+total or not signed or not minimum:raise ValueError('requires signed iOS 16.0 artifact')
 
 
-def validate_clients(path):
+def validate_clients(path,enable_backboardd=False):
     raw=path.read_bytes()
     if len(raw)>8192 or b'\0' in raw:raise ValueError('invalid client config')
     seen={}
@@ -38,12 +39,56 @@ def validate_clients(path):
         mode='allow'
         if line.startswith(b'census '):mode='census';line=line[7:].lstrip(b' \t')
         if not re.fullmatch(rb'[A-Za-z0-9_.-]{1,63}',line):raise ValueError('invalid client name')
-        if line in (b'backboardd',b'SpringBoard'):raise ValueError('compositor clients are permanently denied')
+        if line==b'SpringBoard':raise ValueError('SpringBoard is permanently denied')
+        if line==b'backboardd' and (not enable_backboardd or mode!='allow'):
+            raise ValueError('backboardd requires --enable-backboardd and an allow entry')
         if line in seen and seen[line]!=mode:raise ValueError('conflicting client modes')
         seen[line]=mode
+    # The flag generates the protected config key; shipped input stays smoke-only.
+    if enable_backboardd and b'backboardd' not in seen:raw=raw.rstrip(b'\n')+b'\nbackboardd\n'
+    if len(raw)>8192:raise ValueError('enabled client config exceeds 8192 bytes')
+    return raw
 
 
-def stage(root,icd,bundle,smoke,conf,clients=Path(__file__).with_name('metal-clients.conf'),translator=None,metallib=None,source=None,ca_smoke=None,ca_conf=Path(__file__).with_name('ca-smoke.conf')):
+def backboard_account(root):
+    """Resolve target launchd metadata, never the staging host's account database."""
+    path=root/'System/Library/LaunchDaemons/com.apple.backboardd.plist'
+    if path.is_symlink() or not path.resolve().is_relative_to(root):raise ValueError('linked backboardd job')
+    job=plistlib.loads(path.read_bytes())
+    user=job.get('UserName')
+    if user is None:return 0,0  # launchd system job default; runtime still checks geteuid().
+    if not isinstance(user,str) or not re.fullmatch(r'[A-Za-z0-9_-]+',user):raise ValueError('invalid backboardd UserName')
+    for rel in ('private/etc/master.passwd','private/etc/passwd','etc/master.passwd','etc/passwd'):
+        path=root/rel
+        if not path.resolve().is_relative_to(root) or not path.is_file():continue
+        for line in path.read_text().splitlines():
+            fields=line.split(':')
+            if len(fields)>=4 and fields[0]==user and fields[2].isdigit() and fields[3].isdigit():
+                uid,gid=int(fields[2]),int(fields[3])
+                if uid<2**32-1 and gid<2**32-1:return uid,gid
+    raise ValueError('backboardd account absent from target passwd database')
+
+
+def prepare_backboard_storage(root,account):
+    uid,gid=account;parent=root/'private/var/db/fuxi-metal';client=parent/('backboardd-%u'%uid)
+    # Validate before mutation. A root-only M9i directory can be made traversable;
+    # caches/strike files stay inside private client directories, never writable by others.
+    for path,owner,modes in ((parent,0,(0o700,0o755)),(client,uid,(0o700,))):
+        if not path.resolve().is_relative_to(root) or any(p.is_symlink() for p in [path,*path.parents] if p!=root and root in p.parents):
+            raise ValueError('linked storage path')
+        if path.exists():
+            s=path.stat()
+            if not stat.S_ISDIR(s.st_mode) or s.st_uid!=owner or stat.S_IMODE(s.st_mode) not in modes:
+                raise ValueError('unsafe backboardd storage ownership/mode')
+    missing=[];path=parent
+    while not path.exists():missing.append(path);path=path.parent
+    for path in reversed(missing):path.mkdir();os.chown(path,0,0);os.chmod(path,0o755)
+    os.chmod(parent,0o755)
+    if not client.exists():client.mkdir(mode=0o700);os.chown(client,uid,gid);os.chmod(client,0o700)
+    print('staged /private/var/db/fuxi-metal/backboardd-%u uid=%u gid=%u 0700'%(uid,uid,gid))
+
+
+def stage(root,icd,bundle,smoke,conf,clients=Path(__file__).with_name('metal-clients.conf'),translator=None,metallib=None,source=None,ca_smoke=None,ca_conf=Path(__file__).with_name('ca-smoke.conf'),enable_backboardd=False):
     if os.geteuid()!=0:raise PermissionError('run as root to set root:wheel 0:0')
     root=root.resolve()
     if not (root/'System/Library').is_dir():raise ValueError('expected mounted iOS root')
@@ -55,7 +100,8 @@ def stage(root,icd,bundle,smoke,conf,clients=Path(__file__).with_name('metal-cli
     if translator is None:translator=smoke.parent/'libmetal2vulkan.dylib'
     if metallib is None:metallib=smoke.parent/'metal-smoke.metallib'
     if source is None:source=smoke.parent/'metal2vulkan-source.tar.gz'
-    validate_clients(clients)
+    client_data=validate_clients(clients,enable_backboardd)
+    account=backboard_account(root) if enable_backboardd else None
     info=plistlib.loads((bundle/'Info.plist').read_bytes())
     if any(info.get(k)!=v for k,v in {'CFBundleExecutable':'FuxiMetal','NSPrincipalClass':'FuxiMTLDevice','CFBundleIdentifier':'org.fuxi.metal'}.items()):
         raise ValueError('unexpected plugin plist')
@@ -81,6 +127,7 @@ def stage(root,icd,bundle,smoke,conf,clients=Path(__file__).with_name('metal-cli
         if not target.resolve().is_relative_to(root):raise ValueError('target escapes root')
         if target.is_symlink():raise ValueError('refusing linked destination')
         if not source.is_file():raise ValueError('missing artifact')
+    if account is not None:prepare_backboard_storage(root,account)
     for source,name,mode in artifacts:
         target=root/name
         missing=[];parent=target.parent
@@ -88,7 +135,9 @@ def stage(root,icd,bundle,smoke,conf,clients=Path(__file__).with_name('metal-cli
             missing.append(parent);parent=parent.parent
         for directory in reversed(missing):
             directory.mkdir();os.chmod(directory,0o755);os.chown(directory,0,0)
-        shutil.copyfile(source,target);os.chmod(target,mode);os.chown(target,0,0)
+        if name=='usr/local/share/fuxi/metal-clients.conf':target.write_bytes(client_data)
+        else:shutil.copyfile(source,target)
+        os.chmod(target,mode);os.chown(target,0,0)
         print('staged /'+name+' root:wheel %04o'%mode)
 
 
@@ -102,4 +151,5 @@ if __name__=='__main__':
     ap.add_argument('--translator',type=Path)
     ap.add_argument('--metallib',type=Path)
     ap.add_argument('--source',type=Path,help='external library corresponding source and licence archive')
-    a=ap.parse_args();stage(a.root,a.icd,a.bundle,a.smoke,a.conf,a.clients,a.translator,a.metallib,a.source,a.ca_smoke,a.ca_conf)
+    ap.add_argument('--enable-backboardd',action='store_true',help='add backboardd allow entry and private storage; also requires boot arg fuxigpu=backboardd')
+    a=ap.parse_args();stage(a.root,a.icd,a.bundle,a.smoke,a.conf,a.clients,a.translator,a.metallib,a.source,a.ca_smoke,a.ca_conf,a.enable_backboardd)

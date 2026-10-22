@@ -17,6 +17,7 @@
 #include <vector>
 #include "Translator.hpp"
 #include "PipelineCache.hpp"
+#include "BackboardGate.hpp"
 #include "FramebufferFetch.hpp"
 #include "VertexProfile.hpp"
 #include "../../xnu/fuxi-adreno/NativeAdrenoABI.h"
@@ -32,6 +33,7 @@ inline bool hostRangesOverlap(const void *a,size_t an,const void *b,size_t bn){
 inline std::atomic<int64_t> liveMemoryObjects{0},liveMemoryBytes{0};
 // The line names the failing call; the counters tell a BO quota refusal from real exhaustion.
 inline void check(VkResult r,int line=__builtin_LINE()) {
+ if(r!=VK_SUCCESS)backboardGate.fault();
  if(r!=VK_SUCCESS) throw std::runtime_error("Vulkan rc "+std::to_string(r)+" at Backend.hpp:"+std::to_string(line)+" (memory objects "+std::to_string(liveMemoryObjects.load())+", "+std::to_string(liveMemoryBytes.load()>>10)+" KiB)");
 }
 #define FUXI_VK_FUNCTIONS(X) \
@@ -212,6 +214,7 @@ public:
    GetPhysicalDeviceProperties2(physical,&identity);
    uint8_t translator[32]{};bool identified=Translator::cacheIdentity(translator);
    pipelineCache.open(device,CreatePipelineCache,DestroyPipelineCache,GetPipelineCacheData,props,driver,id,identified?translator:nullptr,client);
+   requireLive();
    GetDeviceQueue(device,family,0,&queue);if(!queue) throw std::runtime_error("null queue");
   } catch(...) {close();throw;}
  }
@@ -226,7 +229,7 @@ public:
   device={};instance={};library=nullptr;
  }
  ~Backend() {close();}
- void requireLive() {if(poisoned) throw std::runtime_error("device poisoned after submit failure");}
+ void requireLive() {if(poisoned || backboardGate.blocked()) throw std::runtime_error("device poisoned or backboardd failure latched");}
  Buffer *allocate(size_t length) {
   std::lock_guard<std::mutex> guard(mutex);requireLive();
   return allocateUnlocked(length);

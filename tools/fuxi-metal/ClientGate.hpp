@@ -5,16 +5,38 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 namespace fuxi {
 enum class ClientMode { deny, allow, census };
+static inline bool systemString(const char *key,char *out,size_t capacity) {
+#ifdef __APPLE__
+ size_t n=capacity;bool ok=!sysctlbyname(key,out,&n,nullptr,0) && n>0 && n<=capacity &&
+  out[n-1]==0 && strlen(out)==n-1;
+ if(!ok && capacity)out[0]=0;return ok;
+#else
+ (void)key;if(capacity)out[0]=0;return false;
+#endif
+}
+static inline bool backboardArmed(const char *args) {
+ if(!args)return false;unsigned keys=0;bool armed=false;
+ for(const char *p=args;*p;) {
+  p+=strspn(p," \t\r\n");size_t n=strcspn(p," \t\r\n");
+  if(n>=8 && !strncmp(p,"fuxigpu=",8)) {++keys;armed=n==18 && !memcmp(p,"fuxigpu=backboardd",18);}
+  p+=n;
+ }
+ return keys==1 && armed;
+}
 static inline bool clientName(const char *s) {
  size_t n=strlen(s);if(!n || n>63)return false;
  for(size_t i=0;i<n;++i)if(!((s[i]>='a'&&s[i]<='z')||(s[i]>='A'&&s[i]<='Z')||
      (s[i]>='0'&&s[i]<='9')||s[i]=='_'||s[i]=='-'||s[i]=='.'))return false;
  return true;
 }
-static inline ClientMode parseClients(char *data,size_t length,const char *process) {
- if(!strcmp(process,"backboardd") || !strcmp(process,"SpringBoard"))return ClientMode::deny;
+static inline ClientMode parseClients(char *data,size_t length,const char *process,const char *bootargs=nullptr) {
+ bool backboard=!strcmp(process,"backboardd");
+ if(!strcmp(process,"SpringBoard") || (backboard && !backboardArmed(bootargs)))return ClientMode::deny;
  if(!clientName(process)||memchr(data,0,length))return ClientMode::deny;
  data[length]=0;ClientMode result=ClientMode::deny;
  for(char *line=data;line;) {
@@ -32,7 +54,7 @@ static inline ClientMode parseClients(char *data,size_t length,const char *proce
   }
   line=next;
  }
- return result;
+ return backboard && result!=ClientMode::allow?ClientMode::deny:result;
 }
 static inline ClientMode readClients(const char *path,const char *process) {
  int fd=open(path,O_RDONLY|O_NOFOLLOW|O_NONBLOCK);if(fd<0)return ClientMode::deny;
@@ -41,6 +63,7 @@ static inline ClientMode readClients(const char *path,const char *process) {
   ssize_t n;while(used<sizeof(data)-1 && (n=read(fd,data+used,sizeof(data)-1-used))>0)used+=(size_t)n;
   char tail;ok=read(fd,&tail,1)==0 && used==(size_t)st.st_size;
  }
- close(fd);return ok?parseClients(data,used,process):ClientMode::deny;
+ char args[4096]={};if(!strcmp(process,"backboardd"))systemString("kern.bootargs",args,sizeof(args));
+ close(fd);return ok?parseClients(data,used,process,args):ClientMode::deny;
 }
 }

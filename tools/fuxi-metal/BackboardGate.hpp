@@ -1,0 +1,110 @@
+/* Boot-scoped crash recovery; no signal handler or mid-context CPU replay. */
+#pragma once
+#include "ClientStorage.hpp"
+#include <chrono>
+#include <atomic>
+#include <mutex>
+#include <sys/file.h>
+namespace fuxi {
+class BackboardGate {
+ std::mutex mutex;
+ int directory=-1,lease=-1;char boot[37]={};unsigned strikes=0;
+ std::atomic<bool> active{false},failed{false};bool good=false;
+ uint64_t frames=0,late=0,failures=0,gpu=0,lastFrames=0,lastGPU=0;
+ double began=0,lastReport=0;
+ static double now(){return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();}
+ bool store(const char *state) {
+  // Fixed temp name is safe under the lifetime flock. Orphans are never read.
+  unlinkat(directory,"gate.tmp",0);
+  int fd=openat(directory,"gate.tmp",O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);
+  if(fd<0)return false;
+  char record[96];int n=snprintf(record,sizeof(record),"FXBB1 %s %u %s\n",boot,strikes,state);
+  bool ok=privateStorage(fd,false,geteuid()) && write(fd,record,size_t(n))==n && !fsync(fd);
+  close(fd);if(ok)ok=!renameat(directory,"gate.tmp",directory,"gate.state");
+  if(ok)ok=!fsync(directory);unlinkat(directory,"gate.tmp",0);return ok;
+ }
+ bool deny(const char *why) {
+  fprintf(stderr,"FUXI MTL: backboardd gate deny reason=%s strikes=%u uid=%lu\n",why,strikes,(unsigned long)geteuid());return false;
+ }
+ bool persistDenied() {
+  if(store("denied"))return true;
+  // A full disk or blocked temp name must not leave an old 'good' reusable.
+  // Invalidate the existing inode durably first; a partial rewrite fails closed.
+  int fd=openat(directory,"gate.state",O_WRONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);
+  if(fd<0)return false;
+  char record[96];int n=snprintf(record,sizeof(record),"FXBB1 %s %u denied\n",boot,strikeLimit);
+  bool ok=privateStorage(fd,false,geteuid()) && !ftruncate(fd,0) && !fsync(fd) &&
+   write(fd,record,size_t(n))==n && !fsync(fd);
+  close(fd);return ok;
+ }
+public:
+ static constexpr unsigned goodFrames=120,strikeLimit=1;
+ static bool validBoot(const char *s) {
+  if(!s || strlen(s)!=36)return false;
+  for(unsigned i=0;i<36;++i) {
+   if(i==8 || i==13 || i==18 || i==23){if(s[i]!='-')return false;}
+   else if(!((s[i]>='0' && s[i]<='9') || (s[i]>='a' && s[i]<='f') || (s[i]>='A' && s[i]<='F')))return false;
+  }return true;
+ }
+ // Takes ownership of storage; separate argument permits host filesystem tests.
+ bool admit(const char *uuid,int storage) {
+  std::lock_guard<std::mutex> guard(mutex);directory=storage;
+  if(!validBoot(uuid))return deny("boot-uuid-unavailable");
+  memcpy(boot,uuid,37);for(char &c:boot)if(c>='A' && c<='F')c=char(c-'A'+'a');
+  if(!privateStorage(directory,true,geteuid()))return deny("storage-permissions");
+  lease=openat(directory,"gate.lock",O_RDWR|O_CREAT|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK,0600);
+  if(!privateStorage(lease,false,geteuid()) || flock(lease,LOCK_EX|LOCK_NB))return deny("lease-unavailable");
+  int fd=openat(directory,"gate.state",O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);
+  if(fd<0 && errno!=ENOENT)return deny("record-open");
+  if(fd>=0) {
+   char data[128]={},oldBoot[37]={},state[16]={};unsigned previous=0;int end=0;
+   ssize_t n=privateStorage(fd,false,geteuid())?read(fd,data,sizeof(data)-1):-1;close(fd);
+   if(n<=0 || sscanf(data,"FXBB1 %36s %u %15s%n",oldBoot,&previous,state,&end)!=3 ||
+      end+1!=n || data[end]!='\n' || !validBoot(oldBoot) || previous>strikeLimit ||
+      (strcmp(state,"armed") && strcmp(state,"good") && strcmp(state,"denied")))return deny("record-invalid");
+   if(!strcmp(oldBoot,boot)) {
+    strikes=previous;
+    if(!strcmp(state,"armed") && strikes<strikeLimit)++strikes;
+    if(!strcmp(state,"denied"))strikes=strikeLimit;
+   }else fprintf(stderr,"FUXI MTL: backboardd gate new-boot reset\n");
+  }
+  if(strikes>=strikeLimit){store("denied");return deny("strikes");}
+  if(!store("armed"))return deny("record-write");
+  active=true;began=lastReport=now();
+  fprintf(stderr,"FUXI MTL: backboardd gate allow armed strikes=%u uid=%lu good_frames=%u\n",strikes,(unsigned long)geteuid(),goodFrames);return true;
+ }
+ bool admit() {char uuid[64]={};systemString("kern.bootsessionuuid",uuid,sizeof(uuid));return admit(uuid,openClientStorage("backboardd"));}
+ bool blocked() const {return active.load() && failed.load();}
+ void fault() {
+  if(!active.load())return;
+  std::lock_guard<std::mutex> guard(mutex);if(!active)return;++failures;if(failed)return;
+  failed=true;strikes=strikeLimit;bool saved=persistDenied();
+  fprintf(stderr,"FUXI MTL: backboardd gate runtime-failure next-respawn=CPU persisted=%u\n",unsigned(saved));
+ }
+ void completed(uint64_t gpuNanos,double wallMS) {
+  if(!active.load())return;
+  std::lock_guard<std::mutex> guard(mutex);if(!active || failed)return;
+  ++frames;gpu+=gpuNanos;if(wallMS>1000.0/60.0)++late;
+  if(frames==1)fprintf(stderr,"FUXI MTL: backboardd first_frame_ms=%.3f gpu_ms=%.3f\n",(now()-began)*1000,gpuNanos/1e6);
+  if(!good && frames>=goodFrames) {
+   if(store("good")){good=true;fprintf(stderr,"FUXI MTL: backboardd gate good frames=%llu\n",(unsigned long long)frames);}
+   else {failed=true;strikes=strikeLimit;bool saved=persistDenied();fprintf(stderr,"FUXI MTL: backboardd gate deny reason=good-write next-respawn=CPU persisted=%u\n",unsigned(saved));}
+  }
+ }
+ void report() {
+  if(!active.load())return;
+  std::lock_guard<std::mutex> guard(mutex);double t=now();if(!active || t-lastReport<5)return;
+  uint64_t count=frames-lastFrames;
+  fprintf(stderr,"FUXI MTL: backboardd frames=%llu gpu_ms=%.3f late=%llu failures=%llu hz=%.2f window_frames=%llu\n",
+   (unsigned long long)frames,count?(gpu-lastGPU)/1e6/double(count):0.0,(unsigned long long)late,
+   (unsigned long long)failures,double(count)/(t-lastReport),(unsigned long long)count);
+  lastReport=t;lastFrames=frames;lastGPU=gpu;
+ }
+ BackboardGate()=default;
+ BackboardGate(const BackboardGate&)=delete;BackboardGate& operator=(const BackboardGate&)=delete;
+ ~BackboardGate(){if(lease>=0)close(lease);if(directory>=0)close(directory);}
+};
+// The dispatch reporter and lease live until process death, including during
+// static teardown. Local test instances still close their descriptors normally.
+inline BackboardGate &backboardGate=*new BackboardGate;
+}

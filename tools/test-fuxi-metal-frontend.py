@@ -18,6 +18,13 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         d=Path(tmp);conf=d/'smoke.conf'
         compiler=['xcrun','clang++'] if os.uname().sysname=='Darwin' else ['clang++']
+        for name in ('ClientGateTests','BackboardGateTests'):
+            subprocess.run([*compiler,'-std=c++17','-Wall','-Wextra','-Werror','-pthread',
+                            '-fsanitize=address,undefined',str(ROOT/'tools/fuxi-metal'/(name+'.cpp')),
+                            '-o',str(d/name)],check=True)
+            if not a.compile_only:subprocess.run([str(d/name)],check=True,timeout=15)
+        if not a.compile_only:
+            subprocess.run(['python3',str(ROOT/'tools/test-fuxi-metal-stage.py'),'--policy-storage-only'],check=True)
         subprocess.run([*compiler,'-std=c++17','-O1','-g','-Wall','-Wextra','-Werror',
                         '-fsanitize=address,undefined','-pthread',
                         str(ROOT/'tools/fuxi-metal/ConstantHooksTests.cpp'),'-o',str(d/'constant-hooks')],check=True)
@@ -65,8 +72,22 @@ def main():
         print(gate.stdout,end='')
         allowed=subprocess.run([str(d/'gate'),'daemon-argv'],env=dict(env,FUXI_TEST_GATE_ALLOW='1'),text=True,capture_output=True,check=True,timeout=10)
         assert allowed.stderr.count('FUXI MTL: gate allow gate-test')==1,allowed.stderr
-        call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/ClientGateTests.cpp'),'-o',str(d/'policy')])
-        subprocess.run([str(d/'policy')],env=env,check=True,timeout=10)
+        def compositor(process,config,args='',expected='deny',**extra):
+            p=subprocess.run([str(d/'gate'),'SpringBoard','ignored'],env=dict(env,FUXI_TEST_GATE_ALLOW='1',
+                FUXI_TEST_PROCESS=process,FUXI_TEST_GATE_CONFIG=config,FUXI_TEST_BOOTARGS=args,
+                FUXI_TEST_GATE_EXPECT=expected,**extra),text=True,capture_output=True,check=True,timeout=10)
+            assert p.stderr.count('FUXI MTL: gate '+expected+' '+process)==1,p.stderr
+            return p
+        compositor('backboardd','')
+        compositor('backboardd','backboardd\n')
+        compositor('backboardd','','fuxigpu=backboardd')
+        compositor('SpringBoard','SpringBoard\n','fuxigpu=backboardd')
+        compositor('SpringBoard','census SpringBoard\n','fuxigpu=backboardd')
+        private=d/'backboardd';private.mkdir(mode=0o700)
+        p=compositor('backboardd','backboardd\n','fuxigpu=backboardd','allow',
+                     FUXI_TEST_GATE_DIR=str(private),FUXI_TEST_GATE_FAULT='1')
+        assert 'backboardd gate good frames=120' in p.stderr and 'next-respawn=CPU persisted=1' in p.stderr,p.stderr
+        compositor('backboardd','backboardd\n','fuxigpu=backboardd',FUXI_TEST_GATE_DIR=str(private))
         call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/CensusTests.mm'),*frameworks,'-o',str(d/'census')])
         census=subprocess.run([str(d/'census')],env=env,text=True,capture_output=True,check=True,timeout=15)
         assert census.stderr.count(' supportsFamily: implemented')==1,census.stderr

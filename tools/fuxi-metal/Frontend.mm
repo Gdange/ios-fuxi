@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include "ClientGate.hpp"
+#include "BackboardGate.hpp"
 #include "Translator.hpp"
 #include "CAState.hpp"
 #include "Timeline.hpp"
@@ -36,6 +37,9 @@ static char clientProcess[64]="unknown";
 #ifndef FUXI_MTL_READ_CLIENTS
 #define FUXI_MTL_READ_CLIENTS fuxi::readClients
 #endif
+#ifndef FUXI_MTL_BACKBOARD_ADMIT
+#define FUXI_MTL_BACKBOARD_ADMIT() fuxi::backboardGate.admit()
+#endif
 static uint64_t observationMicros() {return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();}
 static std::atomic<uint64_t> clientCheckUs{0};
 static void checkClient() {
@@ -48,6 +52,16 @@ static void checkClient() {
    if(fuxi::clientName(name)) {memcpy(clientProcess,name,strlen(name)+1);identified=true;}
   }
   clientMode=identified?FUXI_MTL_READ_CLIENTS(FUXI_MTL_CLIENTS_CONF,clientProcess):fuxi::ClientMode::deny;
+  if(!strcmp(clientProcess,"backboardd")) {
+   if(clientMode!=fuxi::ClientMode::allow)fprintf(stderr,"FUXI MTL: backboardd gate deny reason=policy-or-bootarg\n");
+   else if(!FUXI_MTL_BACKBOARD_ADMIT())clientMode=fuxi::ClientMode::deny;
+   else {
+    // Lifetime diagnostics include idle periods and a stalled render thread.
+    static dispatch_source_t timer=dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW,0));
+    if(timer){dispatch_source_set_timer(timer,dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC),5*NSEC_PER_SEC,NSEC_PER_SEC/10);
+     dispatch_source_set_event_handler(timer,^{fuxi::backboardGate.report();});dispatch_resume(timer);}
+   }
+  }
   clientCheckUs=observationMicros();
   fprintf(stderr,"FUXI MTL: gate %s %s\n",clientMode==fuxi::ClientMode::deny?"deny":"allow",clientProcess);
   if(clientMode==fuxi::ClientMode::census)fprintf(stderr,"FUXI MTL: census enabled %s (no GPU)\n",clientProcess);
@@ -102,6 +116,7 @@ extern "C" uint64_t fuxi_metal_submit_pool_creates() {return fuxi::Backend::subm
 extern "C" uint64_t fuxi_metal_submit_frame_creates() {return fuxi::Backend::submitFrameCreates.load();}
 extern "C" uint64_t fuxi_metal_submit_view_creates() {return fuxi::Backend::submitViewCreates.load();}
 static void failureLog(const char *format,...) {
+ fuxi::backboardGate.fault();
  uint64_t n=failureCount.fetch_add(1);if(n>=64)return;
  va_list args;va_start(args,format);vfprintf(stderr,format,args);va_end(args);
  if(n==63)fprintf(stderr,"FUXI MTL: failure log limit 64 (counter continues)\n");
@@ -974,8 +989,10 @@ static thread_local FuxiCommandBuffer *completionCommand;
  if(_status!=MTLCommandBufferStatusNotEnqueued)return;
  if(_encoding)[self rejectSelector:_cmd];
  _status=MTLCommandBufferStatusCommitted;
+ bool backboard=!strcmp(clientProcess,"backboardd");
+ auto frameStart=std::chrono::steady_clock::now();uint64_t gpuBefore=backboard?fuxi::Backend::gpuNanos.load():0;
  // Deliberately synchronous M4 queue: no dispatch worker or asynchronous promise.
- try {if(!strcmp(clientProcess,"fuxi-ca-smoke") && failureCount.load())throw std::runtime_error("CA diagnostic failure latched: GPU submission refused");if(_rejected)throw std::runtime_error("unsupported command: GPU submission refused");if(clientMode==fuxi::ClientMode::census)throw std::runtime_error("census: no GPU submission");auto *backend=owner(_queue->_device)->backend;size_t begin=0;
+ try {if(fuxi::backboardGate.blocked())throw std::runtime_error("backboardd failure latched: CPU on next respawn");if(!strcmp(clientProcess,"fuxi-ca-smoke") && failureCount.load())throw std::runtime_error("CA diagnostic failure latched: GPU submission refused");if(_rejected)throw std::runtime_error("unsupported command: GPU submission refused");if(clientMode==fuxi::ClientMode::census)throw std::runtime_error("census: no GPU submission");auto *backend=owner(_queue->_device)->backend;size_t begin=0;
  auto shadowStart=std::chrono::steady_clock::now();
  for(id r in _resources){FuxiBuffer *s=nil;
   if([r isKindOfClass:[FuxiBuffer class]])s=r;else if([r isKindOfClass:[FuxiTexture class]])s=[(FuxiTexture *)r buffer];
@@ -988,7 +1005,17 @@ static thread_local FuxiCommandBuffer *completionCommand;
  }
  if(begin<_ops.size() || _events.empty())backend->submit(std::vector<fuxi::Operation>(_ops.begin()+begin,_ops.end()),[&]{_scheduled=YES;});
  else _scheduled=YES;
- for(const auto &op:_ops)if(op.pipeline)completedDraws.fetch_add(1);_status=MTLCommandBufferStatusCompleted;}
+ for(const auto &op:_ops)if(op.pipeline)completedDraws.fetch_add(1);
+ bool surfaceFrame=false;
+ if(backboard)for(id r in _resources) {
+  if(![r isKindOfClass:[FuxiTexture class]] || ![(FuxiTexture *)r iosurface])continue;
+  auto *texture=((FuxiTexture *)r)->_texture;if(!texture || !texture->defined)continue;
+  for(const auto &op:_ops)if(op.texture==texture && op.store && (op.pipeline || op.clearOnly)){surfaceFrame=true;break;}
+  if(surfaceFrame)break;
+ }
+ _status=MTLCommandBufferStatusCompleted;
+ if(surfaceFrame)fuxi::backboardGate.completed(fuxi::Backend::gpuNanos.load()-gpuBefore,
+  std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-frameStart).count());}
  catch(const std::exception &e) {
   failureLog("FUXI MTL: submit FAIL %.256s\n",e.what());_status=MTLCommandBufferStatusError;
   if(!_error)_error=[[NSError alloc] initWithDomain:MTLCommandBufferErrorDomain code:MTLCommandBufferErrorInternal
@@ -1105,7 +1132,8 @@ static thread_local FuxiCommandBuffer *completionCommand;
  checkClient();
  if(clientMode==fuxi::ClientMode::deny) {[self release];return nil;}
  CENSUS();
- if((clientMode!=fuxi::ClientMode::census && geteuid()!=0) || !port || owner(self)) {[self release];return nil;}
+ if((clientMode!=fuxi::ClientMode::census && geteuid()!=0 && strcmp(clientProcess,"backboardd")) ||
+    fuxi::backboardGate.blocked() || !port || owner(self)) {[self release];return nil;}
  if(clientMode==fuxi::ClientMode::census) {
   FuxiOwner *state=[FuxiOwner new];
   objc_setAssociatedObject(self,&ownerKey,state,OBJC_ASSOCIATION_RETAIN_NONATOMIC);[state release];return self;
@@ -1122,6 +1150,7 @@ static thread_local FuxiCommandBuffer *completionCommand;
  // back. Refuse discovery on the current no-import kernel even after a root
  // allow-list edit; no partially usable CA device enters Metal's device cache.
  if((!strcmp(clientProcess,"backboardd") || !strcmp(clientProcess,"SpringBoard")) && !state->backend->supportsHostImport()) {
+  fprintf(stderr,"FUXI MTL: backboardd gate deny reason=host-import-unavailable\n");
   unsupported(self,@selector(newTextureWithDescriptor:iosurface:plane:));
   fprintf(stderr,"FUXI MTL: CA preflight deny IOSurface HostImport unavailable\n");[state release];[self release];return nil;
  }

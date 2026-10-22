@@ -7,13 +7,56 @@ import importlib.util
 from pathlib import Path
 import shutil
 import struct
+import plistlib
 import tempfile
 from unittest.mock import patch
 spec=importlib.util.spec_from_file_location('stage',Path(__file__).with_name('stage-fuxi-metal.py'))
 m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 
+def policy_storage_tests():
+    with tempfile.TemporaryDirectory() as tmp:
+        root=Path(tmp);clients=root/'clients'
+        clients.write_bytes(b'fuxi-ca-smoke\n')
+        assert b'\nbackboardd\n' not in m.validate_clients(clients)
+        assert m.validate_clients(clients,True)==b'fuxi-ca-smoke\nbackboardd\n'
+        clients.write_bytes(b'backboardd\n')
+        assert m.validate_clients(clients,True)==b'backboardd\n'
+        for data in (b'backboardd\n',b'SpringBoard\n',b'census backboardd\n',b'census SpringBoard\n'):
+            clients.write_bytes(data)
+            try:m.validate_clients(clients);raise AssertionError('default compositor accepted')
+            except ValueError:pass
+            if data!=b'backboardd\n':
+                try:m.validate_clients(clients,True);raise AssertionError('unsafe compositor accepted')
+                except ValueError:pass
+        job=root/'System/Library/LaunchDaemons/com.apple.backboardd.plist';job.parent.mkdir(parents=True)
+        job.write_bytes(plistlib.dumps({}))
+        assert m.backboard_account(root)==(0,0)
+        job.write_bytes(plistlib.dumps({'UserName':'_render'}))
+        try:m.backboard_account(root);raise AssertionError('missing target user accepted')
+        except ValueError:pass
+        passwd=root/'private/etc/master.passwd';passwd.parent.mkdir(parents=True)
+        passwd.write_text('_render:*:501:502::0:0:render:/var/empty:/usr/bin/false\n')
+        assert m.backboard_account(root)==(501,502)
+        with patch.object(m.os,'chown') as chown:
+            m.prepare_backboard_storage(root,(501,502))
+            directory=root/'private/var/db/fuxi-metal'
+            assert directory.stat().st_mode&0o7777==0o755
+            assert (directory/'backboardd-501').stat().st_mode&0o7777==0o700
+            assert any(c.args==(directory/'backboardd-501',501,502) for c in chown.call_args_list)
+        # Existing unsafe directories are refused, never made world writable/repaired.
+        directory.chmod(0o777)
+        try:m.prepare_backboard_storage(root,(501,502));raise AssertionError('unsafe parent accepted')
+        except ValueError:pass
+        shutil.rmtree(directory);directory.symlink_to(root/'private/etc',target_is_directory=True)
+        try:m.prepare_backboard_storage(root,(501,502));raise AssertionError('linked storage accepted')
+        except ValueError:pass
+    print('PASS: staging opt-in/default deny, SpringBoard/census deny, target launchd UID resolution and 0755 root/0700 client storage')
+
 def main():
-    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--out',type=Path,default=Path('tools/out'));a=ap.parse_args()
+    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--out',type=Path,default=Path('tools/out'))
+    ap.add_argument('--policy-storage-only',action='store_true');a=ap.parse_args()
+    policy_storage_tests()
+    if a.policy_storage_only:return
     with tempfile.TemporaryDirectory() as tmp:
         d=Path(tmp);root=d/'root';(root/'System/Library').mkdir(parents=True)
         icd=a.out/'libvulkan_freedreno.dylib';bundle=a.out/'FuxiMetal.bundle';smoke=a.out/'fuxi-metal-smoke'
@@ -37,6 +80,12 @@ def main():
                 (bundle/'_CodeSignature/CodeResources','System/Library/Extensions/FuxiMetal.bundle/_CodeSignature/CodeResources',0o644)):
                 p=root/rel;assert p.read_bytes()==src.read_bytes() and p.stat().st_mode&0o777==mode
             assert all(c.args[1:]==(0,0) for c in chown.call_args_list)
+            # Exercise the actual staging flag/config writer without target-account assumptions.
+            with patch.object(m,'backboard_account',return_value=(501,502)),patch.object(m,'prepare_backboard_storage') as storage:
+                m.stage(root,icd,bundle,smoke,conf,clients,ca_conf=ca_conf,enable_backboardd=True)
+                storage.assert_called_once_with(root.resolve(),(501,502))
+                assert (root/'usr/local/share/fuxi/metal-clients.conf').read_bytes()==clients.read_bytes()+b'backboardd\n'
+            stage() # Default restaging removes admission again.
             # A missing third-party notice must fail preflight before any copy.
             original_is_file=Path.is_file
             with patch.object(Path,'is_file',lambda p:p.name!='LICENSE.NativeMetal' and original_is_file(p)),patch.object(m.shutil,'copyfile') as copied:

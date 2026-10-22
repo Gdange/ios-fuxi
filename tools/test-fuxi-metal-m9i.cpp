@@ -4,16 +4,19 @@
 #include <cassert>
 #include <fstream>
 #include <iterator>
+#include <sys/wait.h>
 using Cache=fuxi::PipelineCache;
 static std::vector<uint8_t> fakePayload(64);
 static unsigned fakeSeeds=0,fakeCreates=0,fakeDestroys=0;
 static bool refuseSeed=false;
+static VkResult fakeDataResult=VK_SUCCESS;
 static VkResult VKAPI_CALL fakeCreate(VkDevice,const VkPipelineCacheCreateInfo *ci,const VkAllocationCallbacks *,VkPipelineCache *out){
  ++fakeCreates;if(ci->initialDataSize){++fakeSeeds;assert(ci->initialDataSize==fakePayload.size());assert(!memcmp(ci->pInitialData,fakePayload.data(),fakePayload.size()));if(refuseSeed)return VK_ERROR_INITIALIZATION_FAILED;}
  *out=(VkPipelineCache)(uintptr_t)1;return VK_SUCCESS;
 }
 static void VKAPI_CALL fakeDestroy(VkDevice,VkPipelineCache,const VkAllocationCallbacks *){++fakeDestroys;}
 static VkResult VKAPI_CALL fakeData(VkDevice,VkPipelineCache,size_t *n,void *p){
+ if(fakeDataResult!=VK_SUCCESS)return fakeDataResult;
  if(!p){*n=fakePayload.size();return VK_SUCCESS;}assert(*n>=fakePayload.size());memcpy(p,fakePayload.data(),fakePayload.size());*n=fakePayload.size();return VK_SUCCESS;
 }
 static void put(uint8_t *p,uint32_t n){for(unsigned i=0;i<4;++i)p[i]=uint8_t(n>>(i*8));}
@@ -40,13 +43,27 @@ static void unit(const char *directory){
  write(original);refuseSeed=true;{Cache c;auto creates=fakeCreates;open(c);assert(Cache::loadResult==2 && fakeCreates==creates+2 && c.get());c.close();}refuseSeed=false;
  // Never follow files or accept unsafe owner/mode; no driver seeds on refusal.
  write(original);assert(!chmod(path.c_str(),0644));{Cache c;auto seeds=fakeSeeds;open(c);assert(Cache::loadResult==2 && fakeSeeds==seeds);c.close();}assert(!chmod(path.c_str(),0600));
+ struct stat permissions{};assert(!stat(path.c_str(),&permissions));assert(permissions.st_uid==geteuid() && permissions.st_nlink==1);
+ auto hardlink=std::string(directory)+"/hardlink";assert(!link(path.c_str(),hardlink.c_str()));
+ {Cache c;auto seeds=fakeSeeds;open(c);assert(Cache::loadResult==2 && fakeSeeds==seeds);c.close();}assert(!unlink(hardlink.c_str()));
  unlink(path.c_str());assert(!symlink("absent",path.c_str()));{Cache c;open(c);assert(Cache::loadResult==2);c.close();}unlink(path.c_str());
  // The 32 MiB cap is checked before allocation/read (sparse file is sufficient).
  {int fd=::open(path.c_str(),O_CREAT|O_WRONLY,0600);assert(fd>=0);assert(!ftruncate(fd,Cache::headerBytes+Cache::maxBytes+1));::close(fd);}
  {Cache c;open(c);assert(Cache::loadResult==2);c.close();}unlink(path.c_str());
  // Read-only directory policy works even when this harness runs as root.
  assert(!chmod(directory,0500));{Cache c;open(c);assert(Cache::loadResult==0 && Cache::saveResult==2 && c.get());c.finishedPair(101);c.close();}assert(!chmod(directory,0700));
+ assert(!chmod(directory,0755));{Cache c;open(c);assert(Cache::loadResult==0 && Cache::saveResult==2);c.close();}assert(!chmod(directory,0700));
  assert(fakeCreates==fakeDestroys+1); // The intentionally refused seeded create has no object.
+ // Fresh child processes exercise the production backend and optional-cache fault paths.
+ for(unsigned i=0;i<3;++i){pid_t pid=fork();assert(pid>=0);if(!pid){
+   char boot[37];snprintf(boot,sizeof(boot),"aaaaaaaa-1111-2222-3333-%012u",i);
+   assert(fuxi::backboardGate.admit(boot,::open(directory,O_RDONLY|O_DIRECTORY|O_NOFOLLOW)));
+   if(i<2){try {fuxi::check(i?VK_TIMEOUT:VK_ERROR_DEVICE_LOST);assert(false);}catch(const std::runtime_error &) {}}
+   else {fakeDataResult=VK_ERROR_DEVICE_LOST;Cache c;open(c);c.finishedPair(101);c.close();}
+   assert(fuxi::backboardGate.blocked());_exit(0);
+  }int status=0;assert(waitpid(pid,&status,0)==pid && WIFEXITED(status) && !WEXITSTATUS(status));
+ }
+ puts("PASS: M9j cache UID/mode/nlink checks and backend loss/timeout/optional-cache loss latch CPU fallback");
  puts("PASS: M9i validation-before-driver, checkpoints, retry, permissions, cap and memory-only controls");
 }
 int main(int argc,char **argv){

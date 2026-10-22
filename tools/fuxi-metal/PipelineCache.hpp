@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "BackboardGate.hpp"
 namespace fuxi {
 class PipelineCache {
 public:
@@ -39,12 +40,10 @@ private:
   struct stat s{};return fd>=0 && !fstat(fd,&s) && (dir?S_ISDIR(s.st_mode):S_ISREG(s.st_mode)) &&
    s.st_uid==owner() && (s.st_mode&07777)==(dir?0700:0600) && (dir || s.st_nlink==1);
  }
- static uid_t owner(){
-#ifdef FUXI_MTL_HOST_TEST
-  return geteuid();
-#else
-  return 0;
-#endif
+ static uid_t owner(){return geteuid();}
+ static VkResult result(VkResult r){
+  // Optional cache failures stay memory-only, but never hide device loss.
+  if(r==VK_ERROR_DEVICE_LOST || r==VK_TIMEOUT)backboardGate.fault();return r;
  }
  void disable(){if(directory>=0)::close(directory);directory=-1;}
  const char *validatePayload(const uint8_t *p,size_t n) const {
@@ -72,9 +71,9 @@ private:
   return validatePayload(payload.data(),n);
  }
  bool saveData(size_t &bytes){
-  if(data(device,cache,&bytes,nullptr)!=VK_SUCCESS || bytes<32 || bytes>maxBytes)return false;
+  if(result(data(device,cache,&bytes,nullptr))!=VK_SUCCESS || bytes<32 || bytes>maxBytes)return false;
   std::vector<uint8_t> payload(bytes);
-  if(data(device,cache,&bytes,payload.data())!=VK_SUCCESS || bytes<32 || bytes>payload.size() || validatePayload(payload.data(),bytes))return false;
+  if(result(data(device,cache,&bytes,payload.data()))!=VK_SUCCESS || bytes<32 || bytes>payload.size() || validatePayload(payload.data(),bytes))return false;
   auto h=identity;put(h.data()+16,uint32_t(bytes));put(h.data()+20,crc32(payload.data(),bytes));
   char temp[96];snprintf(temp,sizeof(temp),".cache-%lu-%u",(unsigned long)getpid(),sequence.fetch_add(1));
   FD f(openat(directory,temp,O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600));
@@ -114,15 +113,13 @@ public:
    put(identity.data()+24,p.driverVersion);put(identity.data()+28,driver.driverID);
    memcpy(identity.data()+32,id.driverUUID,16);memcpy(identity.data()+48,driver.driverInfo,256);
    if(translator)memcpy(identity.data()+304,translator,32);
-   if(valid && translator && geteuid()==owner()) {
+   if(valid && translator) {
 #ifdef FUXI_MTL_HOST_TEST
     // Host harness only. No production environment override of trusted storage.
     const char *root=getenv("FUXI_MTL_TEST_CACHE_DIR");
     if(root)directory=::open(root,O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
 #else
-    FD parent(::open("/private/var/db",O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW));
-    if(parent.n>=0 && (!mkdirat(parent.n,"fuxi-metal",0700) || errno==EEXIST))
-     directory=openat(parent.n,"fuxi-metal",O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
+    directory=openClientStorage(client.c_str());
 #endif
     if(!secure(directory,true))disable();
    }
@@ -132,7 +129,7 @@ public:
   }catch(...){reason="allocation";payload.clear();loadResult=2;disable();saveResult=2;}
   // A valid cache may still be refused by a driver: retry empty, never fail open.
   VkPipelineCacheCreateInfo ci{};ci.sType=VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;ci.initialDataSize=payload.size();ci.pInitialData=payload.empty()?nullptr:payload.data();
-  if(create(device,&ci,nullptr,&cache)!=VK_SUCCESS){cache={};if(!payload.empty()){reason="driver";loadResult=2;loadBytes=0;ci.initialDataSize=0;ci.pInitialData=nullptr;if(create(device,&ci,nullptr,&cache)!=VK_SUCCESS)cache={};}}
+  if(result(create(device,&ci,nullptr,&cache))!=VK_SUCCESS){cache={};if(!payload.empty()){reason="driver";loadResult=2;loadBytes=0;ci.initialDataSize=0;ci.pInitialData=nullptr;if(result(create(device,&ci,nullptr,&cache))!=VK_SUCCESS)cache={};}}
   char result[48];if(reason)snprintf(result,sizeof(result),"discard(%s)",reason);
   else snprintf(result,sizeof(result),"%s",loadResult==1?"hit":"empty");
   fprintf(stderr,"FUXI MTL: pipeline cache load %s bytes=%llu result=%s\n",client.c_str(),(unsigned long long)loadBytes.load(),result);
@@ -144,11 +141,11 @@ public:
   // At most one checkpoint per second; called only after new pipeline builds.
   if((pending>=4 || milliseconds>=100) && now-lastSave>=std::chrono::seconds(1))save();
   size_t bytes=0;
-  if(data(device,cache,&bytes,nullptr)!=VK_SUCCESS || bytes>maxBytes){
+  if(result(data(device,cache,&bytes,nullptr))!=VK_SUCCESS || bytes>maxBytes){
    // Never serialize an oversized generation. Existing VkPipelines survive.
    destroy(device,cache,nullptr);cache={};dirty=false;pending=0;
    VkPipelineCacheCreateInfo ci{};ci.sType=VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
-   if(create(device,&ci,nullptr,&cache)!=VK_SUCCESS)cache={};
+   if(result(create(device,&ci,nullptr,&cache))!=VK_SUCCESS)cache={};
   }
  }
  void close() noexcept {save();if(cache)destroy(device,cache,nullptr);cache={};disable();pending=0;dirty=false;}

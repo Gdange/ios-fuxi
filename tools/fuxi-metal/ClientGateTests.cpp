@@ -1,8 +1,8 @@
 #include "ClientGate.hpp"
 #include <cassert>
 #include <string>
-static fuxi::ClientMode parse(std::string text,const char *name="fuxi-metal-smoke") {
- size_t n=text.size();text.push_back(0);return fuxi::parseClients(text.data(),n,name);
+static fuxi::ClientMode parse(std::string text,const char *name="fuxi-metal-smoke",const char *args=nullptr) {
+ size_t n=text.size();text.push_back(0);return fuxi::parseClients(text.data(),n,name,args);
 }
 int main() {
  using M=fuxi::ClientMode;
@@ -13,6 +13,15 @@ int main() {
   assert(parse(std::string("census ")+name+"\n",name)==M::deny);
  }
  assert(parse("fuxi-metal-smoke\n","backboardd")==M::deny);
+ const char *armed="other=1 fuxigpu=backboardd quiet";
+ assert(parse("backboardd\n","backboardd",armed)==M::allow);
+ assert(parse("fuxi-ca-smoke\n","backboardd",armed)==M::deny);
+ assert(parse("census backboardd\n","backboardd",armed)==M::deny);
+ assert(parse("backboardd\ncensus backboardd\n","backboardd",armed)==M::deny);
+ for(const char *args:{"", "fuxigpu=backboardd-extra", "xfuxigpu=backboardd", "fuxigpu=SpringBoard",
+     "fuxigpu=backboardd fuxigpu=off", "fuxigpu=off fuxigpu=backboardd", "fuxigpu=backboardd fuxigpu=backboardd"})
+  assert(parse("backboardd\n","backboardd",args)==M::deny);
+ for(const char *config:{"SpringBoard\n","census SpringBoard\n"})assert(parse(config,"SpringBoard",armed)==M::deny);
  assert(parse("# comment\n\tfuxi-metal-smoke \r\n")==M::allow);
  assert(parse("census backboardd\n","backboardd")==M::deny);
  assert(parse("backboardd\ncensus backboardd\n","backboardd")==M::deny);
