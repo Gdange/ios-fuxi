@@ -85,7 +85,7 @@ static unsigned nr, ne, sleeps, frees, allocations;
 static int old_iova_arg;
 static bool old_iova_present;
 static int clock_arg, iboff_arg;
-static int aspm_arg, stop22_arg, keep_arg;
+static int aspm_arg, stop22_arg, keep_arg, qrtr_arg;
 static const char *probe_arg, *pre_arg, *bhi_arg, *vec_arg, *fw_arg, *cnss_arg, *seq_arg;
 static unsigned cache_attrs[32][1024];
 static bool cache_drop;
@@ -115,6 +115,7 @@ static bool PE_parse_boot_argn(const char *name, void *out, int size) {
     if(!strcmp(name,"fuxiwlaniboff")) { memcpy(out,&iboff_arg,size); return true; }
     if(!strcmp(name,"fuxiwlanstop22")) { memcpy(out,&stop22_arg,size); return true; }
     if(!strcmp(name,"fuxiwlankeep")) { memcpy(out,&keep_arg,size); return true; }
+    if(!strcmp(name,"fuxiwlanqrtr")) { memcpy(out,&qrtr_arg,size); return true; }
     assert(!strcmp(name,"fuxiwlanoldiova"));
     if(old_iova_present) memcpy(out,&old_iova_arg,size);
     return old_iova_present;
@@ -271,9 +272,9 @@ static void init(void) {
     memset(wl_cb_unusable,0,sizeof(wl_cb_unusable));
     memset(probe_block,0,sizeof(probe_block));
     probe_steal=probe_change_next=false; corrupt_write_pa=0; corrupt_write_mask=1; nread_masks=0;
-    memset(&wl_amss,0,sizeof(wl_amss)); memset(&wl_image,0,sizeof(wl_image)); memset(&wl_vectors,0,sizeof(wl_vectors));
+    memset(&wl_ipcr,0,sizeof(wl_ipcr)); memset(&wl_amss,0,sizeof(wl_amss)); memset(&wl_image,0,sizeof(wl_image)); memset(&wl_vectors,0,sizeof(wl_vectors));
     memset(&wl_tables,0,sizeof(wl_tables)); wl_owned=wl_enabled=wl_route_owned=wl_route_installed=false;
-    old_iova_arg=0; old_iova_present=false; probe_arg=NULL; aspm_arg=stop22_arg=keep_arg=0;
+    old_iova_arg=0; old_iova_present=false; probe_arg=NULL; aspm_arg=stop22_arg=keep_arg=qrtr_arg=0;
     pre_arg=bhi_arg=vec_arg=fw_arg=cnss_arg=seq_arg=NULL;
     wl_seq_undos=wl_eq_bank=wl_msi_cap=wl_pm_cap=0; wl_cycle_attempted=wl_cycle_powered=wl_msi_pvm=wl_link_off=wl_dbi_ready=false; wl3_faults=0;
     memset(&wl_msi_sink,0,sizeof(wl_msi_sink));
