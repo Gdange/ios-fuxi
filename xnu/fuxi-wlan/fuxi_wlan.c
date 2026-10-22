@@ -15,6 +15,7 @@
  *   fuxiwlanfw=stock  separate caller-supplied stock image, no fallback
  *   fuxiwlanbhi=full  M6l whole-file BHI size experiment
  *   fuxiwlanvec=early|rddm  M6l TX staging or RDDM RX experiment
+ *   fuxiwlancnss=pdc  M6n AOP WLAN PDC setup before rails (default off)
  * Steps 17..28 probe DMA safety and load rootfs firmware through BHI/BHIe.
  * No interrupts, channels or QMI are enabled; see docs-lanes/wlan-bt.md M6.
  *
@@ -96,6 +97,8 @@ static struct fw_window fw_windows[] = {
 	{0x60100000, 0x4000, 0},    /* config window (iATU region 0, CFG0) */
 	{0x60400000, 0x4000, 0},    /* endpoint BAR0, first 16 KiB (MHI/BHI) */
 	{0x81c60000, 0x20000, 0},   /* cmd-db (reserved DDR) */
+	{0x0c300000, 0x4000, 0},    /* opt-in M6n AOSS QMP; descriptor bounds 0x400 */
+	{0x00408000, 0x4000, 0},    /* opt-in M6n IPCC MPROC SEND_ID */
 };
 #define FW_NWIN (sizeof(fw_windows) / sizeof(fw_windows[0]))
 static uint64_t fw_mapped_bytes;
@@ -697,6 +700,10 @@ static struct wl_dma wl_image, wl_vectors, wl_contexts, wl_tables;
 static struct wl_dma wl_rddm, wl_rxvectors;
 #define WL_RDDM_SIZE 0x780000u /* ath12k WCN7850; crash sink only, never dumped */
 static unsigned wl_pre, wl_full, wl_vec, wl_fw;
+static unsigned wl_cnss;
+static bool wl_pdc_attempted;
+static unsigned wl_pdc_acks;
+static const char *const wl_cnss_names[] = {"off", "pdc"};
 static bool wl_variant_invalid;
 static const char *const wl_pre_names[] = {"off", "qfprom", "warm", "reset", "wake", "l1ss"};
 static const char *const wl_fw_names[] = {"off", "stock"};
@@ -715,7 +722,7 @@ wl_variant_arg(const char *name, const char *const *names, unsigned count)
 	return 0;
 }
 
-static bool wl_variant_active(void) { return wl_pre || wl_full || wl_vec || wl_fw; }
+static bool wl_variant_active(void) { return wl_pre || wl_full || wl_vec || wl_fw || wl_cnss; }
 static unsigned wl_bhi_bytes(void) { return wl_full ? wl_fw_size : WL_CHUNK; }
 enum wl_probe_mode { WL_PROBE_OFF, WL_PROBE_UNMAPPED, WL_PROBE_PATTERN,
     WL_PROBE_CIVAC, WL_PROBE_NC, WL_PROBE_INVALID };
@@ -734,6 +741,7 @@ wl_probe_configure(void)
 	wl_fw = wl_variant_arg("fuxiwlanfw", wl_fw_names, 2);
 	wl_full = wl_variant_arg("fuxiwlanbhi", sizes, 2);
 	wl_vec = wl_variant_arg("fuxiwlanvec", wl_vec_names, 3);
+	wl_cnss = wl_variant_arg("fuxiwlancnss", wl_cnss_names, 2);
 	wl_probe = WL_PROBE_OFF; wl_probe_fired = false;
 	if (PE_parse_boot_argn("fuxiwlanprobe", arg, sizeof(arg))) {
 		arg[sizeof(arg) - 1] = 0;
@@ -753,6 +761,8 @@ wl_probe_configure(void)
 	printf("FUXI WLAN: M6k probe=%s (one BHI doorbell; diagnostic modes stop at 22)\n", wl_probe_names[wl_probe]);
 	printf("FUXI WLAN: M6m fw=%s l1ss=%u valid=%u (stock means supplied input, not verified provenance)\n",
 	    wl_fw_names[wl_fw], wl_pre == 5, !wl_variant_invalid);
+	printf("FUXI WLAN: M6n cnss=%s valid=%u (PDC before step 1; stop at 22)\n",
+	    wl_cnss_names[wl_cnss], !wl_variant_invalid);
 }
 #define WL_CNSS_IOVA 0xa0000000ull
 #define WL_CNSS_IOVA_END 0xb0000000ull
@@ -824,6 +834,101 @@ wl_sleep(unsigned ms)
 	/* Yield this dedicated thread; root mount and other drivers must run. */
 	assert_wait_timeout((event_t)&wl5_report, THREAD_UNINT, ms, NSEC_PER_MSEC);
 	thread_block(THREAD_CONTINUE_NULL);
+}
+
+/* Independent QMP polling implementation. The only kernel QMP writer here is
+ * this single WLAN thread; shim audio.c runs in a separate boot environment.
+ * Public protocol/DT facts and pinned source references: docs/wlan-m6n.md.
+ * Never overwrite a busy slot, clear an unacknowledged packet, or retry a
+ * partially applied PDC table. Acknowledgement means consumption, not a
+ * voltage readback. No security/fuse state is written. */
+#define WL_AOSS_QMP 0x0c300000ull
+#define WL_AOSS_IPCC 0x00408000ull
+
+static int
+wl_qmp_wait(unsigned offset, uint32_t expected)
+{
+	for (unsigned ms = 0; ms <= 1000; ms++) {
+		uint32_t value = wl_prd(WL_AOSS_QMP + offset);
+		if (fw_faults) { return 1; }
+		if (value == expected) { return 0; }
+		if (ms < 1000) { wl_sleep(1); }
+	}
+	printf("FUXI WLAN: M6n QMP timeout offset %#x expected %#x\n", offset, expected);
+	return 1;
+}
+
+static int
+wl_qmp_kick(void)
+{
+	__asm__ volatile("dsb sy" ::: "memory");
+	if (fw_faults) { return 1; }
+	wl_pwr(WL_AOSS_IPCC + 0xc, 0); /* AOP client 0 / QMP signal 0 */
+	return fw_faults ? 1 : 0;
+}
+
+static int
+wl_cnss_pdc(void)
+{
+	if (!wl_cnss) { return 0; }
+	if (wl_variant_invalid || fw_faults || wl_pdc_attempted) { return 1; }
+	wl_pdc_attempted = true;
+	wl_pdc_acks = 0;
+	if (wl_prd(WL_AOSS_QMP) != 0x4d41494c || wl_prd(WL_AOSS_QMP + 4) != 1) { return 2; }
+	unsigned offset = wl_prd(WL_AOSS_QMP + 0x38), bytes = wl_prd(WL_AOSS_QMP + 0x34);
+	if (fw_faults || (offset & 3) || offset < 0x40 || offset >= 0x400 ||
+	    bytes < 68 || bytes > 0x400 - offset || wl_prd(WL_AOSS_QMP + offset)) { return 3; }
+	uint32_t link = wl_prd(WL_AOSS_QMP + 0x28), channel = wl_prd(WL_AOSS_QMP + 0x30);
+	if (fw_faults) { return 3; }
+	if (link != 0xffff || channel != 0xffff) {
+		uint32_t remote = wl_prd(WL_AOSS_QMP + 0xc);
+		if (fw_faults || (remote && remote != 0xffff && remote != 0xffff0000)) { return 4; }
+		wl_pwr(WL_AOSS_QMP + 0x10, remote);
+		wl_pwr(WL_AOSS_QMP + 0x24, 0xffff);
+		if (wl_qmp_kick() || wl_qmp_wait(0x28, 0xffff)) { return 4; }
+		wl_pwr(WL_AOSS_QMP + 0x2c, 0xffff);
+		if (wl_qmp_kick() || wl_qmp_wait(0x14, 0xffff)) { return 4; }
+		wl_pwr(WL_AOSS_QMP + 0x18, 0xffff);
+		if (wl_qmp_kick() || wl_qmp_wait(0x30, 0xffff)) { return 4; }
+	}
+	if (wl_prd(WL_AOSS_QMP + 0xc) != 0xffff || wl_prd(WL_AOSS_QMP + 0x14) != 0xffff ||
+	    fw_faults) { return 4; }
+	/* KIWI autonomous power settings, encoded as protocol data, not driver
+	 * code imported from CNSS. RF voltage pairs first, then route MX to BB,
+	 * enable BB PDC and set its MX/CX up/down values. */
+	const char *const rf[] = {"s4e", "s4g", "s6g"};
+	const unsigned volts[][2] = {{916, 612}, {1316, 944}, {1864, 1820}, {976, 800}, {940, 420}};
+	for (unsigned i = 0; i < 13; i++) {
+		char msg[64] = {0};
+		int n;
+		if (i < 6 || i >= 9) {
+			unsigned row = i < 6 ? i / 2 : 3 + (i - 9) / 2;
+			unsigned down = i < 6 ? i & 1 : (i - 9) & 1;
+			n = snprintf(msg, sizeof(msg), "{class: wlan_pdc, ss: %s, res: %s.v, %sval: %u}",
+			    i < 6 ? "rf" : "bb", i < 6 ? rf[row] : row == 3 ? "s2g" : "s5g",
+			    down ? "dwn" : "up", volts[row][down]);
+		} else {
+			n = snprintf(msg, sizeof(msg), "{class: wlan_pdc, ss: %s, res: %s, enable: %u}",
+			    i == 8 ? "bb" : "rf", i == 6 ? "s2g.m" : i == 7 ? "s2g.v" : "pdc", i == 8 ? 1u : 0u);
+		}
+		if (n <= 0 || (unsigned)n >= sizeof(msg) || fw_faults ||
+		    wl_prd(WL_AOSS_QMP + offset)) { return 5; }
+		printf("FUXI WLAN: M6n PDC %u/13 %s\n", i + 1, msg);
+		for (unsigned word = 0; word < 16; word++) {
+			uint32_t value = 0;
+			for (unsigned b = 0; b < 4; b++) { value |= (uint32_t)(uint8_t)msg[4 * word + b] << (8 * b); }
+			if (fw_faults) { return 5; }
+			wl_pwr(WL_AOSS_QMP + offset + 4 + 4 * word, value);
+		}
+		if (fw_faults) { return 5; }
+		__asm__ volatile("dsb sy" ::: "memory");
+		wl_pwr(WL_AOSS_QMP + offset, 64);
+		uint32_t length = wl_prd(WL_AOSS_QMP + offset); /* drain posted writes */
+		if (fw_faults || (length != 64 && length != 0) || wl_qmp_kick() || wl_qmp_wait(offset, 0)) { return 6; }
+		wl_pdc_acks++;
+	}
+	printf("FUXI WLAN: M6n PDC consumed %u/13 before WLAN rails; AOP policy persists until reconfigured\n", wl_pdc_acks);
+	return 0;
 }
 
 /* Wired allocations need neither physical contiguity nor low DDR. */
@@ -2027,6 +2132,10 @@ wl_probe_observe(void)
 	wl_host_diag("probe-completion");
 	if (!fw_faults && !(flags & WL_DIAG_TRANSPORT)) { wl_boot_logs(); }
 	if (wl_variant_active()) {
+		if (wl_cnss) {
+			printf("FUXI WLAN: M6n result cnss=%s PDC consumed %u/13 EE %#x ERRCODE %#x; raw code, no security decode\n",
+			    wl_cnss_names[wl_cnss], wl_pdc_acks, wl_mrd(wl_bhi + 0x28), wl_mrd(wl_bhi + 0x30));
+		}
 		printf("FUXI WLAN: M6m result fw=%s pre=%s bhi=%s vec=%s EE %#x ERRCODE %#x observation 5000 ms; stop/contain\n",
 		    wl_fw_names[wl_fw], wl_pre_names[wl_pre], wl_full ? "full" : "off", wl_vec_names[wl_vec],
 		    wl_mrd(wl_bhi + 0x28), wl_mrd(wl_bhi + 0x30));
@@ -2044,6 +2153,7 @@ wl5_step(unsigned s)
 	switch (s) {
 	case 17:
 		if (wl_variant_invalid) { return 0x6c; }
+		if (wl_cnss && wl_pdc_acks != 13) { return 0x6e; }
 		if (wl_probe == WL_PROBE_INVALID) { return 0x6b; }
 		/* M4 validated BHIOFF; independently validate all M5 block extents. */
 		wl_bhi = wl4_report[25]; wl_bhie = wl4_report[26];
@@ -2352,7 +2462,12 @@ fw_run(unsigned limit)
 		unsigned faults0 = fw_faults;
 		int e;
 		if (s <= WL3_STEPS) {
-			e = wl_icc_step(s); /* failure blocks link training / BHI */
+			e = s == 1 ? wl_cnss_pdc() : 0; /* before any WLAN power writes */
+			if (s == 1 && e) {
+				printf("FUXI WLAN: M6n PDC blocked before WLAN power, consumed %u/13 reason %u; reboot to retry\n",
+				    wl_pdc_acks, (unsigned)e);
+			}
+			if (!e) { e = wl_icc_step(s); } /* failure blocks link training / BHI */
 			if (!e) {
 				wlan_m3(s); /* runs only step s: earlier ones are in wl3_done */
 				e = (int)(wl3_report[3] & 0xffu);
@@ -2410,17 +2525,21 @@ static void
 fw_thread(void *arg, wait_result_t result)
 {
 	unsigned limit = (unsigned)(uintptr_t)arg;
+	unsigned mapped = 0;
 	(void)result;
 	for (unsigned i = 0; i < FW_NWIN; i++) {
+		if ((!wl_cnss || wl_variant_invalid) &&
+		    (fw_windows[i].pa == WL_AOSS_QMP || fw_windows[i].pa == WL_AOSS_IPCC)) { continue; }
 		kern_return_t kr = fw_map_window(&fw_windows[i]);
 		if (kr != KERN_SUCCESS) {
 			printf("FUXI WLAN: map PA %#llx bytes %#llx failed %d\n",
 			    fw_windows[i].pa, fw_windows[i].size, kr);
 			goto out;
 		}
+		mapped++;
 	}
 	printf("FUXI WLAN: mapped %llu bytes in %u windows; running steps 1..%u\n",
-	    fw_mapped_bytes, (unsigned)FW_NWIN, limit);
+	    fw_mapped_bytes, mapped, limit);
 	fw_run(limit);
 out:
 	printf("FUXI WLAN: thread exit\n");

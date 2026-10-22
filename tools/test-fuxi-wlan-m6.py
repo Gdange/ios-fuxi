@@ -78,7 +78,7 @@ static int old_iova_arg;
 static bool old_iova_present;
 static int clock_arg, iboff_arg;
 static int aspm_arg;
-static const char *probe_arg, *pre_arg, *bhi_arg, *vec_arg, *fw_arg;
+static const char *probe_arg, *pre_arg, *bhi_arg, *vec_arg, *fw_arg, *cnss_arg;
 static unsigned cache_attrs[32][1024];
 static bool cache_drop;
 static unsigned clock_delays;
@@ -94,8 +94,9 @@ static bool PE_parse_boot_argn(const char *name, void *out, int size) {
     const char *arg = !strcmp(name,"fuxiwlanpre") ? pre_arg :
                       !strcmp(name,"fuxiwlanbhi") ? bhi_arg :
                       !strcmp(name,"fuxiwlanfw") ? fw_arg :
+                      !strcmp(name,"fuxiwlancnss") ? cnss_arg :
                       !strcmp(name,"fuxiwlanvec") ? vec_arg : NULL;
-    if(!strcmp(name,"fuxiwlanpre") || !strcmp(name,"fuxiwlanbhi") || !strcmp(name,"fuxiwlanvec") || !strcmp(name,"fuxiwlanfw")) {
+    if(!strcmp(name,"fuxiwlanpre") || !strcmp(name,"fuxiwlanbhi") || !strcmp(name,"fuxiwlanvec") || !strcmp(name,"fuxiwlanfw") || !strcmp(name,"fuxiwlancnss")) {
         if(arg) { strncpy(out,arg,size); return true; }
         return false;
     }
@@ -260,7 +261,8 @@ static void init(void) {
     memset(&wl_image,0,sizeof(wl_image)); memset(&wl_vectors,0,sizeof(wl_vectors));
     memset(&wl_tables,0,sizeof(wl_tables)); wl_owned=wl_enabled=wl_route_owned=wl_route_installed=false;
     old_iova_arg=0; old_iova_present=false; probe_arg=NULL; aspm_arg=0;
-    pre_arg=bhi_arg=vec_arg=fw_arg=NULL;
+    pre_arg=bhi_arg=vec_arg=fw_arg=cnss_arg=NULL;
+    wl_pdc_attempted=false; wl_pdc_acks=0;
     memset(&wl_rddm,0,sizeof(wl_rddm)); memset(&wl_rxvectors,0,sizeof(wl_rxvectors));
     cache_drop=false; memset(cache_attrs,0,sizeof(cache_attrs)); wl_iova_configure();
     clock_arg=iboff_arg=0; clock_delays=nreads=0; track_reads=false;
