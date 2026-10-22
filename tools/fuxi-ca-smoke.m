@@ -20,6 +20,8 @@
 #include <mach/mach_time.h>
 #include <mach/thread_policy.h>
 #include <mach/thread_info.h>
+#include <mach/task_policy.h>
+#include <pthread/qos.h>
 #include <sys/resource.h>
 #include <mach/processor_info.h>
 #include <mach/arm/processor_info.h>
@@ -200,11 +202,17 @@ static void displayStage(id<MTLDevice> device,Class rendererClass,SEL factory,NS
   [CATransaction begin];[CATransaction setDisableActions:YES];CALayer *root=displayScene(space,NO);
   [renderer setLayer:root];[renderer setBounds:CGRectMake(0,0,1080,2400)];[CATransaction commit];[CATransaction flush];
   // Pace like a compositor's render thread: a time-constraint thread gets no timer
-  // coalescing leeway. The smoke inherits the exec-swapped daemon's darwin-bg policy,
-  // which keeps RT from taking effect and gives sleeps the background leeway
-  // (32x the interval, at most 100 ms): 4 ms sleeps overshot by up to 100 ms (observed).
+  // coalescing leeway. The smoke inherits the exec-swapped background daemon's policy:
+  // the thread runs at priority 4 (throttled), the time-constraint request is accepted
+  // but not applied, and sleeps get the background leeway (32x the interval, at most
+  // 100 ms) (observed). Ask for the foreground role and interactive QoS first.
   schedReport("inherited");
   if(setpriority(PRIO_DARWIN_PROCESS,0,0))printf("FUXI CA: display clear darwin-bg errno=%d\n",errno);
+  {task_category_policy_data_t role={TASK_FOREGROUND_APPLICATION};
+   kern_return_t kr=task_policy_set(mach_task_self(),TASK_CATEGORY_POLICY,(task_policy_t)&role,TASK_CATEGORY_POLICY_COUNT);
+   printf("FUXI CA: display foreground role kr=%d\n",kr);schedReport("role");}
+  {int rc=pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE,0);
+   printf("FUXI CA: display user-interactive qos rc=%d\n",rc);schedReport("qos");}
   {mach_timebase_info_data_t tb;mach_timebase_info(&tb);uint64_t ms=1000000ull*tb.denom/tb.numer;
    thread_time_constraint_policy_data_t rt={(uint32_t)(ms*50/3),(uint32_t)(ms*10),(uint32_t)(ms*50/3),FALSE};
    kern_return_t kr=thread_policy_set(mach_thread_self(),THREAD_TIME_CONSTRAINT_POLICY,(thread_policy_t)&rt,THREAD_TIME_CONSTRAINT_POLICY_COUNT);
