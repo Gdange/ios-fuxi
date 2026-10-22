@@ -97,7 +97,7 @@ int main() {
    [c commit];assert(c.status==MTLCommandBufferStatusCompleted); // idempotent after completion
    assert(!c.blitCommandEncoder);[dst release];
   }}
-  assert(fuxi::Backend::live==0 && fuxi::Backend::submissions==17); // 16 rounds + the enqueue probe
+  assert(fuxi::Backend::live==0 && fuxi::Backend::submissions==16 && fuxi::Backend::emptySubmits==1); // Enqueue probe completes without GPU work
   @autoreleasepool {
    id<MTLCommandBuffer>c=q.commandBuffer;id<MTLBlitCommandEncoder>e=c.blitCommandEncoder;
    // A missing encoder entry must name the selector, return without throwing,

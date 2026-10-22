@@ -82,6 +82,19 @@ extern "C" uint64_t fuxi_metal_submits() {return fuxi::Backend::submits.load();}
 extern "C" uint64_t fuxi_metal_submit_prepare_nanoseconds() {return fuxi::Backend::submitPrepareNanos.load();}
 extern "C" uint64_t fuxi_metal_submit_wait_nanoseconds() {return fuxi::Backend::submitWaitNanos.load();}
 extern "C" uint64_t fuxi_metal_submit_retire_nanoseconds() {return fuxi::Backend::submitRetireNanos.load();}
+extern "C" uint64_t fuxi_metal_submit_objects_nanoseconds() {return fuxi::Backend::submitObjectsNanos.load();}
+extern "C" uint64_t fuxi_metal_submit_descriptors_nanoseconds() {return fuxi::Backend::submitDescriptorsNanos.load();}
+extern "C" uint64_t fuxi_metal_submit_record_nanoseconds() {return fuxi::Backend::submitRecordNanos.load();}
+extern "C" uint64_t fuxi_metal_submit_shadow_nanoseconds() {return fuxi::Backend::shadowCopyNanos.load();}
+extern "C" uint64_t fuxi_metal_submit_flush_nanoseconds() {return fuxi::Backend::submitFlushNanos.load();}
+extern "C" uint64_t fuxi_metal_submit_invalidate_nanoseconds() {return fuxi::Backend::submitInvalidateNanos.load();}
+extern "C" uint64_t fuxi_metal_submit_flush_calls() {return fuxi::Backend::flushCalls.load();}
+extern "C" uint64_t fuxi_metal_submit_invalidate_calls() {return fuxi::Backend::invalidateCalls.load();}
+extern "C" uint64_t fuxi_metal_submit_empty() {return fuxi::Backend::emptySubmits.load();}
+extern "C" uint64_t fuxi_metal_submit_object_creates() {return fuxi::Backend::submitObjectCreates.load();}
+extern "C" uint64_t fuxi_metal_submit_pool_creates() {return fuxi::Backend::submitPoolCreates.load();}
+extern "C" uint64_t fuxi_metal_submit_frame_creates() {return fuxi::Backend::submitFrameCreates.load();}
+extern "C" uint64_t fuxi_metal_submit_view_creates() {return fuxi::Backend::submitViewCreates.load();}
 static void failureLog(const char *format,...) {
  uint64_t n=failureCount.fetch_add(1);if(n>=64)return;
  va_list args;va_start(args,format);vfprintf(stderr,format,args);va_end(args);
@@ -957,9 +970,11 @@ static thread_local FuxiCommandBuffer *completionCommand;
  _status=MTLCommandBufferStatusCommitted;
  // Deliberately synchronous M4 queue: no dispatch worker or asynchronous promise.
  try {if(!strcmp(clientProcess,"fuxi-ca-smoke") && failureCount.load())throw std::runtime_error("CA diagnostic failure latched: GPU submission refused");if(_rejected)throw std::runtime_error("unsupported command: GPU submission refused");if(clientMode==fuxi::ClientMode::census)throw std::runtime_error("census: no GPU submission");auto *backend=owner(_queue->_device)->backend;size_t begin=0;
+ auto shadowStart=std::chrono::steady_clock::now();
  for(id r in _resources){FuxiBuffer *s=nil;
   if([r isKindOfClass:[FuxiBuffer class]])s=r;else if([r isKindOfClass:[FuxiTexture class]])s=[(FuxiTexture *)r buffer];
   if(s && s->_shadow)memcpy(s->_buffer->contents,s->_wrapped,s->_wrappedLength);}
+ fuxi::Backend::shadowCopyNanos+=(uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-shadowStart).count();
  for(const auto &point:_events){
   if(point.operation>begin){backend->submit(std::vector<fuxi::Operation>(_ops.begin()+begin,_ops.begin()+point.operation),[&]{_scheduled=YES;});begin=point.operation;}
   if(point.signal)[point.event setSignaledValue:point.value];

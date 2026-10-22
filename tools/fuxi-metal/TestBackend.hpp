@@ -34,6 +34,7 @@ public:
  ResourceLimits limits;ObjectCache<Pipeline> objects;
  static constexpr size_t maxBufferLength=ResourceLimits::single;
  static inline std::atomic<uint64_t> pipelineHits{0},pipelineMisses{0},gpuNanos{0},gpuSamples{0};
+ static inline std::atomic<uint64_t> submitObjectsNanos{0},submitDescriptorsNanos{0},submitRecordNanos{0},shadowCopyNanos{0},submitFlushNanos{0},submitInvalidateNanos{0},flushCalls{0},invalidateCalls{0},emptySubmits{0},submitObjectCreates{0},submitPoolCreates{0},submitFrameCreates{0},submitViewCreates{0};
  static inline std::atomic<uint64_t> submits{0},submitPrepareNanos{0},submitWaitNanos{0},submitRetireNanos{0};
  static inline bool modelPipelines=false;
  uint32_t maxTextureDimension() const{return limits.dimension;}
@@ -73,6 +74,7 @@ public:
  void submit(const std::vector<Operation>& ops,const std::function<void()> &scheduled={}) {
   if(getenv("FUXI_TEST_LOST")) {poisoned=true;throw std::runtime_error("modeled device loss");}
   if(getenv("FUXI_TEST_HANG"))for(;;)pause();
+  if(ops.empty()){++emptySubmits;if(scheduled)scheduled();return;}
   ++submissions;if(scheduled)scheduled();
   for(auto &op:ops) {
    if(op.texture){auto *t=op.texture;

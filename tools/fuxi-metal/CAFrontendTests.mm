@@ -17,7 +17,9 @@ int main(){@autoreleasepool {
   id b=[device newBufferWithLength:16 options:0];assert(b);[b release]; // No backend lock in callbacks.
  }];
  [command addCompletedHandler:^(id<MTLCommandBuffer> c){assert(c.status==MTLCommandBufferStatusCompleted);assert(++sequence==2);}];
+ assert(fuxi::Backend::submissions==0);auto emptyBefore=fuxi::Backend::emptySubmits.load();
  assert([command commitAndWaitUntilSubmitted] && sequence==2);[command waitUntilScheduled];[command waitUntilCompleted];
+ assert(fuxi::Backend::submissions==0 && fuxi::Backend::emptySubmits==emptyBefore+1);
  [command addScheduledHandler:^(id<MTLCommandBuffer> c){(void)c;++sequence;}];assert(sequence==3);
  FuxiEvent *event=[device newSharedEvent];id<MTLFence> fence=[device newFence];
  dispatch_queue_t callbacks=dispatch_queue_create("fuxi.ca.test",DISPATCH_QUEUE_SERIAL);
@@ -31,6 +33,22 @@ int main(){@autoreleasepool {
  command=[queue commandBuffer];[command encodeWaitForEvent:(id)event value:4];
  FuxiBlit *blit=[command blitCommandEncoder];[blit updateFence:fence];[blit waitForFence:fence];[blit endEncoding];
  [command commit];assert(!command.error);
+ // A real modeled write, signal/wait, then an empty command preserve queue order
+ // and callback reentrancy. Valid SDK enums only: never provoke Mac Metal asserts.
+ FuxiBuffer *ordered=[device newBufferWithLength:16 options:MTLResourceStorageModeShared];
+ command=[queue commandBuffer];blit=[command blitCommandEncoder];[blit fillBuffer:(id)ordered range:NSMakeRange(0,16) value:0x6d];[blit endEncoding];
+ [command encodeSignalEvent:(id)event value:5];[command commit];assert(!command.error);
+ auto submittedBefore=fuxi::Backend::submissions;emptyBefore=fuxi::Backend::emptySubmits.load();sequence=0;
+ command=[queue commandBuffer];[command encodeWaitForEvent:(id)event value:5];[command encodeSignalEvent:(id)event value:6];
+ [command addScheduledHandler:^(id<MTLCommandBuffer> c){assert(c.status==MTLCommandBufferStatusCompleted && ++sequence==1);assert([event signaledValue]==6);
+  for(unsigned i=0;i<16;++i)assert(((uint8_t *)[ordered contents])[i]==0x6d);
+ }];
+ [command addCompletedHandler:^(id<MTLCommandBuffer> c){assert(!c.error && ++sequence==2);
+  id<MTLCommandBuffer> nested=[queue commandBuffer];[nested commit];assert(nested.status==MTLCommandBufferStatusCompleted);
+ }];[command commit];[command waitUntilCompleted];assert(sequence==2);
+ // Event-only work never calls submit; the nested empty command completes once.
+ assert(fuxi::Backend::submissions==submittedBefore && fuxi::Backend::emptySubmits==emptyBefore+1);
+ [ordered release];
  [queue setCompletionQueue:callbacks];command=[queue commandBuffer];
  [command addCompletedHandler:^(id<MTLCommandBuffer> c){[c waitUntilCompleted];assert(!c.error);dispatch_semaphore_signal(delivered);}];[command commit];
  assert(!dispatch_semaphore_wait(delivered,dispatch_time(DISPATCH_TIME_NOW,1000000000)));

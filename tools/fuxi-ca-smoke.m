@@ -139,6 +139,10 @@ static void displayStage(id<MTLDevice> device,Class rendererClass,SEL factory,NS
  uint64_t (*waited)(void)=(uint64_t(*)(void))dlsym(plugin,"fuxi_metal_submit_wait_nanoseconds");
  uint64_t (*retired)(void)=(uint64_t(*)(void))dlsym(plugin,"fuxi_metal_submit_retire_nanoseconds");
  int breakdown=submits && prepare && waited && retired;uint64_t warmStart[4]={0},warmEnd[4]={0};
+ const char *detailNames[]={"objects_nanoseconds","descriptors_nanoseconds","record_nanoseconds","shadow_nanoseconds","flush_nanoseconds","invalidate_nanoseconds","flush_calls","invalidate_calls","empty","object_creates","pool_creates","frame_creates","view_creates"};
+ uint64_t (*detail[13])(void)={0};uint64_t detailStart[13]={0},detailEnd[13]={0};int detailed=1;
+ for(unsigned i=0;i<13;++i){char symbol[96];snprintf(symbol,sizeof(symbol),"fuxi_metal_submit_%s",detailNames[i]);detail[i]=(uint64_t(*)(void))dlsym(plugin,symbol);if(!detail[i])detailed=0;}
+
  arm(60);uint64_t startDraws=draws(),startHits=hits(),startMisses=misses();double times[60],wall[60];unsigned late=0;
  // Let IOSurface choose the padded row (1080*4 need not be a Vulkan row pitch).
  IOSurfaceRef surface=IOSurfaceCreate((CFDictionaryRef)@{(id)kIOSurfaceWidth:@1080,(id)kIOSurfaceHeight:@2400,
@@ -173,7 +177,8 @@ static void displayStage(id<MTLDevice> device,Class rendererClass,SEL factory,NS
    // Cold frame 0 is measured separately; the following 59 frames target 60 Hz.
    if(!frame)epoch=end;
    if(breakdown && (frame==0 || frame==59)){uint64_t *v=frame?warmEnd:warmStart;v[0]=submits();v[1]=prepare();v[2]=waited();v[3]=retired();}
-   else if(wall[frame]>1000.0/60.0 || end>epoch+(frame+1)/60.0)++late;
+   if(detailed && (frame==0 || frame==59))for(unsigned i=0;i<13;++i)(frame?detailEnd:detailStart)[i]=detail[i]();
+   if(frame && (wall[frame]>1000.0/60.0 || end>epoch+(frame+1)/60.0))++late;
    if(frame<59){CFTimeInterval deadline=epoch+(frame+1)/60.0,now=CACurrentMediaTime();
     if(deadline>now)usleep((useconds_t)((deadline-now)*1e6));}
   }
@@ -195,6 +200,9 @@ static void displayStage(id<MTLDevice> device,Class rendererClass,SEL factory,NS
   double p=(warmEnd[1]-warmStart[1])/1e6/59,w=(warmEnd[2]-warmStart[2])/1e6/59,r=(warmEnd[3]-warmStart[3])/1e6/59;
   printf("FUXI CA: display warm per-frame submits=%.2f prepare=%.3f wait=%.3f retire=%.3f other=%.3f wall=%.3f ms\n",
    (double)(warmEnd[0]-warmStart[0])/59,p,w,r,sum/59-p-w-r,sum/59);}
+ if(detailed){double d[13];for(unsigned i=0;i<13;++i)d[i]=(double)(detailEnd[i]-detailStart[i])/59;
+  printf("FUXI CA: display warm detail objects=%.3f descriptors=%.3f record=%.3f shadow=%.3f flush=%.3f invalidate=%.3f ms flush_calls=%.2f invalidate_calls=%.2f empty=%.2f creates=%.2f pool_creates=%.2f frame_creates=%.2f view_creates=%.2f\n",
+   d[0]/1e6,d[1]/1e6,d[2]/1e6,d[3]/1e6,d[4]/1e6,d[5]/1e6,d[6],d[7],d[8],d[9],d[10],d[11],d[12]);}
  if(!fuxiCAAcceptSize(m,1080,2400))fail("pixels=2592000 max=%u mean=%.4f bad=%u",m.max_error,m.mean_error,m.bad_pixels);
  if(failures() || hits()==startHits)fail("display frontend errors/cache reuse missing");
  // Pixel PASS alone cannot prove display rate. Require every warm frame's render
