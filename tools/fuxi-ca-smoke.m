@@ -160,12 +160,43 @@ static void schedReport(const char *label){thread_extended_info_data_t i;mach_ms
  int bg=getpriority(PRIO_DARWIN_PROCESS,0);kern_return_t kr=thread_info(mach_thread_self(),THREAD_EXTENDED_INFO,(thread_info_t)&i,&n);
  printf("FUXI CA: display sched %s darwin_bg=%d policy=%d curpri=%d priority=%d kr=%d\n",label,bg,
   kr?-1:i.pth_policy,kr?-1:i.pth_curpri,kr?-1:i.pth_priority,kr);}
+// libproc is not in the iOS SDK; these are the stable proc_info calls and layout.
+extern int proc_listallpids(void *buffer,int buffersize);
+extern int proc_pidinfo(int pid,int flavor,uint64_t arg,void *buffer,int buffersize);
+extern int proc_name(int pid,void *buffer,uint32_t buffersize);
+struct fuxiTaskInfo{uint64_t virt,resident,user,sys,threadsUser,threadsSys;
+ int32_t policy,faults,pageins,cow,sent,received,mach,unix,csw,threads,running,priority;};
+typedef struct{int pid;uint64_t cpu;int32_t csw,mach,unix;}fuxiProc;
+static unsigned procSnapshot(fuxiProc *out,unsigned max){int pids[1024];int n=proc_listallpids(pids,sizeof(pids));unsigned k=0;
+ for(int i=0;i<n&&k<max;++i){struct fuxiTaskInfo t;
+  if(proc_pidinfo(pids[i],4/*PROC_PIDTASKINFO*/,0,&t,sizeof(t))!=(int)sizeof(t))continue;
+  out[k++]=(fuxiProc){pids[i],t.user+t.sys,t.csw,t.mach,t.unix};}
+ return k;}
+static fuxiProc procBefore[1024],procAfter[1024];
+typedef struct{int pid;double ms;int32_t csw,sys;int fresh;}fuxiBusy;
+static int compareBusy(const void *a,const void *b){const fuxiBusy *x=a,*y=b;
+ double kx=x->ms+x->csw*0.01,ky=y->ms+y->csw*0.01;return (ky>kx)-(ky<kx);}
+// Who ran during the quiet second: CPU time (task times are mach units on arm64),
+// context switches and syscalls per process, plus processes started during it.
+static void procReport(unsigned na,unsigned nb){mach_timebase_info_data_t tb;mach_timebase_info(&tb);
+ static fuxiBusy busy[1024];unsigned m=0,fresh=0;
+ for(unsigned i=0;i<nb;++i){const fuxiProc *b=&procAfter[i];const fuxiProc *a=NULL;
+  for(unsigned j=0;j<na;++j)if(procBefore[j].pid==b->pid){a=&procBefore[j];break;}
+  fuxiBusy x={b->pid,(double)(b->cpu-(a?a->cpu:0))*tb.numer/tb.denom/1e6,b->csw-(a?a->csw:0),
+   (b->mach-(a?a->mach:0))+(b->unix-(a?a->unix:0)),!a};
+  fresh+=!a;if(x.ms>0.5||x.csw>20||x.fresh)busy[m++]=x;}
+ qsort(busy,m,sizeof(*busy),compareBusy);
+ printf("FUXI CA: quiet probe processes before=%u after=%u started=%u\n",na,nb,fresh);
+ for(unsigned i=0;i<m&&i<12;++i){char name[64]="?";proc_name(busy[i].pid,name,sizeof(name));
+  printf("FUXI CA: quiet probe proc %s pid=%d cpu_ms=%.1f csw=%d syscalls=%d%s\n",name,busy[i].pid,busy[i].ms,busy[i].csw,busy[i].sys,busy[i].fresh?" started":"");}}
 // One undisturbed second: the system's own interrupt rate per CPU (a cooling baseline).
-static void quietProbe(void){processor_cpu_stat_data_t a[8],b[8];unsigned n=cpuStats(a,8);
+static void quietProbe(void){processor_cpu_stat_data_t a[8],b[8];unsigned np=procSnapshot(procBefore,1024);unsigned n=cpuStats(a,8);
  CFTimeInterval t=CACurrentMediaTime();usleep(1000000);double wall=(CACurrentMediaTime()-t)*1000;
+ unsigned nq=procSnapshot(procAfter,1024);
  if(!n||cpuStats(b,8)!=n){printf("FUXI CA: quiet probe cpu stats unavailable\n");return;}
  for(unsigned c=0;c<n;++c)printf("FUXI CA: quiet probe cpu%u in %.1f ms timer=%u ipi=%u irq=%u\n",c,wall,
-  b[c].timer_cnt-a[c].timer_cnt,b[c].ipi_cnt-a[c].ipi_cnt,b[c].irq_ex_cnt-a[c].irq_ex_cnt);}
+  b[c].timer_cnt-a[c].timer_cnt,b[c].ipi_cnt-a[c].ipi_cnt,b[c].irq_ex_cnt-a[c].irq_ex_cnt);
+ procReport(np,nq);}
 static void timerProbe(void){
  quietProbe();
  sleepProbe("idle");
