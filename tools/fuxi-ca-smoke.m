@@ -143,7 +143,7 @@ static void displayStage(id<MTLDevice> device,Class rendererClass,SEL factory,NS
  uint64_t (*detail[13])(void)={0};uint64_t detailStart[13]={0},detailEnd[13]={0};int detailed=1;
  for(unsigned i=0;i<13;++i){char symbol[96];snprintf(symbol,sizeof(symbol),"fuxi_metal_submit_%s",detailNames[i]);detail[i]=(uint64_t(*)(void))dlsym(plugin,symbol);if(!detail[i])detailed=0;}
 
- arm(60);uint64_t startDraws=draws(),startHits=hits(),startMisses=misses();double times[60],wall[60];unsigned late=0;
+ arm(60);uint64_t startDraws=draws(),startHits=hits(),startMisses=misses();double times[60],wall[60],asked[60]={0},overshoot[60]={0};unsigned late=0,slept=0;
  // Let IOSurface choose the padded row (1080*4 need not be a Vulkan row pitch).
  IOSurfaceRef surface=IOSurfaceCreate((CFDictionaryRef)@{(id)kIOSurfaceWidth:@1080,(id)kIOSurfaceHeight:@2400,
   (id)kIOSurfaceBytesPerElement:@4,(id)kIOSurfacePixelFormat:@0x42475241});
@@ -180,7 +180,8 @@ static void displayStage(id<MTLDevice> device,Class rendererClass,SEL factory,NS
    if(detailed && (frame==0 || frame==59))for(unsigned i=0;i<13;++i)(frame?detailEnd:detailStart)[i]=detail[i]();
    if(frame && (wall[frame]>1000.0/60.0 || end>epoch+(frame+1)/60.0))++late;
    if(frame<59){CFTimeInterval deadline=epoch+(frame+1)/60.0,now=CACurrentMediaTime();
-    if(deadline>now)usleep((useconds_t)((deadline-now)*1e6));}
+    // Record how far each pacing sleep overshoots: a coarse kernel timer shows up here.
+    if(deadline>now){usleep((useconds_t)((deadline-now)*1e6));asked[slept]=(deadline-now)*1000;overshoot[slept++]=(CACurrentMediaTime()-deadline)*1000;}}
   }
   [CATransaction begin];[CATransaction setDisableActions:YES];CALayer *expected=displayScene(space,YES);displayPosition(expected,59);[CATransaction commit];
   CGContextRef cpu=CGBitmapContextCreate(reference,1080,2400,8,4320,space,kCGBitmapByteOrder32Little|kCGImageAlphaPremultipliedFirst);
@@ -196,6 +197,8 @@ static void displayStage(id<MTLDevice> device,Class rendererClass,SEL factory,NS
  printf("FUXI CA: display GPU min/median/max=%.3f/%.3f/%.3f ms cold=%.3f ms frames=60 cache_hits=%llu cache_misses=%llu\n",
   times[0],(times[29]+times[30])/2,times[59],cold,(unsigned long long)(hits()-startHits),(unsigned long long)(misses()-startMisses));
  printf("FUXI CA: display warm wall min/median/max=%.3f/%.3f/%.3f ms late=%u/59 target_hz=60\n",warm[0],warm[29],warm[58],late);
+ if(slept){double o[60],a=0;for(unsigned i=0;i<slept;++i){o[i]=overshoot[i];a+=asked[i];}qsort(o,slept,sizeof(double),compareDouble);
+  printf("FUXI CA: display sleep overshoot min/median/max=%.3f/%.3f/%.3f ms sleeps=%u asked_mean=%.3f ms\n",o[0],o[slept/2],o[slept-1],slept,a/slept);}
  if(breakdown){double sum=0;for(unsigned i=1;i<60;++i)sum+=wall[i];
   double p=(warmEnd[1]-warmStart[1])/1e6/59,w=(warmEnd[2]-warmStart[2])/1e6/59,r=(warmEnd[3]-warmStart[3])/1e6/59;
   printf("FUXI CA: display warm per-frame submits=%.2f prepare=%.3f wait=%.3f retire=%.3f other=%.3f wall=%.3f ms\n",
