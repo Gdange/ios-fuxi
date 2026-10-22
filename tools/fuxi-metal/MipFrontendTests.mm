@@ -58,7 +58,7 @@ int main(){@autoreleasepool {
  assert(failureCount==errors);
  [t setPurgeableState:MTLPurgeableStateEmpty];assert(!t->_texture->isDefined(0) && !t->_texture->isDefined(2));
  // Refusals use valid SDK values; do not provoke SDK descriptor-array assertions.
- d.storageMode=MTLStorageModeMemoryless;assert(![device newTextureWithDescriptor:d]);d.storageMode=MTLStorageModeShared;
+ d.storageMode=MTLStorageModeMemoryless;{FuxiTexture *m=[device newTextureWithDescriptor:d];assert(m && m.storageMode==MTLStorageModeMemoryless && m.mipmapLevelCount==d.mipmapLevelCount);[m release];}d.storageMode=MTLStorageModeShared;
  d.textureType=MTLTextureType2DArray;d.arrayLength=2;assert(![device newTextureWithDescriptor:d]);d.textureType=MTLTextureType2D;d.arrayLength=1;
  d.pixelFormat=MTLPixelFormatBGRA8Unorm_sRGB;assert(![device newTextureWithDescriptor:d]);d.pixelFormat=MTLPixelFormatDepth32Float;assert(![device newTextureWithDescriptor:d]);d.pixelFormat=MTLPixelFormatBGRA8Unorm;
  d.swizzle=MTLTextureSwizzleChannelsMake(MTLTextureSwizzleBlue,MTLTextureSwizzleGreen,MTLTextureSwizzleRed,MTLTextureSwizzleAlpha);assert(![device newTextureWithDescriptor:d]);d.swizzle=MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed,MTLTextureSwizzleGreen,MTLTextureSwizzleBlue,MTLTextureSwizzleAlpha);

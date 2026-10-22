@@ -567,7 +567,7 @@ static bool textureDescriptorAccepted(MTLTextureDescriptor *d,uint32_t dimension
  CHECK("textureType",d.textureType,actual==MTLTextureType2D);CHECK("pixelFormat",d.pixelFormat,actual==80 || actual==70 || actual==115 || actual==10 || actual==1 || actual==30 || actual==94);
  CHECK("width",d.width,actual && actual<=dimension);CHECK("height",d.height,actual && actual<=dimension);CHECK("depth",d.depth,actual==1);
  CHECK("mipmapLevelCount",d.mipmapLevelCount,actual && actual<=fuxi::mipCount((uint32_t)d.width,(uint32_t)d.height));CHECK("arrayLength",d.arrayLength,actual==1);CHECK("sampleCount",d.sampleCount,actual==1);CHECK("swizzle.identity",identitySwizzle(d.swizzle),actual);
- CHECK("storageMode",d.storageMode,actual==MTLStorageModePrivate || actual==MTLStorageModeShared);CHECK("cpuCacheMode",d.cpuCacheMode,actual==MTLCPUCacheModeDefaultCache || actual==MTLCPUCacheModeWriteCombined);
+ CHECK("storageMode",d.storageMode,actual==MTLStorageModePrivate || actual==MTLStorageModeShared || actual==MTLStorageModeMemoryless);CHECK("cpuCacheMode",d.cpuCacheMode,actual==MTLCPUCacheModeDefaultCache || actual==MTLCPUCacheModeWriteCombined);
  CHECK("hazardTrackingMode",d.hazardTrackingMode,actual==MTLHazardTrackingModeDefault || actual==MTLHazardTrackingModeTracked);
  CHECK("usage",d.usage,!(actual&~(MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead|MTLTextureUsagePixelFormatView)));
  CHECK("pixelFormat.A8RenderTarget",d.pixelFormat,actual!=MTLPixelFormatA8Unorm || (!(d.usage&MTLTextureUsageRenderTarget) && d.usage!=MTLTextureUsageUnknown));
@@ -575,7 +575,7 @@ static bool textureDescriptorAccepted(MTLTextureDescriptor *d,uint32_t dimension
 #undef CHECK
  return true;
 }
-@interface FuxiTexture : FuxiResource { @public fuxi::Texture *_texture; MTLTextureUsage _usage; IOSurfaceRef _surface; BOOL _shared;FuxiTexture *_viewParent;FuxiBuffer *_backingBuffer;NSUInteger _backingOffset,_backingRow;uint32_t _baseLevel,_levelCount;MTLCPUCacheMode _cacheMode;NSString *_descriptorText; }
+@interface FuxiTexture : FuxiResource { @public fuxi::Texture *_texture; MTLTextureUsage _usage; IOSurfaceRef _surface; BOOL _shared,_memoryless;FuxiTexture *_viewParent;FuxiBuffer *_backingBuffer;NSUInteger _backingOffset,_backingRow;uint32_t _baseLevel,_levelCount;MTLCPUCacheMode _cacheMode;NSString *_descriptorText; }
 @end
 @implementation FuxiTexture
 - (void)rejectSelector:(SEL)selector {
@@ -599,7 +599,8 @@ static bool textureDescriptorAccepted(MTLTextureDescriptor *d,uint32_t dimension
 - (NSUInteger)sampleCount {CENSUS();return 1;}
 - (MTLTextureType)textureType {CENSUS();return MTLTextureType2D;}
 - (MTLPixelFormat)pixelFormat {CENSUS();return (MTLPixelFormat)_texture->format;}
-- (MTLStorageMode)storageMode {CENSUS();return (_surface || _shared)?MTLStorageModeShared:MTLStorageModePrivate;}
+// Memoryless is only a promise not to load or store, so private memory backs it.
+- (MTLStorageMode)storageMode {CENSUS();return _memoryless?MTLStorageModeMemoryless:(_surface || _shared)?MTLStorageModeShared:MTLStorageModePrivate;}
 - (MTLTextureUsage)usage {CENSUS();return _usage;}
 - (IOSurfaceRef)iosurface {CENSUS();return _viewParent?[_viewParent iosurface]:_surface;}
 - (NSUInteger)iosurfacePlane {CENSUS();return 0;}
@@ -630,10 +631,10 @@ static bool textureDescriptorAccepted(MTLTextureDescriptor *d,uint32_t dimension
   failureLog("FUXI MTL: texture reject viewRange 0 format=%lu type=%lu levels=%lu+%lu slices=%lu+%lu parent=format%lu/mips%lu desc=%s\n",(unsigned long)format,(unsigned long)type,(unsigned long)levels.location,(unsigned long)levels.length,(unsigned long)slices.location,(unsigned long)slices.length,(unsigned long)[self pixelFormat],(unsigned long)[self mipmapLevelCount],(_descriptorText?_descriptorText:@"unavailable").UTF8String);return nil;
  }
  FuxiTexture *view=[FuxiTexture new];view->_device=[_device retain];view->_texture=_texture;view->_baseLevel=_baseLevel+(uint32_t)levels.location;view->_levelCount=(uint32_t)levels.length;
- view->_descriptorText=[_descriptorText copy];view->_usage=_usage;view->_shared=[self storageMode]==MTLStorageModeShared;view->_cacheMode=_cacheMode;view->_viewParent=[self retain];return view;
+ view->_descriptorText=[_descriptorText copy];view->_usage=_usage;view->_shared=[self storageMode]==MTLStorageModeShared;view->_memoryless=_memoryless;view->_cacheMode=_cacheMode;view->_viewParent=[self retain];return view;
 }
 - (void)transfer:(void *)bytes row:(NSUInteger)row image:(NSUInteger)image region:(MTLRegion)r level:(NSUInteger)level slice:(NSUInteger)slice write:(BOOL)write {CENSUS();
- if([self storageMode]==MTLStorageModePrivate)invalid(@"texture CPU transfer requires shared storage");
+ if([self storageMode]!=MTLStorageModeShared)invalid(@"texture CPU transfer requires shared storage");
  if(level>=[self mipmapLevelCount])invalid(@"texture CPU mip level");
  uint32_t absolute=_baseLevel+(uint32_t)level;
  size_t pixel=fuxi::Backend::texelBytes((uint32_t)[self pixelFormat]),width=_texture->levelWidth(absolute),height=_texture->levelHeight(absolute);
@@ -1365,7 +1366,7 @@ static thread_local FuxiCommandBuffer *completionCommand;
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d {CENSUS();
  if(clientMode==fuxi::ClientMode::census)return nil;
  if(!textureDescriptorAccepted(d,owner(self)->backend->maxTextureDimension()))return nil;
- FuxiTexture *t=[FuxiTexture new];t->_descriptorText=[textureDescriptorText(d) copy];t->_cacheMode=d.cpuCacheMode;t->_device=[self retain];t->_usage=d.usage;t->_shared=d.storageMode==MTLStorageModeShared;
+ FuxiTexture *t=[FuxiTexture new];t->_descriptorText=[textureDescriptorText(d) copy];t->_cacheMode=d.cpuCacheMode;t->_device=[self retain];t->_usage=d.usage;t->_shared=d.storageMode==MTLStorageModeShared;t->_memoryless=d.storageMode==MTLStorageModeMemoryless;
  try {t->_texture=owner(self)->backend->allocateTexture((uint32_t)d.pixelFormat,(uint32_t)d.usage,(uint32_t)d.width,(uint32_t)d.height,(uint32_t)d.mipmapLevelCount);}catch(const std::exception &e) {failureLog("FUXI MTL: texture reject allocation 0 desc=%s reason=%s\n",textureDescriptorText(d).UTF8String,e.what());[t release];return nil;}return t;
 }
 - (id)newTextureWithBytesNoCopy:(void *)bytes length:(NSUInteger)length descriptor:(MTLTextureDescriptor *)d deallocator:(void (^)(void *,NSUInteger))deallocator {CENSUS();

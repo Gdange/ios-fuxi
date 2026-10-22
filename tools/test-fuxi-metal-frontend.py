@@ -55,7 +55,7 @@ def main():
         call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/MipFrontendTests.mm'),*frameworks,'-o',str(d/'mips')])
         mip=subprocess.run([str(d/'mips')],env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0'),text=True,capture_output=True,check=True,timeout=15)
         rejects=[line for line in mip.stderr.splitlines() if 'FUXI MTL: texture reject ' in line]
-        assert len(rejects)>=7 and all('desc=' in line and 'mips=' in line and 'usage=' in line and 'swizzle=' in line for line in rejects),mip.stderr
+        assert len(rejects)>=6 and all('desc=' in line and 'mips=' in line and 'usage=' in line and 'swizzle=' in line for line in rejects),mip.stderr
         print(mip.stdout,end='')
         call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/CAFrontendTests.mm'),*frameworks,'-o',str(d/'ca-frontend')])
         subprocess.run([str(d/'ca-frontend')],env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0'),check=True,timeout=15)
