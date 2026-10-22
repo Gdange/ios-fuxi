@@ -64,7 +64,7 @@ int main() {
    FuxiQueue *queue=[FuxiQueue new];queue->_device=[device retain];
    FuxiEvent *event=[FuxiEvent new];event->_device=[device retain];
    FuxiSurveyDrawable *drawable=[FuxiSurveyDrawable new];__block unsigned completed=0,scheduled=0;
-   unsigned submissions=fuxi::Backend::submissions;
+   int submissions=fuxi::Backend::submissions;
    for(unsigned i=0;i<3;++i){FuxiCommandBuffer *cb=(FuxiCommandBuffer *)[queue commandBuffer];
     [cb addScheduledHandler:^(id<MTLCommandBuffer> b){assert(b.status==MTLCommandBufferStatusCompleted);++scheduled;}];
     [cb addCompletedHandler:^(id<MTLCommandBuffer> b){assert(b.status==MTLCommandBufferStatusCompleted && !b.error);++completed;}];

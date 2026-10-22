@@ -990,7 +990,10 @@ static NSString *passAttachmentText(MTLRenderPassAttachmentDescriptor *a){
  id t=a.texture;NSString *texture=@"nil";
  if([t isKindOfClass:[FuxiTexture class]]){auto ft=(FuxiTexture *)t;texture=[NSString stringWithFormat:@"{%@ viewBase=%u viewLevels=%lu}",ft->_descriptorText?:@"model",ft->_baseLevel,(unsigned long)[ft mipmapLevelCount]];}
  else if(t)texture=[NSString stringWithFormat:@"class=%s",object_getClassName(t)];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
  return [NSString stringWithFormat:@"texture=%@ level=%lu slice=%lu plane=%lu load=%lu store=%lu options=%lu resolve=%s/%lu/%lu/%lu",texture,(unsigned long)a.level,(unsigned long)a.slice,(unsigned long)a.depthPlane,(unsigned long)a.loadAction,(unsigned long)a.storeAction,(unsigned long)a.storeActionOptions,a.resolveTexture?object_getClassName(a.resolveTexture):"nil",(unsigned long)a.resolveLevel,(unsigned long)a.resolveSlice,(unsigned long)a.resolveDepthPlane];
+#pragma clang diagnostic pop
 }
 static NSString *renderPassText(MTLRenderPassDescriptor *d){
  NSMutableString *text=[NSMutableString stringWithFormat:@"renderPass area=%lux%lu array=%lu samples=%lu visibility=%u tile=%lux%lu imageblock=%lu threadgroup=%lu rateMap=%u colors=[",(unsigned long)d.renderTargetWidth,(unsigned long)d.renderTargetHeight,(unsigned long)d.renderTargetArrayLength,(unsigned long)d.defaultRasterSampleCount,d.visibilityResultBuffer!=nil,(unsigned long)d.tileWidth,(unsigned long)d.tileHeight,(unsigned long)d.imageblockSampleLength,(unsigned long)d.threadgroupMemoryLength,d.rasterizationRateMap!=nil];
@@ -1054,7 +1057,10 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
   COLOR_CHECK("level",c.level,actual<[texture mipmapLevelCount]);COLOR_CHECK("slice",c.slice,!actual);COLOR_CHECK("depthPlane",c.depthPlane,!actual);
   COLOR_CHECK("resolveTexture",c.resolveTexture,!actual);COLOR_CHECK("resolveLevel",c.resolveLevel,!actual);COLOR_CHECK("resolveSlice",c.resolveSlice,!actual);COLOR_CHECK("resolveDepthPlane",c.resolveDepthPlane,!actual);
   COLOR_CHECK("loadAction",c.loadAction,actual<=MTLLoadActionClear);COLOR_CHECK("storeAction",c.storeAction,actual==MTLStoreActionDontCare || actual==MTLStoreActionStore);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
   COLOR_CHECK("storeActionOptions",c.storeActionOptions,!actual);
+#pragma clang diagnostic pop
   auto clear=c.clearColor;for(double x:{clear.red,clear.green,clear.blue,clear.alpha})if(!std::isfinite(x))invalid(@"nonfinite clearColor");
   COLOR_CHECK("widthAtLevel",std::max(NSUInteger(1),[texture width]>>c.level),actual==std::max(NSUInteger(1),[t width]>>a.level));
   COLOR_CHECK("heightAtLevel",std::max(NSUInteger(1),[texture height]>>c.level),actual==std::max(NSUInteger(1),[t height]>>a.level));

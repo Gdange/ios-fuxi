@@ -34,8 +34,9 @@ int main(){@autoreleasepool {
  refuses(^{pass.colorAttachments[3].slice=1;},^{pass.colorAttachments[3].slice=0;});
  for(auto action:{MTLStoreActionMultisampleResolve,MTLStoreActionStoreAndMultisampleResolve,MTLStoreActionUnknown})refuses(^{pass.colorAttachments[2].storeAction=action;},^{pass.colorAttachments[2].storeAction=MTLStoreActionStore;});
  id visibility=[device newBufferWithLength:256 options:0];refuses(^{pass.visibilityResultBuffer=visibility;},^{pass.visibilityResultBuffer=nil;});[visibility release];
- refuses(^{pass.depthAttachment.texture=(id)textures[0];},^{pass.depthAttachment.texture=nil;});
- refuses(^{pass.stencilAttachment.texture=(id)textures[0];},^{pass.stencilAttachment.texture=nil;});
+ id first=(id)textures[0];// blocks cannot capture C arrays
+ refuses(^{pass.depthAttachment.texture=first;},^{pass.depthAttachment.texture=nil;});
+ refuses(^{pass.stencilAttachment.texture=first;},^{pass.stencilAttachment.texture=nil;});
  refuses(^{pass.defaultRasterSampleCount=4;},^{pass.defaultRasterSampleCount=1;});
  // Slot 7 works without slot 0; mip area derives from the first present slot.
  for(unsigned i=0;i<4;++i)pass.colorAttachments[i].texture=nil;
