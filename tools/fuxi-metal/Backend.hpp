@@ -42,6 +42,11 @@ inline void check(VkResult r,int line=__builtin_LINE()) {
  if(r!=VK_SUCCESS)backboardGate.fault();
  if(r!=VK_SUCCESS) throw std::runtime_error("Vulkan rc "+std::to_string(r)+" at Backend.hpp:"+std::to_string(line)+" (memory objects "+std::to_string(liveMemoryObjects.load())+", "+std::to_string(liveMemoryBytes.load()>>10)+" KiB)");
 }
+// A host-pointer import the caller falls back from (to a shadow copy) is not a GPU failure:
+// throw without latching backboardd onto the CPU.
+inline void importCheck(VkResult r,int line=__builtin_LINE()) {
+ if(r!=VK_SUCCESS) throw std::runtime_error("Vulkan rc "+std::to_string(r)+" at Backend.hpp:"+std::to_string(line)+" (host import)");
+}
 #define FUXI_VK_FUNCTIONS(X) \
  X(CreateQueryPool) X(DestroyQueryPool) X(GetQueryPoolResults) X(CmdResetQueryPool) X(CmdWriteTimestamp) \
  X(DestroyDevice) X(GetDeviceQueue) X(CreateBuffer) X(DestroyBuffer) X(GetBufferMemoryRequirements) \
@@ -286,13 +291,13 @@ public:
    if(!(externalFeatures&VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) || (externalFeatures&VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT) || !(properties.externalMemoryProperties.compatibleHandleTypes&info.handleType))throw std::runtime_error("no-copy buffer external import unavailable");
    check(CreateBuffer(device,&ci,nullptr,&b->buffer));VkMemoryRequirements req{};GetBufferMemoryRequirements(device,b->buffer,&req);
    if(req.size>bytes)throw std::runtime_error("no-copy buffer allocation size");
-   VkMemoryHostPointerPropertiesEXT hp{};hp.sType=VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;check(GetMemoryHostPointerPropertiesEXT(device,VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,base,&hp));
+   VkMemoryHostPointerPropertiesEXT hp{};hp.sType=VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;importCheck(GetMemoryHostPointerPropertiesEXT(device,VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,base,&hp));
    uint32_t type=0;while(type<memory.memoryTypeCount && (!(req.memoryTypeBits&hp.memoryTypeBits&(1u<<type)) || !(memory.memoryTypes[type].propertyFlags&VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)))++type;
    if(type==memory.memoryTypeCount)throw std::runtime_error("no-copy buffer memory type");
    VkImportMemoryHostPointerInfoEXT hi{};hi.sType=VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;hi.handleType=VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;hi.pHostPointer=base;
    VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.pNext=&hi;ai.allocationSize=bytes;ai.memoryTypeIndex=type;
    limits.reserve(ai.allocationSize);b->charged=ai.allocationSize;
-   check(AllocateMemory(device,&ai,nullptr,&b->memory));++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;b->memoryBytes=ai.allocationSize;b->allocated=bytes;b->memoryType=type;check(BindBufferMemory(device,b->buffer,b->memory,0));
+   importCheck(AllocateMemory(device,&ai,nullptr,&b->memory));++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;b->memoryBytes=ai.allocationSize;b->allocated=bytes;b->memoryType=type;check(BindBufferMemory(device,b->buffer,b->memory,0));
    check(MapMemory(device,b->memory,0,VK_WHOLE_SIZE,0,&b->contents));return b;
   }catch(...){destroyUnlocked(b);throw;}
  }

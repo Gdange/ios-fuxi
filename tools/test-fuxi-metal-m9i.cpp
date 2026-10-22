@@ -63,7 +63,13 @@ static void unit(const char *directory){
    assert(fuxi::backboardGate.blocked());_exit(0);
   }int status=0;assert(waitpid(pid,&status,0)==pid && WIFEXITED(status) && !WEXITSTATUS(status));
  }
- puts("PASS: M9j cache UID/mode/nlink checks and backend loss/timeout/optional-cache loss latch CPU fallback");
+ // A refused host-pointer import falls back to a shadow copy and must not latch the CPU.
+ {pid_t pid=fork();assert(pid>=0);if(!pid){
+   assert(fuxi::backboardGate.admit("aaaaaaaa-1111-2222-3333-000000000009",::open(directory,O_RDONLY|O_DIRECTORY|O_NOFOLLOW)));
+   try {fuxi::importCheck(VK_ERROR_INVALID_EXTERNAL_HANDLE);assert(false);}catch(const std::runtime_error &) {}
+   assert(!fuxi::backboardGate.blocked());_exit(0);
+  }int status=0;assert(waitpid(pid,&status,0)==pid && WIFEXITED(status) && !WEXITSTATUS(status));}
+ puts("PASS: M9j cache UID/mode/nlink checks and backend loss/timeout/optional-cache loss latch CPU fallback, host-import refusal does not");
  puts("PASS: M9i validation-before-driver, checkpoints, retry, permissions, cap and memory-only controls");
 }
 int main(int argc,char **argv){
