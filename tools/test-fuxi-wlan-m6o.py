@@ -17,7 +17,7 @@ static unsigned rail_addr[64], rail_data[64], nrail, fail_rail;
 static unsigned special_writes, fault_special, drop_special;
 static uint64_t special_pa[128];
 static uint32_t special_mask[128];
-static bool cycle_peer=true, reset_peer=true, reset_stuck;
+static bool cycle_peer=true, l23_peer=true, reset_peer=true, reset_stuck;
 static uint32_t eqvec[2], eqfmdc[2];
 static unsigned fail_nth_alloc;
 static unsigned test_rh_send(unsigned t, unsigned addr, unsigned data) {
@@ -44,7 +44,7 @@ static void model_write(uint64_t pa, uint32_t v) {
         setreg(WL_DBI+0x8a8,eqvec[bank]); setreg(WL_DBI+0x8ac,eqfmdc[bank]);
     }
     if(cycle_peer) {
-        if(pa==WL_DBI+0xf24 && v==0x10) setreg(WL_PARF+0x24,0x20);
+        if(pa==WL_DBI+0xf24 && v==0x10 && l23_peer) setreg(WL_PARF+0x24,0x20);
         if(pa==WL_PARF+0x1b0) setreg(WL_DBI+0x80,(v&0x100)?1u<<29:0);
         if(pa==TS_TLMM+0x1000*94+4 && !(v&2)) {
             /* A real probe cycle loses EP state: restore must be substantive. */
@@ -80,7 +80,7 @@ static int firstwrite(uint64_t pa, uint32_t mask, uint32_t value) {
 static void setup(const char *arg) {
     init(); seq_arg=arg; wl_probe_configure();
     nrail=fail_rail=special_writes=fault_special=drop_special=fail_nth_alloc=0;
-    cycle_peer=reset_peer=true; reset_stuck=false;
+    cycle_peer=l23_peer=reset_peer=true; reset_stuck=false;
     memset(special_pa,0,sizeof(special_pa));
     eqvec[0]=0x23ab4501; eqvec[1]=0x34cd6702;
     eqfmdc[0]=0x95; eqfmdc[1]=0x8a;
@@ -199,7 +199,10 @@ int main(void) {
     for(unsigned nth=1;nth<=18;nth++) {
         setup("cycle"); fail_rail=nth; assert(wl5_step(17)==0x6f); fail_rail=0; cleanup(17);
     }
-    setup("cycle"); cycle_peer=false; assert(wl5_step(17)==0x6f && sleeps==110 && !nrail); cleanup(17);
+    /* A dead link still aborts before any rail command. */
+    setup("cycle"); cycle_peer=false; assert(wl5_step(17)==0x6f && !nrail); cleanup(17);
+    /* A missing L23_READY alone is logged and the power cycle continues, as downstream. */
+    setup("cycle"); l23_peer=false; assert(!wl5_step(17) && nrail==18); cleanup(17);
     setup("cycle"); wl3_report[20]=0x1234; assert(wl5_step(17)==0x6f); cleanup(17);
 
     /* Every new host write rejects a mismatch/fault and rolls back partial state. */

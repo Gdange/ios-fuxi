@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,2998 @@
+@@ -0,0 +1,3000 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -2241,7 +2241,9 @@
 +	    wl_m6o_write("cycle D3hot", WL_EPCFG+pm+4, 3, 3)) { return 1; }
 +	wl_sleep(10); /* PCI D3hot transition, before PME_TURNOFF */
 +	if (wl_m6o_write("cycle PME_TURNOFF", WL_DBI+0xf24, 0x10, ~0u) ||
-+	    wl_m6o_wait(WL_PARF+0x24, 0x20, 0x20, 100) ||
++	    /* Downstream logs a missing L23_READY and powers off anyway. */
++	    (wl_m6o_wait(WL_PARF+0x24, 0x20, 0x20, 100) && !fw_faults &&
++	     (printf("FUXI WLAN: M6o cycle L23_READY not received, continuing as downstream\n"), 0)) ||
 +	    wl_m6o_write("cycle PERST low", TS_TLMM+0x1000ull*94+4, 0, 2) ||
 +	    wl_m6o_write("cycle LTSSM off", WL_PARF+0x1b0, 0, 0x100) ||
 +	    wl_m6o_wait(WL_DBI+0x80, 1u<<29, 0, 100) ||
