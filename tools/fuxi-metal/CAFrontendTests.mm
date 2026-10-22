@@ -9,6 +9,13 @@
 @implementation FuxiCATestBase
 @end
 int main(){@autoreleasepool {
+ // Persistence diagnostics preserve enum/byte values through the C exports.
+ fuxi::Backend::pipelineCacheLoadResult=1;fuxi::Backend::pipelineCacheLoadBytes=4096;
+ fuxi::Backend::pipelineCacheSaveResult=3;fuxi::Backend::pipelineCacheSaveBytes=2048;
+ fuxi::Backend::pipelineCacheSaveCount=2;fuxi::Backend::pipelineCacheSaveFailures=1;
+ assert(fuxi_metal_pipeline_cache_load_result()==1 && fuxi_metal_pipeline_cache_load_bytes()==4096);
+ assert(fuxi_metal_pipeline_cache_save_result()==3 && fuxi_metal_pipeline_cache_save_bytes()==2048);
+ assert(fuxi_metal_pipeline_cache_save_count()==2 && fuxi_metal_pipeline_cache_save_failures()==1);
  Class cls=makeDeviceClass([FuxiCATestBase class]);assert(cls && class_getInstanceSize(cls)==528);
  id device=[cls alloc];FuxiOwner *state=[FuxiOwner new];state->backend=new fuxi::Backend;
  objc_setAssociatedObject(device,&ownerKey,state,OBJC_ASSOCIATION_RETAIN_NONATOMIC);[state release];

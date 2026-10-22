@@ -172,6 +172,10 @@ static void displayStage(id<MTLDevice> device,Class rendererClass,SEL factory,NS
  uint64_t (*samples)(void)=(uint64_t(*)(void))dlsym(plugin,"fuxi_metal_gpu_samples");
  uint64_t (*hits)(void)=(uint64_t(*)(void))dlsym(plugin,"fuxi_metal_pipeline_cache_hits");
  uint64_t (*misses)(void)=(uint64_t(*)(void))dlsym(plugin,"fuxi_metal_pipeline_cache_misses");
+ uint64_t (*cacheLoad)(void)=(uint64_t(*)(void))dlsym(plugin,"fuxi_metal_pipeline_cache_load_result");
+ uint64_t (*cacheBytes)(void)=(uint64_t(*)(void))dlsym(plugin,"fuxi_metal_pipeline_cache_load_bytes");
+ uint64_t (*cacheSave)(void)=(uint64_t(*)(void))dlsym(plugin,"fuxi_metal_pipeline_cache_save_result");
+ uint64_t (*cacheSavedBytes)(void)=(uint64_t(*)(void))dlsym(plugin,"fuxi_metal_pipeline_cache_save_bytes");
  if(!gpu || !samples || !hits || !misses)fail("display diagnostic exports");
  // Optional CPU breakdown of the backend submit; absent in older plugins.
  uint64_t (*submits)(void)=(uint64_t(*)(void))dlsym(plugin,"fuxi_metal_submits");
@@ -250,6 +254,11 @@ static void displayStage(id<MTLDevice> device,Class rendererClass,SEL factory,NS
  base=IOSurfaceGetBaseAddress(surface);struct FuxiCAComparison m=fuxiCACompareSize(base,row,reference,1080,2400);
  if(IOSurfaceUnlock(surface,kIOSurfaceLockReadOnly,NULL))fail("display consumer unlock");
  for(unsigned i=0;i<60;++i)printf("FUXI CA: display frame=%u gpu_ms=%.3f wall_ms=%.3f\n",i,times[i],wall[i]);
+ if(cacheLoad && cacheBytes && cacheSave && cacheSavedBytes){
+  const char *loads[]={"empty","hit","discard"},*saves[]={"none","saved","unavailable","error"};
+  uint64_t l=cacheLoad(),s=cacheSave();
+  printf("FUXI CA: display pipeline cache load=%s bytes=%llu save=%s saved_bytes=%llu\n",l<3?loads[l]:"unknown",
+   (unsigned long long)cacheBytes(),s<4?saves[s]:"unknown",(unsigned long long)cacheSavedBytes());}
  double cold=times[0];qsort(times,60,sizeof(double),compareDouble);
  double warm[59];for(unsigned i=0;i<59;++i)warm[i]=wall[i+1];qsort(warm,59,sizeof(double),compareDouble);
  printf("FUXI CA: display GPU min/median/max=%.3f/%.3f/%.3f ms cold=%.3f ms frames=60 cache_hits=%llu cache_misses=%llu\n",

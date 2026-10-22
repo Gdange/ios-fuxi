@@ -34,6 +34,7 @@ public:
  ResourceLimits limits;ObjectCache<Pipeline> objects;
  static constexpr size_t maxBufferLength=ResourceLimits::single;
  static inline std::atomic<uint64_t> pipelineHits{0},pipelineMisses{0},gpuNanos{0},gpuSamples{0};
+ static inline std::atomic<uint64_t> pipelineCacheLoadResult{0},pipelineCacheLoadBytes{0},pipelineCacheSaveResult{0},pipelineCacheSaveBytes{0},pipelineCacheSaveCount{0},pipelineCacheSaveFailures{0};
  static inline std::atomic<uint64_t> submitObjectsNanos{0},submitDescriptorsNanos{0},submitRecordNanos{0},shadowCopyNanos{0},submitFlushNanos{0},submitInvalidateNanos{0},flushCalls{0},invalidateCalls{0},emptySubmits{0},submitObjectCreates{0},submitPoolCreates{0},submitFrameCreates{0},submitViewCreates{0};
  static inline std::atomic<uint64_t> submits{0},submitPrepareNanos{0},submitWaitNanos{0},submitRetireNanos{0};
  static inline bool modelPipelines=false;
@@ -41,7 +42,7 @@ public:
  ~Backend(){objects.clear([&](Pipeline *p){destroy(p);});}
  static inline bool modelTextures=false;
  static inline int live=0,submissions=0,constructed=0;bool poisoned=false;
- Backend() {++constructed;}
+ explicit Backend(const char * ="unknown") {++constructed;}
  Buffer *allocate(size_t n) {
   if(!n || n>maxBufferLength)throw std::runtime_error("length");
   auto *b=new Buffer{calloc(1,n),n,n};++live;return b;

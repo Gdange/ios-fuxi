@@ -64,5 +64,11 @@ public:
  ~Translator() {if(dylib)dlclose(dylib);}
  Translator(const Translator&)=delete;Translator& operator=(const Translator&)=delete;
  static Translator &get() {static Translator translator;return translator;}
+ static bool cacheIdentity(uint8_t *out) noexcept {
+  try {
+   auto &tr=get();auto fn=(int (*)(uint8_t *))dlsym(tr.dylib,"fuxi_m2v_cache_identity");
+   return fn && fn(out)==1;
+  }catch(...){return false;} // Older/unavailable bridges keep the memory-only path.
+ }
 };
 }

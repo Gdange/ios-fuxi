@@ -76,6 +76,12 @@ extern "C" uint64_t fuxi_metal_failure_count() {return failureCount.load();}
 extern "C" uint64_t fuxi_metal_completed_draws() {return completedDraws.load();}
 extern "C" uint64_t fuxi_metal_pipeline_cache_hits() {return fuxi::Backend::pipelineHits.load();}
 extern "C" uint64_t fuxi_metal_pipeline_cache_misses() {return fuxi::Backend::pipelineMisses.load();}
+extern "C" uint64_t fuxi_metal_pipeline_cache_load_result() {return fuxi::Backend::pipelineCacheLoadResult.load();}
+extern "C" uint64_t fuxi_metal_pipeline_cache_load_bytes() {return fuxi::Backend::pipelineCacheLoadBytes.load();}
+extern "C" uint64_t fuxi_metal_pipeline_cache_save_result() {return fuxi::Backend::pipelineCacheSaveResult.load();}
+extern "C" uint64_t fuxi_metal_pipeline_cache_save_bytes() {return fuxi::Backend::pipelineCacheSaveBytes.load();}
+extern "C" uint64_t fuxi_metal_pipeline_cache_save_count() {return fuxi::Backend::pipelineCacheSaveCount.load();}
+extern "C" uint64_t fuxi_metal_pipeline_cache_save_failures() {return fuxi::Backend::pipelineCacheSaveFailures.load();}
 extern "C" uint64_t fuxi_metal_gpu_nanoseconds() {return fuxi::Backend::gpuNanos.load();}
 extern "C" uint64_t fuxi_metal_gpu_samples() {return fuxi::Backend::gpuSamples.load();}
 extern "C" uint64_t fuxi_metal_submits() {return fuxi::Backend::submits.load();}
@@ -1110,7 +1116,7 @@ static thread_local FuxiCommandBuffer *completionCommand;
  if(io)dlclose(io);
  if(rc || !registry) {failureLog("FUXI MTL: registryID FAIL\n");[self release];return nil;}
  FuxiOwner *state=[FuxiOwner new];state->registry=registry;
- try {if(clientMode!=fuxi::ClientMode::census)state->backend=new fuxi::Backend;}
+ try {if(clientMode!=fuxi::ClientMode::census)state->backend=new fuxi::Backend(clientProcess);}
  catch(const std::exception &e) {failureLog("FUXI MTL: device FAIL %s\n",e.what());[state release];[self release];return nil;}
  // CA's documented late library/pipeline failures can abort, rather than fall
  // back. Refuse discovery on the current no-import kernel even after a root

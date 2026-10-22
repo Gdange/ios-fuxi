@@ -162,6 +162,15 @@ unsafe fn name<'a>(p:*const c_char)->Result<&'a str,String> {
     std::str::from_utf8(bytes).map_err(|e|e.to_string())
 }
 #[no_mangle] pub extern "C" fn fuxi_m2v_abi()->u32 {6}
+// Optional ABI-6 capability: invalidate persistent products on adapter or pin changes.
+// Hash source at compile time input; never expose paths, shader bytes or libraries.
+#[no_mangle] pub unsafe extern "C" fn fuxi_m2v_cache_identity(out:*mut u8)->i32 {
+    if out.is_null(){return 0;}
+    let mut h=Sha256::new();
+    h.update(b"metal2vulkan:720ef1ce9ae2a2068999a8675717418b9416283e;cache-v1;");
+    h.update(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"),"/",file!())));
+    std::ptr::copy_nonoverlapping(h.finalize().as_ptr(),out,32);1
+}
 #[no_mangle] pub unsafe extern "C" fn fuxi_m2v_open(p:*const u8,n:usize,err:*mut c_char,cap:usize)->*mut c_void {
     attempt(err,cap,|| {
         if p.is_null() || n==0 || n>4*1024*1024{return Err("library outside 1..4 MiB".into());}

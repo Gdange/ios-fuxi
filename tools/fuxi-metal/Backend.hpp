@@ -112,6 +112,9 @@ public:
  bool poisoned=false;
  static constexpr size_t maxBufferLength=ResourceLimits::single;
  static inline std::atomic<uint64_t> pipelineHits{0},pipelineMisses{0},gpuNanos{0},gpuSamples{0};
+ static inline auto &pipelineCacheLoadResult=PipelineCache::loadResult,&pipelineCacheLoadBytes=PipelineCache::loadBytes;
+ static inline auto &pipelineCacheSaveResult=PipelineCache::saveResult,&pipelineCacheSaveBytes=PipelineCache::saveBytes;
+ static inline auto &pipelineCacheSaveCount=PipelineCache::saveCount,&pipelineCacheSaveFailures=PipelineCache::saveFailures;
  // CPU cost of submit(): entry to QueueSubmit (incl. the lock), the fence wait, and retirement.
  static inline std::atomic<uint64_t> submits{0},submitPrepareNanos{0},submitWaitNanos{0},submitRetireNanos{0};
  static inline std::atomic<uint64_t> submitObjectsNanos{0},submitDescriptorsNanos{0},submitRecordNanos{0},shadowCopyNanos{0},submitFlushNanos{0},submitInvalidateNanos{0};
@@ -128,7 +131,7 @@ public:
  uint32_t maxTextureDimension() const{return limits.dimension;}
  size_t resourceBytes() const{return limits.used;}
  bool supportsTimestamps() const{return timestampBits && timestampPeriod>0;}
- Backend() {
+ explicit Backend(const char *client="unknown") {
   setenv("TU_DARWIN_SERVICE","NativeAdrenoGpuPublished",1);
   setenv("TU_DARWIN_OPEN_TYPE","0",1);setenv("TU_DEBUG","nocb",1);setenv("MESA_LOG_LEVEL","debug",1);
   try {
@@ -203,7 +206,12 @@ public:
    FUXI_VK_FUNCTIONS(LOAD)
 #undef LOAD
 #undef INSTANCE
-   pipelineCache.open(device,CreatePipelineCache,DestroyPipelineCache,GetPipelineCacheData);
+   VkPhysicalDeviceDriverProperties driver{};driver.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+   VkPhysicalDeviceIDProperties id{};id.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;driver.pNext=&id;
+   VkPhysicalDeviceProperties2 identity{};identity.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;identity.pNext=&driver;
+   GetPhysicalDeviceProperties2(physical,&identity);
+   uint8_t translator[32]{};bool identified=Translator::cacheIdentity(translator);
+   pipelineCache.open(device,CreatePipelineCache,DestroyPipelineCache,GetPipelineCacheData,props,driver,id,identified?translator:nullptr,client);
    GetDeviceQueue(device,family,0,&queue);if(!queue) throw std::runtime_error("null queue");
   } catch(...) {close();throw;}
  }
@@ -547,9 +555,10 @@ public:
    try {
     check(CreateGraphicsPipelines(device,cache,1,&gi,nullptr,&p->pipeline));assembly.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;assembly.primitiveRestartEnable=VK_TRUE;
     check(CreateGraphicsPipelines(device,cache,1,&gi,nullptr,&p->stripPipeline));
-   }catch(...) {pipelineCache.finishedPair();throw;}
-   pipelineCache.finishedPair();
-   fprintf(stderr,"FUXI MTL: Vulkan pipelines PASS %.3f ms cache=%u\n",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-began).count(),cache!=VK_NULL_HANDLE);
+   }catch(...) {pipelineCache.finishedPair(std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-began).count());throw;}
+   auto buildMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-began).count();
+   pipelineCache.finishedPair(buildMs);
+   fprintf(stderr,"FUXI MTL: Vulkan pipelines PASS %.3f ms cache=%u\n",buildMs,cache!=VK_NULL_HANDLE);
    fprintf(stderr,"FUXI MTL: framebuffer fetch plan mask=%u ordered=%u\n",p->fetchMask,p->orderedColorAccess);
    p->translation=translated.handle;translated.handle=nullptr;cleanup();return p;
   }catch(...) {cleanup();destroyPipelineUnlocked(p);throw;}
