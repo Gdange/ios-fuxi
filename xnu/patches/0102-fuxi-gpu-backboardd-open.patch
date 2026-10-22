@@ -1,0 +1,46 @@
+--- a/iokit/Kernel/arm/FuxiAdrenoUserClient.cpp
++++ b/iokit/Kernel/arm/FuxiAdrenoUserClient.cpp
+@@ -15,6 +15,7 @@
+ #include <kern/task.h>
+ #include <sys/proc.h>
+ #include <pexpert/pexpert.h>
++#include <sys/codesign.h>
+ #include "fuxi_gpu_abi.h"
+ #include "fuxi_abi_wire.h"
+ 
+@@ -395,6 +396,25 @@ OSDefineMetaClassAndStructors(FuxiAdrenoUserClient,IOUserClient)
+  * provider object or a mutable IOClass property. This owns only a discovery
+  * name; it implements no Apple family/user-client ABI. The native root-only
+  * ABI below remains the sole GPU connection contract. */
++/* M9j: the render server backboardd runs as mobile, not root. Admit that one
++ * non-root client only when the boot asks for it (fuxigpu=backboardd) and the
++ * caller is the platform binary named backboardd opening for itself. FuxiMetal
++ * keeps its own two-key gate and crash fallback in userspace. */
++static bool backboardClient(task_t task) {
++ char arg[32]={};
++ if (!PE_parse_boot_argn("fuxigpu",arg,sizeof(arg)) || strcmp(arg,"backboardd")) return false;
++ if (task!=current_task()) return false;
++ char name[32]={};
++ proc_selfname(name,sizeof(name));
++ if (strcmp(name,"backboardd")) return false;
++ proc_t p=proc_self();
++ if (!p) return false;
++ bool platform=csproc_get_platform_binary(p)!=0;
++ int pid=proc_pid(p);
++ proc_rele(p);
++ IOLog("FUXI GPU ABI: non-root open backboardd pid %d platform %d -> %s\n",pid,(int)platform,platform?"admit":"deny");
++ return platform;
++}
+ class IOAcceleratorES : public IOService {
+  OSDeclareDefaultStructors(IOAcceleratorES)
+ };
+@@ -412,7 +432,8 @@ public:
+   if (!handler) return kIOReturnBadArgument;
+   *handler=nullptr;
+   if (type!=0x4147 && type!=0) return kIOReturnUnsupported;
+-  if (IOUserClient::clientHasPrivilege(securityID,kIOClientPrivilegeAdministrator)!=kIOReturnSuccess) return kIOReturnNotPrivileged;
++  if (IOUserClient::clientHasPrivilege(securityID,kIOClientPrivilegeAdministrator)!=kIOReturnSuccess &&
++      !backboardClient(task)) return kIOReturnNotPrivileged;
+   auto *uc=new FuxiAdrenoUserClient;
+   if (!uc) return kIOReturnNoMemory;
+   if (!uc->initWithTask(task,securityID,type)) { uc->release(); return kIOReturnNoMemory; }
