@@ -89,6 +89,7 @@ static void checkClient() {
    else if(!FUXI_MTL_BACKBOARD_ADMIT())clientMode=fuxi::ClientMode::deny;
    else {
     backboardSurvey.enable(FUXI_MTL_BACKBOARD_MODE()==2);
+    fuxi::backboardGate.surveying=backboardSurvey.active();
     if(backboardSurvey.active())fprintf(stderr,"FUXI MTL: backboardd survey enabled diagnostic: screen may blank for up to 20s after refusal\n");
     // Lifetime diagnostics include idle periods and a stalled render thread.
     static dispatch_source_t timer=dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW,0));
@@ -747,9 +748,16 @@ static bool textureDescriptorAccepted(MTLTextureDescriptor *d,uint32_t dimension
 @interface FuxiPipeline : FuxiLabeledObject { @public id _device; fuxi::Pipeline *_pipeline;NSString *_descriptorText; }
 @end
 @implementation FuxiPipeline
-- (void)dealloc {[_descriptorText release];owner(_device)->backend->destroy(_pipeline);[_device release];[super dealloc];}
+- (void)dealloc {[_descriptorText release];if(_pipeline)owner(_device)->backend->destroy(_pipeline);[_device release];[super dealloc];}
 - (id)device {CENSUS();return _device;}
 @end
+// Survey mode: CA aborts on a nil render pipeline ("Metal failed to build render
+// pipeline", device M9l survey boot). After the refusal is recorded, hand back an
+// empty pipeline; its draws are dropped and every submission is already a no-op.
+static id surveyPipeline(id refused,NSError **error,id device){
+ if(refused || !backboardSurvey.active() || !fuxi::backboardGate.blocked())return refused;
+ if(error)*error=nil;FuxiPipeline *p=[FuxiPipeline new];p->_device=[device retain];p->_descriptorText=@"survey placeholder";return p;
+}
 @interface FuxiSampler : FuxiLabeledObject { @public id _device;fuxi::Sampler *_sampler; }
 @end
 @implementation FuxiSampler
@@ -1545,7 +1553,7 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
 - (id)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {CENSUS();
  if(error)*error=nil;if(clientMode==fuxi::ClientMode::census)return nil;
  DescriptorContext context(pipelineDescriptorText(d));
- if(NSString *field=pipelineRejection(d,self))return metalError(error,field.UTF8String);
+ if(NSString *field=pipelineRejection(d,self))return surveyPipeline(metalError(error,field.UTF8String),error,self);
  id v=d.vertexFunction,f=d.fragmentFunction;
  FuxiPipeline *p=[FuxiPipeline new];p->_descriptorText=[pipelineDescriptorText(d) copy];p->_device=[self retain];p->_label=[d.label copy];
  try {auto a=(FuxiFunction *)v,b=(FuxiFunction *)f;fuxi::CompileOptions o{};auto color=d.colorAttachments[0];
@@ -1558,7 +1566,7 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
   for(unsigned i=0;i<4;++i)o.strides[i]=(uint32_t)d.vertexDescriptor.layouts[i].stride;
   NSData *constants[2]={a->_constants,b->_constants};for(unsigned i=0;i<2;++i){o.constantCount[i]=(uint32_t)(constants[i].length/sizeof(fuxi::Constant));if(o.constantCount[i]>fuxi::maxFunctionConstants)throw std::runtime_error("constants bound");if(constants[i].length)memcpy(o.constants[i],constants[i].bytes,constants[i].length);}
   p->_pipeline=owner(self)->backend->compilePipeline(a->_library->_library,a->_name.UTF8String,b->_library->_library,b->_name.UTF8String,o);}
- catch(const std::exception &e) {[p release];return metalError(error,e.what());}return p;
+ catch(const std::exception &e) {[p release];return surveyPipeline(metalError(error,e.what()),error,self);}return p;
 }
 - (id)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d options:(MTLPipelineOption)options reflection:(MTLRenderPipelineReflection **)reflection error:(NSError **)error {CENSUS();
  DescriptorContext context(pipelineDescriptorText(d));

@@ -75,6 +75,9 @@ public:
  }
  bool admit() {char uuid[64]={};systemString("kern.bootsessionuuid",uuid,sizeof(uuid));return admit(uuid,openClientStorage("backboardd"));}
  bool blocked() const {return active.load() && failed.load();}
+ // Survey mode keeps allocating after the latch so later refusals still surface.
+ std::atomic<bool> surveying{false};
+ bool refusesResources() const {return blocked() && !surveying.load();}
  void fault() {
   if(!active.load())return;
   std::lock_guard<std::mutex> guard(mutex);if(!active)return;++failures;if(failed)return;

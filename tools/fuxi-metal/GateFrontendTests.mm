@@ -72,6 +72,12 @@ int main() {
    // A single refusal persists denial immediately, even beyond the normal log cap.
    failureCount=1000;failureLog("survey distinct first\n");assert(backboardExits==0 && fuxi::backboardGate.blocked());
    for(unsigned i=0;i<100;++i)failureLog("survey distinct first\n");assert(backboardSurvey.distinct()==1 && deadlineArms==1 && surveyDeadline);
+   // Survey keeps resources and pipelines non-nil after the latch: CA aborts on a nil pipeline.
+   assert(fuxi::backboardGate.surveying.load() && !fuxi::backboardGate.refusesResources());
+   {NSError *err=[NSError errorWithDomain:@"t" code:1 userInfo:nil];id owner=[NSObject new];
+    FuxiPipeline *placeholder=surveyPipeline(nil,&err,owner);assert(placeholder && !err && !placeholder->_pipeline);
+    fuxi::backboardGate.surveying=false;assert(fuxi::backboardGate.refusesResources());fuxi::backboardGate.surveying=true;
+    [placeholder release];[owner release];}
    id device=[NSObject new];FuxiOwner *state=[FuxiOwner new];state->backend=new fuxi::Backend;
    objc_setAssociatedObject(device,&ownerKey,state,OBJC_ASSOCIATION_RETAIN_NONATOMIC);[state release];
    FuxiQueue *queue=[FuxiQueue new];queue->_device=[device retain];

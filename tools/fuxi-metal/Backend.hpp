@@ -246,7 +246,7 @@ public:
   device={};instance={};library=nullptr;
  }
  ~Backend() {close();}
- void requireLive() {if(poisoned || backboardGate.blocked()) throw std::runtime_error("device poisoned or backboardd failure latched");}
+ void requireLive() {if(poisoned || backboardGate.refusesResources()) throw std::runtime_error("device poisoned or backboardd failure latched");}
  Buffer *allocate(size_t length) {
   std::lock_guard<std::mutex> guard(mutex);requireLive();
   return allocateUnlocked(length);
