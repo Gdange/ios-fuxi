@@ -305,7 +305,7 @@ int main(void) {
         if(kind==5)((struct wl_context *)(wl_contexts.va+0x1800))->len=0;
         assert(finish_step() && !starts);contain();
     }
-    dev_on=false;setup(NULL);qrtr_arg=4;wl_probe_configure();assert(!wl_qrtr);
+    dev_on=false;setup(NULL);qrtr_arg=5;wl_probe_configure();assert(!wl_qrtr);
     setup(NULL);stop22_arg=0;qrtr_arg=1;wl_probe_configure();cache_drop=true;assert(run(20)==20);cache_drop=false;cleanup(20);
     setup(NULL);stop22_arg=0;qrtr_arg=1;wl_probe_configure();fail_nth_alloc=4;assert(run(20)==20);fail_nth_alloc=0;cleanup(20);
     start(0,true);wl_finish(27);assert(frees==allocations && !starts);dev_on=false;

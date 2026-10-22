@@ -120,6 +120,10 @@ static bool PE_parse_boot_argn(const char *name, void *out, int size) {
     if(old_iova_present) memcpy(out,&old_iova_arg,size);
     return old_iova_present;
 }
+/* String API uses the same synthetic argument source, without numeric coercion. */
+static bool PE_parse_boot_arg_str(const char *name, char *out, int size) {
+    return PE_parse_boot_argn(name, out, size);
+}
 static bool progress = true, fail_bm, fail_perst, no_root;
 static bool noncontig, high_memory, fail_alloc, tlb_busy, mismatch, inject_fault;
 static uint64_t mismatch_pa, read_fault_pa, corrupt_write_pa;

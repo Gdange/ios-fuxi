@@ -20,7 +20,7 @@
  *   fuxiwlanseq=cyclerails  also cycle shared rails (froze the SoC once)
  *   fuxiwlanstop22=1  retain the BHI-only diagnostic stop (default: continue)
  *   fuxiwlankeep=1  retain DMA/device only after complete selected milestone success
- *   fuxiwlanqrtr=1  W11 capability-only diagnostic; =2 W12 setup; =3 W13 small-chunk negotiation
+ *   fuxiwlanqrtr=1  W11 capability-only diagnostic; =2 W12 setup; =3 W13 small-chunk negotiation; =4 W14 downloads
  * Steps 17..28 probe DMA safety and load rootfs firmware through BHI/BHIe.
  * Completion is polled; M6o can enable MSI to a RAM sink. W11 channels/QMI are opt-in;
  * see docs-lanes/wlan-bt.md M6.
@@ -69,6 +69,8 @@
 #include <arm/caches_internal.h>
 /* osfmk/vm/pmap.h declares these under MACH_KERNEL_PRIVATE only; bsd/ cannot
  * see them, but they are in the same kernel image (M6k fuxiwlanprobe=nc). */
+/* pexpert exposes the string-only parser under XNU_KERNEL_PRIVATE. */
+extern boolean_t PE_parse_boot_arg_str(const char *, char *, int);
 extern unsigned int pmap_cache_attributes(ppnum_t pn);
 extern void pmap_set_cache_attributes(ppnum_t pn, unsigned int cacheattr);
 
@@ -713,7 +715,7 @@ static bool wl_mhi_valid;
 struct wl_dma { vm_offset_t va; vm_size_t size; uint64_t pa, iova; bool nc; };
 static struct wl_dma wl_image, wl_vectors, wl_contexts, wl_tables;
 static struct wl_dma wl_amss; /* full file when BHI uses a separate prefix */
-static bool wl_qrtr, wl_w12, wl_w13, wl_w11_attempted, wl_w11_ok;
+static bool wl_qrtr, wl_w12, wl_w13, wl_w14, wl_w11_attempted, wl_w11_ok;
 /* W12/W13 allocate after an accepted REQUEST_MEM; retain partial allocations until
  * containment is proven. Limit includes XNU page rounding, not just wire sizes. */
 #define WL13_CHUNK_LIMIT (2u * 1024u * 1024u)
@@ -724,6 +726,25 @@ static uint32_t wl_target_size[WL_TARGET_MAX], wl_target_type[WL_TARGET_MAX];
 static unsigned wl_target_n;
 static uint64_t wl_target_total;
 static struct wl_dma wl_ipcr;
+/* W14 inputs are retained through keep/containment, including partial reads. */
+static struct wl_dma wl14_regdb, wl14_bdf, wl14_m3;
+static char wl14_bdf_name[65]; /* one extra byte detects XNU string truncation */
+#define WL14_FILE_MAX (1024u * 1024u)
+#define WL14_M3_MAX (2u * 1024u * 1024u)
+#define WL14_SEG 6144u
+static bool
+wl14_basename(const char *s)
+{
+	if (!*s || !((*s >= 'A' && *s <= 'Z') || (*s >= 'a' && *s <= 'z') || (*s >= '0' && *s <= '9'))) { return false; }
+	for (unsigned i = 0; i < sizeof(wl14_bdf_name)-1; i++) {
+		char c = s[i];
+		if (!c) { return true; }
+		if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+		    (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.')) { return false; }
+		if (c == '.' && i && s[i-1] == '.') { return false; }
+	}
+	return false;
+}
 static bool wl_stop22, wl_keep, wl_bhie_fired, wl_amss_reached;
 static bool wl_sbl_ready, wl_contexts_published, wl_sbl_m0;
 static uint32_t wl_bhie_seq;
@@ -825,8 +846,18 @@ wl_probe_configure(void)
 	(void)PE_parse_boot_argn("fuxiwlanstop22", &stop22, sizeof(stop22));
 	(void)PE_parse_boot_argn("fuxiwlankeep", &keep, sizeof(keep));
 	(void)PE_parse_boot_argn("fuxiwlanqrtr", &qrtr, sizeof(qrtr));
-	wl_w13 = qrtr == 3; wl_w12 = qrtr == 2 || wl_w13; wl_qrtr = qrtr == 1 || wl_w12; wl_w11_attempted = wl_w11_ok = false;
+	wl_w14 = qrtr == 4; wl_w13 = qrtr == 3 || wl_w14; wl_w12 = qrtr == 2 || wl_w13; wl_qrtr = qrtr == 1 || wl_w12; wl_w11_attempted = wl_w11_ok = false;
 	wl_stop22 = stop22 == 1; wl_keep = keep == 1;
+	if (wl_w14) {
+		bzero(wl14_bdf_name, sizeof(wl14_bdf_name));
+		if (!PE_parse_boot_arg_str("fuxiwlanbdf", wl14_bdf_name, sizeof(wl14_bdf_name))) {
+			memcpy(wl14_bdf_name, "bd_m3gl.elf", sizeof("bd_m3gl.elf"));
+		}
+		if (wl14_bdf_name[sizeof(wl14_bdf_name)-2] || !wl14_basename(wl14_bdf_name)) {
+			wl_variant_invalid = true;
+			printf("FUXI WLAN: W14 invalid fuxiwlanbdf basename; refused\n");
+		} else { printf("FUXI WLAN: W14 selected BDF %s (override fuxiwlanbdf; default unverified)\n", wl14_bdf_name); }
+	}
 	wl_bhie_fired = wl_amss_reached = false;
 	wl_sbl_ready = wl_contexts_published = wl_sbl_m0 = false;
 	wl_bhie_seq = 0;
@@ -847,7 +878,7 @@ wl_probe_configure(void)
 	if (wl_pre == 5 && retain == 1) { wl_variant_invalid = true; }
 	printf("FUXI WLAN: W10 continue=%u keep=%u (stop22=1 retains BHI diagnostics; no data channels)\n", !wl_stop22, wl_keep);
 	printf("FUXI WLAN: W11 qrtr=%u keep=%u (one conversation after AMSS/M0)\n", wl_qrtr, wl_keep);
-	if (wl_w12) { printf("FUXI WLAN: W12 selected qrtr=%u target memory cap %u bytes\n", wl_w13 ? 3 : 2, WL_TARGET_CAP); }
+	if (wl_w12) { printf("FUXI WLAN: W12 selected qrtr=%u target memory cap %u bytes\n", wl_w14 ? 4 : wl_w13 ? 3 : 2, WL_TARGET_CAP); }
 	if (wl_w13) { printf("FUXI WLAN: W13 small-chunk policy limit %u bytes; one zero-segment negotiation, aligned IOVAs\n", WL13_CHUNK_LIMIT); }
 	printf("FUXI WLAN: M6o seq mask %#x valid=%u (selectors default off)\n",
 	    wl_seq_flags, !wl_variant_invalid);
@@ -1872,7 +1903,7 @@ wl_pt_pa(unsigned table)
 static vm_offset_t
 wl_owned_alias(uint64_t pa, unsigned bytes, bool tables_only)
 {
-	struct wl_dma *bufs[] = { &wl_tables, &wl_image, &wl_vectors, &wl_contexts, &wl_rddm, &wl_rxvectors, &wl_msi_sink, &wl_amss, &wl_ipcr };
+	struct wl_dma *bufs[] = { &wl_tables, &wl_image, &wl_vectors, &wl_contexts, &wl_rddm, &wl_rxvectors, &wl_msi_sink, &wl_amss, &wl_ipcr, &wl14_regdb, &wl14_bdf, &wl14_m3 };
 	unsigned fixed = sizeof(bufs)/sizeof(bufs[0]);
 	for (unsigned i = 0; i < (tables_only ? 1u : fixed + WL_TARGET_MAX); i++) {
 		struct wl_dma *d = i < fixed ? bufs[i] : &wl_target[i-fixed];
@@ -2852,7 +2883,8 @@ wl_probe_observe(void)
 #define WL_IPCR_TXR 0u
 #define WL_IPCR_RXR 0x100u
 #define WL_IPCR_TXBUF 0x1000u
-#define WL_IPCR_RXBUF (WL_IPCR_TXBUF + WL_IPCR_N * WL_IPCR_MTU)
+#define WL_IPCR_TXMTU (wl_w14 ? 8192u : WL_IPCR_MTU)
+#define WL_IPCR_RXBUF (WL_IPCR_TXBUF + WL_IPCR_N * WL_IPCR_TXMTU)
 #define WL_IPCR_BYTES (WL_IPCR_RXBUF + WL_IPCR_N * WL_IPCR_MTU)
 #define WL_QRTR_CTRL 0xfffffffeu
 #define WL_QRTR_LOCAL 1u
@@ -2868,11 +2900,13 @@ static uint32_t wl_chdb, wl_erdb, wl_server_node, wl_server_port, wl_peer_node;
 static bool wl_cmd_done, wl_hello, wl_cap_sent, wl_cap_done, wl_w11_stopping;
 static unsigned wl_w11_error;
 enum { WL12_DISCOVERY, WL12_IND, WL12_HOST, WL12_REQUEST, WL12_RESPOND,
-    WL12_READY, WL12_CAP, WL12_DONE };
+    WL12_READY, WL12_CAP, WL12_DONE, WL14_REGDB, WL14_BDF, WL14_M3, WL14_READY };
 static unsigned wl12_stage;
 static uint16_t wl12_txn, wl12_msg;
 static bool wl12_reply, wl12_requested, wl12_ready;
 static bool wl13_delayed, wl13_negotiated;
+static bool wl14_ready, wl14_init_done, wl14_board_valid;
+static uint32_t wl14_board;
 static int wl_w12_run(void);
 static int wl_qmi_w12(const uint8_t *, unsigned);
 
@@ -2942,11 +2976,11 @@ static int
 wl_ipcr_send(const uint8_t *packet, unsigned bytes)
 {
 	unsigned i = wl_tx_write, next = wl_ring_next(i, WL_IPCR_N);
-	if (!bytes || bytes > WL_IPCR_MTU || next == wl_tx_read || wl_w11_guard()) {
+	if (!bytes || bytes > WL_IPCR_TXMTU || next == wl_tx_read || wl_w11_guard()) {
 		return wl_w11_fail("TX length/full/transport guard");
 	}
-	uint64_t addr = wl_ipcr.iova + WL_IPCR_TXBUF + i * WL_IPCR_MTU;
-	memcpy((void *)(wl_ipcr.va + WL_IPCR_TXBUF + i * WL_IPCR_MTU), packet, bytes);
+	uint64_t addr = wl_ipcr.iova + WL_IPCR_TXBUF + i * WL_IPCR_TXMTU;
+	memcpy((void *)(wl_ipcr.va + WL_IPCR_TXBUF + i * WL_IPCR_TXMTU), packet, bytes);
 	wl_ipcr_ring(WL_IPCR_TXR)[i] = (struct wl_tre){addr, bytes, (2u << 16) | (1u << 9)};
 	wl_tx_write = next;
 	wl_w11_barrier();
@@ -2959,7 +2993,8 @@ wl_ipcr_send(const uint8_t *packet, unsigned bytes)
 static int
 wl_qrtr_send(unsigned type, uint32_t node, uint32_t port, const uint8_t *data, unsigned len)
 {
-	uint8_t packet[1024] = {0};
+	static uint8_t packet[8192]; /* one boot thread; copied before publication */
+	bzero(packet, sizeof(packet));
 	unsigned padded = (len + 3) & ~3u;
 	if (len > sizeof(packet)-32 || padded > sizeof(packet)-32) { return wl_w11_fail("QRTR TX bounds"); }
 	/* QRTR v1, eight little-endian u32 words; size excludes header/padding. */
@@ -3004,7 +3039,7 @@ wl_qmi_cap(const uint8_t *p, unsigned len)
 		if (len-off < 3) { return wl_w11_fail("QMI truncated TLV header"); }
 		unsigned type = p[off], n = wl_get16(p+off+1); off += 3;
 		if (n > len-off) { return wl_w11_fail("QMI truncated TLV value"); }
-		unsigned bit = type == 2 ? 1 : (type >= 0x10 && type <= 0x1c ? 2u << (type-0x10) : 0);
+		unsigned bit = type == 2 ? 1 : (type >= 0x10 && type <= 0x29 ? 2u << (type-0x10) : 0);
 		if (bit && (seen & bit)) { return wl_w11_fail("QMI duplicate capability TLV"); }
 		seen |= bit;
 		const uint8_t *v = p+off;
@@ -3053,6 +3088,28 @@ wl_qmi_cap(const uint8_t *p, unsigned len)
 				dev_size[i] = wl_get32(v+16*i+8) | ((uint64_t)wl_get32(v+16*i+12) << 32);
 			}
 			break;
+		case 0x1e:
+			if (n != 4) { return wl_w11_fail("hang_data_addr_offset size"); }
+			printf("FUXI WLAN: W14 cap hang_data_addr_offset %#x (reported only)\n", wl_get32(v)); break;
+		case 0x1f:
+			if (n != 2) { return wl_w11_fail("hang_data_length size"); }
+			printf("FUXI WLAN: W14 cap hang_data_length %u (reported only)\n", wl_get16(v)); break;
+		case 0x22:
+			/* Vendor protocol fact: u8 count, then 32-byte name + four u32s.
+			 * Original decoder; no cnss2 implementation/EI tables imported. */
+			if (!n || v[0] > 16 || n != 1u+48u*v[0]) { return wl_w11_fail("ol_cpr_cfg bounds"); }
+			printf("FUXI WLAN: W14 cap ol_cpr_cfg pmu_param_len %u (reported only; no power writes)\n", v[0]);
+			for (unsigned i = 0; i < v[0]; i++) {
+				const uint8_t *q = v+1+48*i; char name[33]; unsigned k = 0;
+				while (k < 32 && q[k]) { k++; }
+				wl_qmi_text(name, q, k);
+				printf("FUXI WLAN: W14 ol_cpr_cfg %u pin %s wake_volt_valid %u wake_volt %u sleep_volt_valid %u sleep_volt %u\n",
+				    i, name, wl_get32(q+32), wl_get32(q+36), wl_get32(q+40), wl_get32(q+44));
+			}
+			break;
+		case 0x26:
+			if (n != 4) { return wl_w11_fail("he_channel_width_cap size"); }
+			printf("FUXI WLAN: W14 cap he_channel_width_cap %#x\n", wl_get32(v)); break;
 		default:
 			if (wl_w12) { printf("FUXI WLAN: W12 cap unknown TLV %#x bytes %u\n", type, n); }
 			break;
@@ -3063,7 +3120,7 @@ wl_qmi_cap(const uint8_t *p, unsigned len)
 	printf("FUXI WLAN: %s valid %#x chip id %#x chip family %#x board id %#x soc id %#x firmware %#x timestamp %s build %s\n",
 	    wl_w12 ? "W12 cap:" : "W11 WLFW cap:", seen, chip, family, board, soc, version, stamp, build);
 	if (wl_w12) {
-		printf("FUXI WLAN: W12 cap: num macs %u voltage mv %u time freq hz %u otp %#x eeprom cal timeout %u fw caps %#llx chain cap %u (presence in valid mask)\n",
+		printf("FUXI WLAN: W12 cap: num macs %u voltage mv %u time freq hz %u otp %#x eeprom cal timeout %u fw caps %#llx rd_card_chain_cap %u (presence in valid mask)\n",
 		    macs, mv, hz, otp, cal_timeout, caps, chain);
 		if (seen & (2u << 12)) {
 			for (unsigned i = 0; i < 4; i++) {
@@ -3071,6 +3128,7 @@ wl_qmi_cap(const uint8_t *p, unsigned len)
 			}
 		}
 	}
+	wl14_board = board; wl14_board_valid = !!(seen & (2u << 1));
 	wl_cap_done = true;
 	return 0;
 }
@@ -3165,7 +3223,7 @@ wl_w11_events(void)
 					unsigned roff = ch == 20 ? WL_IPCR_TXR : WL_IPCR_RXR;
 					if (ev.ptr != wl_ipcr.iova+roff+ri*16 || (ch == 20 && ri == wl_tx_write)) { return wl_w11_fail("transfer completion pointer/order"); }
 					struct wl_tre tre = wl_ipcr_ring(roff)[ri];
-					if (bytes > WL_IPCR_MTU || bytes > (tre.d0 & 0xffff)) { return wl_w11_fail("transfer completion length"); }
+					if (bytes > (ch == 20 ? WL_IPCR_TXMTU : WL_IPCR_MTU) || bytes > (tre.d0 & 0xffff)) { return wl_w11_fail("transfer completion length"); }
 					if (ch == 20) { wl_tx_read = wl_ring_next(ri, WL_IPCR_N); }
 					else {
 						uint64_t lo = wl_ipcr.iova + WL_IPCR_RXBUF;
@@ -3265,6 +3323,7 @@ wl_w11_run(void)
 	wl12_stage = WL12_DISCOVERY; wl12_txn = wl12_msg = 0;
 	wl12_reply = wl12_requested = wl12_ready = false;
 	wl13_delayed = wl13_negotiated = false;
+	wl14_ready = wl14_init_done = wl14_board_valid = false; wl14_board = 0;
 	wl_chdb = wl_mrd(0x18); wl_erdb = wl_mrd(0x20);
 	if (!wl_qrtr || !wl_amss_reached || !wl_contexts_published || wl_w11_guard() ||
 	    (wl_chdb & 7) || wl_chdb < 0x100 || wl_chdb > 0x3c00 ||
@@ -3348,9 +3407,9 @@ wl_put64(uint8_t *p, uint64_t v)
 	wl_put32(p, (uint32_t)v); wl_put32(p+4, (uint32_t)(v >> 32));
 }
 
-/* All known requests fit 888 TLV bytes. Reserve header + TLVs separately
- * from QRTR's 1024-byte bounded TX staging buffer. No heap protocol buffers. */
-#define WL12_QMI_MAX 895u
+/* W14 BDF requests need 6144 data bytes plus TLVs/header. Static encoders
+ * avoid growing the boot thread stack; only one request is outstanding. */
+#define WL12_QMI_MAX (WL14_SEG + 64u)
 struct wl12_encoder { uint8_t data[WL12_QMI_MAX]; unsigned len; };
 static int
 wl12_tlv(struct wl12_encoder *e, unsigned type, uint64_t value, unsigned bytes)
@@ -3366,7 +3425,7 @@ wl12_tlv(struct wl12_encoder *e, unsigned type, uint64_t value, unsigned bytes)
 static int
 wl12_send(struct wl12_encoder *e, unsigned msg, unsigned stage)
 {
-	if (e->len < 7 || e->len > sizeof(e->data) || wl12_txn >= (wl_w13 ? 5 : 4) || wl_w11_guard()) {
+	if (e->len < 7 || e->len > sizeof(e->data) || wl12_txn >= (wl_w14 ? 512 : wl_w13 ? 5 : 4) || wl_w11_guard()) {
 		return wl_w11_fail("QMI request bounds/one attempt");
 	}
 	wl12_stage = stage; wl12_msg = msg; wl12_txn++; wl12_reply = false;
@@ -3486,7 +3545,7 @@ wl_qmi_w12(const uint8_t *p, unsigned len)
 		return e;
 	}
 	const uint8_t *segments = NULL; unsigned segment_bytes = 0;
-	bool result = false, status = false; uint64_t fw_status = 0;
+	bool result = false, status = false, shared = false; uint64_t fw_status = 0;
 	for (unsigned off = 7; off < len;) {
 		if (len-off < 3) { return wl_w11_fail("QMI truncated TLV header"); }
 		unsigned type = p[off], n = wl_get16(p+off+1); off += 3;
@@ -3508,6 +3567,15 @@ wl_qmi_w12(const uint8_t *p, unsigned len)
 		} else if (!indication && msg == 0x20 && type == 0x10) {
 			if (status || n != 8) { return wl_w11_fail("IND_REGISTER status duplicate/size"); }
 			status = true; fw_status = wl_get64(v);
+		} else if (!indication && msg == 0x36 && type == 0x10) {
+			if (shared || !n || v[0] > 8 || n != 1u+20u*v[0]) { return wl_w11_fail("RESPOND_MEM share_mem duplicate/bounds"); }
+			shared = true;
+			printf("FUXI WLAN: W14 RESPOND_MEM share_mem_len %u (reported only)\n", v[0]);
+			for (unsigned i = 0; i < v[0]; i++) {
+				const uint8_t *q = v+1+20*i;
+				printf("FUXI WLAN: W14 share_mem %u type %u start %#llx size %#llx (never dereferenced)\n",
+				    i, wl_get32(q), wl_get64(q+4), wl_get64(q+12));
+			}
 		} else {
 			printf("FUXI WLAN: W12 msg %#x unknown TLV %#x bytes %u\n", msg, type, n);
 		}
@@ -3530,6 +3598,17 @@ wl_qmi_w12(const uint8_t *p, unsigned len)
 		}
 		if (!segments) { return wl_w11_fail("REQUEST_MEM missing segments"); }
 		return wl12_request_mem(segments, segment_bytes);
+	}
+	if (wl_w14 && (msg == 0x21 || msg == 0x38)) {
+		/* Only an indication after M3 publication can satisfy W14. A race
+		 * before the M3 reply is retained; the reply is still mandatory. */
+		if (wl12_stage == WL14_M3 || wl12_stage == WL14_READY) {
+			if (msg == 0x21) { wl14_ready = true; }
+			else { wl14_init_done = true; }
+			printf("FUXI WLAN: W14 %s indication%s\n", msg == 0x21 ? "FW_READY" : "FW_INIT_DONE",
+			    wl12_stage == WL14_M3 ? " queued during M3_INFO reply wait" : "");
+		} else { printf("FUXI WLAN: W14 premature ready indication %#x ignored stage %u\n", msg, wl12_stage); }
+		return 0;
 	}
 	if (msg == 0x37) {
 		if (wl13_delayed) {
@@ -3576,7 +3655,7 @@ wl12_wait(unsigned what, const char *stage)
 			if (wl12_stage == WL12_RESPOND) { wl13_respond_diagnostics(); }
 			return 1;
 		}
-		if (what == 0 ? wl12_reply : what == 1 ? wl12_requested : wl12_ready) { return 0; }
+		if (what == 0 ? wl12_reply : what == 1 ? wl12_requested : what == 2 ? wl12_ready : wl14_ready) { return 0; }
 		if (ms < 10000) { wl_sleep(10); }
 	}
 	printf("FUXI WLAN: W12 timeout %s (10000 ms); contain, no retry\n", stage);
@@ -3630,10 +3709,118 @@ wl12_map_target(struct wl_dma *d)
 	return wl_w11_guard();
 }
 
+
+/* W14 uses ath12k v6.6 BSD-3-Clause-Clear EI field facts, credited above.
+ * File reads and codecs are original. No firmware bytes are built into XNU. */
+static int
+wl14_read(const char *name, struct wl_dma *d, unsigned limit, unsigned *size)
+{
+	char path[128]; vnode_t vp = NULL; vfs_context_t ctx = vfs_context_kernel();
+	if (!wl14_basename(name)) { return wl_w11_fail("W14 invalid firmware basename"); }
+	snprintf(path, sizeof(path), "/usr/local/share/fuxi/wlan/%s", name);
+	int e = vnode_open(path, FREAD | O_NOFOLLOW | O_NONBLOCK, 0, 0, &vp, ctx);
+	if (e) {
+		printf("FUXI WLAN: W14 missing/unreadable file %s errno %d; contain\n", path, e);
+		return wl_w11_fail("W14 firmware open");
+	}
+	struct vnode_attr a; VATTR_INIT(&a); VATTR_WANTED(&a, va_data_size);
+	e = vnode_getattr(vp, &a, ctx);
+	if (e || vnode_vtype(vp) != VREG || !VATTR_IS_SUPPORTED(&a, va_data_size) ||
+	    !a.va_data_size || a.va_data_size > limit) {
+		printf("FUXI WLAN: W14 invalid file %s size/type (limit %u)\n", path, limit);
+		e = 1; goto close;
+	}
+	*size = (unsigned)a.va_data_size;
+	if (d == &wl14_m3) {
+		uint64_t align = wl13_alignment(*size);
+		wl_iova_next = (wl_iova_next+align-1) & ~(align-1);
+	}
+	if (d->va || wl_dma_alloc(d, *size)) { e = 1; goto close; }
+	int resid = 0;
+	e = vn_rdwr(UIO_READ, vp, (caddr_t)d->va, (int)*size, 0, UIO_SYSSPACE, 0,
+	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
+	if (resid) { e = 1; }
+	if (!e) { printf("FUXI WLAN: W14 file %s bytes %u\n", name, *size); }
+close:
+	/* No data is advertised on a failed/short read; partial allocations stay
+	 * owned until the common containment/quarantine path proves safety. */
+	if (vnode_close(vp, FREAD, ctx)) { e = 1; }
+	if (e) { printf("FUXI WLAN: W14 file read/validation failed %s\n", path); return wl_w11_fail("W14 file read/validation"); }
+	return wl_w11_guard();
+}
+
+static int
+wl14_encode_bdf(struct wl12_encoder *e, const uint8_t *data,
+    unsigned remaining, unsigned seg, unsigned type)
+{
+	unsigned n = remaining > WL14_SEG ? WL14_SEG : remaining;
+	if (!n || e->len != 7 || type > 4 ||
+	    wl12_tlv(e, 1, 1, 1) || wl12_tlv(e, 0x10, wl14_board, 4) ||
+	    wl12_tlv(e, 0x11, remaining, 4) || wl12_tlv(e, 0x12, seg, 4)) { return wl_w11_fail("W14 segment bounds"); }
+	/* EI data_len is u16 within TLV 0x13; valid flags are presence only.
+	 * ath12k total_size is REMAINING on every segment, not original size. */
+	e->data[e->len++] = 0x13; wl_put16(e->data+e->len, n+2); e->len += 2;
+	wl_put16(e->data+e->len, n); e->len += 2;
+	memcpy(e->data+e->len, data, n); e->len += n;
+	return wl12_tlv(e, 0x14, remaining <= WL14_SEG, 1) || wl12_tlv(e, 0x15, type, 1);
+}
+
+static int
+wl14_download(const char *name, struct wl_dma *d, unsigned stage)
+{
+	unsigned size = 0;
+	if (wl14_read(name, d, WL14_FILE_MAX, &size)) { return 1; }
+	const uint8_t *data = (const void *)d->va;
+	unsigned type = stage == WL14_REGDB ? 4 : size >= 4 && !memcmp(data, "\177ELF", 4) ? 1 : 0;
+	static struct wl12_encoder e;
+	for (unsigned off = 0, seg = 0; off < size; seg++) {
+		unsigned n = size-off > WL14_SEG ? WL14_SEG : size-off;
+		bzero(&e, sizeof(e)); e.len = 7;
+		if (wl14_encode_bdf(&e, data+off, size-off, seg, type) ||
+		    wl12_send(&e, 0x25, stage) || wl12_wait(0, "W14 BDF_DOWNLOAD reply") ||
+		    wl_w11_wait(3, "W14 segment TX drain")) { return 1; }
+		printf("FUXI WLAN: W14 download %s type %u seg %u bytes %u remaining %u end %u ok\n",
+		    name, type, seg, n, size-off, off+n == size);
+		off += n;
+	}
+	if (stage == WL14_REGDB) { printf("FUXI WLAN: W14 regdb ok\n"); }
+	else { printf("FUXI WLAN: W14 bdf %s ok\n", name); }
+	return 0;
+}
+
+static int
+wl_w14_run(void)
+{
+	if (!wl14_board_valid) { return wl_w11_fail("W14 CAP missing board id"); }
+	if (wl14_download("regdb_xiaomi.bin", &wl14_regdb, WL14_REGDB) ||
+	    wl14_download(wl14_bdf_name, &wl14_bdf, WL14_BDF)) { return 1; }
+	unsigned size = 0;
+	if (wl14_read("m3.bin", &wl14_m3, WL14_M3_MAX, &size)) { return 1; }
+	/* Clean after reading, before NC conversion and mapping/publication.
+	 * Mapping checks live SMMU and every leaf.
+	 * Firmware receives the IOVA and exact file size, never VA/backing PA. */
+	wl_dma_clean(&wl14_m3);
+	if (wl_probe == WL_PROBE_CIVAC) { wl_dma_civac(&wl14_m3); }
+	if (wl_dma_nc(&wl14_m3) || wl12_map_target(&wl14_m3)) { return wl_w11_fail("W14 M3 DMA NC/map"); }
+	static struct wl12_encoder e;
+	bzero(&e, sizeof(e)); e.len = 7;
+	wl14_ready = wl14_init_done = false;
+	printf("FUXI WLAN: W14 M3 DMA IOVA %#llx bytes %u Normal-NC mapped\n", wl14_m3.iova, size);
+	if (wl12_tlv(&e, 1, wl14_m3.iova, 8) || wl12_tlv(&e, 2, size, 4) ||
+	    wl12_send(&e, 0x3c, WL14_M3) || wl12_wait(0, "W14 M3_INFO reply") ||
+	    wl_w11_wait(3, "W14 M3 TX drain")) { return 1; }
+	printf("FUXI WLAN: W14 m3 ok\n");
+	wl12_stage = WL14_READY;
+	if (wl12_wait(3, "W14 FW_READY indication") || wl_w11_guard()) { return 1; }
+	printf("FUXI WLAN: W14 fw ready (FW_INIT_DONE %u); stop before WLAN config/mode\n", wl14_init_done);
+	return 0;
+}
+
 static int
 wl_w12_run(void)
 {
-	struct wl12_encoder e = {{0}, 7};
+	static struct wl12_encoder e;
+	bzero(&e, sizeof(e)); e.len = 7;
 	wl_target_n = 0; wl_target_total = 0;
 	/* IND_REGISTER: exactly the five enables + client ID set by ath12k.
 	 * Pin/cal-download/cal-update/MSA/XO/rejuvenate TLVs remain absent. */
@@ -3709,6 +3896,13 @@ wl_w12_run(void)
 	bzero(&e, sizeof(e)); e.len = 7;
 	if (wl12_send(&e, 0x24, WL12_CAP) || wl12_wait(0, "CAP_REQ reply") ||
 	    wl_w11_wait(3, "W12 TX completion drain")) { return 1; }
+	if (wl_w14) {
+		if (wl_w14_run()) { return 1; }
+		if (wl_w11_events() || wl_w11_wait(3, "W14 final TX drain") || wl_w11_guard()) { return 1; }
+		wl_w11_ok = true;
+		printf("FUXI WLAN: W14 complete; %s\n", wl_keep ? "keep requested, DMA/channels/wake retained (polling ended)" : "stop/contain");
+		return 0;
+	}
 	wl12_stage = WL12_DONE;
 	printf("FUXI WLAN: W12 capability complete; next ath12k host steps regdb/BDF/M3 deferred; observing indications 200 ms\n");
 	for (unsigned ms = 0; ms < 200; ms += 10) {
@@ -4085,6 +4279,7 @@ wl5_abort(unsigned step)
 		wl_dma_free(&wl_msi_sink); wl_dma_free(&wl_tables);
 		wl_dma_free(&wl_rxvectors); wl_dma_free(&wl_rddm);
 		for (unsigned i = 0; i < WL_TARGET_MAX; i++) { wl_dma_free(&wl_target[i]); }
+		wl_dma_free(&wl14_regdb); wl_dma_free(&wl14_bdf); wl_dma_free(&wl14_m3);
 		wl_dma_free(&wl_ipcr);
 		wl_dma_free(&wl_contexts); wl_dma_free(&wl_vectors); wl_dma_free(&wl_amss); wl_dma_free(&wl_image);
 		printf("FUXI WLAN: abort buffers freed\n");
