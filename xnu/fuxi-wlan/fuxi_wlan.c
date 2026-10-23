@@ -18,6 +18,8 @@
  *   fuxiwlancnss=pdc  M6n AOP WLAN PDC setup before rails (default off)
  *   fuxiwlanseq=cycle,parf,dbi,eq,hostirq,msi,por,prefix  M6o opt-ins
  *   fuxiwlanseq=cyclerails  also cycle shared rails (froze the SoC once)
+ *   fuxiwlanrails=1  re-vote six rails ON before WLAN_EN (also on cycle resume)
+ *   fuxiwlanrails=2  re-vote ON only immediately before WLAN_MODE; no rail OFF
  *   fuxiwlanstop22=1  retain the BHI-only diagnostic stop (default: continue)
  *   fuxiwlankeep=1  retain DMA/device only after complete selected milestone success
  *   fuxiwlanmlo=1  ath12k PHY_CAP/MLO negotiation; =2 omit MLO (W12+; default unchanged)
@@ -721,6 +723,8 @@ static struct wl_dma wl_image, wl_vectors, wl_contexts, wl_tables;
 static struct wl_dma wl_amss; /* full file when BHI uses a separate prefix */
 static bool wl_qrtr, wl_w12, wl_w13, wl_w14, wl_w15, wl_w11_attempted, wl_w11_ok;
 static unsigned wl15_variant, wl16_variant, wl12_mlo_variant;
+static unsigned wl_rails_variant;
+static bool wl_rails_requested;
 static bool wl16_large, wl16_redrive;
 /* W12/W13 allocate after an accepted REQUEST_MEM; retain partial allocations until
  * containment is proven. Limit includes XNU page rounding, not just wire sizes. */
@@ -848,6 +852,19 @@ wl_probe_configure(void)
 	wl_vec = wl_variant_arg("fuxiwlanvec", wl_vec_names, 3);
 	wl_cnss = wl_variant_arg("fuxiwlancnss", wl_cnss_names, 2);
 	wl_seq_configure();
+	int rails = 0;
+	wl_rails_requested = PE_parse_boot_argn("fuxiwlanrails", &rails, sizeof(rails));
+	wl_rails_variant = 0;
+	if (rails < 0 || rails > 2) { wl_variant_invalid = true; }
+	else { wl_rails_variant = (unsigned)rails; }
+	if (wl_rails_variant && (wl_seq_flags & WL_O_CYCLERAILS)) {
+		wl_variant_invalid = true;
+		printf("FUXI WLAN: rails ON-only conflicts with cyclerails; refused before power writes\n");
+	}
+	if (wl_rails_requested && rails) {
+		printf("FUXI WLAN: rails variant %d (1 early before WLAN_EN, 2 late before WLAN_MODE) valid %u\n",
+		    rails, !wl_variant_invalid);
+	}
 	int stop22 = 0, keep = 0, qrtr = 0;
 	(void)PE_parse_boot_argn("fuxiwlanstop22", &stop22, sizeof(stop22));
 	(void)PE_parse_boot_argn("fuxiwlankeep", &keep, sizeof(keep));
@@ -2322,27 +2339,79 @@ wl_m6o_wait(uint64_t pa, uint32_t mask, uint32_t expected, unsigned ms)
 	return 1;
 }
 
+/* ---- opt-in ON-only rail re-votes; audit: docs-lanes/wlan-rails.md ----
+ * External PMU inputs, not the WCN PMU's internal WLAN output regulators.
+ * Preserve M6o's downstream order and requested mV, including S4E=950.
+ * VRM register facts: voltage +0 (mV), enable +4, mode +8; PMIC HPM/PWM=7.
+ * rh_send already supports a waited single-register regulator request.
+ */
+static const struct {
+	unsigned idx, addr, mv;
+	const char *name;
+} wl_rails[] = {
+	{0, 0x40a00, 1800, "ldob15"},
+	{4, 0x44000, 1000, "smpg5"},
+	{2, 0x40400, 980, "smpg2"},
+	{1, 0x40200, 950, "smpe4"},
+	{5, 0x40600, 1900, "smpg6"},
+	{3, 0x40500, 1350, "smpg4"},
+};
+
+static int
+wl_rails_on(unsigned variant, const char *where)
+{
+	if (!wl_rails_variant || wl_rails_variant != variant) { return 0; }
+	printf("FUXI WLAN: rails variant %u %s begin ON-only\n", variant, where);
+	/* Validate the complete cmd-db table before the first vote. */
+	for (unsigned i = 0; i < 6; i++) {
+		unsigned addr = wl3_report[20+wl_rails[i].idx];
+		if (addr != wl_rails[i].addr || fw_faults) {
+			printf("FUXI WLAN: rails skip %s cmd-db addr %#x expected %#x faults %u; refused\n",
+			    wl_rails[i].name, addr, wl_rails[i].addr, fw_faults);
+			return 1;
+		}
+	}
+	for (unsigned i = 0; i < 6; i++) {
+		const unsigned values[] = {wl_rails[i].mv, 1, 7};
+		const char *const kinds[] = {"voltage-mV", "enable", "mode-HPM/PWM"};
+		for (unsigned reg = 0; reg < 3; reg++) {
+			unsigned addr = wl_rails[i].addr + 4*reg;
+			printf("FUXI WLAN: rails begin %s %s addr %#x value %u\n",
+			    wl_rails[i].name, kinds[reg], addr, values[reg]);
+			unsigned e = rh_send(0, addr, values[reg]);
+			printf("FUXI WLAN: rails %s %s addr %#x value %u completion %#x\n",
+			    wl_rails[i].name, kinds[reg], addr, values[reg], e);
+			if (e) { return 1; } /* no retry, rollback or OFF vote */
+		}
+		wl_sleep(1); /* as in the existing M3 rail votes; no analog readback */
+	}
+	printf("FUXI WLAN: rails variant %u %s complete ON-only\n", variant, where);
+	return 0;
+}
+/* ---- end opt-in ON-only rail re-votes ---- */
+
 /* Explicit cyclerails only: the original rail cycle froze the SoC once.
  * These six votes may be shared; plain cycle and its undo never alter them. */
 static int
 wl_m6o_rails(bool on)
 {
 	if (!(wl_seq_flags & WL_O_CYCLERAILS)) { return 0; }
-	static const unsigned idx[] = {0, 4, 2, 1, 5, 3};
-	static const unsigned mv[] = {1800, 1000, 980, 950, 1900, 1350};
+	if (wl_rails_variant) {
+		printf("FUXI WLAN: rails ON-only refuses legacy cyclerails vote\n");
+		return 1;
+	}
 	for (unsigned n = 0; n < 6; n++) {
-		unsigned i = on ? n : 5-n, addr = wl3_report[20+idx[i]];
-		static const unsigned expected[] = {0x40a00, 0x44000, 0x40400, 0x40200, 0x40600, 0x40500};
-		if (addr != expected[i] || fw_faults) { return 1; }
+		unsigned i = on ? n : 5-n, addr = wl3_report[20+wl_rails[i].idx];
+		if (addr != wl_rails[i].addr || fw_faults) { return 1; }
 		unsigned e = 0;
 		if (on) {
-			printf("FUXI WLAN: M6o begin rail voltage addr %#x mV %u\n", addr, mv[i]);
-			e = rh_send(0, addr, mv[i]);
+			printf("FUXI WLAN: M6o begin rail voltage addr %#x mV %u\n", addr, wl_rails[i].mv);
+			e = rh_send(0, addr, wl_rails[i].mv);
 			if (e) { return 1; }
 		}
 		printf("FUXI WLAN: M6o begin rail enable addr %#x value %u\n", addr+4, on ? 1u : 0u);
 		e = rh_send(0, addr+4, on ? 1 : 0);
-		printf("FUXI WLAN: M6o WLAN rail %#x %s mV %u completion %#x\n", addr, on ? "on" : "off", mv[i], e);
+		printf("FUXI WLAN: M6o WLAN rail %#x %s mV %u completion %#x\n", addr, on ? "on" : "off", wl_rails[i].mv, e);
 		if (e) { return 1; }
 	}
 	return 0;
@@ -2511,6 +2580,7 @@ wl_m6o_cycle(void)
 	printf("FUXI WLAN: M6o cycle begin WLAN_EN low dwell 10 ms\n");
 	wl_sleep(10);
 	if (((wl_seq_flags & WL_O_CYCLERAILS) && wl_m6o_rails(true)) ||
+	    wl_rails_on(1, "cycle before WLAN_EN high") ||
 	    wl_m6o_write("cycle WLAN_EN high", TS_TLMM+0x1000ull*80+4, 2, 2)) { return 1; }
 	printf("FUXI WLAN: M6o cycle begin WLAN_EN high dwell 10 ms\n");
 	wl_sleep(10); /* retained M6o WLAN_EN dwell; EP latency follows PHY ready */
@@ -4238,6 +4308,7 @@ wl_w15_run(void)
 	 * ATH12K_FIRMWARE_MODE_NORMAL=0; optional 0x10 hw_debug u8=0. */
 	printf("FUXI WLAN: W15 wlan mode normal hw_debug 0\n");
 	if (wl12_tlv(&e, 1, 0, 4) || wl12_tlv(&e, 0x10, 0, 1) ||
+	    wl_rails_on(2, "late before WLAN_MODE") ||
 	    wl12_send(&e, 0x22, WL15_MODE) || wl12_wait(0, "WLAN_MODE reply") ||
 	    wl_w11_wait(3, "W15 MODE TX drain") || wl_w11_guard()) { return 1; }
 	printf("FUXI WLAN: W15 wlan mode normal ok; stop before CE/HTC\n");
@@ -4827,7 +4898,9 @@ fw_run(unsigned limit)
 				    wl_pdc_acks, (unsigned)e);
 			}
 			if (!e && s == 1 && wl_variant_invalid && wl_seq_requested) { e = 0x6f; }
+			if (!e && s == 1 && wl_variant_invalid && wl_rails_requested) { e = 0x6f; }
 			if (!e) { e = wl_icc_step(s); } /* failure blocks link training / BHI */
+			if (!e && s == 3) { e = wl_rails_on(1, "early before WLAN_EN high"); }
 			if (!e) {
 				wlan_m3(s); /* runs only step s: earlier ones are in wl3_done */
 				e = (int)(wl3_report[3] & 0xffu);

@@ -112,6 +112,8 @@ static int wl5_step(unsigned s) { if(s==21) bhi++; return 0; }
 static unsigned wl_pdc_acks, pdc_error;
 static unsigned wl_seq_flags;
 static bool wl_variant_invalid, wl_seq_requested;
+static bool wl_rails_requested;
+static int wl_rails_on(unsigned variant, const char *where) { return 0; }
 static int wl_cnss_pdc(void) { return pdc_error; } /* peer exercised by M6n suite */
 static void wl5_status(unsigned s) { }
 static bool wl_smmu_fault(unsigned s) { return false; }
