@@ -1,0 +1,390 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -6692,7 +6692,34 @@ handle_mac_transition:
+ 	}
+ 
+ 	/* Update the process' identity version and set the security token */
++#if defined(FUXI)
++	/*
++	 * fuxixpcid=1 (patch 0105): xpcproxy execs the real daemon in place. Keep
++	 * the pid version of that exec so the audit token launchd recorded for
++	 * the spawn still names the daemon; otherwise launchd can treat the job
++	 * as a new instance and respawn it (HackiOS xnu/redwood.patch, APSL 2.0).
++	 * p_comm is still the old image name here (set_proc_name runs later).
++	 */
++	{
++		static int fuxi_xpcid = -1;
++		static uint32_t fuxi_xpcid_logged;
++		if (fuxi_xpcid < 0) {
++			uint32_t v = 0;
++			fuxi_xpcid = (PE_parse_boot_argn("fuxixpcid", &v, sizeof(v)) && v == 1) ? 1 : 0;
++		}
++		if (fuxi_xpcid == 1 && strcmp(p->p_comm, "xpcproxy") == 0) {
++			if (fuxi_xpcid_logged < 8) {
++				fuxi_xpcid_logged++;
++				printf("FUXI IDLE: xpcproxy pid %d exec keeps pidversion %d (fuxixpcid=1)\n",
++				    proc_getpid(p), proc_pidversion(p));
++			}
++		} else {
++			proc_setpidversion(p, OSIncrementAtomic(&nextpidversion));
++		}
++	}
++#else
+ 	proc_setpidversion(p, OSIncrementAtomic(&nextpidversion));
++#endif
+ 	task_set_uniqueid(task);
+ 	set_security_token_task_internal(p, task);
+ 
+--- a/iokit/Kernel/IOPMrootDomain.cpp
++++ b/iokit/Kernel/IOPMrootDomain.cpp
+@@ -556,6 +556,15 @@ static uint32_t         gDarkWakeFlags = kDarkWakeFlagPromotionEarly;
+ 
+ static uint32_t         gNoIdleFlag = 0;
+ static uint32_t         gSleepDisabledFlag = 0;
++#if defined(FUXI)
++/* fuxinosleep=1 (patch 0105): refuse every system sleep. The port has no
++ * working sleep/wake path; powerd asks for idle sleep after the display goes
++ * off and IOCPUSleepKernel then hangs (HackiOS xnu/redwood.patch, APSL 2.0).
++ * Kept apart from gSleepDisabledFlag, which "sleep-disabled" in the device
++ * tree overwrites at boot complete. */
++static uint32_t         gFuxiNoSleep = 0;
++static uint64_t         gFuxiNoSleepCount = 0;
++#endif
+ static uint32_t         gSwdPanic = 1;
+ static uint32_t         gSwdSleepTimeout = 0;
+ static uint32_t         gSwdWakeTimeout = 0;
+@@ -1592,6 +1601,15 @@ IOPMrootDomain::start( IOService * nub )
+ 	PE_parse_boot_argn("swd_timeout", &gSwdSleepWakeTimeout, sizeof(gSwdSleepWakeTimeout));
+ 	PE_parse_boot_argn("haltmspanic", &gHaltTimeMaxPanic, sizeof(gHaltTimeMaxPanic));
+ 	PE_parse_boot_argn("haltmslog", &gHaltTimeMaxLog, sizeof(gHaltTimeMaxLog));
++#if defined(FUXI)
++	{
++		uint32_t nosleep = 0;
++		if (PE_parse_boot_argn("fuxinosleep", &nosleep, sizeof(nosleep)) && nosleep == 1) {
++			gFuxiNoSleep = 1;
++			IOLog("FUXI IDLE: system sleep refused (fuxinosleep=1)\n");
++		}
++	}
++#endif
+ 
+ 	// read noidle setting from Device Tree
+ 	if (PE_get_default("no-idle", &gNoIdleFlag, sizeof(gNoIdleFlag))) {
+@@ -7380,6 +7398,17 @@ IOPMrootDomain::checkSystemSleepAllowed( IOOptionBits options,
+ 	// Conditions that prevent idle and demand system sleep.
+ 
+ 	do {
++#if defined(FUXI)
++		if (gFuxiNoSleep) {
++			gFuxiNoSleepCount++;
++			if (gFuxiNoSleepCount && !(gFuxiNoSleepCount & (gFuxiNoSleepCount - 1))) {
++				IOLog("FUXI IDLE: system sleep refused (fuxinosleep=1) reason %u options 0x%x count %llu\n",
++				    sleepReason, (unsigned)options, gFuxiNoSleepCount);
++			}
++			err = kPMConfigPreventSystemSleep;
++			break;
++		}
++#endif
+ 		if (gSleepDisabledFlag) {
+ 			err = kPMConfigPreventSystemSleep;
+ 			break;
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -42,6 +42,7 @@ osfmk/arm/arm_timer.c		standard
+ osfmk/arm/arm_init.c	optional config_pmap_ppl
+ osfmk/arm64/arm_vm_init.c	optional config_pmap_ppl
+ osfmk/arm64/sweet_early.c	standard
++osfmk/arm64/fuxi_idle.c	standard
+ osfmk/arm64/arm64_hypercall.c	standard
+ osfmk/arm/io_map.c		standard
+ osfmk/arm64/loose_ends.c	standard
+--- a/osfmk/arm64/fuxi_idle_logic.h
++++ b/osfmk/arm64/fuxi_idle_logic.h
+@@ -0,0 +1,175 @@
++/* Pure helpers of osfmk/arm64/fuxi_idle.c (patch 0105), shared with the host
++ * test tools/test-fuxi-idle.py. No kernel headers: integers in, text out.
++ *
++ * Ported from HackiOS hackios-xnu-kernel xnu/files/bsd/dev/redwood_cpufreq.c
++ * (cpuload=MS: busy share = wall time minus idle time) (APSL 2.0).
++ * SPDX-License-Identifier: APSL-2.0
++ */
++#ifndef FUXI_IDLE_LOGIC_H
++#define FUXI_IDLE_LOGIC_H
++
++#define FI_MAX_CPUS     8
++#define FI_PERIOD_MAX   3600u   /* seconds */
++
++/* One CPU at one instant. Times are mach_absolute_time() units. */
++struct fi_sample {
++	uint64_t idle, user, sys;       /* recount: idle time, user and system run time */
++	uint64_t irq, ipi, tmr;         /* cpu_stat: irq_ex_cnt, ipi_cnt, timer_cnt */
++	int valid;                      /* the processor was registered when sampled */
++};
++
++/* fuxicpuload=N: N seconds between lines, 0 = off, capped at an hour. */
++static inline unsigned
++fi_period(unsigned seconds)
++{
++	return seconds > FI_PERIOD_MAX ? FI_PERIOD_MAX : seconds;
++}
++
++static inline uint64_t
++fi_delta(uint64_t now, uint64_t then)
++{
++	return now >= then ? now - then : 0;
++}
++
++/* Busy percent of a wall interval from the idle time in it (interrupts count as busy). */
++static inline unsigned
++fi_busy_pct(uint64_t wall, uint64_t idle)
++{
++	if (!wall) {
++		return 0;
++	}
++	if (idle >= wall) {
++		return 0;
++	}
++	return (unsigned)(((wall - idle) * 100 + wall / 2) / wall);
++}
++
++/* Share of the wall interval, in percent, of a run time (user or system). */
++static inline unsigned
++fi_share_pct(uint64_t wall, uint64_t part)
++{
++	if (!wall) {
++		return 0;
++	}
++	if (part >= wall) {
++		return 100;
++	}
++	return (unsigned)((part * 100 + wall / 2) / wall);
++}
++
++/* Events per second over wall_ms milliseconds. */
++static inline uint64_t
++fi_rate(uint64_t events, uint64_t wall_ms)
++{
++	if (!wall_ms) {
++		return 0;
++	}
++	return (events * 1000 + wall_ms / 2) / wall_ms;
++}
++
++static inline void
++fi_append(char *buf, unsigned size, unsigned *at, const char *text)
++{
++	while (*text && *at + 1 < size) {
++		buf[(*at)++] = *text++;
++	}
++	buf[*at < size ? *at : size - 1] = 0;
++}
++
++static inline void
++fi_append_u(char *buf, unsigned size, unsigned *at, uint64_t v)
++{
++	char digits[24];
++	unsigned n = 0;
++	do {
++		digits[n++] = (char)('0' + v % 10);
++		v /= 10;
++	} while (v && n < sizeof(digits));
++	char out[24];
++	for (unsigned i = 0; i < n; i++) {
++		out[i] = digits[n - 1 - i];
++	}
++	out[n] = 0;
++	fi_append(buf, size, at, out);
++}
++
++/*
++ * One log line:
++ *   FUXI IDLE: cpuload 10s up 600s avg 9% irq 5200 ipi 8400 tmr 3100 | c0 23% u5 s17 i812 p1934 t377 | c1 - | ...
++ * avg is over the CPUs that were valid at both samples; irq/ipi/tmr totals are
++ * per second. A CPU that came online between the samples prints "-".
++ * Returns the line length (the buffer is always terminated).
++ */
++static inline unsigned
++fi_format(char *buf, unsigned size, unsigned period, uint64_t up_s, uint64_t wall, uint64_t wall_ms,
++    const struct fi_sample *prev, const struct fi_sample *cur, unsigned ncpu)
++{
++	unsigned at = 0, counted = 0, busy_sum = 0;
++	uint64_t irq = 0, ipi = 0, tmr = 0;
++	if (!size) {
++		return 0;
++	}
++	buf[0] = 0;
++	if (ncpu > FI_MAX_CPUS) {
++		ncpu = FI_MAX_CPUS;
++	}
++	for (unsigned c = 0; c < ncpu; c++) {
++		if (!prev[c].valid || !cur[c].valid) {
++			continue;
++		}
++		busy_sum += fi_busy_pct(wall, fi_delta(cur[c].idle, prev[c].idle));
++		irq += fi_delta(cur[c].irq, prev[c].irq);
++		ipi += fi_delta(cur[c].ipi, prev[c].ipi);
++		tmr += fi_delta(cur[c].tmr, prev[c].tmr);
++		counted++;
++	}
++	fi_append(buf, size, &at, "FUXI IDLE: cpuload ");
++	fi_append_u(buf, size, &at, period);
++	fi_append(buf, size, &at, "s up ");
++	fi_append_u(buf, size, &at, up_s);
++	fi_append(buf, size, &at, "s avg ");
++	fi_append_u(buf, size, &at, counted ? (busy_sum + counted / 2) / counted : 0);
++	fi_append(buf, size, &at, "% irq ");
++	fi_append_u(buf, size, &at, fi_rate(irq, wall_ms));
++	fi_append(buf, size, &at, " ipi ");
++	fi_append_u(buf, size, &at, fi_rate(ipi, wall_ms));
++	fi_append(buf, size, &at, " tmr ");
++	fi_append_u(buf, size, &at, fi_rate(tmr, wall_ms));
++	for (unsigned c = 0; c < ncpu; c++) {
++		fi_append(buf, size, &at, " | c");
++		fi_append_u(buf, size, &at, c);
++		if (!prev[c].valid || !cur[c].valid) {
++			fi_append(buf, size, &at, " -");
++			continue;
++		}
++		fi_append(buf, size, &at, " ");
++		fi_append_u(buf, size, &at, fi_busy_pct(wall, fi_delta(cur[c].idle, prev[c].idle)));
++		fi_append(buf, size, &at, "% u");
++		fi_append_u(buf, size, &at, fi_share_pct(wall, fi_delta(cur[c].user, prev[c].user)));
++		fi_append(buf, size, &at, " s");
++		fi_append_u(buf, size, &at, fi_share_pct(wall, fi_delta(cur[c].sys, prev[c].sys)));
++		fi_append(buf, size, &at, " i");
++		fi_append_u(buf, size, &at, fi_rate(fi_delta(cur[c].irq, prev[c].irq), wall_ms));
++		fi_append(buf, size, &at, " p");
++		fi_append_u(buf, size, &at, fi_rate(fi_delta(cur[c].ipi, prev[c].ipi), wall_ms));
++		fi_append(buf, size, &at, " t");
++		fi_append_u(buf, size, &at, fi_rate(fi_delta(cur[c].tmr, prev[c].tmr), wall_ms));
++	}
++	return at;
++}
++
++/* fuxinosleep / fuxixpcid: a boot-arg value is on only when it is exactly 1. */
++static inline int
++fi_flag(int present, unsigned value)
++{
++	return present && value == 1;
++}
++
++/* Log the 1st, 2nd, 4th, 8th ... event of a repeating refusal. */
++static inline int
++fi_log_this(uint64_t count)
++{
++	return count && !(count & (count - 1));
++}
++
++#endif /* FUXI_IDLE_LOGIC_H */
+--- a/osfmk/arm64/fuxi_idle.c
++++ b/osfmk/arm64/fuxi_idle.c
+@@ -0,0 +1,110 @@
++/* FUXI cooling diagnostics (patch 0105). Off unless a boot-arg asks.
++ *
++ * fuxicpuload=N  every N seconds (1..3600) one console line with each CPU's
++ *                busy share (wall time minus recount idle time, interrupts
++ *                count as busy), user/system share, and its interrupt, IPI
++ *                and timer-interrupt rates per second (cpu_stat counters).
++ *                Used to attribute idle heat (docs-lanes/cooling.md).
++ *
++ * Ported from HackiOS hackios-xnu-kernel xnu/files/bsd/dev/redwood_cpufreq.c
++ * (cpuload=MS, load_thread) and xnu/redwood.patch ml_cpu_idle_time() (APSL 2.0).
++ * SPDX-License-Identifier: APSL-2.0
++ * Changes: seconds instead of milliseconds, a blocking wait with 100 ms timer
++ * leeway so the logger does not add its own wakeups, per-CPU irq/ipi/timer
++ * rates and user/system split, printf instead of the loader log.
++ */
++#include <pexpert/arm64/board_config.h>
++#if defined(FUXI)
++#include <stdint.h>
++#include <string.h>
++#include <kern/clock.h>
++#include <kern/kern_types.h>
++#include <kern/misc_protos.h>
++#include <kern/processor.h>
++#include <kern/recount.h>
++#include <kern/sched_prim.h>
++#include <kern/startup.h>
++#include <kern/thread.h>
++#include <arm/cpu_data_internal.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "fuxi_idle_logic.h"
++
++static unsigned fi_seconds;
++static unsigned fi_ncpu;
++static struct fi_sample fi_prev[FI_MAX_CPUS], fi_cur[FI_MAX_CPUS];
++
++static void
++fi_sample_all(struct fi_sample *s)
++{
++	for (unsigned c = 0; c < fi_ncpu; c++) {
++		processor_t p = processor_array[c];
++		cpu_data_t *cd = CpuDataEntries[c].cpu_data_vaddr;
++		if (p == PROCESSOR_NULL || cd == NULL) {
++			s[c].valid = 0;
++			continue;
++		}
++		struct recount_usage usage = { 0 };
++		uint64_t idle = 0;
++		recount_processor_usage(&p->pr_recount, &usage, &idle);
++		s[c].idle = idle;
++		s[c].user = usage.ru_user_time_mach;
++		s[c].sys = usage.ru_system_time_mach;
++		s[c].irq = cd->cpu_stat.irq_ex_cnt;
++		s[c].ipi = cd->cpu_stat.ipi_cnt;
++		s[c].tmr = cd->cpu_stat.timer_cnt;
++		s[c].valid = 1;
++	}
++}
++
++static void
++fi_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	static char line[640];
++	uint64_t then = mach_absolute_time();
++
++	fi_sample_all(fi_prev);
++	for (;;) {
++		uint64_t now, wall_ns, up_ns;
++
++		assert_wait_timeout_with_leeway((event_t)&fi_seconds, THREAD_UNINT,
++		    TIMEOUT_URGENCY_SYS_NORMAL | TIMEOUT_URGENCY_LEEWAY, fi_seconds * 1000, 100, NSEC_PER_MSEC);
++		thread_block(THREAD_CONTINUE_NULL);
++		now = mach_absolute_time();
++		fi_sample_all(fi_cur);
++		absolutetime_to_nanoseconds(now - then, &wall_ns);
++		absolutetime_to_nanoseconds(now, &up_ns);
++		(void)fi_format(line, sizeof(line), fi_seconds, up_ns / NSEC_PER_SEC, now - then,
++		    wall_ns / NSEC_PER_MSEC, fi_prev, fi_cur, fi_ncpu);
++		printf("%s\n", line);
++		memcpy(fi_prev, fi_cur, sizeof(fi_prev));
++		then = now;
++	}
++}
++
++static void
++fuxi_idle_init(void)
++{
++	unsigned seconds = 0;
++	thread_t thread;
++	int max;
++
++	if (!PE_parse_boot_argn("fuxicpuload", &seconds, sizeof(seconds)) || !fi_period(seconds)) {
++		return;
++	}
++	fi_seconds = fi_period(seconds);
++	max = ml_get_max_cpu_number();
++	fi_ncpu = max < 0 ? 1 : (unsigned)max + 1;
++	if (fi_ncpu > FI_MAX_CPUS) {
++		fi_ncpu = FI_MAX_CPUS;
++	}
++	if (kernel_thread_start(fi_thread, NULL, &thread) != KERN_SUCCESS) {
++		printf("FUXI IDLE: cpuload thread NOT started\n");
++		return;
++	}
++	thread_set_thread_name(thread, "fuxi_cpuload");
++	thread_deallocate(thread);
++	printf("FUXI IDLE: cpuload every %us over %u CPUs (fuxicpuload=%u)\n", fi_seconds, fi_ncpu, seconds);
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, fuxi_idle_init);
++#endif /* FUXI */
