@@ -356,10 +356,13 @@ terminate:
  * fuxikeyscript=S: S seconds after the key thread starts, press Power (lock),
  * Power (wake), Volume Up twice and Volume Down once through the injection
  * path, so a boot without anyone at the phone shows how iOS maps each key.
- * Only for device tests; it does not need fuxikeyinject=1.
+ * fuxikeyscriptn=N runs only the first N steps (N=1: a single Power press,
+ * to watch auto-lock after a wake). Only for device tests; it does not need
+ * fuxikeyinject=1.
  */
 static int fk_inject(const struct fuxi_key_inject *cmd);
 static int fk_script_chan;
+static unsigned fk_script_count;
 static const struct { unsigned key, gap_ms; const char *why; } fk_script_steps[] = {
 	{0, 8000, "power (expect lock)"},
 	{0, 8000, "power (expect wake)"},
@@ -384,7 +387,7 @@ fk_script(void *arg, wait_result_t wr)
 	unsigned delay = (unsigned)(uintptr_t)arg;
 	printf("FUXI KEYS: script starts in %u s\n", delay);
 	fk_script_sleep(delay * 1000u);
-	for (unsigned i = 0; i < sizeof(fk_script_steps) / sizeof(fk_script_steps[0]); ++i) {
+	for (unsigned i = 0; i < fk_script_count; ++i) {
 		struct fuxi_key_inject cmd = {fk_script_steps[i].key, FUXI_KEY_INJECT_CLICK, 120};
 		printf("FUXI KEYS: script step %u %s\n", i + 1, fk_script_steps[i].why);
 		(void)fk_inject(&cmd);
@@ -416,6 +419,12 @@ fuxi_keys_init(void)
 	}
 	unsigned script = 0;
 	if (PE_parse_boot_argn("fuxikeyscript", &script, sizeof(script)) && script > 0 && script < 3600) {
+		unsigned steps = sizeof(fk_script_steps) / sizeof(fk_script_steps[0]);
+		fk_script_count = steps;
+		if (PE_parse_boot_argn("fuxikeyscriptn", &fk_script_count, sizeof(fk_script_count)) &&
+		    (fk_script_count == 0 || fk_script_count > steps)) {
+			fk_script_count = steps;
+		}
 		if (kernel_thread_start(fk_script, (void *)(uintptr_t)script, &thread) == KERN_SUCCESS) {
 			thread_deallocate(thread);
 		} else {
