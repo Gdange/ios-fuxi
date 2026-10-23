@@ -18,7 +18,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         d=Path(tmp);conf=d/'smoke.conf'
         compiler=['xcrun','clang++'] if os.uname().sysname=='Darwin' else ['clang++']
-        for name in ('ClientGateTests','BackboardGateTests','TextureLevelsTests','SurveyTests','ClientSetupTests','NativeSelectionTests'):
+        for name in ('ClientGateTests','BackboardGateTests','TextureLevelsTests','SurveyTests','ClientSetupTests','NativeSelectionTests','SurfaceLeaseTests'):
             subprocess.run([*compiler,'-std=c++17','-Wall','-Wextra','-Werror','-pthread',
                             '-fsanitize=address,undefined',str(ROOT/'tools/fuxi-metal'/(name+'.cpp')),
                             '-o',str(d/name)],check=True)
@@ -48,10 +48,12 @@ def main():
         frameworks=['-framework','Foundation','-framework','Metal','-framework','IOSurface']
         def call(command):subprocess.run(command,check=True)
         if a.compile_only:
-            for name in ['ConstantFrontendTests','FrontendTests','PipelineFrontendTests','CAFrontendTests','MipFrontendTests','MRTFrontendTests','GateFrontendTests','CensusTests','RenderServerFrontendTests','BlitFrontendTests','LinearFrontendTests']:
+            for name in ['ConstantFrontendTests','FrontendTests','PipelineFrontendTests','CAFrontendTests','MipFrontendTests','MRTFrontendTests','GateFrontendTests','CensusTests','RenderServerFrontendTests','BlitFrontendTests','LinearFrontendTests','ScanoutFrontendTests']:
                 call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal'/(name+'.mm')),*frameworks,'-o',str(d/name)])
             print('PASS: compile-only frontend tests; no test executables run')
             return
+        call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/ScanoutFrontendTests.mm'),*frameworks,'-o',str(d/'scanout')])
+        subprocess.run([str(d/'scanout')],env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0'),check=True,timeout=15)
         call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/LinearFrontendTests.mm'),*frameworks,'-o',str(d/'linear')])
         subprocess.run([str(d/'linear')],env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0'),check=True,timeout=15)
         call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/BlitFrontendTests.mm'),*frameworks,'-o',str(d/'blits')])

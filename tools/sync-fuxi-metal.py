@@ -17,6 +17,8 @@ FILES = {
     'bsd/dev/gpu-clock.h': '../../shim/fuxi-probe/gpu-clock.h',
     'bsd/dev/LICENSE.AdrenoFirmware': '../../shim/fuxi-probe/LICENSE.AdrenoFirmware',
     'iokit/Kernel/arm/FuxiAdrenoUserClient.cpp': 'FuxiAdrenoUserClient.cpp',
+    'bsd/dev/fuxi_gpu_scanout.inc': 'fuxi_gpu_scanout.inc',
+    'bsd/dev/LICENSE.NativeMetal': 'LICENSE.NativeMetal',
     'bsd/dev/fuxi_gpu_abi_backend.inc': 'fuxi_gpu_abi_backend.inc',
     'osfmk/arm/fuxi_adreno_host.c': 'fuxi_adreno_host.c',
 }

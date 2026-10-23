@@ -11,6 +11,17 @@ struct fg_times {
 /* Full-range lookup only; zero for unpublished, wrapping or unknown PAs. */
 uintptr_t fuxi_gpu_nc_pointer(uint64_t pa, uint64_t bytes);
 int fuxi_gpu_ready(void);
+/* Default-off command-mode handoff. configure is called before GPU startup.
+ * acquire: 1 CPU/GPU may write, 0 deferred, -1 held. publish: 1 transferred,
+ * 0 old path (caller kicks), -1 held. All calls are nonblocking.
+ * reserve/release bracket a SweetSurface cache transaction; 0 means defer.
+ */
+void fuxi_gpu_scanout_configure(uintptr_t pixels, unsigned enabled, unsigned check);
+int fuxi_gpu_scanout_owned(void);
+int fuxi_gpu_scanout_acquire(void);
+int fuxi_gpu_scanout_publish(void);
+int fuxi_gpu_scanout_reserve(void);
+void fuxi_gpu_scanout_release(void);
 void fuxi_gpu_start(uint64_t framebuffer, unsigned width, unsigned height, unsigned pitch);
 int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,
     uint64_t length, struct fg_times *t);

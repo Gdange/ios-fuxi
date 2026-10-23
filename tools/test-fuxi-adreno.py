@@ -29,7 +29,13 @@ def function(source, name):
 PREFIX = r'''
 #include <assert.h>
 #define FG_GUARD
-static unsigned fg_client_busy;
+#include <stdint.h>
+static unsigned fg_client_busy, fg_scanout_owned, fg_scanout_writable, fg_scanout_requested;
+static uintptr_t fg_scanout_source;
+static unsigned fg_scanout_pitch,fg_scanout_sx,fg_scanout_sy,fg_scanout_dx,fg_scanout_dy,fg_scanout_w,fg_scanout_h;
+static unsigned scanoutStops,verifyBad;
+static int fg_scanout_verify(void) {return !verifyBad;}
+static int fg_scanout_stop(const char *reason) {(void)reason;scanoutStops++;fg_scanout_writable=0;return -1;}
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -209,6 +215,7 @@ static int g3_gw(unsigned reg,unsigned value)
 }
 static void reset(void)
 {
+ fg_scanout_owned=fg_scanout_writable=fg_scanout_requested=scanoutStops=verifyBad=0;
  fg_faults=fg_suspends=fg_reset_held=0;
  fg_state=1; fg_force=fg_seq=fg_access_failed=mode=fail_tlb=tlbs=isolated=doorbells=0;
  g3_wptr=rptr=wptr=8190; fence=cache_clean=pending=gbif=reset_held=faulted_sids=paddr_missing=0;
@@ -315,6 +322,19 @@ int main(void)
  fg_fail("saturated",0);assert(fg_faults==UINT64_MAX);
  assert(fg_isolate() && fg_suspends==UINT64_MAX);
  fg_suspends=5;assert(fg_isolate() && fg_suspends==5);
+ // New handoff: an unknown DMA drain holds display ownership on both submit
+ // and asynchronous retirement errors. No CPU reuse of the target is legal.
+ for(unsigned submitFail=0;submitFail<2;submitFail++) {
+  reset();assert(fuxi_gpu_map(0,1,(uintptr_t)source_buf,4352*10,&times));
+  fg_scanout_owned=fg_scanout_requested=fg_scanout_writable=1;
+  mode=7;if(submitFail)fg_force=2;
+  assert(model_copy(0,1,(uintptr_t)source_buf,4352*10,4352,0,0,0,0,10,10,&times)==-1);
+  assert(scanoutStops==1 && !fg_scanout_writable && fg_state==2);
+ }
+ reset();assert(fuxi_gpu_map(0,1,(uintptr_t)source_buf,4352*10,&times));
+ fg_scanout_owned=fg_scanout_requested=fg_scanout_writable=verifyBad=1;
+ assert(!model_copy(0,1,(uintptr_t)source_buf,4352*10,4352,0,0,0,0,10,10,&times));
+ assert(isolated && !scanoutStops && fg_state==2); // confirmed drain permits CPU replay
  /* Independent windows and generations; unmapping one preserves the others. */
  reset();
  for(unsigned slot=0;slot<4;slot++) {

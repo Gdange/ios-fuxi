@@ -16,6 +16,7 @@ submit = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(submit)
 
 PREFIX = r'''
+static unsigned fg_scanout_requested;
 #include <assert.h>
 #define FG_GUARD
 static unsigned fg_abi_enabled;
@@ -130,7 +131,7 @@ static void kmem_free(int map,uintptr_t va,size_t size)
 }
 static int SecureDTLookupEntry(void *p,const char *s,DTEntry *e)
 { assert(!p && !strcmp(s,"/chosen")); *e=1; return 0; }
-static int SecureDTGetProperty(DTEntry e,const char *s,void **p,unsigned *n)
+static int SecureDTGetProperty(DTEntry e,const char *s,const void **p,unsigned *n)
 { assert(e==1 && !strcmp(s,"fuxi-gpu-memory")); *p=reservation; *n=invalid_reservation?0:16; return 0; }
 static void gpu_probe(unsigned stage) { (void)stage; gpu_calls++;if(valid_handoff) {gpu_extra[5][4]=1;gpu_extra[13][2]=1;} }
 static unsigned g3_read(uint64_t a) {
@@ -171,6 +172,7 @@ static void reset(void)
  gpu_calls=alloc_calls=enter_calls=remove_calls=free_calls=enqueued=0;
  fail_alloc=fail_enter=invalid_reservation=0;
  live=cursor=removed=0;
+ fg_scanout_requested=1;
  fg_limit=17; enable_arg=1; gPhysSize=FG_RAM_SIZE;
  valid_handoff=abi_inits=abi_publishes=abi_fail=fg_abi_enabled=0;
  level_arg=clock_logs=g_gpu_selected=fg_clock_measure=0;
@@ -179,7 +181,10 @@ int main(void)
 {
  uint64_t total=0;
  for(unsigned i=0;i<COUNT;i++) total+=fg_windows[i].size;
- assert(total==0x2180000); /* 32 MiB scratch + 1536 KiB resources */
+ assert(total==0x2188000); /* Existing windows + two optional 16K DPU windows. */
+ reset();fg_scanout_requested=0;assert(fg_map_windows()==KERN_SUCCESS);
+ assert(live==total-32768 && fg_mapped_bytes==total-32768 && alloc_calls==COUNT-2);
+ assert(!fg_pointer(0xae16000) && !fg_pointer(0xae36000));
  reset(); assert(fg_map_windows()==KERN_SUCCESS);
  assert(live==total && fg_mapped_bytes==total && alloc_calls==COUNT && !free_calls);
  assert(enter_calls==total/PAGE_SIZE && strstr(last_log,"IO submap 0 bytes"));
@@ -227,6 +232,16 @@ int main(void)
   assert(g_gpu_selected==(level_arg<=6?level_arg:0) && enqueued==1);
  }
  reset(); fuxi_gpu_start(G4_FB_PA,1080,2400,1); assert(fg_state==2 && !enqueued);
+ /* The combined ready line must identify the selected request as a vote,
+  * including legacy zero and every bounded GPU-CLOCK selection. */
+ const unsigned ready_khz[]={220000,220000,295000,348000,401000,475000,550000};
+ for(unsigned level=0;level<7;level++) {
+  reset();valid_handoff=1;level_arg=level;
+  fuxi_gpu_start(G4_FB_PA,1080,2400,4320);fg_thread(NULL,NULL);
+  char expected[96];
+  snprintf(expected,sizeof(expected),"requested %u kHz GPU vote (not measured)",ready_khz[level]);
+  assert(fg_state==1 && clock_logs==1 && strstr(last_log,expected));
+ }
  /* ABI MMIO/table setup must precede publishing ready to the display;
   * service publication must follow it. Failure only withholds the ABI. */
  for(unsigned fail=0;fail<2;fail++) {

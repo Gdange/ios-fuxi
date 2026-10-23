@@ -125,7 +125,7 @@ boot-dependent lowercase hexadecimal readback as printed by `%#x`:
 FUXI GPU CLOCK: level=4 gpu_index=4 requested_khz=401000 gx_arc=<vote> bw_index=2 ddr_kBps=6074218 hfi_ack=1
 FUXI GPU CLOCK: GMU table_khz=0/200000/500000 cx_arc=<off>/<low>/<high> (no host GMU perf-index vote)
 FUXI GPU CLOCK: PLL0 mode=<mode> l=<l> alpha=<alpha> PLL1 mode=<mode> l=<l> alpha=<alpha> gmu_rcgr=<cfg> gmu_derived_khz=<rate> core_measured_khz=unavailable
-FUXI GPU: ready, BGRA strided rects + one fence, 4 cached backings, requested 401000 kHz, async one-in-flight, no timer sleep
+FUXI GPU: ready, BGRA strided rects + one fence, 4 cached backings, requested 401000 kHz GPU vote (not measured), async one-in-flight, no timer sleep
 ```
 
 On the programmed PLL1 L=0x44440016, alpha=0xeaaa, GMU CFG=0x303 path,
@@ -145,7 +145,7 @@ FUXI GPU CLOCK: rbbm_count_khz=unavailable
 ```
 
 The absent/zero default first line has `level=0 gpu_index=1 requested_khz=220000`,
-`bw_index=0 ddr_kBps=0`; ready says `requested 220000 kHz`. An invalid example:
+`bw_index=0 ddr_kBps=0`; ready says `requested 220000 kHz GPU vote (not measured)`. An invalid example:
 
 ```text
 FUXI GPU CLOCK: rejected fuxigpulevel=7 (allowed 0..6); legacy level=0

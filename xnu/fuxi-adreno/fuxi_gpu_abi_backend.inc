@@ -13,6 +13,7 @@ _Static_assert(FG_ABI_PT >= FG_FW_BASE+3*FG_FW_SLOT, "ABI/cold handoff or firmwa
 _Static_assert(FG_ABI_PT+FG_ABI_PT_BYTES <= G_MEM+G_MEM_SIZE, "ABI tables exceed scratch");
 static unsigned fg_abi_live, fg_abi_seq, fg_abi_completed, fg_abi_poisoned, fg_abi_timed_out;
 static int fg_abi_drained = 1;
+static int fg_abi_live_for_scanout(void) { return fg_abi_live; }
 static uint64_t fg_client_deadline;
 static thread_call_data_t fg_client_watchdog;
 /* Every mapped import can be referenced indirectly by PM4, not just the IB
@@ -84,6 +85,7 @@ static int fg_abi_fault(const char *why)
  fg_abi_poisoned = 1;
  fg_fail(why,0x701);
  fg_abi_drained = fg_isolate();
+ if (!fg_abi_drained && fg_scanout_owned) (void)fg_scanout_stop("GPU DMA drain failed");
  if (fg_abi_drained) fg_abi_import_cache(1);
  fg_client_busy = 0;
  return fg_abi_drained ? -1 : -2;
@@ -316,7 +318,7 @@ int fuxi_gpu_abi_submit(const uint64_t *iovas, const uint64_t *sizes,
 {
  FG_GUARD;
  if (!fg_abi_live || !fuxi_gpu_ready() || fg_abi_poisoned || fg_abi_seq==UINT32_MAX) return -1;
- if (fg_busy || fg_client_busy) return 1;
+ if (fg_busy || fg_client_busy || fg_scanout_reserved) return 1;
  if (g3_faulted() || g3_gr(0x806)!=g3_wptr || g3_gr(0x807)!=g3_wptr || (g3_gr(0x210)&~1u))
   return fg_abi_fault("client pre-submit idle/fault");
  uint32_t words[160];

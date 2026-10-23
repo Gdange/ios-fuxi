@@ -40,6 +40,7 @@ extern unsigned fuxi_gpu_access(uintptr_t, uint64_t *, unsigned, unsigned);
 #define rsr(r) ({ uint64_t v; __asm__ volatile("mrs %0, " r : "=r"(v)); v; })
 #define delay fg_delay
 static void fg_delay(unsigned us) { delay_for_interval(us, NSEC_PER_USEC); }
+static unsigned fg_scanout_requested;
 struct fg_window { uint64_t pa, size; uintptr_t va; };
 /* Disjoint apertures; the framebuffer is mapped by SweetFramebuffer only.
  * Stage14 uses scratch, never stage15's panel readback/CPU comparator. */
@@ -50,6 +51,7 @@ static struct fg_window fg_windows[] = {
  {0xb280000,0x8000,0}, {0x81c60000,0x20000,0},
  {FG_SCRATCH,FG_SCRATCH_SIZE,0}, {0x9b098000,0x4000,0},
  {0xae04000,0x4000,0},
+ {0xae14000,0x4000,0}, {0xae34000,0x4000,0},
 };
 static uint64_t fg_mapped_bytes;
 /* io_map's 8 MiB submap and ALL ml_io_map variants use KMA_NOFAIL.
@@ -85,6 +87,7 @@ static kern_return_t fg_map_windows(void)
 {
  for (unsigned i = 0; i < sizeof(fg_windows)/sizeof(fg_windows[0]); i++) {
   struct fg_window *w = &fg_windows[i];
+  if (!fg_scanout_requested && (w->pa == 0xae14000 || w->pa == 0xae34000)) continue;
   kern_return_t kr = fg_map_window(w);
   if (kr != KERN_SUCCESS) {
    printf("FUXI GPU: map PA %#llx bytes %#llx failed %d, mapped %llu bytes, IO submap 0 bytes\n",
@@ -459,13 +462,15 @@ int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,
  t->misses++;
  return 1;
 }
+static int fg_abi_live_for_scanout(void);
+#include "fuxi_gpu_scanout.inc"
 static int fg_abi_init(void);
 static thread_call_data_t fg_init_call;
 static void fg_thread(thread_call_param_t arg, thread_call_param_t result)
 {
  (void)arg; (void)result;
  /* Sleepable thread-call worker, delayed until after AppleCLCD registers. */
- DTEntry chosen; void *prop; unsigned bytes;
+ DTEntry chosen; const void *prop; unsigned bytes;
  if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
      SecureDTGetProperty(chosen, "fuxi-gpu-memory", &prop, &bytes) != kSuccess ||
      bytes != 16 || ((uint64_t *)prop)[0] != FG_SCRATCH || ((uint64_t *)prop)[1] != FG_SCRATCH_SIZE) {
@@ -512,7 +517,7 @@ static void fg_thread(thread_call_param_t arg, thread_call_param_t result)
      !fg_source_tables()) { fg_fail("scanout geometry/mapping", 4); goto out; }
  uint32_t tlb[128] = {0};
  if (g4_tlb(tlb) || fg_access_failed) { fg_fail("initial TLB sync", 5); goto out; }
- printf("FUXI GPU: ready, BGRA strided rects + one fence, 4 cached backings, requested %u kHz, async one-in-flight, no timer sleep\n", g_gpu_freq[g_gpu_selected ? g_gpu_selected : 1]);
+ printf("FUXI GPU: ready, BGRA strided rects + one fence, 4 cached backings, requested %u kHz GPU vote (not measured), async one-in-flight, no timer sleep\n", g_gpu_freq[g_gpu_selected ? g_gpu_selected : 1]);
  /* Finish all ABI-only MMIO/table setup before the display can submit.
   * Publication may race userspace, so it follows the release of ready. */
  int publish_abi = fg_abi_enabled && fg_abi_init();
@@ -599,8 +604,15 @@ int fuxi_gpu_poll(struct fg_times *t)
  int err = fg_access_failed || g3_faulted();
  if (!err && g3_read(G3_FENCE_PA+64) == fg_magic && g3_gr(0x806) == g3_wptr &&
      g3_gr(0x807) == g3_wptr && !(g3_gr(0x210) & ~1u)) {
-  fg_busy = 0;
   t->wait += mach_absolute_time()-fg_submit_time;
+  if (fg_scanout_requested && !fg_scanout_verify()) {
+   fg_fail("scanout pixel mismatch", 0x604);
+   int drained = fg_isolate();
+   fg_busy = 0;
+   if (!drained && fg_scanout_owned) (void)fg_scanout_stop("GPU DMA drain failed");
+   return drained ? -1 : -2;
+  }
+  fg_busy = 0;
   return 1;
  }
  if (!err && !fg_expired()) return 0;
@@ -608,6 +620,7 @@ int fuxi_gpu_poll(struct fg_times *t)
  /* Only fault containment has bounded register polling; no scheduler wait. */
  int drained = fg_isolate();
  fg_busy = 0;
+ if (!drained && fg_scanout_owned) (void)fg_scanout_stop("GPU DMA drain failed");
  t->wait += mach_absolute_time()-fg_submit_time;
  return drained ? -1 : -2;
 }
@@ -616,6 +629,7 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
     unsigned width, unsigned height, struct fg_times *t)
 {
  FG_GUARD;
+ if (fg_scanout_owned && !fg_scanout_writable) return 0;
  if (!fuxi_gpu_ready() || fg_busy || fg_client_busy || slot >= FG_CACHE_SLOTS || fg_generation[slot] != generation) return 0;
  if (!width || !height || width > 1080 || height > 2400 || dx > 1080-width || dy > 2400-height ||
      (source & 3) || (pitch & 3) || pitch > 131008 || ((uint64_t)sx+width)*4 > pitch ||
@@ -626,7 +640,13 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
  t->clean += mach_absolute_time()-start;
  start = mach_absolute_time();
  int err = 0;
- if (g3_faulted()) { fg_fail("before present", 0x601); return 0; }
+ if (g3_faulted()) {
+  fg_fail("before present", 0x601);
+  if (fg_scanout_owned && !fg_isolate()) {
+   (void)fg_scanout_stop("GPU DMA drain failed"); return -1;
+  }
+  return 0;
+ }
  unsigned stride = 2;
  while ((pitch*stride) & 63) stride *= 2;
  /* XML has 15-bit dimensions; coordinates here are <2416 and strided pitch
@@ -646,7 +666,14 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
  t->submit += mach_absolute_time()-start;
  if (err || fg_access_failed) {
   fg_fail("present submit", err);
-  return !fg_isolate() ? -1 : 0;
+  int drained = fg_isolate();
+  if (!drained && fg_scanout_owned) (void)fg_scanout_stop("GPU DMA drain failed");
+  return drained ? 0 : -1;
+ }
+ if (fg_scanout_requested) {
+  fg_scanout_source = source; fg_scanout_pitch = pitch;
+  fg_scanout_sx = sx; fg_scanout_sy = sy; fg_scanout_dx = dx; fg_scanout_dy = dy;
+  fg_scanout_w = width; fg_scanout_h = height;
  }
  fg_magic = magic;
  fg_submit_time = mach_absolute_time();

@@ -256,6 +256,12 @@ static void absolutetime_to_nanoseconds(uint64_t n,uint64_t *out) {*out=n;}
 static bool PE_parse_boot_argn(const char *,int *n,unsigned) {*n=1;return true;}
 static void fuxi_perf_swap(void) {}
 static void fuxi_display_kick(void) {kicks++;}
+static int scanAcquire=1,scanPublish=0;
+static bool scanOwned=false;
+static int fuxi_gpu_scanout_owned(void) {return scanOwned;}
+static unsigned scanPublications;
+static int fuxi_gpu_scanout_acquire(void) {return scanAcquire;}
+static int fuxi_gpu_scanout_publish(void) {scanPublications++;return scanPublish;}
 static int IOLog(const char *,...) {logs++;return 0;}
 static void *IOMallocData(unsigned n) {return malloc(n);}
 static void IOFreeData(void *p,unsigned) {free(p);}
@@ -438,7 +444,7 @@ def main():
             'OSDeclareDefaultStructors(AppleCLCD);', 'public:')
         methods = ''.join(function(display, name) for name in (
             'AppleCLCD::presentWantedLocked', 'AppleCLCD::wakePresentLocked', 'sweet_fb_rearm',
-            'AppleCLCD::vsyncFired', 'get32', 'AppleCLCD::swap', 'AppleCLCD::present'))
+            'AppleCLCD::vsyncFired', 'AppleCLCD::scanoutLog', 'get32', 'AppleCLCD::swap', 'AppleCLCD::present'))
         methods = methods.replace('__asm__ volatile ("dsb sy" ::: "memory");', '(void)0;')
         cpp = tmp / 'display.cpp'
         cpp.write_text(DISPLAY_PREFIX + declaration + methods + DISPLAY_TEST)

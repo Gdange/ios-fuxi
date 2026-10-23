@@ -29,6 +29,7 @@
 #include "Translator.hpp"
 #include "CAState.hpp"
 #include "Timeline.hpp"
+#include "SurfaceLease.hpp"
 #include "VertexProfile.hpp"
 #ifndef FUXI_MTL_BACKEND_HEADER
 #define FUXI_MTL_BACKEND_HEADER "Backend.hpp"
@@ -40,6 +41,9 @@ extern "C" void _objc_msgForward(void);
 #endif
 static fuxi::ClientMode clientMode=fuxi::ClientMode::deny;
 static char clientProcess[64]="unknown";
+static bool gpuScanout=false;
+static int lockScanoutSurface(uintptr_t p) {return IOSurfaceLock((IOSurfaceRef)p,0,nullptr);}
+static void unlockScanoutSurface(uintptr_t p) {(void)IOSurfaceUnlock((IOSurfaceRef)p,0,nullptr);}
 static fuxi::MetalBackend selectedBackend=fuxi::MetalBackend::fuxi;
 #ifndef FUXI_MTL_BOOTARGS
 #define FUXI_MTL_BOOTARGS(out,size) fuxi::systemString("kern.bootargs",out,size)
@@ -100,6 +104,8 @@ static void checkClient() {
   if(clientMode==fuxi::ClientMode::allow){
    char args[4096]={};
    (void)FUXI_MTL_BOOTARGS(args,sizeof(args));
+   gpuScanout=fuxi::gpuScanoutEnabled(args);
+   if(gpuScanout)fprintf(stderr,"FUXI MTL: GPU scanout surface locks per submission\n");
    selectedBackend=fuxi::selectMetalBackend(args);if(selectedBackend==fuxi::MetalBackend::invalid)clientMode=fuxi::ClientMode::deny;
   }
   if(!strcmp(clientProcess,"backboardd")) {
@@ -656,7 +662,7 @@ static bool textureDescriptorAccepted(MTLTextureDescriptor *d,uint32_t dimension
 #undef CHECK
  return true;
 }
-@interface FuxiTexture : FuxiResource { @public fuxi::Texture *_texture; MTLTextureUsage _usage; IOSurfaceRef _surface; BOOL _shared,_memoryless;FuxiTexture *_viewParent;FuxiBuffer *_backingBuffer;NSUInteger _backingOffset,_backingRow;uint32_t _baseLevel,_levelCount;MTLCPUCacheMode _cacheMode;NSString *_descriptorText; }
+@interface FuxiTexture : FuxiResource { @public fuxi::Texture *_texture; MTLTextureUsage _usage; IOSurfaceRef _surface; BOOL _shared,_memoryless,_surfaceLockHeld;FuxiTexture *_viewParent;FuxiBuffer *_backingBuffer;NSUInteger _backingOffset,_backingRow;uint32_t _baseLevel,_levelCount;MTLCPUCacheMode _cacheMode;NSString *_descriptorText; }
 @end
 @implementation FuxiTexture
 - (void)rejectSelector:(SEL)selector {
@@ -667,7 +673,7 @@ static bool textureDescriptorAccepted(MTLTextureDescriptor *d,uint32_t dimension
  bool safeToUnlock=_viewParent?true:owner(_device)->backend->destroy(_texture);
  // A timeout leaves ownership unknown. Preserve the locked surface/pages until
  // process teardown, just as Backend preserves Vulkan allocations on poison.
- if(_surface && safeToUnlock) {IOSurfaceUnlock(_surface,0,nullptr);IOSurfaceDecrementUseCount(_surface);CFRelease(_surface);}
+ if(_surface && safeToUnlock) {if(_surfaceLockHeld)IOSurfaceUnlock(_surface,0,nullptr);IOSurfaceDecrementUseCount(_surface);CFRelease(_surface);}
  [_descriptorText release];[_viewParent release];[_backingBuffer release];[_device release];[super dealloc];
 }
 - (id)device {CENSUS();return _device;}
@@ -724,6 +730,9 @@ static bool textureDescriptorAccepted(MTLTextureDescriptor *d,uint32_t dimension
     row<r.size.width*pixel || row>SIZE_MAX/r.size.height || (image && image<row*r.size.height))invalid(@"texture CPU region/stride");
  auto *backend=owner(_device)->backend;fuxi::Buffer *staging=nullptr;
  try {
+  if(gpuScanout)backend->requireLive();
+  fuxi::SurfaceLease lease(gpuScanout,lockScanoutSurface,unlockScanoutSurface,&backend->poisoned);
+  if(gpuScanout)lease.add((uintptr_t)[self iosurface]);
   // Shared buffer textures and their views expose the same CPU rows. The GPU
   // shadow is refreshed at use; CPU writes must precede commit, never race it.
   if(FuxiBuffer *backing=(FuxiBuffer *)[self buffer]){
@@ -1199,6 +1208,10 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
   for(const auto &point:_events)if(point.signal)[point.event setSignaledValue:point.value];
   _scheduled=YES;_status=MTLCommandBufferStatusCompleted;[_error release];_error=nil;finishSurvey();
  }else try {if(fuxi::backboardGate.blocked())throw std::runtime_error("backboardd failure latched: CPU on next respawn");if(!strcmp(clientProcess,"fuxi-ca-smoke") && failureCount.load())throw std::runtime_error("CA diagnostic failure latched: GPU submission refused");if(_rejected)throw std::runtime_error("unsupported command: GPU submission refused");if(clientMode==fuxi::ClientMode::census)throw std::runtime_error("census: no GPU submission");auto *backend=owner(_queue->_device)->backend;size_t begin=0;
+ if(gpuScanout)backend->requireLive();
+ fuxi::SurfaceLease lease(gpuScanout,lockScanoutSurface,unlockScanoutSurface,&backend->poisoned);
+ if(gpuScanout)for(id resource in _resources)if([resource isKindOfClass:[FuxiTexture class]])
+  lease.add((uintptr_t)[(FuxiTexture *)resource iosurface]);
  auto shadowStart=std::chrono::steady_clock::now();
  for(id r in _resources){FuxiBuffer *s=nil;
   if([r isKindOfClass:[FuxiBuffer class]])s=r;else if([r isKindOfClass:[FuxiTexture class]])s=[(FuxiTexture *)r buffer];
@@ -1610,13 +1623,14 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
  CHECK("IOSurface.lock",IOSurfaceLock(surface,kIOSurfaceLockAvoidSync,nullptr),actual==0);
 #undef CHECK
  FuxiTexture *t=[FuxiTexture new];t->_descriptorText=[textureDescriptorText(d) copy];t->_cacheMode=d.cpuCacheMode;t->_device=[self retain];t->_usage=d.usage;
- t->_surface=(IOSurfaceRef)CFRetain(surface);IOSurfaceIncrementUseCount(surface);
+ t->_surface=(IOSurfaceRef)CFRetain(surface);t->_surfaceLockHeld=YES;IOSurfaceIncrementUseCount(surface);
  try {
   void *base=IOSurfaceGetBaseAddress(surface);void *start=planes?IOSurfaceGetBaseAddressOfPlane(surface,plane):base;
   if(!base || !start || uintptr_t(start)<uintptr_t(base))throw std::runtime_error("IOSurface plane base address");
   size_t offset=uintptr_t(start)-uintptr_t(base);
   t->_texture=owner(self)->backend->importTexture(base,IOSurfaceGetAllocSize(surface),row,(uint32_t)width,(uint32_t)height,offset);
  }catch(const std::exception &e) {failureLog("FUXI MTL: texture reject IOSurfaceImport 0 desc=%s %s reason=%s\n",textureDescriptorText(d).UTF8String,layout.UTF8String,e.what());[t release];return nil;}
+ if(gpuScanout){IOSurfaceUnlock(surface,0,nullptr);t->_surfaceLockHeld=NO;}
  fprintf(stderr,"FUXI MTL: IOSurface import PASS BGRA8 %lux%lu same-memory %s\n",(unsigned long)d.width,(unsigned long)d.height,layout.UTF8String);return t;
 }
 - (id)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)d {CENSUS();

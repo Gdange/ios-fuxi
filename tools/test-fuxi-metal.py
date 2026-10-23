@@ -101,6 +101,8 @@ int main() {
 }
 '''
 BACKEND_PREFIX = r'''
+static unsigned fg_scanout_reserved,fg_scanout_owned,scanoutStops;
+static int fg_scanout_stop(const char *reason) {(void)reason;scanoutStops++;return -1;}
 #include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -187,6 +189,7 @@ static void seed(void) {
  regs[0xe07]=regs[0xe09]=0xfffff000;regs[0xe08]=regs[0xe0a]=0x1ffff;regs[0x534]=1;regs[0xe0b]=0x1000000;regs[0xe0d]=0x12ff000;regs[0xe01]=3u<<21;
  sregs[SMMU_ID2/4]=0x5511;
  state=drainGood=1;fg_busy=fg_client_busy=fg_access_failed=0;g3_wptr=0;
+ fg_scanout_owned=scanoutStops=0;
  fg_abi_live=fg_abi_seq=fg_abi_completed=fg_abi_poisoned=fg_abi_timed_out=0;fg_abi_hang_dumped=0;
  fg_faults=fg_suspends=highReads=rollover=0;
  ticks=tlbs=failTlb=doorbells=enqueued=drains=fault=cacheClean=cacheInvalidate=0;
@@ -202,6 +205,7 @@ static void complete(void) {
  regs[0x806]=regs[0x807]=g3_wptr;regs[0x210]=0;
 }
 int main(void) {
+ assert(!fg_abi_live_for_scanout());
  /* Every mismatch, read failure and MMIO write failure uses the actual init.
   * The first failure still captures all registers; later attempts never dump.
   * Refusal must precede table construction and ABI publication. */
@@ -293,7 +297,9 @@ int main(void) {
  uint64_t sizes[1]={4096},addresses[1]={va},fence=0;
  fg_busy=1;
  assert(fuxi_gpu_abi_submit(addresses,sizes,1,&fence)==1 && !doorbells);
- fg_busy=0;
+ fg_busy=0;fg_scanout_reserved=1;
+ assert(fuxi_gpu_abi_submit(addresses,sizes,1,&fence)==1 && !doorbells);
+ fg_scanout_reserved=0;
  assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence) && fence==1 && fg_client_busy && enqueued==1);
  assert(sregs[(g_cb(g3_bank)+0x20)/4]==(uint32_t)FG_ABI_PT);
  assert(fuxi_gpu_abi_submit(addresses,sizes,1,&fence)==1 && doorbells==1);
@@ -310,13 +316,14 @@ int main(void) {
  assert(!fuxi_gpu_abi_map(va,source,bytes,3,0,2)); /* reuse after TLBI */
  /* Client never calls WaitFence: delayed callback must still stop DMA. */
  for(unsigned good=0;good<2;good++) {
-  reset();drainGood=good;
+  reset();drainGood=good;fg_scanout_owned=1;
   assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence));
   regs[0x928]=0x23450000;regs[0x92a]=0x90;sregs[(g_cb(g3_bank)+0x58)/4]=0xc0000002;
   unsigned beforeWrites=writeCount;
   ticks=100001;fg_abi_watch(NULL,NULL);
   assert(state==2 && drains==1 && !fg_client_busy && !fuxi_gpu_abi_available());
   assert(fuxi_gpu_abi_poll(fence)==(good?-3:-4));
+  assert(scanoutStops==!good);
   assert(!fuxi_gpu_abi_status(&faults,&suspends) && faults==1 && suspends==1);
   assert(hangLines==16 && writeCount==beforeWrites);
   assert(strstr(hangLog[3],"CP_IB1_BASE_LO [0x928]=0x23450000"));
@@ -362,7 +369,7 @@ int main(void) {
  assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence));
  complete();fg_abi_watch(NULL,NULL);assert(cacheClean==512 && cacheInvalidate==512);
  for(unsigned good=0;good<2;good++) {
-  reset();drainGood=good;
+  reset();drainGood=good;fg_scanout_owned=1;
   assert(!fuxi_gpu_abi_map_import(va,source,16384,3));
   assert(!fuxi_gpu_abi_submit(addresses,sizes,1,&fence));
   ticks=100001;fg_abi_watch(NULL,NULL);

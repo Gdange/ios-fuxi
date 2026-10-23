@@ -4,7 +4,7 @@
 root-image edit, hosted workflow, CI run or push. The supplied 9.5 s first-frame
 and subsequent late-frame observations are motivation, not measurements made
 here. This option targets compilation cost; it does not change GPU/CPU clocks,
-submission, presentation or the old readiness line mentioning 220 MHz.
+submission, presentation or the readiness line reporting the requested GPU vote.
 
 ## Existing path and reference finding
 

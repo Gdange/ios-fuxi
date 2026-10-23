@@ -1,0 +1,33 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -134,7 +134,10 @@
+  uint64_t cpu = thread_get_runtime_self(), start = mach_absolute_time();
+  IOLockLock(sweet_gpu_lock);
+  if (sweet_gpu_inflight) { IOLockUnlock(sweet_gpu_lock); return 2; }
+- if (s->gpuWriters || s->gpuQuarantined) { IOLockUnlock(sweet_gpu_lock); return 0; }
++ if (s->gpuWriters || s->gpuQuarantined) {
++  IOLockUnlock(sweet_gpu_lock); return fuxi_gpu_scanout_owned() ? 3 : 0;
++ }
++ if (!fuxi_gpu_scanout_reserve()) { IOLockUnlock(sweet_gpu_lock); return 3; }
+  unsigned slot = FG_CACHE_SLOTS, victim = 0, replacement = FG_CACHE_SLOTS;
+  uint64_t length = s->memory->getLength()-s->offset;
+  uintptr_t source = src+s->offset;
+@@ -186,6 +189,7 @@
+   s->retain(); /* failed submit/drain: reject writers, preserve until reset */
+  }
+  out:
++ fuxi_gpu_scanout_release();
+  sweet_gpu_times.cpu += thread_get_runtime_self()-cpu;
+  IOLockUnlock(sweet_gpu_lock);
+  return result;
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -1,5 +1,8 @@
++extern int fuxi_gpu_scanout_owned(void);
+ void fuxi_display_kick(void)
+ {
++    /* GPU-SCANOUT owns manual START until reset; console must stay muted. */
++    if (fuxi_gpu_scanout_owned()) return;
+     if (fuxi_intf1 == NULL || (fuxi_intf1[0x2b4 / 4] & 0x80000000u)) {
+         __asm__ volatile("dsb sy" ::: "memory");
+         return;
