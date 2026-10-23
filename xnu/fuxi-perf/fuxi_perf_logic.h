@@ -58,7 +58,9 @@ static int fp_state(int boosted, int valid, int temp, int safe, int duty_ok,
   if (activity < start) activity = start;
   /* Idle is below cool, so thermal cuts may also use it. The thermal and
    * duty guards still veto every high vote, including input wakeups. */
-  if (now >= activity && now-activity >= idle_after) return FP_IDLE;
+  /* No idle before the first swap: boot-time shader compiles run with no
+   * input or swap, and 307 MHz silver made the first frame 6 s later. */
+  if (swap && now >= activity && now-activity >= idle_after) return FP_IDLE;
   /* An input preceding idle must not let a swap wake into high, even when
    * the idle timeout is shorter than the legacy boost hold. */
   if (input <= idle_entry) input = 0;

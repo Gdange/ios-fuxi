@@ -177,8 +177,10 @@ average busy time 0–4%. Cool still votes roughly 1.2–1.4 GHz.
 Add `fuxiperf=1 fuxiperfidle=5000` to select each domain's lowest eligible
 EPSS LUT frequency after five seconds without input or swaps. The accepted
 timeout is 1000–60000 ms; missing or invalid values leave the feature off,
-including the existing log format and polling behavior. The quiet interval
-starts at governor readiness if neither hook has fired. With the recorded
+including the existing log format and polling behavior. Idle is never
+entered before the first swap: **OBSERVED** with idle allowed from governor
+readiness, boot-time shader compiles ran at 307 MHz silver and backboardd's
+first frame came at 14.0 s instead of 7.9 s. With the recorded
 LUT fixture, idle selects silver/gold/prime at 307200/499200/595200 kHz;
 the ready log reports the actual choices.
 

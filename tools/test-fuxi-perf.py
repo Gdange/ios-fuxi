@@ -70,15 +70,17 @@ int main(void) {
  assert(fp_idle_level(idle_rows,5,400000,1401600,&khz)==2 && khz==1152000);
  /* Quiet time starts at ready, even with no hooks yet. Exact MS boundary. */
  assert(fp_state(0,1,450,1,1,1099,0,0,1500,1000,100,0)==FP_COOL);
- assert(fp_state(0,1,450,1,1,1100,0,0,1500,1000,100,0)==FP_IDLE);
+ assert(fp_state(0,1,450,1,1,1100,0,50,1500,1000,100,0)==FP_IDLE);
+ /* No idle before the first swap (boot-time shader compiles). */
+ assert(fp_state(0,1,450,1,1,1100,0,0,1500,1000,100,0)==FP_COOL);
  assert(fp_state(0,1,450,1,1,1101,1101,0,1500,1000,100,1100)==FP_HIGH);
  assert(fp_state(0,1,450,1,1,1101,100,1101,1500,1000,100,1100)==FP_COOL);
  assert(fp_state(0,1,450,1,1,1102,100,1101,1500,1000,100,1100)==FP_COOL);
- assert(fp_state(1,1,450,1,1,1100,100,0,1500,1000,100,0)==FP_IDLE);
+ assert(fp_state(1,1,450,1,1,1100,100,50,1500,1000,100,0)==FP_IDLE);
  assert(fp_state(0,1,700,0,1,1101,1101,0,1500,1000,100,1100)==FP_COOL);
  assert(fp_state(0,0,-400,0,1,1101,1101,0,1500,1000,100,1100)==FP_COOL);
  assert(fp_state(0,1,450,1,0,1101,1101,0,1500,1000,100,1100)==FP_COOL);
- assert(fp_state(0,1,700,0,1,1100,0,0,1500,1000,100,0)==FP_IDLE);
+ assert(fp_state(0,1,700,0,1,1100,0,50,1500,1000,100,0)==FP_IDLE);
  assert(fp_state(0,1,450,1,1,1100,1101,0,1500,1000,100,0)==FP_COOL);
  /* Disabled policy is exactly the legacy policy across the guard boundaries. */
  for(int b=0;b<2;b++)for(int v=0;v<2;v++)for(int t=599;t<=681;t++)
@@ -335,10 +337,11 @@ int main(void) {
  arg_value=100000;fp_configure();assert(fp_idle_floor==100000 && !fp_idle_after);
  arg_value=3000000;fp_configure();assert(fp_idle_floor==3000000 && !fp_idle_after);
  /* Actual LUTs and worker: no new periodic wakes; hook wakeups do no MMIO. */
- reset_init();fp_idle_ms=1000;fp_configure();log_count=0;fp_worker(0,0);
+ reset_init();fp_swap=50;fp_idle_ms=1000;fp_configure();log_count=0;fp_worker(0,0);
  assert(fp_ready && fp_idle_start==100 && !fp_idling && scheduled==200);
  assert(strstr(last_log,"ready idle LUT 307200/499200/595200 kHz"));
  for(unsigned d=0;d<3;d++)assert(fp_idle[d]==0 && fp_idle_khz[d]<=fp_cool_khz[d]);
+ fp_swap=50; /* the first frame was already published before start */
  ticks=1099;fp_worker(0,0);assert(!fp_idling);
  ticks=1100;fp_worker(0,0);assert(fp_idling && !fp_boosted && scheduled==1200);
  assert(fp_idle_entries==1 && fp_idle_transitions==1);
@@ -357,14 +360,14 @@ int main(void) {
  assert(!memcmp(before_idle_writes,writes,sizeof(writes)));
  fp_worker(0,0);assert(!fp_idling && fp_boosted && scheduled==ticks+20);
  /* The old input is still within hold when a swap wakes a 1000ms idle. */
- reset_init();fp_idle_ms=1000;fp_configure();fp_worker(0,0);
+ reset_init();fp_swap=50;fp_idle_ms=1000;fp_configure();fp_worker(0,0);
  ticks=101;fuxi_perf_input();fp_worker(0,0);assert(fp_boosted);
  ticks=1101;fp_worker(0,0);assert(fp_idling);
  ticks=1102;fuxi_perf_swap();fp_worker(0,0);assert(!fp_idling && !fp_boosted);
  ticks=1103;fp_worker(0,0);assert(!fp_boosted);
  /* Hot/invalid samples still cut high; an already lower idle stays lower.
   * A recovered failed domain may also take idle, never high. */
- reset_init();fp_idle_ms=1000;fp_configure();fp_worker(0,0);
+ reset_init();fp_swap=50;fp_idle_ms=1000;fp_configure();fp_worker(0,0);
  ticks=1100;fp_worker(0,0);assert(fp_idling);
  regs[3][0xa4/4]=(1u<<21)|770;
  ticks=1200;fp_worker(0,0);assert(fp_idling && fp_blocked && scheduled==1220);
@@ -379,14 +382,14 @@ int main(void) {
  ticks=10200;fp_worker(0,0);assert(fp_idle_time==100);
  /* Floor rounds up per domain and clamps at cool even for a huge floor. */
  for(unsigned floor=500000;floor<=3000000;floor+=2500000) {
-  reset_init();fp_idle_ms=1000;fp_idle_floor=floor;fp_configure();fp_worker(0,0);
+  reset_init();fp_swap=50;fp_idle_ms=1000;fp_idle_floor=floor;fp_configure();fp_worker(0,0);
   for(unsigned d=0;d<3;d++) {
    assert(fp_idle_khz[d]<=fp_cool_khz[d]);
    assert(fp_idle_khz[d]>=(floor<fp_cool_khz[d]?floor:fp_cool_khz[d]));
   }
  }
  /* First eight idle transitions and every 64th only; counters span windows. */
- reset_init();fp_idle_ms=1000;fp_configure();fp_worker(0,0);fp_window=1000000;
+ reset_init();fp_swap=50;fp_idle_ms=1000;fp_configure();fp_worker(0,0);fp_window=1000000;
  for(unsigned n=1;n<=66;n++) {
   ticks+=1000;unsigned logs=log_count;fp_worker(0,0);assert(fp_idling);
   assert(log_count==logs+(fp_idle_transitions<=8 || !(fp_idle_transitions&63)));
