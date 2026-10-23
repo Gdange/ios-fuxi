@@ -54,6 +54,7 @@ The host side, `tools/fuxi-xnu-monitor.py`, talks to the loader over USB. It str
 | `shim/fuxi-probe/` | Hardware probes linked into the loader: display, touch, thermal/EPSS, GPU (`gpu.c`) |
 | `tools/fuxi-*.py`, `tools/mkadt-fuxi.py` | USB monitor, GPU probe decoder, ADT builder, root staging, DTB inspection |
 | `tools/mkiosroot.sh`, `tools/sweet-root-tweaks.py` | Build the iOS root image from the IPSW and apply the bring-up changes |
+| `xnu/fuxi-sys/`, `tools/fuxi-audio/`, `tools/fuxi-sb/`, `tools/fuxi-sys-root.py` | Opt-in P-SYS system fixes (patch 0107, HAL plug-in, SpringBoard library, root edits) |
 | `docs-lanes/` | Per-subsystem notes: GPU, thermal, buttons, touch/display |
 | `docs/sweet.md` | The original ios-sweet README |
 
@@ -82,6 +83,8 @@ You need an unlocked bootloader, a rooted recovery for installing the root file,
 
 - **HackiOS ([kernel](https://github.com/oosexgang/hackios-xnu-kernel), APSL 2.0; [userland](https://github.com/oosexgang/hackios-xnu-userland), MIT) by OOSEX GANG**: xnu + iOS 16.5 on the POCO X5 Pro. Its AMFI/Sandbox query layouts, button debounce/bus-lock ideas, tap-to-wake through `TouchDetectionMode` and button usage map informed or were ported into the H1 overlay (`xnu/fuxi-h1/`, MIT notice in `fuxi_key_state.h`). See [kernel H1](docs-lanes/kernel-h1.md#reference-credit).
 - **HackiOS ([hackios-xnu-kernel](https://github.com/oosexgang/hackios-xnu-kernel), APSL 2.0, and [hackios-xnu-userland](https://github.com/oosexgang/hackios-xnu-userland), MIT) by OOSEX GANG**: the cooling lane ports their launchd on-demand pass (`tools/launchd-on-demand.py`), the mediaserverd/SpringBoard Metal denial, and the cpuload log, sleep refusal and xpcproxy identity hunks in patch 0105. See [cooling](docs-lanes/cooling.md).
+- **HackiOS ([kernel](https://github.com/oosexgang/hackios-xnu-kernel), APSL 2.0; [userland](https://github.com/oosexgang/hackios-xnu-userland), MIT) by OOSEX GANG**: P-SYS ports, all opt-in: the privilege-by-entitlement table and uncontained container-path result of `kern_minimac.c` (`xnu/fuxi-sys/`, patch 0107, APSL header), the Speaker/Hawking/Actuator/Codec AudioServerPlugIn of `audio_plugin.c` (`tools/fuxi-audio/`, MIT header), the SpringBoard snapshot-format fix of `inject_sb.c` (`tools/fuxi-sb/`, MIT header) and the respawn-job list of `mkjobs.py`. See [P-SYS port](docs-lanes/sys-port.md).
+
 - **[ios-sweet](https://github.com/dipa-studio/ios-sweet) by [dipa-studio](https://github.com/dipa-studio)**: the original project this repository is forked from. The XNU port, the iOS userland bring-up, the kernel patches up to 0081 and most of the tooling come from it.
 - **Claude Opus 5.5 ([Anthropic](https://www.anthropic.com))**: AI pair engineer on the Xiaomi 13 bring-up: loader, XNU patches, drivers, thermal work and device testing.
 - **[OpenAI Codex](https://openai.com/codex)**: the GPU lane: GMU memory setup, firmware loading, HFI startup, GX power-up and the command-processor probe stages.
