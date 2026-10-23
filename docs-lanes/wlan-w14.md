@@ -1,4 +1,4 @@
-# WLAN W14: host downloads through firmware readiness
+# WLAN W14/W15: firmware readiness and WLAN start
 
 ## Evidence and boundary
 
@@ -11,19 +11,20 @@ board ID 0, SoC ID `0x40170200`, firmware `0x1103006c`, build
 caps `0x3`. Step 28 passed with zero faults and keep selected. The excerpt is
 read-only evidence; neither it nor firmware contents are committed here.
 
-**W14 has host validation only.** `fuxiwlanqrtr=4` inherits W13 memory
-negotiation, then sends regdb, board data and M3_INFO, requires FW_READY
-indication `0x21`, and stops. No WLAN config/mode, calibration download,
-network interface, retry/recovery or background polling is added. `=3` still
-stops after CAP and passive observation; `=2` and `=1` retain their earlier
-boundaries. Unknown selector values still stop at W10.
+**Current device evidence (supplied for W15):** `fuxiwlanqrtr=4` on
+WCN7850 hw2.0, firmware `WLAN.HMT.1.1.c7-00108`, completed IND_REGISTER,
+HOST_CAP, memory negotiation, FW_MEM_READY, CAP (chip 2, family 4, board ID
+absent), REGDB, BDF, M3_INFO and **FW_READY_IND `0x38`**. W14 stops before
+WLAN config/mode. The legacy ath11k `0x21` indication alone is insufficient.
+Earlier missing-M3 log templates below describe the historical host-only
+milestone, not the current supplied device result.
 
-**The supplied local KIWI inventory has no `m3.bin`.** With those files alone,
-W14 can test regdb/BDF and then must log the missing M3 file and contain. It
-cannot reach `W14 m3 ok` or `W14 fw ready`. Do not substitute Data.msc,
-phy_ucode.elf, a board-data ELF, AMSS, or the REQUEST_MEM type-3 dump allocation
-for the missing M3 image. Obtain a matching image separately before attempting
-the complete milestone; its actual size is presently unknown.
+**W15 has host validation only.** `fuxiwlanqrtr=5` inherits W14, then sends
+WLAN_INI, WLAN_CFG and WLAN_MODE normal, observes indications for 2 seconds,
+and stops before CE/HTC. Values 0 through 4 retain their previous behavior;
+unknown selector values still stop at W10. No CE rings, HTC, WMI, network
+interface, retry/recovery or background polling is added. No device, image
+build, staging, push or CI execution was used for W15.
 
 ## Protocol sources and licence
 
@@ -155,10 +156,9 @@ After correlated CAP success:
    convert every alias to Normal-NC, map its owned IOVA through invalid live
    SMMU leaves, invalidate/synchronize TLB and verify every leaf/ownership.
    Send M3_INFO `0x3c`, require a successful response and TX drain.
-4. Wait at most 10 seconds for FW_READY `0x21`. Log optional FW_INIT_DONE
-   `0x38`, drain transport and pass the milestone. As requested, `0x38` alone
-   does **not** replace `0x21`; ath12k calls `0x38` FW_READY, so message IDs
-   matter when interpreting logs from different hosts.
+4. Wait at most 10 seconds for ath12k FW_READY `0x38`. The legacy ath11k
+   ready `0x21` is reported only and cannot satisfy this wait. Drain
+   transport and pass W14, or continue into W15 when selected.
 
 BDF request TLVs, from ath12k EI layout (no native struct packing):
 
@@ -180,7 +180,7 @@ publication. Target memory and M3 share the existing bounded IOVA pool; the
 separate 64-MiB REQUEST_MEM budget remains unchanged. Staging regdb/BDF data
 is copied into the owned IPCR TX slot and is not advertised as target memory.
 
-Only W14 uses **8192-byte TX slots**; RX remains 4096 bytes. The enlarged
+W14 and W15 use **8192-byte TX slots**; RX remains 4096 bytes. The enlarged
 preallocated IPCR allocation has 16 TX and 16 RX slots; all TX slots and RX
 buffers are mapped before AMSS. A full BDF QMI request is 6189 bytes, QRTR v1
 header/padding makes a 6224-byte MHI transfer. Static bounded packet/encoder
@@ -198,7 +198,7 @@ TX drains retain two-second deadlines. No request/segment is retried.
 
 Ready indications before M3 publication are logged and ignored. A ready
 indication racing the M3 reply is queued, but cannot bypass a missing or
-rejected reply. Duplicate ready indications are harmless. Optional init-done
+rejected reply. Duplicate ready indications are harmless. Legacy ath11k `0x21`
 is logged if received while polling; no additional wait is imposed for it.
 
 Regdb/BDF/M3 allocations, including partial reads/conversions/maps, remain
@@ -248,7 +248,7 @@ After staging a suitable M3 image, the intended remaining success lines are:
 FUXI WLAN: W14 file m3.bin bytes <size>
 FUXI WLAN: W14 M3 DMA IOVA <address> bytes <size> Normal-NC mapped
 FUXI WLAN: W14 m3 ok
-FUXI WLAN: W14 fw ready (FW_INIT_DONE <0-or-1>); stop before WLAN config/mode
+FUXI WLAN: W14 fw ready (ath11k 0x21 also seen <0-or-1>); stop before WLAN config/mode
 FUXI WLAN: W14 complete; keep requested, DMA/channels/wake retained (polling ended)
 FUXI WLAN: step 28 ok code 0x101c (... ms, faults 0)
 ```
@@ -273,11 +273,128 @@ M3 allocation/NC/map failures, IOVA versus high noncontiguous backing, every
 M3 PTE and zero padding, early/queued/optional ready indications, strict
 FW_READY timeout, successful keep/contain and M3 quarantine on failed undo.
 
-All **13 source-only** WLAN entrypoints pass: M5, M6, M6i, M6k, M6l, M6m,
-M6n, M6o/W9, W10, W11, W12, W13 and W14. W11's unsupported-selector fixture
-now uses 5, because 4 is assigned to W14. The patch's embedded C matches the
-canonical source byte-for-byte with checked hunk counts. W14 is registered in
+Historical W14 validation passed **13 source-only** WLAN entrypoints: M5, M6,
+M6i, M6k, M6l, M6m, M6n, M6o/W9, W10, W11, W12, W13 and W14. W11's unsupported-selector fixture
+now uses 6, because 4 and 5 are assigned to W14 and W15. The patch's embedded
+C matches the canonical source byte-for-byte with checked hunk counts. W14 is registered in
 the host-check list; the build script, CI/workflows and image builds are not
 run. The separate M6 artifact verifier requires prebuilt kernel/ADT/loader/
 boot artifacts and is not part of these source-only tests. No phone tools,
 root staging, push, firmware copies or external messages were used.
+
+## W15 firmware start (`fuxiwlanqrtr=5`)
+
+The W15 tables and encodings are adapted from Linux **v6.12 ath12k**, under
+**BSD-3-Clause-Clear**, with attribution beside the ported tables. Credit The
+Linux Foundation (2018–2021) and Qualcomm Innovation Center, Inc. (2021–2024).
+Sources: [qmi.c](https://github.com/torvalds/linux/blob/v6.12/drivers/net/wireless/ath/ath12k/qmi.c),
+[qmi.h](https://github.com/torvalds/linux/blob/v6.12/drivers/net/wireless/ath/ath12k/qmi.h),
+[hw.c](https://github.com/torvalds/linux/blob/v6.12/drivers/net/wireless/ath/ath12k/hw.c),
+[ce.c](https://github.com/torvalds/linux/blob/v6.12/drivers/net/wireless/ath/ath12k/ce.c),
+[hal.c](https://github.com/torvalds/linux/blob/v6.12/drivers/net/wireless/ath/ath12k/hal.c),
+and [hal.h](https://github.com/torvalds/linux/blob/v6.12/drivers/net/wireless/ath/ath12k/hal.h).
+No GPL code or downloaded source/firmware blobs are committed.
+
+After the accepted M3_INFO reply and FW_READY `0x38`, W15 follows
+`ath12k_qmi_firmware_start()` in order:
+
+| Request | Message | Exact TLVs (value lengths) |
+| --- | --- | --- |
+| WLAN_INI | `0x2f` | `0x10` (1): `enable_fwlog=0`. |
+| WLAN_CFG | `0x23` | `0x10` (3): raw `WIN`, without NUL or count; `0x11` (181): u8 count 9 + nine 20-byte target CE entries; `0x12` (169): u8 count 14 + fourteen 12-byte service entries; `0x17` (145): u8 count 36 + thirty-six LE u32 shadow addresses. |
+| WLAN_MODE | `0x22` | `0x01` (4): normal mode 0; `0x10` (1): hw_debug 0. |
+
+**INI policy difference:** the supplied upstream v6.12 implementation sets
+`enable_fwlog=1`. W15 sends **0** to honor this lane's explicit request for
+fw log off; it does not claim that value matches upstream. Optional-valid
+flags are local EI metadata and are not serialized. The CFG body is 510
+bytes (517 including the QMI header); INI/MODE bodies are 4/11 bytes.
+
+`qmi_wlanfw_wlan_{ini,cfg,mode}_req_msg_v01` and their `_ei` tables define
+the encodings. Target entries follow
+`qmi_wlanfw_ce_tgt_pipe_cfg_s_v01_ei`: pipe number, enum32 direction,
+entries, maximum bytes, flags. The native `ce_pipe_config.reserved` field
+is omitted. Service entries follow `qmi_wlanfw_ce_svc_pipe_cfg_s_v01_ei`:
+service ID, enum32 direction, pipe number. Counts are exactly hw.c's WCN7850
+`target_ce_count=9` and `svc_to_ce_map_len=14`, excluding the sentinel. The
+RSVD_CTRL downlink maps to CE2. Shadow v1 TLV `0x13` is absent.
+
+The shadow-v3 array is the result of `ath12k_ce_get_shadow_config()` for
+WCN7850 hw2.0: `ath12k_hal_srng_create_config_wcn7850()` supplies ring bases,
+counts and strides; `ath12k_hal_srng_shadow_config()` traverses HAL enum order,
+skipping CE and DMAC/PMAC rings. Each entry is `reg_start[1] + ring *
+reg_size[1]`, plus 4 for destination TP. This produces 29 addresses: 8 REO
+destination, exception, reinject, command, status; 5 TCL data, command,
+status; WBM idle, SW release, 8 WBM completion. Then
+`ath12k_ce_shadow_config()` adds 7 addresses in CE order: CE0 source, CE1
+destination/status, CE2 destination/status, CE3 source, CE4 source.
+`ath12k_host_ce_config_wcn7850` has no host entries for CE5–8, so they add no
+shadows even though target CE5 has 32 entries. The total 36 is below both
+HAL's 40-register limit and QMI's 60-entry limit. These WCSS-relative values
+are sent in `qmi_wlanfw_shadow_reg_v3_cfg_s_v01_ei`; W15 never accesses those
+registers or creates rings.
+
+Each request has a unique transaction and one 10-second reply wait. Common
+response TLV `0x02` must occur exactly once with a four-byte result/error;
+both must be zero. Rejected, missing, duplicate or truncated results contain
+without retry or advancing. Indications cannot complete a transaction.
+Stale/wrong-message replies are ignored within the same deadline. Existing
+MHI TX drain checks apply between requests. After MODE, 200 samples at 10 ms
+plus a final event pass report indications without provisioning or sending
+additional WLFW requests. IPCR RX reposts and event credits continue. Six
+read-only BHI/MHI/ERRDBG reads capture state after observation (also on W15
+failure) before the existing containment path can change it. Keep retains
+DMA/channels/wake only on complete success; failed containment quarantines
+all published allocations.
+
+Expected success lines, following the inherited W12–W14 setup logs:
+
+```text
+FUXI WLAN: W15 fw ready; starting WLAN INI/CFG/MODE
+FUXI WLAN: W15 wlan ini enable_fwlog 0
+FUXI WLAN: W15 send txn <n> msg 0x2f stage 12
+FUXI WLAN: W15 reply txn <n> msg 0x2f result 0 error 0
+FUXI WLAN: W15 wlan ini ok
+FUXI WLAN: W15 wlan cfg host WIN target CE 9 service map 14 shadow v3 36
+FUXI WLAN: W15 send txn <n+1> msg 0x23 stage 13
+FUXI WLAN: W15 reply txn <n+1> msg 0x23 result 0 error 0
+FUXI WLAN: W15 wlan cfg ok
+FUXI WLAN: W15 wlan mode normal hw_debug 0
+FUXI WLAN: W15 send txn <n+2> msg 0x22 stage 14
+FUXI WLAN: W15 reply txn <n+2> msg 0x22 result 0 error 0
+FUXI WLAN: W15 wlan mode normal ok; stop before CE/HTC
+FUXI WLAN: W15 observing indications 2000 ms (reported only)
+FUXI WLAN: W15 indication msg <id> stage 15 bytes <n> (reported only)
+FUXI WLAN: W15 WLAN start diagnostic BHI_EXECENV <ee> (<name>) MHISTATUS <status> SYSERR(bit2) <bit> MHI_STATE <state> BHI_ERRCODE <code> BHI_ERRDBG1 <d1> BHI_ERRDBG2 <d2> BHI_ERRDBG3 <d3> access-faults <n> valid <bit>
+FUXI WLAN: W15 complete; keep requested, DMA/channels/wake retained (polling ended)
+```
+
+The indication line is conditional, and indications may also race any W15
+reply (stages 12–14). Transactions depend on segment counts; the synthetic
+host peer uses 13/14/15. Without keep, completion ends `stop/contain`.
+A timeout logs `FUXI WLAN: W15 timeout WLAN_<INI|CFG|MODE> reply (10000 ms);
+contain, no retry`, then `FUXI WLAN: W15 failure: <reason>; contain, no retry`.
+Rejection includes the decoded result/error; RDDM additionally logs
+`FUXI WLAN: W15 RDDM observed; dump not collected; contain`.
+
+`python3 tools/test-fuxi-wlan-w15.py` compiles the production C using the
+existing ASan/UBSan host peer. Independently written Python expectations
+construct all three complete QMI requests, derive shadow addresses by ring
+arithmetic, and compare every byte; the peer separately decodes CFG TLVs,
+lengths, counts and strides. Twenty-one failures cover rejection, timeout,
+missing result, truncated result, nonzero error with success result,
+duplicate result and stale/wrong-message-only replies at each step. Tests
+also cover the FW_READY-only and absent-board device shapes, M3/ready
+failure gates, indication races, late memory/ready indications at 10 ms/1 s/2 s,
+exact 2-second observation, no CE writes or further allocations, precisely
+six diagnostic reads without writes, SYSERR/RDDM evidence, keep/non-keep and
+failed-containment quarantine. W10–W14 suites retain legacy behavior checks;
+W11's unsupported selector moves from 5 to 6. W15 is registered alongside
+them in the host check list. Patch 0099's C hunk is regenerated byte-for-byte.
+All six `tools/test-fuxi-wlan-w1*.py` entrypoints (W10–W15) pass with
+ASan/UBSan, including the source/patch equality and hunk-count checks.
+
+**Still unverified:** target acceptance of W15 requests, WLAN normal-mode
+stability and subsequent indications/ERRDBG state. No W15 device boot or
+kernel cross-build has been performed. CE/HTC/WMI and networking remain
+future lanes.

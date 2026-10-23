@@ -20,7 +20,7 @@
  *   fuxiwlanseq=cyclerails  also cycle shared rails (froze the SoC once)
  *   fuxiwlanstop22=1  retain the BHI-only diagnostic stop (default: continue)
  *   fuxiwlankeep=1  retain DMA/device only after complete selected milestone success
- *   fuxiwlanqrtr=1  W11 capability-only diagnostic; =2 W12 setup; =3 W13 small-chunk negotiation; =4 W14 downloads
+ *   fuxiwlanqrtr=1  W11 capability-only diagnostic; =2 W12 setup; =3 W13 small-chunk negotiation; =4 W14 downloads; =5 W15 config/mode
  * Steps 17..28 probe DMA safety and load rootfs firmware through BHI/BHIe.
  * Completion is polled; M6o can enable MSI to a RAM sink. W11 channels/QMI are opt-in;
  * see docs-lanes/wlan-bt.md M6.
@@ -715,7 +715,7 @@ static bool wl_mhi_valid;
 struct wl_dma { vm_offset_t va; vm_size_t size; uint64_t pa, iova; bool nc; };
 static struct wl_dma wl_image, wl_vectors, wl_contexts, wl_tables;
 static struct wl_dma wl_amss; /* full file when BHI uses a separate prefix */
-static bool wl_qrtr, wl_w12, wl_w13, wl_w14, wl_w11_attempted, wl_w11_ok;
+static bool wl_qrtr, wl_w12, wl_w13, wl_w14, wl_w15, wl_w11_attempted, wl_w11_ok;
 /* W12/W13 allocate after an accepted REQUEST_MEM; retain partial allocations until
  * containment is proven. Limit includes XNU page rounding, not just wire sizes. */
 #define WL13_CHUNK_LIMIT (2u * 1024u * 1024u)
@@ -846,7 +846,7 @@ wl_probe_configure(void)
 	(void)PE_parse_boot_argn("fuxiwlanstop22", &stop22, sizeof(stop22));
 	(void)PE_parse_boot_argn("fuxiwlankeep", &keep, sizeof(keep));
 	(void)PE_parse_boot_argn("fuxiwlanqrtr", &qrtr, sizeof(qrtr));
-	wl_w14 = qrtr == 4; wl_w13 = qrtr == 3 || wl_w14; wl_w12 = qrtr == 2 || wl_w13; wl_qrtr = qrtr == 1 || wl_w12; wl_w11_attempted = wl_w11_ok = false;
+	wl_w15 = qrtr == 5; wl_w14 = qrtr == 4 || wl_w15; wl_w13 = qrtr == 3 || wl_w14; wl_w12 = qrtr == 2 || wl_w13; wl_qrtr = qrtr == 1 || wl_w12; wl_w11_attempted = wl_w11_ok = false;
 	wl_stop22 = stop22 == 1; wl_keep = keep == 1;
 	if (wl_w14) {
 		bzero(wl14_bdf_name, sizeof(wl14_bdf_name));
@@ -878,7 +878,7 @@ wl_probe_configure(void)
 	if (wl_pre == 5 && retain == 1) { wl_variant_invalid = true; }
 	printf("FUXI WLAN: W10 continue=%u keep=%u (stop22=1 retains BHI diagnostics; no data channels)\n", !wl_stop22, wl_keep);
 	printf("FUXI WLAN: W11 qrtr=%u keep=%u (one conversation after AMSS/M0)\n", wl_qrtr, wl_keep);
-	if (wl_w12) { printf("FUXI WLAN: W12 selected qrtr=%u target memory cap %u bytes\n", wl_w14 ? 4 : wl_w13 ? 3 : 2, WL_TARGET_CAP); }
+	if (wl_w12) { printf("FUXI WLAN: W12 selected qrtr=%u target memory cap %u bytes\n", wl_w15 ? 5 : wl_w14 ? 4 : wl_w13 ? 3 : 2, WL_TARGET_CAP); }
 	if (wl_w13) { printf("FUXI WLAN: W13 small-chunk policy limit %u bytes; one zero-segment negotiation, aligned IOVAs\n", WL13_CHUNK_LIMIT); }
 	printf("FUXI WLAN: M6o seq mask %#x valid=%u (selectors default off)\n",
 	    wl_seq_flags, !wl_variant_invalid);
@@ -2900,7 +2900,8 @@ static uint32_t wl_chdb, wl_erdb, wl_server_node, wl_server_port, wl_peer_node;
 static bool wl_cmd_done, wl_hello, wl_cap_sent, wl_cap_done, wl_w11_stopping;
 static unsigned wl_w11_error;
 enum { WL12_DISCOVERY, WL12_IND, WL12_HOST, WL12_REQUEST, WL12_RESPOND,
-    WL12_READY, WL12_CAP, WL12_DONE, WL14_REGDB, WL14_BDF, WL14_M3, WL14_READY };
+    WL12_READY, WL12_CAP, WL12_DONE, WL14_REGDB, WL14_BDF, WL14_M3, WL14_READY,
+    WL15_INI, WL15_CFG, WL15_MODE, WL15_OBSERVE };
 static unsigned wl12_stage;
 static uint16_t wl12_txn, wl12_msg;
 static bool wl12_reply, wl12_requested, wl12_ready;
@@ -2922,7 +2923,7 @@ static void wl_w11_barrier(void) { __asm__ volatile("dsb sy" ::: "memory"); }
 static int
 wl_w11_fail(const char *reason)
 {
-	if (!wl_w11_error) { printf("FUXI WLAN: %s failure: %s; contain, no retry\n", wl_w12 ? "W12" : "W11", reason); }
+	if (!wl_w11_error) { printf("FUXI WLAN: %s failure: %s; contain, no retry\n", wl_w15 && wl12_stage >= WL15_INI ? "W15" : wl_w12 ? "W12" : "W11", reason); }
 	wl_w11_error = 1; wl_w11_ok = false;
 	return 1;
 }
@@ -3431,8 +3432,125 @@ wl12_send(struct wl12_encoder *e, unsigned msg, unsigned stage)
 	wl12_stage = stage; wl12_msg = msg; wl12_txn++; wl12_reply = false;
 	e->data[0] = 0; wl_put16(e->data+1, wl12_txn);
 	wl_put16(e->data+3, msg); wl_put16(e->data+5, e->len-7);
-	printf("FUXI WLAN: W12 send txn %u msg %#x stage %u\n", wl12_txn, msg, stage);
+	printf("FUXI WLAN: %s send txn %u msg %#x stage %u\n", wl_w15 && stage >= WL15_INI ? "W15" : "W12", wl12_txn, msg, stage);
 	return wl_qrtr_send(1, wl_server_node, wl_server_port, e->data, e->len);
+}
+
+/* W15 variable arrays: one u8 count followed by explicitly LE u32 fields.
+ * Native structure padding and optional-valid flags never go on the wire. */
+static int
+wl15_array(struct wl12_encoder *e, unsigned type, const void *words,
+    unsigned count, unsigned fields)
+{
+	if (!fields || fields > 5 || count > 60 || e->len > sizeof(e->data) ||
+	    4+count*fields*4 > sizeof(e->data)-e->len) { return wl_w11_fail("W15 array bounds"); }
+	uint8_t *p = e->data+e->len;
+	p[0] = type; wl_put16(p+1, 1+count*fields*4); p[3] = count;
+	for (unsigned i = 0; i < count*fields; i++) {
+		uint32_t word; memcpy(&word, (const uint8_t *)words+4*i, sizeof(word));
+		wl_put32(p+4+4*i, word);
+	}
+	e->len += 4+count*fields*4;
+	return 0;
+}
+
+/* The Clear BSD License (for the ath12k adaptations below):
+ * Copyright (c) 2018-2021 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2021-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted (subject to the limitations in the disclaimer
+ * below) provided that the following conditions are met:
+ *
+ * - Redistributions of source code must retain the above copyright notice,
+ *   this list of conditions and the following disclaimer.
+ * - Redistributions in binary form must reproduce the above copyright
+ *   notice, this list of conditions and the following disclaimer in the
+ *   documentation and/or other materials provided with the distribution.
+ * - Neither the name of the copyright holder nor the names of its
+ *   contributors may be used to endorse or promote products derived from
+ *   this software without specific prior written permission.
+ *
+ * NO EXPRESS OR IMPLIED LICENSES TO ANY PARTY'S PATENT RIGHTS ARE GRANTED BY
+ * THIS LICENSE. THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
+ * CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT
+ * NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+ * PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER
+ * OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+ * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+ * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+ * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+ * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+ * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+ * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+/* Adapted from Linux ath12k hw.c (BSD-3-Clause-Clear), v6.12:
+ * ath12k_target_ce_config_wlan_wcn7850 and
+ * ath12k_target_service_to_ce_map_wlan_wcn7850; ce.h directions/flags,
+ * htc.h service IDs. Copyright (c) 2018-2021 The Linux Foundation;
+ * Copyright (c) 2021-2024 Qualcomm Innovation Center, Inc.
+ * qmi.c qmi_wlanfw_ce_tgt_pipe_cfg_s_v01_ei has FIVE u32 fields:
+ * pipe_num, pipe_dir (enum32), nentries, nbytes_max, flags (no reserved).
+ * qmi_wlanfw_ce_svc_pipe_cfg_s_v01_ei: service_id, pipe_dir, pipe_num.
+ * hw_params.target_ce_count=9, svc_to_ce_map_len=14 excludes sentinel. */
+static const uint32_t wl15_target_ce[9][5] = {
+	{0, 2, 32, 2048, 0}, {1, 1, 32, 2048, 0},
+	{2, 1, 32, 2048, 0}, {3, 2, 32, 2048, 0},
+	{4, 2, 256, 256, 8}, {5, 1, 32, 2048, 0},
+	{6, 3, 32, 16384, 0}, {7, 4, 0, 0, 8}, {8, 3, 32, 16384, 0}
+};
+static const uint32_t wl15_service_ce[14][3] = {
+	{0x104, 2, 3}, {0x104, 1, 2}, /* WMI_DATA_VO */
+	{0x102, 2, 3}, {0x102, 1, 2}, /* WMI_DATA_BK */
+	{0x101, 2, 3}, {0x101, 1, 2}, /* WMI_DATA_BE */
+	{0x103, 2, 3}, {0x103, 1, 2}, /* WMI_DATA_VI */
+	{0x100, 2, 3}, {0x100, 1, 2}, /* WMI_CONTROL */
+	{1, 2, 0}, {1, 1, 2},         /* RSVD_CTRL (downlink CE2) */
+	{0x300, 2, 4}, {0x300, 1, 1}  /* HTT_DATA_MSG */
+};
+
+/* Adapted from Linux ath12k hal.c/hal.h/ce.c (BSD-3-Clause-Clear), v6.12.
+ * Copyright (c) 2018-2021 The Linux Foundation;
+ * Copyright (c) 2021-2024 Qualcomm Innovation Center, Inc.
+ * Result of ath12k_ce_get_shadow_config():
+ * ath12k_hal_srng_create_config_wcn7850 + ath12k_hal_srng_shadow_config,
+ * then ath12k_ce_shadow_config using ath12k_host_ce_config_wcn7850.
+ * HAL ring enum order; skip DMAC/PMAC and CE initially; every UMAC ring
+ * contributes reg_start[1]+ring*reg_size[1]+(DST ? 4 : 0).
+ * CE source 0/3/4 and destination+status 1/2 only; CE5 has zero entries.
+ * These are WCSS-relative address VALUES for QMI, not BAR accesses. */
+static const uint32_t wl15_shadow_v3[36] = {
+	0x00a3b04c, 0x00a3b054, 0x00a3b05c, 0x00a3b064, /* REO_DST 0..7 TP */
+	0x00a3b06c, 0x00a3b074, 0x00a3b07c, 0x00a3b084,
+	0x00a3b08c, /* REO_EXCEPTION TP */
+	0x00a3b028, /* REO_REINJECT HP */
+	0x00a3b020, /* REO_CMD HP */
+	0x00a3b0ac, /* REO_STATUS TP */
+	0x00a46000, 0x00a46008, 0x00a46010, 0x00a46018, 0x00a46020, /* TCL_DATA */
+	0x00a46028, 0x00a4604c, /* TCL_CMD HP, TCL_STATUS TP */
+	0x00a370b8, 0x00a37010, /* WBM_IDLE_LINK, SW2WBM_RELEASE HP */
+	0x00a370cc, 0x00a370d4, 0x00a370dc, 0x00a370e4, /* WBM2SW_RELEASE TP */
+	0x00a370ec, 0x00a370f4, 0x00a370fc, 0x00a37104,
+	0x01b80400,                         /* CE0 SRC HP */
+	0x01b83400, 0x01b8340c,             /* CE1 DST HP, STATUS TP */
+	0x01b85400, 0x01b8540c,             /* CE2 DST HP, STATUS TP */
+	0x01b86400, 0x01b88400              /* CE3/4 SRC HP */
+};
+
+static int
+wl15_encode_cfg(struct wl12_encoder *e)
+{
+	/* Adapted from Linux ath12k qmi.c/qmi.h (BSD-3-Clause-Clear):
+	 * qmi_wlanfw_wlan_cfg_req_msg_v01 / *_ei. host_version TLV 0x10
+	 * QMI_STRING is raw "WIN" (ATH12K_HOST_VERSION_STRING), no count/NUL.
+	 * TLVs 0x11/0x12/0x17 use QMI_DATA_LEN u8 and nested structs above;
+	 * qmi_wlanfw_shadow_reg_v3_cfg_s_v01_ei is one u32 addr. No v1 0x13. */
+	if (e->len != 7) { return wl_w11_fail("W15 CFG encoder state"); }
+	return wl12_tlv(e, 0x10, 0x4e4957, 3) ||
+	       wl15_array(e, 0x11, wl15_target_ce, 9, 5) ||
+	       wl15_array(e, 0x12, wl15_service_ce, 14, 3) ||
+	       wl15_array(e, 0x17, wl15_shadow_v3, 36, 1);
 }
 
 /* Allocation policy facts: ath12k v6.6 qmi.c, BSD-3-Clause-Clear,
@@ -3531,12 +3649,13 @@ wl12_request_mem(const uint8_t *v, unsigned n)
 static int
 wl_qmi_w12(const uint8_t *p, unsigned len)
 {
+	const char *lane = wl_w15 && wl12_stage >= WL15_INI ? "W15" : "W12";
 	if (len < 7 || wl_get16(p+5) != len-7) { return wl_w11_fail("QMI header length"); }
 	unsigned flag = p[0], txn = wl_get16(p+1), msg = wl_get16(p+3);
 	bool indication = flag == 4;
 	if (flag != 2 && !indication) { return wl_w11_fail("QMI unsupported flag"); }
 	if (!indication && (!wl12_txn || wl12_reply || txn != wl12_txn || msg != wl12_msg)) {
-		printf("FUXI WLAN: W12 unrelated reply txn %u msg %#x stage %u\n", txn, msg, wl12_stage);
+		printf("FUXI WLAN: %s unrelated reply txn %u msg %#x stage %u\n", lane, txn, msg, wl12_stage);
 		return 0;
 	}
 	if (!indication && msg == 0x24) {
@@ -3557,7 +3676,8 @@ wl_qmi_w12(const uint8_t *p, unsigned len)
 		} else if (!indication && type == 2) {
 			if (result || n != 4) { return wl_w11_fail("QMI result duplicate/size"); }
 			result = true;
-			printf("FUXI WLAN: W12 reply txn %u msg %#x result %u error %u%s\n", txn, msg,
+			printf("FUXI WLAN: %s reply txn %u msg %#x result %u error %u%s\n",
+			    lane, txn, msg,
 			    wl_get16(v), wl_get16(v+2), wl_get16(v+2) == 90 ? " (INCOMPATIBLE_STATE)" : "");
 			if (wl_get16(v) || wl_get16(v+2)) {
 				if (wl13_delayed && msg == 0x36 && !wl_get16(v+2)) {
@@ -3577,7 +3697,7 @@ wl_qmi_w12(const uint8_t *p, unsigned len)
 				    i, wl_get32(q), wl_get64(q+4), wl_get64(q+12));
 			}
 		} else {
-			printf("FUXI WLAN: W12 msg %#x unknown TLV %#x bytes %u\n", msg, type, n);
+			printf("FUXI WLAN: %s msg %#x unknown TLV %#x bytes %u\n", lane, msg, type, n);
 		}
 		off += n;
 	}
@@ -3585,6 +3705,12 @@ wl_qmi_w12(const uint8_t *p, unsigned len)
 		if (!result) { return wl_w11_fail("QMI reply missing result"); }
 		if (status) { printf("FUXI WLAN: W12 ind register fw status %#llx\n", fw_status); }
 		wl12_reply = true; return 0;
+	}
+	if (wl_w15 && wl12_stage >= WL15_INI) {
+		/* Observe only after provisioning: never act on a fresh memory or
+		 * readiness indication, and never let it complete a transaction. */
+		printf("FUXI WLAN: W15 indication msg %#x stage %u bytes %u (reported only)\n", msg, wl12_stage, len-7);
+		return 0;
 	}
 	printf("FUXI WLAN: W12 indication msg %#x stage %u bytes %u\n", msg, wl12_stage, len-7);
 	if (msg == 0x35) {
@@ -3634,18 +3760,24 @@ wl_qmi_w12(const uint8_t *p, unsigned len)
  * evidence. RDDM EE=3; MHISTATUS SYSERR is bit 2, MHI state is bits 15:8
  * (SYS_ERR=0xff). Never arm/read a crash dump or initiate a large transfer. */
 static void
-wl13_respond_diagnostics(void)
+wl_wlfw_diagnostics(const char *label)
 {
 	unsigned before = fw_faults;
 	uint32_t ee = wl_mrd(wl_bhi+0x28), st = wl_mrd(0x48);
 	uint32_t code = wl_mrd(wl_bhi+0x30), d1 = wl_mrd(wl_bhi+0x34);
 	uint32_t d2 = wl_mrd(wl_bhi+0x38), d3 = wl_mrd(wl_bhi+0x3c);
-	printf("FUXI WLAN: W13 RESPOND_MEM diagnostic BHI_EXECENV %#x (%s) MHISTATUS %#x SYSERR(bit2) %u MHI_STATE %#x BHI_ERRCODE %#x BHI_ERRDBG1 %#x BHI_ERRDBG2 %#x BHI_ERRDBG3 %#x access-faults %u valid %u\n",
-	    ee, wl_mhi_ee(ee), st, (st >> 2) & 1, (st >> 8) & 255,
+	printf("FUXI WLAN: %s diagnostic BHI_EXECENV %#x (%s) MHISTATUS %#x SYSERR(bit2) %u MHI_STATE %#x BHI_ERRCODE %#x BHI_ERRDBG1 %#x BHI_ERRDBG2 %#x BHI_ERRDBG3 %#x access-faults %u valid %u\n",
+	    label, ee, wl_mhi_ee(ee), st, (st >> 2) & 1, (st >> 8) & 255,
 	    code, d1, d2, d3, fw_faults-before, !fw_faults && ee != ~0u && st != ~0u);
 	if (ee == 3 && !fw_faults) {
-		printf("FUXI WLAN: W13 RDDM observed; dump not collected; contain\n");
+		printf("FUXI WLAN: %s RDDM observed; dump not collected; contain\n", wl_w15 && wl12_stage >= WL15_INI ? "W15" : "W13");
 	}
+}
+
+static void
+wl13_respond_diagnostics(void)
+{
+	wl_wlfw_diagnostics("W13 RESPOND_MEM");
 }
 
 static int
@@ -3660,7 +3792,7 @@ wl12_wait(unsigned what, const char *stage)
 		if (what == 0 ? wl12_reply : what == 1 ? wl12_requested : what == 2 ? wl12_ready : wl14_ready) { return 0; }
 		if (ms < 10000) { wl_sleep(10); }
 	}
-	printf("FUXI WLAN: W12 timeout %s (10000 ms); contain, no retry\n", stage);
+	printf("FUXI WLAN: %s timeout %s (10000 ms); contain, no retry\n", wl_w15 && wl12_stage >= WL15_INI ? "W15" : "W12", stage);
 	if (wl12_stage == WL12_RESPOND) { wl13_respond_diagnostics(); }
 	return wl_w11_fail(stage);
 }
@@ -3790,6 +3922,44 @@ wl14_download(const char *name, struct wl_dma *d, unsigned stage)
 	return 0;
 }
 
+/* Firmware-start QMI only: no CE allocation, register programming, HTC or WMI.
+ * Adapted from Linux ath12k qmi.c (BSD-3-Clause-Clear), v6.12,
+ * ath12k_qmi_firmware_start: INI -> CFG -> MODE, one reply at a time. */
+static int
+wl_w15_run(void)
+{
+	static struct wl12_encoder e;
+	bzero(&e, sizeof(e)); e.len = 7;
+	/* qmi_wlanfw_wlan_ini_req_msg_v01 / *_ei: optional 0x10 u8.
+	 * Explicit lane policy: disable fw log (0). Upstream v6.12 sends 1. */
+	printf("FUXI WLAN: W15 wlan ini enable_fwlog 0\n");
+	if (wl12_tlv(&e, 0x10, 0, 1) || wl12_send(&e, 0x2f, WL15_INI) ||
+	    wl12_wait(0, "WLAN_INI reply") || wl_w11_wait(3, "W15 INI TX drain")) { return 1; }
+	printf("FUXI WLAN: W15 wlan ini ok\n");
+	bzero(&e, sizeof(e)); e.len = 7;
+	printf("FUXI WLAN: W15 wlan cfg host WIN target CE 9 service map 14 shadow v3 36\n");
+	if (wl15_encode_cfg(&e) || wl12_send(&e, 0x23, WL15_CFG) ||
+	    wl12_wait(0, "WLAN_CFG reply") || wl_w11_wait(3, "W15 CFG TX drain")) { return 1; }
+	printf("FUXI WLAN: W15 wlan cfg ok\n");
+	bzero(&e, sizeof(e)); e.len = 7;
+	/* qmi_wlanfw_wlan_mode_req_msg_v01 / *_ei: mandatory 0x01 u32
+	 * ATH12K_FIRMWARE_MODE_NORMAL=0; optional 0x10 hw_debug u8=0. */
+	printf("FUXI WLAN: W15 wlan mode normal hw_debug 0\n");
+	if (wl12_tlv(&e, 1, 0, 4) || wl12_tlv(&e, 0x10, 0, 1) ||
+	    wl12_send(&e, 0x22, WL15_MODE) || wl12_wait(0, "WLAN_MODE reply") ||
+	    wl_w11_wait(3, "W15 MODE TX drain") || wl_w11_guard()) { return 1; }
+	printf("FUXI WLAN: W15 wlan mode normal ok; stop before CE/HTC\n");
+	wl12_stage = WL15_OBSERVE;
+	printf("FUXI WLAN: W15 observing indications 2000 ms (reported only)\n");
+	/* Transport consumes/reposts IPCR RX buffers as usual, but indication
+	 * contents cannot provision memory or trigger further QMI requests. */
+	for (unsigned ms = 0; ms < 2000; ms += 10) {
+		if (wl_w11_events()) { return 1; }
+		wl_sleep(10);
+	}
+	return wl_w11_events() || wl_w11_guard();
+}
+
 static int
 wl_w14_run(void)
 {
@@ -3816,6 +3986,14 @@ wl_w14_run(void)
 	printf("FUXI WLAN: W14 m3 ok\n");
 	wl12_stage = WL14_READY;
 	if (wl12_wait(3, "W14 FW_READY indication") || wl_w11_guard()) { return 1; }
+	if (wl_w15) {
+		printf("FUXI WLAN: W15 fw ready; starting WLAN INI/CFG/MODE\n");
+		wl12_stage = WL15_INI;
+		int error = wl_w15_run();
+		/* Preserve post-MODE or failure evidence before containment/reset. */
+		wl_wlfw_diagnostics("W15 WLAN start");
+		return error || wl_w11_guard();
+	}
 	printf("FUXI WLAN: W14 fw ready (ath11k 0x21 also seen %u); stop before WLAN config/mode\n", wl14_init_done);
 	return 0;
 }
@@ -3904,7 +4082,7 @@ wl_w12_run(void)
 		if (wl_w14_run()) { return 1; }
 		if (wl_w11_events() || wl_w11_wait(3, "W14 final TX drain") || wl_w11_guard()) { return 1; }
 		wl_w11_ok = true;
-		printf("FUXI WLAN: W14 complete; %s\n", wl_keep ? "keep requested, DMA/channels/wake retained (polling ended)" : "stop/contain");
+		printf("FUXI WLAN: %s complete; %s\n", wl_w15 ? "W15" : "W14", wl_keep ? "keep requested, DMA/channels/wake retained (polling ended)" : "stop/contain");
 		return 0;
 	}
 	wl12_stage = WL12_DONE;
