@@ -67,7 +67,7 @@ PEER = PEER[:pos] + r'''
         for(unsigned i=0;i<16384;i+=4096)assert(walk(addr+i)==(wl_phys(wl14_m3.va+i)|WL_DMA_PTE));
         if(io_case==9){reply(txn,msg,true);return;}
         if(io_case==10)return;
-        if(io_case==11){reply(txn,msg,false);return;}
+        if(io_case==11){reply(txn,msg,false);ind(0x21,NULL,0);return;}
         if(io_case==12){reply(txn,msg,false);ind(0x38,NULL,0);return;}
         ind(0x21,NULL,0);ind(0x38,NULL,0); /* race before reply is legal */
         reply(txn,msg,false);return;
@@ -135,19 +135,22 @@ int main(void) {
         unsigned before=ne;wl_finish(28);assert(ne==before && !frees);contain();
     }
     /* Unprogrammed OTP (no board_info TLV, observed on the device): continue with the named BDF. */
+    /* Device try14c: M3 reply, then only 0x38 (ath12k FW_READY_IND). */
+    boot14(12,true);{int e=finish_step();if(e)fprintf(stderr,"%s",logbuf);assert(!e && wl_w11_ok && wl14_ready && !wl14_init_done && strstr(logbuf,"W14 fw ready"));}
+    fail_nth_alloc=0;cache_drop=false;contain();
     boot14(21,true);{int e=finish_step();if(e)fprintf(stderr,"%s",logbuf);assert(!e && wl_w11_ok && wl14_ready && strstr(logbuf,"no board id (OTP unset)"));}
     {unsigned before=ne;wl_finish(28);assert(ne==before && !frees);contain();}
     boot14(0,false);assert(!finish_step());wl_finish(28);assert(frees==allocations);dev_on=false;
     for(unsigned c=1;c<=26;c++) {
-        if(c==8||c==21)continue;
+        if(c==8||c==12||c==21)continue;
         boot14(c,true);unsigned ticks=sleeps;int e=finish_step();
         if(!e)fprintf(stderr,"unexpected success case %u\n",c);assert(e && !wl_w11_ok && sleeps-ticks<23000);
         if(c<=3)assert(strstr(logbuf,"missing/unreadable file"));
         if(c==1)assert(!dl[0] && !dl[1]);
         if(c==2)assert(dl[0]==2 && !dl[1]);
         if(c==3)assert(dl[1]==4 && !m3_requests && strstr(logbuf,"m3.bin"));
-        if(c==6 || c==10 || c==11 || c==12)assert(strstr(logbuf,"timeout"));
-        if(c==11 || c==12)assert(!wl14_ready); /* early 0x21 and 0x38 insufficient */
+        if(c==6 || c==10 || c==11)assert(strstr(logbuf,"timeout"));
+        if(c==11)assert(!wl14_ready); /* ath11k 0x21 alone is insufficient */
         fail_nth_alloc=0;cache_drop=false;contain();
     }
     /* Published M3 allocation remains owned on failed containment. */

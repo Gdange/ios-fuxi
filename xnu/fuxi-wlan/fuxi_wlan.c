@@ -3601,11 +3601,13 @@ wl_qmi_w12(const uint8_t *p, unsigned len)
 	}
 	if (wl_w14 && (msg == 0x21 || msg == 0x38)) {
 		/* Only an indication after M3 publication can satisfy W14. A race
-		 * before the M3 reply is retained; the reply is still mandatory. */
+		 * before the M3 reply is retained; the reply is still mandatory.
+		 * ath12k's FW_READY_IND is 0x38 (ath11k calls 0x38 FW_INIT_DONE
+		 * and uses 0x21 for ready); 0x21 is only reported here. */
 		if (wl12_stage == WL14_M3 || wl12_stage == WL14_READY) {
-			if (msg == 0x21) { wl14_ready = true; }
+			if (msg == 0x38) { wl14_ready = true; }
 			else { wl14_init_done = true; }
-			printf("FUXI WLAN: W14 %s indication%s\n", msg == 0x21 ? "FW_READY" : "FW_INIT_DONE",
+			printf("FUXI WLAN: W14 %s indication%s\n", msg == 0x38 ? "FW_READY (0x38)" : "ath11k FW_READY (0x21)",
 			    wl12_stage == WL14_M3 ? " queued during M3_INFO reply wait" : "");
 		} else { printf("FUXI WLAN: W14 premature ready indication %#x ignored stage %u\n", msg, wl12_stage); }
 		return 0;
@@ -3814,7 +3816,7 @@ wl_w14_run(void)
 	printf("FUXI WLAN: W14 m3 ok\n");
 	wl12_stage = WL14_READY;
 	if (wl12_wait(3, "W14 FW_READY indication") || wl_w11_guard()) { return 1; }
-	printf("FUXI WLAN: W14 fw ready (FW_INIT_DONE %u); stop before WLAN config/mode\n", wl14_init_done);
+	printf("FUXI WLAN: W14 fw ready (ath11k 0x21 also seen %u); stop before WLAN config/mode\n", wl14_init_done);
 	return 0;
 }
 
