@@ -1,0 +1,820 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -17,8 +17,13 @@
+  * Writes are refused unless boot-arg ufsrw=1 is set. Every write is checked
+  * against the partition bounds again right before it is issued, so nothing
+  * outside the named partition can be written.
++ *
++ * Ported from UniXNU drivers/NativeUfs/RootCommands.h (BSD-2-Clause-Patent)
++ * Ported from UniXNU drivers/NativeUfs/NativeUfs.cpp (BSD-2-Clause-Patent)
++ * Optional completion/quarantine and invalidate-only DMA policy; see LICENSE.NativeUfs and LICENSE.UniXNU.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
++#include "fuxi_unixnu_ufs.h"
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/buf.h>
+@@ -115,6 +120,8 @@
+ 	int bmajor, cmajor;
+ 	dev_t bdev;
+ 	bool ready;
++	bool unixnu;                            /* fuxi_unixnu_ufs=1, default off */
++	bool poisoned;                          /* DMA allocation retained until reboot */
+ } su;
+ 
+ #if defined(FUXI)
+@@ -237,6 +244,44 @@
+ 	clean_dcache64((addr64_t)(su.dma_pa + off), len, TRUE);
+ }
+ 
++/* All ranges live in our dedicated, permanently allocated, cache-line-aligned DMA area. */
++static void
++fuxi_ufs_cache(uint32_t off, uint32_t len, bool invalidate)
++{
++	uintptr_t start = (su.dma + off) & ~(uintptr_t)63;
++	uintptr_t end = su.dma + off + len;
++	__asm__ volatile("dsb sy" ::: "memory");
++	for (; start < end; start += 64) {
++		if (invalidate) __asm__ volatile("dc ivac, %0" :: "r"(start) : "memory");
++		else __asm__ volatile("dc civac, %0" :: "r"(start) : "memory");
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++/* Called with sweet_ufs_lock held, before any CPU write to shared DMA memory. */
++static int
++fuxi_ufs_poison(const char *reason, uint32_t db, uint32_t status, uint32_t ocs, int error)
++{
++	if (!su.poisoned) {
++		su.poisoned = true;
++		printf("FUXI UNIXNU UFS: quarantined reason=%s db=%#x is=%#x ocs=%#x; no retry until reboot\n",
++		    reason, db, status, ocs);
++	}
++	return error;
++}
++
++static int
++fuxi_ufs_check_idle(void)
++{
++	if (!su.unixnu) return 0;
++	if (su.poisoned) return EIO;
++	__asm__ volatile("dsb sy" ::: "memory");
++	uint32_t db = ufs_rd(REG_UTRLDBR), status = ufs_rd(REG_IS);
++	if (db || (status & FUXI_UFS_FATAL_STATUS))
++		return fuxi_ufs_poison("preflight", db, status, 15, EIO);
++	return 0;
++}
++
+ /*
+  * One SCSI command in slot 0, data (if any) to/from the bounce buffer
+  * (to the device when write is set). Returns 0 or an errno.
+@@ -244,6 +289,9 @@
+ static int
+ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ {
++	if (su.unixnu && (!cdb || !cdb_len || cdb_len > 16 || len > BOUNCE_SIZE)) return EINVAL;
++	int idle_error = fuxi_ufs_check_idle();
++	if (idle_error) return idle_error;
+ #if defined(FUXI)
+     /* Also permit only the exact device-WLUN ACTIVE power command used by Linux. */
+     bool active_power=!write && len==0 && cdb_len==6 && su.lun==0xd0 &&
+@@ -292,27 +340,34 @@
+ 		utrd->prdt = (1024u / 4) << 16 | n;
+ 	}
+ 
+-	if (su.cache) {
+-		dma_clean(DMA_UTRL, sizeof(*utrd));
+-		dma_clean(DMA_UCD, 16 + cdb_len);
+-		dma_sync(DMA_UCD + offsetof(struct ucd, resp), sizeof(ucd->resp));
++	if (su.unixnu) {
++		fuxi_ufs_cache(DMA_UTRL, sizeof(*utrd), false);
++		fuxi_ufs_cache(DMA_UCD, sizeof(*ucd), false);
++		if (len) fuxi_ufs_cache(DMA_BOUNCE, len, false);
++		ufs_wr(REG_IS, 1);              /* completion only; preserve error evidence */
++		__asm__ volatile("dsb sy" ::: "memory");
++	} else {
++		if (su.cache) {
++			dma_clean(DMA_UTRL, sizeof(*utrd));
++			dma_clean(DMA_UCD, 16 + cdb_len);
++			dma_sync(DMA_UCD + offsetof(struct ucd, resp), sizeof(ucd->resp));
++			if (len) {
++				dma_clean(DMA_UCD + offsetof(struct ucd, prdt),
++				    (utrd->prdt & 0xffff) * sizeof(ucd->prdt[0]));
++			}
++		} else {
++			dma_sync(DMA_UTRL, sizeof(*utrd));
++			dma_sync(DMA_UCD, sizeof(*ucd));
++		}
+ 		if (len) {
+-			dma_clean(DMA_UCD + offsetof(struct ucd, prdt),
+-			    (utrd->prdt & 0xffff) * sizeof(ucd->prdt[0]));
+-		}
+-	} else {
+-		dma_sync(DMA_UTRL, sizeof(*utrd));
+-		dma_sync(DMA_UCD, sizeof(*ucd));
+-	}
+-	if (len) {
+-		if (su.cache && write) {
+-			dma_clean(DMA_BOUNCE, len);
+-		} else {
+-			dma_sync(DMA_BOUNCE, len);
+-		}
+-	}
+-	__builtin_arm_dsb(0xf);
+-
++			if (su.cache && write) {
++				dma_clean(DMA_BOUNCE, len);
++			} else {
++				dma_sync(DMA_BOUNCE, len);
++			}
++		}
++		__builtin_arm_dsb(0xf);
++	}
+ 	ufs_wr(REG_UTRLDBR, 1);
+ 	uint64_t deadline;
+ 	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
+@@ -325,12 +380,28 @@
+ 		spin_until += mach_absolute_time();
+ 		nanoseconds_to_absolutetime(CMD_SLEEP_NS, &sleep_interval);
+ 	}
+-	while (ufs_rd(REG_UTRLDBR) & 1) {
++	for (;;) {
++		uint32_t db = ufs_rd(REG_UTRLDBR);
+ 		uint64_t now = mach_absolute_time();
+-		if (now > deadline) {
+-			ufs_wr(REG_UTRLCLR, ~1u);
+-			printf("SWEET UFS: command 0x%02x timed out\n", cdb[0]);
+-			return ETIMEDOUT;
++		if (su.unixnu) {
++			__asm__ volatile("dsb sy" ::: "memory");
++			uint32_t status = ufs_rd(REG_IS), ocs = 15;
++			if (!(db & 1)) {
++				fuxi_ufs_cache(DMA_UTRL, sizeof(*utrd), true);
++				ocs = *(volatile uint32_t *)&utrd->dw2 & 0xff;
++			}
++			enum fuxi_ufs_end end = fuxi_unixnu_ufs_end(db, status, ocs, now >= deadline);
++			if (end == FUXI_UFS_COMPLETE) break;
++			if (end == FUXI_UFS_FATAL || end == FUXI_UFS_TIMEOUT)
++				return fuxi_ufs_poison(end == FUXI_UFS_FATAL ? "fatal" : "timeout",
++				    db, status, ocs, end == FUXI_UFS_TIMEOUT ? ETIMEDOUT : EIO);
++		} else {
++			if (!(db & 1)) break;
++			if (now > deadline) {
++				ufs_wr(REG_UTRLCLR, ~1u);
++				printf("SWEET UFS: command 0x%02x timed out\n", cdb[0]);
++				return ETIMEDOUT;
++			}
+ 		}
+ 		if (sleepable && now >= spin_until) {
+ 			uint64_t wake = now + MIN(sleep_interval, deadline - now);
+@@ -344,16 +415,25 @@
+ 		}
+ 	}
+ 	__builtin_arm_dsb(0xf);
+-	ufs_wr(REG_IS, ufs_rd(REG_IS));         /* acknowledge completion status */
+-
+-	dma_sync(DMA_UTRL, sizeof(*utrd));
+-	if (su.cache) {
+-		dma_sync(DMA_UCD + offsetof(struct ucd, resp), sizeof(ucd->resp));
++	if (su.unixnu) {
++		ufs_wr(REG_IS, 1);
++		fuxi_ufs_cache(DMA_UTRL, sizeof(*utrd), true);
++		fuxi_ufs_cache(DMA_UCD, sizeof(*ucd), true);
++		if (len && !write) fuxi_ufs_cache(DMA_BOUNCE, len, true);
++		if (!(utrd->dw2 & 0xff) && !fuxi_unixnu_ufs_response(ucd->resp, su.lun, su.tag))
++			return fuxi_ufs_poison("response", 0, ufs_rd(REG_IS), utrd->dw2 & 0xff, EIO);
+ 	} else {
+-		dma_sync(DMA_UCD, sizeof(*ucd));
+-	}
+-	if (len && !(su.cache && write)) {
+-		dma_sync(DMA_BOUNCE, len);
++		ufs_wr(REG_IS, ufs_rd(REG_IS));         /* acknowledge completion status */
++
++		dma_sync(DMA_UTRL, sizeof(*utrd));
++		if (su.cache) {
++			dma_sync(DMA_UCD + offsetof(struct ucd, resp), sizeof(ucd->resp));
++		} else {
++			dma_sync(DMA_UCD, sizeof(*ucd));
++		}
++		if (len && !(su.cache && write)) {
++			dma_sync(DMA_BOUNCE, len);
++		}
+ 	}
+ 
+ 	uint32_t ocs = utrd->dw2 & 0xff;
+@@ -492,8 +572,10 @@
+ 		    su.dma_pa);
+ 		return ENXIO;
+ 	}
++	int idle_error = fuxi_ufs_check_idle();
++	if (idle_error) return idle_error;
+ 	ufs_wr(REG_IE, 0);                      /* polled operation */
+-	ufs_wr(REG_IS, ufs_rd(REG_IS));
++	ufs_wr(REG_IS, su.unixnu ? 1 : ufs_rd(REG_IS));
+ 	ufs_wr(REG_UTRLRSR, 0);
+ 	uint64_t list = su.dma_pa + DMA_UTRL;
+ 	ufs_wr(REG_UTRLBA, (uint32_t)list);
+@@ -553,6 +635,7 @@
+ 
+ 	lck_mtx_lock(&sweet_ufs_lock);
+ 	for (uint32_t done = 0; done < count;) {
++		if ((error = fuxi_ufs_check_idle())) break;
+ 		uint64_t pos = off + done;
+ 		uint64_t lba = pos / UFS_BLOCK;
+ 		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
+@@ -721,6 +804,7 @@
+ static int
+ sweet_ufs_init(void)
+ {
++	if (su.poisoned) return EIO;
+ #if defined(FUXI)
+     uint32_t requested=0;
+     if (!PE_parse_boot_argn("fuxi_ufs_probe", &requested, sizeof(requested)) || requested!=1)
+@@ -770,6 +854,12 @@
+ 	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));
+ 	su.cache = (cache == 1);
+ 	su.wait = (wait == 1);
++#if defined(FUXI)
++	uint32_t unixnu = 0;
++	PE_parse_boot_argn("fuxi_unixnu_ufs", &unixnu, sizeof(unixnu));
++	su.unixnu = (unixnu == 1);
++	if (su.unixnu) printf("FUXI UNIXNU UFS: guarded completion, fatal/timeout quarantine enabled\n");
++#endif
+ 
+ 	su.regs = ml_io_map(reg[0], reg[1]);
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+@@ -985,6 +1075,7 @@
+ 		int error = 0;
+ 
+ 		lck_mtx_lock(&sweet_ufs_lock);
++		error = fuxi_ufs_check_idle();
+ 		while (pos < total && !error) {
+ 			uint32_t off = (uint32_t)(pos % SWEET_LOG_SIZE);
+ 			uint32_t blk = off / UFS_BLOCK;
+--- /dev/null
++++ b/bsd/dev/fuxi_unixnu_ufs.h
+@@ -0,0 +1,36 @@
++// SPDX-License-Identifier: BSD-2-Clause-Patent
++// Ported from UniXNU drivers/NativeUfs/TransferPoll.h (BSD-2-Clause-Patent)
++// Ported from UniXNU drivers/NativeUfs/RootCommands.h (BSD-2-Clause-Patent)
++// See LICENSE.NativeUfs and LICENSE.UniXNU. C policy for XNU 8796's single-slot BSD transport.
++#ifndef FUXI_UNIXNU_UFS_H
++#define FUXI_UNIXNU_UFS_H
++#include <stdint.h>
++
++#define FUXI_UFS_FATAL_STATUS 0x71880u
++enum fuxi_ufs_end { FUXI_UFS_WAIT, FUXI_UFS_COMPLETE, FUXI_UFS_FATAL, FUXI_UFS_TIMEOUT };
++
++static inline enum fuxi_ufs_end
++fuxi_unixnu_ufs_end(uint32_t doorbell, uint32_t status, uint32_t ocs, int expired)
++{
++	if (status & FUXI_UFS_FATAL_STATUS) return FUXI_UFS_FATAL;
++	/* A fast completion may never expose DB=1. DB=0 alone is insufficient. */
++	if (!(doorbell & 1) && ocs != 15) return FUXI_UFS_COMPLETE;
++	return expired ? FUXI_UFS_TIMEOUT : FUXI_UFS_WAIT;
++}
++
++static inline int
++fuxi_unixnu_ufs_response(const uint8_t *rsp, uint8_t lun, uint8_t tag)
++{
++	unsigned length = (unsigned)rsp[10] << 8 | rsp[11];
++	if (rsp[0] != 0x21 || rsp[2] != lun || rsp[3] != tag || rsp[8] || length > 480)
++		return 0;
++	if (length) {
++		unsigned sense = (unsigned)rsp[32] << 8 | rsp[33];
++		if (length < 2 || sense > length - 2) return 0;
++	}
++	/* A successful short/overrun read must never expose stale bounce bytes. */
++	if (!rsp[6] && !rsp[7] && ((rsp[1] & 0x60) || rsp[12] || rsp[13] || rsp[14] || rsp[15]))
++		return 0;
++	return 1;
++}
++#endif
+--- /dev/null
++++ b/bsd/dev/LICENSE.NativeUfs
+@@ -0,0 +1,25 @@
++BSD 2-Clause License
++
++Copyright (c) 2026, blu-sharky
++All rights reserved.
++
++Redistribution and use in source and binary forms, with or without
++modification, are permitted provided that the following conditions are met:
++
++1. Redistributions of source code must retain the above copyright notice, this
++   list of conditions and the following disclaimer.
++
++2. Redistributions in binary form must reproduce the above copyright notice,
++   this list of conditions and the following disclaimer in the documentation
++   and/or other materials provided with the distribution.
++
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
++DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
++FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
++SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
++CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+--- /dev/null
++++ b/bsd/dev/LICENSE.UniXNU
+@@ -0,0 +1,51 @@
++Copyright (c) 2026, UniXNU contributors. All rights reserved.
++
++SPDX-License-Identifier: BSD-2-Clause-Patent
++
++Redistribution and use in source and binary forms, with or without
++modification, are permitted provided that the following conditions are met:
++
++1. Redistributions of source code must retain the above copyright notice,
++   this list of conditions and the following disclaimer.
++
++2. Redistributions in binary form must reproduce the above copyright notice,
++   this list of conditions and the following disclaimer in the documentation
++   and/or other materials provided with the distribution.
++
++Subject to the terms and conditions of this license, each copyright holder
++and contributor hereby grants to those receiving rights under this license
++a perpetual, worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++(except for failure to satisfy the conditions of this license) patent
++license to make, have made, use, offer to sell, sell, import, and otherwise
++transfer this software, where such license applies only to those patent
++claims, already acquired or hereafter acquired, licensable by such copyright
++holder or contributor that are necessarily infringed by:
++
++(a) their Contribution(s) (the licensed copyrights of copyright holders and
++    non-copyrightable additions of contributors, in source or binary form)
++    alone; or
++
++(b) combination of their Contribution(s) with the work of authorship to
++    which such Contribution(s) was added by such copyright holder or
++    contributor, if, at the time the Contribution is added, such addition
++    causes such combination to be necessarily infringed. The patent license
++    shall not apply to any other combinations which include the
++    Contribution.
++
++Except as expressly stated above, no rights or licenses from any copyright
++holder or contributor is granted under this license, whether expressly, by
++implication, estoppel or otherwise.
++
++DISCLAIMER
++
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS BE
++LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++POSSIBILITY OF SUCH DAMAGE.
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -42,7 +42,11 @@
+  * read-modify-write fade read it back uncached). sweet_fb_display_off tells
+  * the touch driver (bsd/dev/fuxi_touch.c) that the display is off.
+  */
++// Ported from UniXNU drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp (BSD-2-Clause-Patent)
++// Optional demand-driven timer policy; see LICENSE.NativeMobileDisplay.
+ #include "SweetSurface.h"
++#include "fuxi_unixnu_copy.h"
++#include "fuxi_unixnu_display.h"
+ #if defined(FUXI)
+ extern "C" {
+ #include "../../../bsd/dev/fuxi_adreno.h"
+@@ -138,12 +142,20 @@
+ 	uint32_t      fStatFrames, fStatSwaps, fStatDropped;
+ 	uint32_t      fGpuFrames, fCpuFrames;
+ 	uint64_t      fGpuTime, fCpuTime;
++	bool          fUnixnuDiff, fUnixnuIdle, fTickArmed;
++	bool          fShadowValid;
++	void         *fShadow;
++	uint64_t      fShadowBytes, fDiffStored, fDiffFull;
++	uint32_t      fDiffFrames, fIdleStops, fIdleWakes;
+ 	bool          fGpuPending;
+ 	uint32_t      fGpuBusyTicks, fGpuFailed;
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
++	void wakePresentLocked(void);
++	bool presentWantedLocked(void);
++	void free(void) APPLE_KEXT_OVERRIDE;
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
+ };
+@@ -214,6 +226,26 @@
+ 		OSSafeReleaseNULL(fWorkLoop);
+ 		return false;
+ 	}
++#if defined(FUXI)
++	uint32_t diff = 0, idle = 0;
++	PE_parse_boot_argn("fuxi_unixnu_diff", &diff, sizeof(diff));
++	PE_parse_boot_argn("fuxi_unixnu_idlefb", &idle, sizeof(idle));
++	fUnixnuDiff = diff == 1;
++	fUnixnuIdle = idle == 1;
++	if (fUnixnuDiff) {
++		fShadowBytes = (uint64_t)fWidth * fHeight * 4;
++		if (fWidth > 16384 || fHeight > 16384 || !fShadowBytes || fShadowBytes > (64ULL << 20) ||
++		    (fWidth & 1) || (fPixels & 7) || (fRowBytes & 7)) {
++			fUnixnuDiff = false;
++		} else {
++			fShadow = IOMallocAligned((vm_size_t)fShadowBytes, 64);
++			if (!fShadow) fUnixnuDiff = false;
++		}
++		IOLog("FUXI UNIXNU FB: differential copy %s (CPU full-panel BGRA only)\n",
++		    fUnixnuDiff ? "enabled" : "unavailable");
++	}
++	if (fUnixnuIdle) IOLog("FUXI UNIXNU FB: demand timer enabled, software 60 Hz, panel power inherited\n");
++#endif
+ 	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
+ 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+ 		IOLog("SWEET FB: no vsync timer\n");
+@@ -229,6 +261,7 @@
+ #if defined(FUXI)
+ 	nanoseconds_to_absolutetime(SWEET_FB_VSYNC_US * 1000ULL, &fTickAbs);
+ 	fNextTick = mach_absolute_time() + fTickAbs;
++	fTickArmed = true;
+ 	fStatStart = mach_absolute_time();
+ 	fVsync->wakeAtTime(kIOTimeOptionsWithLeeway, fNextTick, 0);
+ 	IOLog("SWEET FB: present up to %u Hz (every %u ticks)\n", 60 / fFlushTicks, fFlushTicks);
+@@ -250,17 +283,60 @@
+ 	return true;
+ }
+ 
++void
++AppleCLCD::free(void)
++{
++	if (fShadow) IOFreeAligned(fShadow, (vm_size_t)fShadowBytes);
++	IOMobileFramebuffer::free();
++}
++
++/* fLock serializes sleep/wake decisions with swaps, notifications and power requests. */
++bool
++AppleCLCD::presentWantedLocked(void)
++{
++	bool notify = false;
++	for (unsigned int i = 0; i < fClients->getCount(); i++) {
++		IOMobileFramebufferUserClient *client =
++		    (IOMobileFramebufferUserClient *)fClients->getObject(i);
++		if (client->fFunc[SWEET_FB_NOTIFY_VSYNC] && client->fPort != MACH_PORT_NULL) notify = true;
++	}
++	return fuxi_unixnu_tick_wanted(fPowerOff, fFadeStep == 0, fDirty, fGpuPending, notify);
++}
++
++void
++AppleCLCD::wakePresentLocked(void)
++{
++#if defined(FUXI)
++	if (!fUnixnuIdle || fTickArmed || !presentWantedLocked()) return;
++	fTickArmed = true;
++	fNextTick = mach_absolute_time() + fTickAbs;
++	fVsync->wakeAtTime(kIOTimeOptionsWithLeeway, fNextTick, 0);
++	if (++fIdleWakes == 1) IOLog("FUXI UNIXNU FB: timer wake\n");
++#endif
++}
++
+ static void
+ sweet_fb_rearm(AppleCLCD *fb, IOTimerEventSource *sender)
+ {
+ #if defined(FUXI)
+-	/* Absolute deadlines: the period does not grow by the copy time. */
++	if (!fb->fUnixnuIdle) {
++		/* Preserve the existing continuous-tick path when the option is absent. */
++		fb->fNextTick = fuxi_unixnu_next_tick(fb->fNextTick, fb->fTickAbs, mach_absolute_time());
++		sender->wakeAtTime(kIOTimeOptionsWithLeeway, fb->fNextTick, 0);
++		return;
++	}
++	/* Keep scheduling and wakeups under the same lock: no lost idle->swap wake. */
++	IOLockLock(fb->fLock);
++	if (!fb->presentWantedLocked()) {
++		fb->fTickArmed = false;
++		if (++fb->fIdleStops == 1) IOLog("FUXI UNIXNU FB: timer idle\n");
++		IOLockUnlock(fb->fLock);
++		return;
++	}
+ 	uint64_t now = mach_absolute_time();
+-	fb->fNextTick += fb->fTickAbs;
+-	if (fb->fNextTick <= now) {
+-		fb->fNextTick = now + fb->fTickAbs;
+-	}
++	fb->fNextTick = fuxi_unixnu_next_tick(fb->fNextTick, fb->fTickAbs, now);
+ 	sender->wakeAtTime(kIOTimeOptionsWithLeeway, fb->fNextTick, 0);
++	IOLockUnlock(fb->fLock);
+ #else
+ 	(void)fb;
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+@@ -319,11 +395,18 @@
+ 		IOLockUnlock(fb->fLock);
+ #if defined(FUXI)
+ 		if (step == 0) {
+-			/* Plain stores, no DC ZVA (bzero) on the write-combined mapping. */
+-			for (uint32_t y = 0; y < fb->fHeight; y++) {
+-				volatile uint64_t *row = (volatile uint64_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+-				for (uint32_t x = 0; x < fb->fWidth / 2; x++) {
+-					row[x] = 0;
++			fb->fShadowValid = false;
++			if (fb->fUnixnuDiff) {
++				fuxi_unixnu_fill_pixels((volatile void *)fb->fPixels,
++				    (uint64_t)fb->fRowBytes * fb->fHeight, fb->fRowBytes,
++				    fb->fWidth, fb->fHeight, 0);
++			} else {
++				/* Plain stores, no DC ZVA (bzero) on the write-combined mapping. */
++				for (uint32_t y = 0; y < fb->fHeight; y++) {
++					volatile uint64_t *row = (volatile uint64_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
++					for (uint32_t x = 0; x < fb->fWidth / 2; x++) {
++						row[x] = 0;
++					}
+ 				}
+ 			}
+ 			__asm__ volatile ("dsb sy" ::: "memory");
+@@ -408,6 +491,7 @@
+ 		fStatDropped++;         /* the previous frame was never shown */
+ 	}
+ 	fDirty = true;
++	wakePresentLocked();
+ 	IOLockUnlock(fLock);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+@@ -451,6 +535,7 @@
+ 			    get32(a, 12), dx, dy, w, h);
+ 		}
+ 		if (s == NULL || s == fSurface) {
++			fShadowValid = false;
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
+@@ -506,15 +591,48 @@
+ 			if ((mask & (mask-1)) == 0)
+ 				copied = sweet_surface_gpu_copy(s, src, sx, sy, dx, dy, w, h);
+ 			if (copied == 2) {
++				fShadowValid = false;
+ 				gpuFrame = true;
+ 				fGpuPending = true;
+ 			}
+ 			copyStart = mach_absolute_time();
+ #endif
+-			if (copied != 2) for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+-				    (size_t)w * 4);
++			bool diffCopied = false;
++#if defined(FUXI)
++			if (copied != 2 && fUnixnuDiff && sweet_console_muted &&
++			    s->pixelFormat == SWEET_FB_FORMAT_BGRA && (mask & (mask - 1)) == 0 &&
++			    dx == 0 && dy == 0 && w == (int32_t)fWidth && h == (int32_t)fHeight) {
++				uint64_t offset = (uint64_t)s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4;
++				uint64_t stored = fuxi_unixnu_copy_diff((volatile void *)fPixels,
++				    (uint64_t)fRowBytes * fHeight, fRowBytes, (const void *)(src + offset),
++				    s->memory->getLength() - offset, s->bytesPerRow, fWidth, fHeight,
++				    fShadow, fShadowBytes, fShadowValid);
++				if (stored != UINT64_MAX) {
++					diffCopied = fShadowValid = true;
++					fDiffStored += stored;
++					fDiffFull += (uint64_t)fWidth * fHeight * 4;
++					if (++fDiffFrames == 1 || fDiffFrames % 600 == 0)
++						IOLog("FUXI UNIXNU FB: diff %u frames stored %llu of %llu bytes\n",
++						    fDiffFrames, fDiffStored, fDiffFull);
++				}
++			}
++#endif
++			if (copied != 2 && !diffCopied) {
++				fShadowValid = false;
++#if defined(FUXI)
++				if (fUnixnuDiff) {
++					uint64_t offset = (uint64_t)s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4;
++					uint64_t dest = (uint64_t)dy * fRowBytes + (uint64_t)dx * 4;
++					fuxi_unixnu_copy_pixels((volatile void *)(fPixels + dest),
++					    (uint64_t)fRowBytes * fHeight - dest, fRowBytes, (const void *)(src + offset),
++					    s->memory->getLength() - offset, s->bytesPerRow, w, h);
++				} else
++#endif
++				for (int32_t y = 0; y < h; y++) {
++					memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
++					    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
++					    (size_t)w * 4);
++				}
+ 			}
+ #if defined(FUXI)
+ 			if (copied != 2) {
+@@ -620,6 +738,7 @@
+ 	IOLockLock(fFB->fLock);
+ 	old = fPort;
+ 	fPort = port;
++	fFB->wakePresentLocked();
+ 	IOLockUnlock(fFB->fLock);
+ 	if (old != MACH_PORT_NULL) {
+ 		releaseNotificationPort(old);
+@@ -698,6 +817,7 @@
+ 			IOLockLock(fFB->fLock);
+ 			fFunc[type] = args->scalarInput[0];
+ 			fRefcon[type] = args->scalarInput[1];
++			fFB->wakePresentLocked();
+ 			IOLockUnlock(fFB->fLock);
+ 			char name[32];
+ 			proc_selfname(name, sizeof(name));
+@@ -715,6 +835,7 @@
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
+ 			}
+ 			sweet_fb_display_off = off ? 1 : 0;
++			fFB->wakePresentLocked();
+ 			IOLockUnlock(fFB->fLock);
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+ 		}
+--- /dev/null
++++ b/iokit/Kernel/arm/fuxi_unixnu_copy.h
+@@ -0,0 +1,112 @@
++// SPDX-License-Identifier: BSD-2-Clause-Patent
++// Ported from UniXNU drivers/NativeMobileDisplay/NativeLegacyRequest.h (BSD-2-Clause-Patent)
++// See LICENSE.NativeMobileDisplay. Adapted to Fuxi's cropped iOS 16.7 surfaces.
++#ifndef FUXI_UNIXNU_COPY_H
++#define FUXI_UNIXNU_COPY_H
++#include <stdint.h>
++// IOSurface rows and allocation have independent alignment. Copy visible
++// pixels only, after bounding every row in the real memory descriptor.
++static inline int fuxi_unixnu_surface_bounds(uint32_t width,uint32_t height,
++    uint64_t stride,uint64_t allocation,uint64_t descriptorBytes) {
++    if (!width || !height || width>16384 || height>16384 ||
++        stride<(uint64_t)width*4 || stride>UINT64_MAX/height) return 0;
++    return allocation>=(uint64_t)(height-1)*stride+(uint64_t)width*4 && descriptorBytes>=allocation;
++}
++
++// The GOP destination is device memory: use aligned scalar pixel stores,
++// never a general memcpy that may issue unaligned or wider device accesses.
++// The source is normal mapped IOSurface memory and may have padded rows.
++static inline int fuxi_unixnu_copy_layout(volatile void *destination,
++    uint64_t destinationBytes, uint64_t destinationStride, const void *source,
++    uint64_t sourceBytes, uint64_t sourceStride, uint32_t width, uint32_t height) {
++    uintptr_t dst=(uintptr_t)destination, src=(uintptr_t)source;
++    if (!dst || !src || (dst&3) || (destinationStride&3) ||
++        !fuxi_unixnu_surface_bounds(width,height,destinationStride,destinationBytes,destinationBytes) ||
++        !fuxi_unixnu_surface_bounds(width,height,sourceStride,sourceBytes,sourceBytes) ||
++        destinationBytes>UINTPTR_MAX || sourceBytes>UINTPTR_MAX ||
++        dst>UINTPTR_MAX-destinationBytes || src>UINTPTR_MAX-sourceBytes) return 0;
++    return 1;
++}
++static inline int fuxi_unixnu_fill_pixels(volatile void *destination,
++    uint64_t destinationBytes, uint64_t destinationStride,
++    uint32_t width, uint32_t height, uint32_t value) {
++    uintptr_t dst=(uintptr_t)destination;
++    if (!dst || (dst&3) || (destinationStride&3) ||
++        !fuxi_unixnu_surface_bounds(width,height,destinationStride,destinationBytes,destinationBytes) ||
++        destinationBytes>UINTPTR_MAX || dst>UINTPTR_MAX-destinationBytes) return 0;
++    for (uint32_t row=0;row<height;++row) {
++        volatile uint32_t *out=(volatile uint32_t *)(dst+row*destinationStride);
++        for (uint32_t column=0;column<width;++column)out[column]=value;
++    }
++    return 1;
++}
++static inline int fuxi_unixnu_copy_pixels(volatile void *destination,
++    uint64_t destinationBytes, uint64_t destinationStride, const void *source,
++    uint64_t sourceBytes, uint64_t sourceStride, uint32_t width, uint32_t height) {
++    if (!fuxi_unixnu_copy_layout(destination,destinationBytes,destinationStride,
++        source,sourceBytes,sourceStride,width,height)) return 0;
++    uintptr_t dst=(uintptr_t)destination, src=(uintptr_t)source;
++    // Source and destination are both BGRA8888 little-endian words, so the pixels move unchanged. Use aligned 64-bit
++    // device stores (four per iteration) instead of byte-wise pixel assembly: the stores into device memory dominate.
++    // The destination base and stride are 8-byte aligned in practice (checked here); otherwise 32-bit stores remain.
++    int wide=!(dst&7) && !(destinationStride&7);
++    for (uint32_t row=0;row<height;++row) {
++        volatile uint32_t *out=(volatile uint32_t *)(dst+row*destinationStride);
++        const unsigned char *in=(const unsigned char *)(src+row*sourceStride);
++        uint32_t column=0;
++        if (wide) {
++            volatile uint64_t *out64=(volatile uint64_t *)out;
++            for (;column+8<=width;column+=8) {
++                uint64_t a,b,c,d;
++                __builtin_memcpy(&a,in+(uint64_t)column*4,8);__builtin_memcpy(&b,in+(uint64_t)column*4+8,8);
++                __builtin_memcpy(&c,in+(uint64_t)column*4+16,8);__builtin_memcpy(&d,in+(uint64_t)column*4+24,8);
++                out64[column/2]=a;out64[column/2+1]=b;out64[column/2+2]=c;out64[column/2+3]=d;
++            }
++        }
++        for (;column<width;++column) {
++            uint32_t value;
++            __builtin_memcpy(&value,in+(uint64_t)column*4,4);
++            out[column]=value;
++        }
++    }
++    return 1;
++}
++
++// Differential copy for the slow scanout memory: only 64-byte blocks that differ from the previous frame (kept in an ordinary
++// cached shadow buffer, rows packed at width*4) are stored to the device mapping. The shadow must start from a full copy
++// (valid=0 copies everything). Returns the number of bytes stored, or UINT64_MAX when the geometry needs the plain copy.
++static inline uint64_t fuxi_unixnu_copy_diff(volatile void *destination,
++    uint64_t destinationBytes, uint64_t destinationStride, const void *source,
++    uint64_t sourceBytes, uint64_t sourceStride, uint32_t width, uint32_t height,
++    void *shadow, uint64_t shadowBytes, int valid) {
++    if (!fuxi_unixnu_copy_layout(destination,destinationBytes,destinationStride,
++        source,sourceBytes,sourceStride,width,height)) return UINT64_MAX;
++    uintptr_t dst=(uintptr_t)destination, src=(uintptr_t)source;
++    if (!shadow || shadowBytes<(uint64_t)width*height*4 ||
++        (uintptr_t)shadow>UINTPTR_MAX-shadowBytes || ((uintptr_t)shadow&7) || (dst&7) || (destinationStride&7) || (width&1)) return UINT64_MAX;
++    uint64_t stored=0;
++    const uint32_t words=width/2;
++    for (uint32_t row=0;row<height;++row) {
++        volatile uint64_t *out=(volatile uint64_t *)(dst+row*destinationStride);
++        const unsigned char *in=(const unsigned char *)(src+row*sourceStride);
++        uint64_t *old=(uint64_t *)((unsigned char *)shadow+(uint64_t)row*width*4);
++        uint32_t w=0;
++        for (;w+8<=words;w+=8) {
++            uint64_t v[8];
++            __builtin_memcpy(v,in+(uint64_t)w*8,64);
++            if (valid && !((v[0]^old[w])|(v[1]^old[w+1])|(v[2]^old[w+2])|(v[3]^old[w+3])|
++                           (v[4]^old[w+4])|(v[5]^old[w+5])|(v[6]^old[w+6])|(v[7]^old[w+7]))) continue;
++            for (unsigned i=0;i<8;++i){out[w+i]=v[i];old[w+i]=v[i];}
++            stored+=64;
++        }
++        for (;w<words;++w) {
++            uint64_t v;
++            __builtin_memcpy(&v,in+(uint64_t)w*8,8);
++            if (valid && v==old[w]) continue;
++            out[w]=v;old[w]=v;stored+=8;
++        }
++    }
++    return stored;
++}
++
++#endif
+--- /dev/null
++++ b/iokit/Kernel/arm/fuxi_unixnu_display.h
+@@ -0,0 +1,21 @@
++// SPDX-License-Identifier: BSD-2-Clause-Patent
++// Ported from UniXNU drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp (BSD-2-Clause-Patent)
++// See LICENSE.NativeMobileDisplay. Adapted demand-driven timer policy; no private ABI offsets.
++#ifndef FUXI_UNIXNU_DISPLAY_H
++#define FUXI_UNIXNU_DISPLAY_H
++#include <stdint.h>
++
++static inline int
++fuxi_unixnu_tick_wanted(int off, int needsBlack, int dirty, int gpu, int notify)
++{
++	return gpu || notify || (off ? needsBlack : dirty);
++}
++
++static inline uint64_t
++fuxi_unixnu_next_tick(uint64_t next, uint64_t period, uint64_t now)
++{
++	/* Skip missed periods; never queue a catch-up storm after a slow copy. */
++	next += period;
++	return next <= now ? now + period : next;
++}
++#endif
+--- /dev/null
++++ b/iokit/Kernel/arm/LICENSE.NativeMobileDisplay
+@@ -0,0 +1,51 @@
++Copyright (c) 2026, ArmVirtPlatform contributors. All rights reserved.
++
++SPDX-License-Identifier: BSD-2-Clause-Patent
++
++Redistribution and use in source and binary forms, with or without
++modification, are permitted provided that the following conditions are met:
++
++1. Redistributions of source code must retain the above copyright notice,
++   this list of conditions and the following disclaimer.
++
++2. Redistributions in binary form must reproduce the above copyright notice,
++   this list of conditions and the following disclaimer in the documentation
++   and/or other materials provided with the distribution.
++
++Subject to the terms and conditions of this license, each copyright holder
++and contributor hereby grants to those receiving rights under this license
++a perpetual, worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++(except for failure to satisfy the conditions of this license) patent
++license to make, have made, use, offer to sell, sell, import, and otherwise
++transfer this software, where such license applies only to those patent
++claims, already acquired or hereafter acquired, licensable by such copyright
++holder or contributor that are necessarily infringed by:
++
++(a) their Contribution(s) (the licensed copyrights of copyright holders and
++    non-copyrightable additions of contributors, in source or binary form)
++    alone; or
++
++(b) combination of their Contribution(s) with the work of authorship to
++    which such Contribution(s) was added by such copyright holder or
++    contributor, if, at the time the Contribution is added, such addition
++    causes such combination to be necessarily infringed. The patent license
++    shall not apply to any other combinations which include the
++    Contribution.
++
++Except as expressly stated above, no rights or licenses from any copyright
++holder or contributor is granted under this license, whether expressly, by
++implication, estoppel or otherwise.
++
++DISCLAIMER
++
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS BE
++LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++POSSIBILITY OF SUCH DAMAGE.
