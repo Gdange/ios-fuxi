@@ -561,3 +561,136 @@ temperature was about 4 C lower than in a run that left it on
 (**GUESS:** both panel and scanout power; back-to-back boots add residual
 heat). Mode 1 stays the recommended setting despite the slower first
 frame; re-lock after wake remains open.
+
+
+
+## Round 3: startup delay investigation (incomplete)
+
+**No startup performance fix or device acceptance is established.** The
+justified change in this round is additional opt-in measurement. Publishing
+invented capabilities, changing initial brightness, or deferring discovery
+would change the policy that currently permits boot auto-off without an
+identified timeout to repair.
+
+### OBSERVED: startup comparison
+
+The supplied `first-bl79` and `first-ctl85` traces have these ordered markers.
+Line numbers establish order, not elapsed time between untimestamped lines.
+
+| Marker | Mode 1 (`first-bl79`) | Service absent (`first-ctl85`) |
+| --- | --- | --- |
+| Initial interest / brightness read | 611–617: installs `IOGeneralInterest`, reads value 65536 | absent |
+| QuartzCore backlight-presence lookup | 1366: FuxiBacklight | 1310: none |
+| CoreBrightness backlight enumeration | 1958: one service | 1922: zero services |
+| Color initialization reads | 1971–1982: whitepoint, CCT range, pre-strobe; 2023–2026: PAB/AML | absent |
+| Night Shift initialization | 1984–1990: Night mode, CoreDuet, default status | absent |
+| First frame marker | 2225: 12831.294 ms, GPU 1.852 ms | 2054: 7593.691 ms, GPU 1.849 ms |
+
+The first-frame difference is **5237.603 ms**. Before that marker, both traces
+record 17 pipeline-cache misses; their logged durations total 676.752 versus
+448.762 ms. That 227.990 ms difference does not account for five seconds,
+although these totals are not a complete CPU/scheduling profile. The command
+lines also differ in scripted-key and scanout-check options; use matched
+arguments for the next experiment.
+
+Read 64 is reached before the first frame. Subsequent reads 65–255 are
+suppressed by the existing sampler. The early interest/brightness read has
+no caller identity; it must not be attributed to backboardd solely because
+that process has already launched. No backlight open, external selector or
+`setProperties` appears before the first frame. Installing an interest is
+not a delivered power message.
+
+### OBSERVED: offline code findings and exclusions
+
+The locally supplied shared cache was inspected with the existing disassembler
+and Ghidra headless decompiler. Extracted images and long analysis output
+remain outside the commit. Addresses below are specific to that cache.
+
+| Entry point | Finding |
+| --- | --- |
+| QuartzCore `___CADeviceHasBacklight_block_invoke`, `0x1884cb708` | Tests `backlight-control = true` once and caches whether a service exists. It does not read brightness or wait for a property. |
+| CoreBrightness `-[CBDisplayContaineriOS findBacklight]`, `0x1af0cb224` | Enumerates that predicate, retains a service and handles display arrival. The successful branch enables additional container/color setup. |
+| CoreBrightness `___54-[CBDisplayContaineriOS handleCBDisplayContainerStart]_block_invoke`, `0x1af0cd614` | The internal-display path finds the backlight before creating the color module; failed discovery skips that creation. |
+| CoreBrightness `-[CBColorModuleiOS initColorStruct]`, `0x1af07c598` | Searches the service/parents for whitepoint and CCT properties, matching the observed read sequence. |
+| CoreBrightness `___18-[BLControl start]_block_invoke`, `0x1af0a15a4`; `-[BLControl waitForALSArrival]`, `0x1af0a672c` | A device-type-gated HID ALS-arrival wait uses a 5,000,000,000 ns semaphore deadline. It runs before backlight enumeration, so finding that constant does not explain the service-dependent increment. |
+| CoreBrightness `___DisplayFadeUpdateFactorFade`, `0x1af001adc` | Its off-latch ramp delay has a one-second bound. Mode 1 advertises nonzero initial brightness and sends no OFF interest. This is not evidence for a five-second startup fade. |
+| CoreBrightness `-[NightModeControl initWithSupportObject:queue:callback:]`, `0x1af0428e8`; `saveStatusToPrefs:`, `0x1af04229c` | Default status creation reaches `NSUserDefaults synchronize`. The trace reaches this setup, but does not time the synchronize call. |
+| CoreBrightness `-[SunriseSunsetProvider copySunriseSunsetInfo:]`, `0x1af027df8` | Its semaphore deadline is supplied by the caller. NightModeControl initializes that timeout to **20 ms**, not five seconds. |
+
+No inspected path establishes a five-second `IOServiceWaitQuiet`, missing
+`IODisplayConnect`, property retry, or required AAB/ALS capability that can
+be safely repaired by adding a registry property. In particular, the
+`AppleARMBacklight` conformance checks are real, but changing conformance
+would enable an additional private driver path; it is not a demonstrated
+startup fix.
+
+### GUESS and the opt-in change
+
+**GUESS:** the extra time is in the additional container/color/Night Shift
+startup work or a synchronous dependency it invokes. Preference synchronization
+is one candidate; no particular call is yet the established cause. Both
+the property sampler's blind interval and the lack of caller/timing markers
+prevent the supplied console logs from locating the entire delay.
+
+Use **`fuxibacklight=1 fuxibacklighttrace=1`** for the next diagnostic boot.
+The second argument accepts exactly 1 and is effective only with mode 1.
+It logs the first **512** read/snapshot events, then every 256th event, and
+adds caller process, monotonic `uptime_us` and `io_us` for sampled reads,
+individual sets and whole-table serialization. Each stamp shares its event
+number with the existing property/value lines. `io_us` times the underlying
+registry operation, excluding the diagnostic dictionary printing; timestamps
+between events also include logging, scheduling and userland work.
+
+Look for:
+
+```text
+FUXI BACKLIGHT: startup trace enabled mode=1 read_limit=512 interests=none
+FUXI BACKLIGHT: trace set #2 uptime_us=... io_us=... process=...
+FUXI BACKLIGHT: set #2 key=IOGeneralInterest ...
+FUXI BACKLIGHT: trace read #... uptime_us=... io_us=... process=backboardd
+FUXI BACKLIGHT: read #... key=... ...
+FUXI MTL: backboardd first_frame_ms=... gpu_ms=...
+SWEET FB: display off
+```
+
+Pair stamps by event number, not adjacency when CPUs interleave output.
+Metal's first-frame duration is relative to its own initialization marker;
+it is **not absolute uptime**. Compare the startup clock markers before
+subtracting timestamps. A multi-second `io_us` implicates a registry operation;
+a gap between quick reads implicates intervening work. If the gap remains
+inside opaque userland initialization, a temporary userland entry/exit probe
+is still needed to identify that call.
+
+Defaults, existing mode gates, brightness values, publication ordering and
+framebuffer power paths are unchanged. The diagnostic adds no interest
+fanout, deferred publication, policy timer, or hardware writes. Modes 2/3
+ignore the new argument. It therefore preserves mode 1's existing auto-off
+protocol, but host testing cannot prove the extra logging has no timing effect.
+
+### Acceptance experiment and validation
+
+Compare repeated boots with service absent, mode 1, and mode 1 plus tracing,
+using the same kernel/root, GPU/cache state, cooling, all other arguments
+and no input before spontaneous off. Retain the initial display-on and at
+least 120 seconds of idle observation. Do not send interest messages.
+The trace boot is for localization; console overhead may perturb its timing.
+
+A subsequent performance fix is accepted only if matched repeated boots give
+**`first_frame_ms <= 8500` and spontaneous auto-off approximately 30 seconds
+after SpringBoard display-on** (the observed mode 1 range is 20–40 seconds).
+A faster first frame with missing auto-off fails. Record scripted Power
+direction separately; the existing post-wake re-lock failure remains open.
+This diagnostic is not claimed to meet the first-frame target.
+
+Host validation executes the production registry overrides and stamp formatter
+with controlled monotonic time. It checks exact opt-in gates, original read
+sampling without tracing, extended sampling with tracing, unchanged returned
+values/failures, snapshot release, absence of fanout, and existing parser/power
+regressions under ASan/UBSan. Patch 0109 remains generated from canonical sources.
+
+Round 3 checks passed: backlight ASan/UBSan, framebuffer/UFS, HID/key, idle
+and governor host tests; all eleven patch sync checks; full ARM64 syntax
+against saved XNU headers for backlight/framebuffer/UFS and framebuffer
+without FUXI; both kernel-profile CI dry runs; shell syntax and diff whitespace.
+No kernel link or device boot was performed. The precise stall and a
+performance change remain unfinished.

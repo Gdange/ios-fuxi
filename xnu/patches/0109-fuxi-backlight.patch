@@ -10,7 +10,7 @@
  iokit/Kernel/arm/FuxiNetworkStack.cpp                            optional iokitcpp
 --- /dev/null
 +++ b/iokit/Kernel/arm/FuxiBacklight.cpp
-@@ -0,0 +1,322 @@
+@@ -0,0 +1,356 @@
 +/*
 + * FUXI backlight-control observer and opt-in logical power notifications.
 + * Published by AppleCLCD before its first registerService(), only on opt-in.
@@ -33,14 +33,29 @@
 +#include <libkern/c++/OSString.h>
 +#include <pexpert/pexpert.h>
 +#include <sys/proc.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
 +#include "fuxi_backlight_logic.h"
 +
 +enum { BL_READ, BL_SET, BL_PROPERTIES, BL_OPEN, BL_METHOD, BL_BRIGHTNESS, BL_POWER, BL_COUNT };
 +static volatile SInt32 bl_events[BL_COUNT];
-+static bool bl_log(unsigned kind, uint32_t *event)
++static bool bl_log(unsigned kind, uint32_t *event, bool trace = false)
 +{
 +	*event = (uint32_t)OSIncrementAtomic(&bl_events[kind]);
++	if (kind == BL_READ) return fbl_read_log_this(*event, trace);
 +	return fbl_log_this(*event);
++}
++
++/* Monotonic boot-time stamps; Metal's first-frame duration is relative. */
++static void bl_stamp(const char *op, uint32_t event, uint64_t started)
++{
++	uint64_t now = mach_absolute_time(), ns = 0, elapsed = 0;
++	absolutetime_to_nanoseconds(now, &ns);
++	absolutetime_to_nanoseconds(now - started, &elapsed);
++	char name[33] = {};
++	proc_selfname(name, sizeof(name));
++	IOLog("FUXI BACKLIGHT: trace %s #%u uptime_us=%llu io_us=%llu process=%.32s\n",
++	    op, event, ns / 1000, elapsed / 1000, name);
 +}
 +
 +/* Log values without serializing arbitrary user data or leaking addresses.
@@ -85,6 +100,7 @@
 +	OSDeclareDefaultStructors(FuxiBacklight);
 +	IOLock *fLock;
 +	uint32_t fRequested;
++	bool fStartupTrace;
 +	bool publishBrightness(uint32_t value);
 +public:
 +	using IOService::getProperty;
@@ -135,7 +151,12 @@
 +	int enable = 0;
 +	bool present = PE_parse_boot_argn("fuxibacklight", &enable, sizeof(enable));
 +	if (!fbl_enabled(present, enable)) return false;
++	int trace = 0;
++	bool tracePresent = PE_parse_boot_argn("fuxibacklighttrace", &trace, sizeof(trace));
++	fStartupTrace = fbl_startup_trace(present, enable, tracePresent, trace);
 +	if (!IOService::start(provider)) return false;
++	if (fStartupTrace)
++		IOLog("FUXI BACKLIGHT: startup trace enabled mode=1 read_limit=512 interests=none\n");
 +	fLock = IOLockAlloc();
 +	fRequested = FUXI_BACKLIGHT_MAX;
 +	if (!fLock || !setProperty("backlight-control", kOSBooleanTrue) ||
@@ -159,29 +180,42 @@
 +
 +OSObject *FuxiBacklight::getProperty(const OSSymbol *key) const
 +{
++	uint64_t started = fStartupTrace ? mach_absolute_time() : 0;
 +	OSObject *value = IOService::getProperty(key);
 +	uint32_t event;
-+	if (bl_log(BL_READ, &event)) bl_value("read", event, key->getCStringNoCopy(), value);
++	if (bl_log(BL_READ, &event, fStartupTrace)) {
++		if (fStartupTrace) bl_stamp("read", event, started);
++		bl_value("read", event, key->getCStringNoCopy(), value);
++	}
 +	return value;
 +}
 +
 +bool FuxiBacklight::setProperty(const OSSymbol *key, OSObject *value)
 +{
 +	uint32_t event;
-+	if (bl_log(BL_SET, &event)) bl_value("set", event, key->getCStringNoCopy(), value);
-+	return IOService::setProperty(key, value);
++	bool sampled = bl_log(BL_SET, &event);
++	if (sampled) bl_value("set", event, key->getCStringNoCopy(), value);
++	/* Exclude console printing from the underlying registry operation's time. */
++	uint64_t started = fStartupTrace ? mach_absolute_time() : 0;
++	bool result = IOService::setProperty(key, value);
++	if (fStartupTrace && sampled) bl_stamp("set", event, started);
++	return result;
 +}
 +
 +bool FuxiBacklight::serializeProperties(OSSerialize *s) const
 +{
 +	/* CreateCFProperties bypasses getProperty: log its entire snapshot too. */
 +	uint32_t event;
-+	if (bl_log(BL_READ, &event)) {
++	bool sampled = bl_log(BL_READ, &event, fStartupTrace);
++	if (sampled) {
 +		OSDictionary *snapshot = dictionaryWithProperties();
 +		bl_value("read-all", event, "*", snapshot);
 +		OSSafeReleaseNULL(snapshot);
 +	}
-+	return IOService::serializeProperties(s);
++	uint64_t started = fStartupTrace ? mach_absolute_time() : 0;
++	bool result = IOService::serializeProperties(s);
++	if (fStartupTrace && sampled) bl_stamp("read-all", event, started);
++	return result;
 +}
 +
 +IOReturn FuxiBacklight::setProperties(OSObject *properties)
@@ -335,7 +369,7 @@
 +#endif /* FUXI */
 --- /dev/null
 +++ b/iokit/Kernel/arm/fuxi_backlight_logic.h
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,36 @@
 +/* Observation-only backlight policy; no panel units or hardware access. */
 +#ifndef FUXI_BACKLIGHT_LOGIC_H
 +#define FUXI_BACKLIGHT_LOGIC_H
@@ -353,6 +387,15 @@
 +{
 +	/* Mode 3 isolates ON delivery; OFF and framebuffer ordering match mode 2. */
 +	return present && value == 3 && on;
++}
++static inline int fbl_startup_trace(int present, int value, int trace_present, int trace)
++{
++	/* Only the notification-free mode 1 is eligible for this experiment. */
++	return present && value == 1 && trace_present && trace == 1;
++}
++static inline int fbl_read_log_this(uint32_t event, int trace)
++{
++	return event && (event <= (trace ? 512u : 64u) || (event & 255u) == 0);
 +}
 +static inline int fbl_log_this(uint32_t event)
 +{

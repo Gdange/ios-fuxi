@@ -53,6 +53,8 @@ for signature in ('getProperty(const OSSymbol *key) const',
                   'externalMethod(uint32_t selector'):
     assert signature in source, signature
 assert 'dictionaryWithProperties()' in function('FuxiBacklight::serializeProperties')
+assert 'fbl_startup_trace(present, enable, tracePresent, trace)' in start
+assert 'startup trace enabled mode=1 read_limit=512 interests=none' in start
 assert 'args->scalarInput[i]' in function('FuxiBacklightUserClient::externalMethod')
 assert 'return kIOReturnUnsupported;' in function('FuxiBacklightUserClient::externalMethod')
 assert 'fRequested = (uint32_t)requested;' in source
@@ -88,18 +90,28 @@ struct OSNumber : OSObject {
 };
 struct OSDictionary : OSObject {
     std::map<std::string, OSObject *> values;
+    unsigned releases = 0;
+    void release() { ++releases; }
     OSObject *getObject(const char *key) {
         auto p = values.find(key); return p == values.end() ? nullptr : p->second;
     }
 };
+struct OSSymbol {
+    std::string value;
+    explicit OSSymbol(const char *v) : value(v) {}
+    const char *getCStringNoCopy() const { return value.c_str(); }
+};
+struct OSSerialize {};
+#define OSSafeReleaseNULL(p) do { if (p) (p)->release(); (p) = nullptr; } while (0)
 #define OSDynamicCast(t, p) dynamic_cast<t *>(p)
 enum { kIOReturnSuccess, kIOReturnBadArgument, kIOReturnUnsupported, kIOReturnNoMemory };
-enum { BL_PROPERTIES, BL_BRIGHTNESS, BL_POWER };
+enum { BL_READ, BL_SET, BL_PROPERTIES, BL_OPEN, BL_METHOD, BL_BRIGHTNESS, BL_POWER, BL_COUNT };
 using IOReturn = int;
 using UInt32 = uint32_t;
 constexpr UInt32 kIOMessageDeviceHasPoweredOn = 0xe0000230;
 constexpr UInt32 kIOMessageDeviceWillPowerOff = 0xe0000210;
-static bool bl_log(unsigned, uint32_t *event) { *event = 1; return true; }
+using SInt32 = int32_t;
+static SInt32 OSIncrementAtomic(volatile SInt32 *n) { return ++*n; }
 static void bl_value(const char *, uint32_t, const char *, OSObject *) {}
 static std::vector<std::string> logs;
 static void IOLog(const char *format, ...) {
@@ -109,6 +121,12 @@ static void IOLog(const char *format, ...) {
     vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
     logs.emplace_back(buffer);
+}
+static uint64_t trace_clock;
+static uint64_t mach_absolute_time() { return trace_clock += 3000; }
+static void absolutetime_to_nanoseconds(uint64_t time, uint64_t *ns) { *ns = time; }
+static void proc_selfname(char *name, unsigned size) {
+    assert(size == 33); snprintf(name, size, "backboardd");
 }
 static unsigned locked;
 static void IOLockLock(void *) { assert(!locked); ++locked; }
@@ -127,6 +145,23 @@ struct OSIterator {
     void release() { ++releases; }
 };
 struct IOService : OSObject {
+    mutable unsigned registryReads = 0, serializations = 0;
+    unsigned registryWrites = 0;
+    bool failRegistry = false;
+    std::map<std::string, OSObject *> registry;
+    mutable OSDictionary snapshot;
+    OSObject *getProperty(const OSSymbol *key) const {
+        ++registryReads;
+        auto p = registry.find(key->value);
+        return p == registry.end() ? nullptr : p->second;
+    }
+    bool setProperty(const OSSymbol *key, OSObject *value) {
+        ++registryWrites;
+        if (failRegistry) return false;
+        registry[key->value] = value; return true;
+    }
+    OSDictionary *dictionaryWithProperties() const { return &snapshot; }
+    bool serializeProperties(OSSerialize *) const { ++serializations; return !failRegistry; }
     OSIterator iterator;
     unsigned traversals = 0;
     bool failIterator = false;
@@ -147,6 +182,10 @@ struct FuxiBacklight : IOService {
     void *fLock = nullptr;
     uint32_t fRequested = FUXI_BACKLIGHT_MAX, published = FUXI_BACKLIGHT_MAX;
     bool fail = false;
+    bool fStartupTrace = false;
+    OSObject *getProperty(const OSSymbol *) const;
+    bool setProperty(const OSSymbol *, OSObject *);
+    bool serializeProperties(OSSerialize *) const;
     bool publishBrightness(uint32_t value) {
         assert(locked == 1);
         if (fail) return false;
@@ -176,6 +215,12 @@ struct AppleCLCD : IOService {
     static IOReturn powerChangeAction(OSObject *, void *, void *, void *, void *);
 };
 '''
+MODEL += '\nstatic volatile SInt32 bl_events[BL_COUNT];\n'
+MODEL += '\nstatic bool bl_log(unsigned kind, uint32_t *event, bool trace = false)\n' + function('bl_log')
+MODEL += '\nstatic void bl_stamp(const char *op, uint32_t event, uint64_t started)\n' + function('bl_stamp')
+MODEL += '\nOSObject *FuxiBacklight::getProperty(const OSSymbol *key) const\n' + function('FuxiBacklight::getProperty')
+MODEL += '\nbool FuxiBacklight::setProperty(const OSSymbol *key, OSObject *value)\n' + function('FuxiBacklight::setProperty')
+MODEL += '\nbool FuxiBacklight::serializeProperties(OSSerialize *s) const\n' + function('FuxiBacklight::serializeProperties')
 MODEL += '\nIOReturn FuxiBacklight::setProperties(OSObject *properties)\n' + function('FuxiBacklight::setProperties')
 MODEL += '\nvoid fuxi_backlight_display_state(IOService *provider, bool on)\n' + notify
 MODEL += '\nIOReturn AppleCLCD::powerChangeAction(OSObject *owner, void *state, void *, void *, void *)\n' + power
@@ -195,6 +240,59 @@ int main() {
     for (uint32_t n = 0; n <= 4096; ++n)
         assert(bool(fbl_log_this(n)) == (n && (n <= 64 || n % 256 == 0)));
     assert(!fbl_log_this(UINT32_MAX));
+    for (int mode : {-1, 0, 1, 2, 3, 4})
+        for (bool present : {false, true})
+            for (bool tracePresent : {false, true})
+                for (int trace : {-1, 0, 1, 2})
+                    assert(bool(fbl_startup_trace(present, mode, tracePresent, trace)) ==
+                           (present && mode == 1 && tracePresent && trace == 1));
+    for (uint32_t n = 0; n <= 4096; ++n) {
+        assert(fbl_read_log_this(n, false) == fbl_log_this(n));
+        assert(bool(fbl_read_log_this(n, true)) == (n && (n <= 512 || n % 256 == 0)));
+    }
+    assert(!fbl_read_log_this(UINT32_MAX, true));
+
+    // Run the production registry overrides and trace clock/formatting. Trace
+    // sampling must never alter the value, error, snapshot lifetime or fanout.
+    FuxiBacklight probe;
+    OSSymbol key("IODisplayParameters"), interest("IOGeneralInterest");
+    OSObject property;
+    OSSerialize serializer;
+    for (bool trace : {false, true}) {
+        probe.fStartupTrace = trace;
+        logs.clear(); trace_clock = 0;
+        bl_events[BL_READ] = bl_events[BL_SET] = 0;
+        assert(probe.setProperty(&key, &property));
+        assert(probe.setProperty(&interest, &property));
+        unsigned reads = probe.registryReads, snapshots = probe.snapshot.releases;
+        for (unsigned i = 0; i < 769; ++i)
+            assert(probe.getProperty(&key) == &property);
+        // #770 is suppressed in either mode, but still serializes normally.
+        assert(probe.serializeProperties(&serializer));
+        assert(probe.registryReads == reads + 769);
+        assert(probe.snapshot.releases == snapshots);
+        bl_events[BL_READ] = 0;
+        assert(probe.serializeProperties(&serializer));
+        assert(probe.snapshot.releases == snapshots + 1);
+        probe.failRegistry = true;
+        assert(!probe.setProperty(&key, nullptr));
+        assert(probe.getProperty(&key) == &property);
+        assert(!probe.serializeProperties(&serializer));
+        probe.failRegistry = false;
+        assert(probe.messages.empty() && !locked);
+        if (trace) {
+            // 512 initial reads + #768; three sets, three other sampled reads.
+            assert(logs.size() == 519);
+            for (const auto &log : logs) {
+                assert(log.find("FUXI BACKLIGHT: trace ") == 0);
+                assert(log.find("uptime_us=") != std::string::npos);
+                assert(log.find("io_us=3 process=backboardd") != std::string::npos);
+            }
+            assert(logs[1].find("trace set #2 ") != std::string::npos);
+        } else {
+            assert(logs.empty() && trace_clock == 0);
+        }
+    }
     FuxiBacklight service;
     OSNumber zero(0), half(32768), maximum(65536), high(65537), negative(UINT64_MAX);
     OSObject wrong;
@@ -325,4 +423,4 @@ with tempfile.TemporaryDirectory(prefix='fuxi-backlight-test-') as tmp:
     subprocess.run(['clang++', '-std=c++17', '-Wall', '-Wextra', '-Werror',
                     '-fsanitize=address,undefined', '-I', str(SRC), str(path), '-o', str(exe)], check=True)
     subprocess.run([str(exe)], check=True)
-print('PASS: fuxi backlight (sync, opt-in, registry shape, parser, logical power interests, rate limits)')
+print('PASS: fuxi backlight (sync, opt-in, registry shape, parser, logical power interests, startup trace, rate limits)')
