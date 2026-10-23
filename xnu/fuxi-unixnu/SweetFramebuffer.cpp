@@ -73,6 +73,7 @@ extern "C" { int sweet_fb_display_off; }        /* read by bsd/dev/fuxi_touch.c 
 
 #if defined(FUXI)
 extern void fuxi_backlight_publish(IOService *provider);
+extern void fuxi_backlight_display_state(IOService *provider, bool on);
 #endif
 
 enum {
@@ -139,6 +140,9 @@ public:
 	bool          fDirty;
 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
 	bool          fPowerOff;      /* RequestPowerChange(0) */
+#if defined(FUXI)
+	bool          fBacklightPowerNotifications;
+#endif
 	uint32_t      fFadeStep;      /* fade-out steps done while off */
 	uint64_t      fTickAbs;       /* vsync period, absolute time units */
 	uint64_t      fNextTick;      /* next vsync deadline */
@@ -159,6 +163,9 @@ public:
 	uint32_t      fGpuBusyTicks, fGpuFailed;
 
 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+	IOReturn requestPowerChange(uint64_t state);
+	static IOReturn powerChangeAction(OSObject *owner, void *state,
+	    void *, void *, void *);
 	void addClient(IOMobileFramebufferUserClient *client);
 	void removeClient(IOMobileFramebufferUserClient *client);
 	void wakePresentLocked(void);
@@ -281,6 +288,9 @@ AppleCLCD::start(IOService *provider)
 	setProperty("external", false);
 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
 #if defined(FUXI)
+	int backlight = 0;
+	PE_parse_boot_argn("fuxibacklight", &backlight, sizeof(backlight));
+	fBacklightPowerNotifications = backlight == 2;
 	fuxi_backlight_publish(this);
 #endif
 	registerService();
@@ -867,6 +877,40 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
 static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
 
 IOReturn
+AppleCLCD::requestPowerChange(uint64_t state)
+{
+	void *argument = (void *)(uintptr_t)state;
+#if defined(FUXI)
+	/* Serialize mode 2 requests and interest delivery with each other.
+	 * Never call arbitrary interest clients holding fLock. */
+	if (fBacklightPowerNotifications)
+		return fWorkLoop->runAction(&AppleCLCD::powerChangeAction, this, argument);
+#endif
+	return powerChangeAction(this, argument, NULL, NULL, NULL);
+}
+
+IOReturn
+AppleCLCD::powerChangeAction(OSObject *owner, void *state, void *, void *, void *)
+{
+	AppleCLCD *fb = (AppleCLCD *)owner;
+	bool off = state == NULL;
+	IOLockLock(fb->fLock);
+	if (off != fb->fPowerOff) {
+		fb->fPowerOff = off;
+		fb->fFadeStep = 0;
+		fb->fDirty = true;     /* on: redraw the latest frame */
+	}
+	sweet_fb_display_off = off ? 1 : 0;
+	fb->wakePresentLocked();
+	IOLockUnlock(fb->fLock);
+	IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+#if defined(FUXI)
+	if (fb->fBacklightPowerNotifications) fuxi_backlight_display_state(fb, !off);
+#endif
+	return kIOReturnSuccess;
+}
+
+IOReturn
 IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
     __unused void *reference)
@@ -930,17 +974,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		break;
 	case kSweetFBRequestPowerChange:
 		if (args->scalarInputCount >= 1) {
-			bool off = args->scalarInput[0] == 0;
-			IOLockLock(fFB->fLock);
-			if (off != fFB->fPowerOff) {
-				fFB->fPowerOff = off;
-				fFB->fFadeStep = 0;
-				fFB->fDirty = true;     /* on: redraw the latest frame */
-			}
-			sweet_fb_display_off = off ? 1 : 0;
-			fFB->wakePresentLocked();
-			IOLockUnlock(fFB->fLock);
-			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+			ret = fFB->requestPowerChange(args->scalarInput[0]);
 		}
 		break;
 	case kSweetFBSwapWait:

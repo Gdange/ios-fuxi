@@ -64,7 +64,8 @@ direct `IODisplay` conformance handles the public helper's discovery rule.
 
 ## Published contract
 
-Only **`fuxibacklight=1`** enables publication. Absent, zero, and other values
+Phase 1 uses **`fuxibacklight=1`**. Mode 2, described below, also publishes the
+service. Absent, zero, and values other than 1 or 2
 return before allocation, attachment, property publication, or probe logging.
 Both publication and start verify the argument; all code and the AppleCLCD
 call are FUXI-only. The built-in source is in `iokit/conf/files.arm64`.
@@ -118,8 +119,9 @@ data by length, and keys are limited to 96 characters. Suppressed log events
 still execute and store valid requests. Ordinary reads may come from kernel
 matching as well as user space; they do not identify a particular consumer.
 
-No MMIO, panel/DSI/PMIC writes, framebuffer pixel writes, power callbacks, or
-DCS commands occur in this service. Even brightness zero only changes stored
+No MMIO, panel/DSI/PMIC writes, framebuffer pixel writes, or
+DCS commands occur in this service. Mode 1 sends no power notifications.
+Even brightness zero only changes stored
 state. Existing `SWEET FB: display off/on` remains the independent power path.
 Phase 1 may change userland policy by satisfying discovery; it does not promise
 to restore auto-lock or reduce power. A later phase can map validated requests
@@ -156,3 +158,142 @@ The broad host sweep had 43 passing scripts; 22 need explicit external build
 inputs and two need absent generated build artifacts. The staging test's
 artifact-independent `--policy-storage-only` mode also passed. No kernel link,
 boot, or device acceptance test was performed.
+
+## Power wake investigation and mode 2 interest experiment
+
+**Root cause status:** the missing logical backlight power notifications are
+an established interface gap. Their responsibility for the missing post-wake
+auto-lock is **GUESS**, not a demonstrated root cause. Mode 2 repairs that
+specific gap as an opt-in experiment; no device result is claimed.
+
+### OBSERVED: two boot traces
+
+The supplied `research/it/bl79.log` and `research/it/wake80.log` both use
+`fuxibacklight=1`. The service is discovered, brightness is read, and
+`IOGeneralInterest` is installed. No backlight `setProperties` call appears.
+The first 64 property writes would be logged, so the missing first call is
+not explained by rate limiting.
+
+In `wake80`, the initial on/off requests are at lines 2487/3462. The supplied
+timing observation puts that off about 40 seconds after on. The scripted
+Power down at line 3541 produces another on at 3546; Power up is at 3557.
+There is no subsequent framebuffer off during the reported 420 seconds
+without input. This establishes failure to request auto-off, not the internal
+state of a SpringBoard timer. The comparative boot observation is that
+publishing the service permits initial auto-lock; it does not suffice after wake.
+
+`TouchDetectionMode=0x101` appears at 3554. AKS selectors 17/26/8 also occur,
+with selector 8 returning `0xe00002c7` both before and after wake. That error
+does not distinguish the successful initial idle cycle from the failed wake
+cycle. Ordinary SpringBoard/BLS/CoreBrightness stderr and OS logging are not
+available on this kernel console; missing userland messages prove nothing.
+
+### OBSERVED: local iOS code and XNU contract
+
+The supplied ARM64 shared cache was inspected offline with the already
+installed `ipsw` disassembler. A small read-only HFS catalog reader also
+extracted backboardd from the existing local root image. Extracted bytes,
+symbol tables, and disassembly remain only in ignored `research/idle/`.
+The following addresses are unslid entry points in those supplied images,
+not runtime addresses or a portable ABI across iOS versions.
+
+| Image / entry point | Static finding |
+| --- | --- |
+| CoreBrightness `_DisplayCreateWithID`, `0x1af0d8510` | Reads `IODisplayParameters` / `brightness` / `value`; initializes the cached backlight-on word at context offset `0x68` from whether value is nonzero. The synthetic initial 65536 therefore describes an on backlight. |
+| CoreBrightness `_BacklightGeneralInterestNotificationCallback`, `0x1af0e29e4` | Recognizes **`0xe0000230` = ON** and **`0xe0000210` = OFF**, setting that same word to 1 or 0. The inspected callback ignores the payload and does not reread brightness or dispatch a BLS completion. |
+| CoreBrightness `___DisplayFadeUpdateFactorFade`, `0x1af001adc` | Checks the cached on word during a positive-factor fade and has a bounded wait/retry path when the backlight is still considered off. This proves the word affects fade handling; it does not prove an idle-timer dependency. |
+| IOMobileFramebuffer `_kern_GetBlock`, `0x1af224cac` | Selector **79 (`0x4f`)** reads a generic block, with an identifier and byte offset in scalar inputs. It copies data in chunks up to 4096 bytes. A 40-byte zero reply is not a power-completion acknowledgement. The trace does not identify the requested block. |
+| IOMobileFramebuffer `_kern_RequestPowerChange`, `0x1af2284f0` | Uses selector 12. Power callbacks use the separate notification registration path. Neither boot trace contains selector 72 registration or a `notifications type` line, so there is no observed power-callback subscriber to notify. |
+| SpringBoard `-[SBBacklightIdleTimer reset]`, `0x1c5b3447c` | Enables its attention timer if disabled, resets its expectation, and reconfigures attention timeouts with reset requested. A Power event reaching HID is not proof this method ran. |
+| SpringBoard `-[SBBacklightController backlight:didCompleteUpdateToState:forEvent:]`, `0x1c5e2f218` | Invokes a pending change completion. The request completion block subsequently notifies backlight observers. This is a BLS completion path, distinct from the CoreBrightness interest callback. |
+| BacklightServicesHost `-[BLSHBacklightOSInterfaceProvider transitionToDisplayMode:withDuration:]`, `0x1ef791c48` | Has a CBDisplayStateClient path and a legacy path using `BKSHIDServicesSetBacklightFactorWithFadeDurationAsync` plus its own completion timer when that client is unsupported. The runtime branch has not been measured here. A mandatory kernel display-on-complete handshake cannot be inferred from the method name. |
+| backboardd `-[BKHIDUITouchDetectionModeDigitizerServiceWrapper applyUIMode:]`, `0x100080da8` | ORs **`0x100`** into the digitizer mode for hardware-button change sources; its log formatter calls this `fromHardwareButton`. Thus 0x101 carries source metadata, not an additional touch contact or a completion acknowledgement. |
+| backboardd `-[BKUserEventTimer systemShellDidFinishLaunching:]`, `0x100031bf0` | Queues the block at `0x1000324c4` that sets `_safeToResetIdleTimer` and posts the safe-to-set notification. This inspected gate is a shell-startup event, not a per-wake backlight acknowledgement. |
+| AttentionAwareness `AttentionServiceEventFilter::filter`, `0x1ab135e68` | Maps eligible HID events, including keyboard events, to attention masks and passes their timestamp to `processHIDEvent:mask:timestamp:`. This path does not itself wait for a backlight-service message. Delivery to a particular timer still depends on its client configuration. |
+
+XNU `IOMessage.h` names the two recognized constants
+`kIOMessageDeviceHasPoweredOn` and `kIOMessageDeviceWillPowerOff`.
+`IOService::messageClients` fans out through `gIOGeneralInterest`, including
+interest notifiers. Simply changing a registry property does not execute
+this callback. The inspected CoreBrightness `DisplayOn` dictionary update is
+an internal state/event path; it does not establish a required property named
+`DisplayOn` or `backlight-state` on FuxiBacklight. No such property is invented.
+
+### Change and limits
+
+**`fuxibacklight=2`** publishes the same observation service as mode 1 and
+sends the two recognized, payload-free messages from that child after each
+accepted SweetFramebuffer selector-12 request: zero means OFF, nonzero means
+ON. Repeated requests also report the current logical state. No message is
+sent at publication, before userland has registered its interest.
+
+Only mode 2 runs power requests through AppleCLCD's workloop gate, keeping
+concurrent power requests and their notifications ordered. The framebuffer
+lock is released before invoking interest clients, allowing callback re-entry.
+The child is found under the requesting framebuffer rather than through a
+global service pointer. Both the framebuffer integration and the notification
+function check the opt-in. Absent/0/unknown values remain disabled; mode 1
+retains its previous direct request path and sends no new messages.
+
+This reports **logical power accepted by the existing framebuffer path**.
+It is not a panel-ready signal: black clearing/redraw and GPU retirement may
+finish later. Brightness remains the separately stored request; no synthetic
+zero-brightness write, HID user-activity event, periodic auto-off timer,
+selector-79 data, or IOMFB power callback is added. These choices keep the
+experiment limited to the observed interest protocol.
+
+**GUESS:** failing to keep CoreBrightness's backlight-on latch consistent
+with framebuffer power might interfere with its fade/transition handling and
+subsequent idle policy. The callback only changes that latch; the investigation
+has not shown it re-arms SpringBoard's timer. Assertions, attention-client
+configuration, or a BLS/scene completion that never arrives remain alternatives.
+
+### Exact acceptance experiment
+
+Run matched boots with modes 1 and 2, retaining the existing boot configuration
+and using `fuxikeyscript=150 fuxikeyscriptn=1`. Do not add touches or other
+keys. Record at least 420 seconds after the scripted Power release. Check:
+
+1. Initial auto-off still occurs. Mode 2 prints
+   `FUXI BACKLIGHT: logical power interest notifications enabled` once.
+2. Each `SWEET FB: display off` is followed by
+   `FUXI BACKLIGHT: power #... off message=0xe0000210 result=0x0 logical-only`;
+   each on by the corresponding `on message=0xe0000230` line. The message
+   result is fanout status, not proof userland received or processed it.
+3. After the single scripted Power wake/release, look for another
+   `SWEET FB: display off` without input. Compare its interval to the initial
+   idle cycle; allow 120 seconds before declaring a prompt re-arm failure,
+   then retain the full 420-second observation for comparison with `wake80`.
+4. Repeat the matched pair before attributing a restored auto-lock to the
+   change. `0x101` may remain: its hardware-button bit is expected metadata.
+
+If mode 2 posts both messages successfully but auto-off still fails, the
+notification experiment has not repaired idle re-arm. The next discriminating
+experiment is a temporary userland observer, writing explicit markers through
+a verified kernel-console sink (not ordinary stderr): capture the wake-time
+BLS state/transition completion, `SBBacklightIdleTimer` reset/descriptor
+timeouts, and attention-client enabled state before wake, after Power release,
+and at +60/+120 seconds. Use the entry points above to select hooks; do not
+guess a new registry property or treat selector 79 as an acknowledgement.
+That distinguishes a missing completion from an idle assertion or attention
+timer that remains disabled despite completion.
+
+### Host validation
+
+`tools/test-fuxi-backlight.py` now executes the production notification fanout
+and framebuffer power-request bodies under ASan/UBSan in addition to the
+existing parser tests. It covers all argument gates, both message directions,
+repeated/nonzero requests, provider isolation, missing children, iterator
+allocation failure, state-before-notification ordering, callback property
+re-entry without the framebuffer lock, and the unchanged mode-1 direct path.
+The framebuffer host adapter also recognizes the IOReturn declaration.
+Host tests cannot establish auto-lock restoration on iOS.
+
+Validation for mode 2: 45 complete host scripts passed, including the backlight,
+framebuffer, HID/key, idle and governor tests; all eleven sync checks passed.
+Twenty-two other scripts require external build inputs. Two full artifact
+checks lack generated Metal/WLAN outputs; the Metal staging policy-only check
+and M9i compile-only check passed separately. ARM64 syntax checks passed for
+both changed translation units against saved XNU 8796 headers, and for the
+framebuffer without FUXI. Both kernel-profile CI dry runs and shell syntax
+checks passed. No kernel link or device boot was performed.

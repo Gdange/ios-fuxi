@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Backlight probe: patch sync, gates, API shape and production parser logic."""
+"""Backlight probe: patch sync, gates, parser and logical power interests."""
 from pathlib import Path
 import re
 import subprocess
@@ -11,15 +11,15 @@ source = (SRC / 'FuxiBacklight.cpp').read_text()
 fb = (ROOT / 'xnu/fuxi-unixnu/SweetFramebuffer.cpp').read_text()
 
 
-def function(name):
-    start = source.index(name + '(')
+def function(name, code=source):
+    start = code.index(name + '(')
     # Use the definition, not a class declaration.
-    start = source.index('{', start)
+    start = code.index('{', start)
     depth, end = 1, start + 1
     while depth:
-        depth += (source[end] == '{') - (source[end] == '}')
+        depth += (code[end] == '{') - (code[end] == '}')
         end += 1
-    return source[start:end]
+    return code[start:end]
 
 
 subprocess.run(['python3', str(ROOT / 'tools/sync-fuxi-backlight.py'), '--check'], check=True)
@@ -32,7 +32,15 @@ start = function('FuxiBacklight::start')
 assert start.index('if (!fbl_enabled(present, enable)) return false;') < start.index('IOService::start(provider)')
 assert start.index('setProperty("backlight-control", kOSBooleanTrue)') < start.index('registerService();')
 assert start.index('publishBrightness(fRequested)') < start.index('registerService();')
-assert '#if defined(FUXI)\n\tfuxi_backlight_publish(this);\n#endif\n\tregisterService();' in fb
+assert fb.index('fuxi_backlight_publish(this);') < fb.index('\n\tregisterService();')
+assert 'fBacklightPowerNotifications = backlight == 2;' in fb
+assert 'runAction(&AppleCLCD::powerChangeAction, this, argument)' in fb
+power = function('AppleCLCD::powerChangeAction', fb)
+assert power.index('IOLockUnlock(fb->fLock);') < power.index('fuxi_backlight_display_state(fb, !off)')
+notify = function('fuxi_backlight_display_state')
+assert notify.index('if (!fbl_power_notifications(present, enable)) return;') < notify.index('getClientIterator()')
+assert 'on ? kIOMessageDeviceHasPoweredOn : kIOMessageDeviceWillPowerOff' in notify
+assert 'service->messageClients(message)' in notify
 assert 'class FuxiBacklight : public IODisplay' in source
 for key in ('min', 'max', 'value'):
     assert f'brightness->setObject("{key}"' in source
@@ -47,7 +55,7 @@ assert 'args->scalarInput[i]' in function('FuxiBacklightUserClient::externalMeth
 assert 'return kIOReturnUnsupported;' in function('FuxiBacklightUserClient::externalMethod')
 assert 'fRequested = (uint32_t)requested;' in source
 assert 'IOLockLock(fLock);' in source and 'IOLockUnlock(fLock);' in source
-# Hardware-free translation unit, including no framebuffer power callback.
+# Hardware-free translation unit; logical notifications never drive scanout.
 code = re.sub(r'/\*.*?\*/|//[^\n]*', '', source, flags=re.S)
 for forbidden in ('ml_io_map', 'IOMemoryDescriptor', 'IOMemoryMap', 'writeRegister',
                   'fuxi_display_kick', 'sweet_fb_display_off', 'setPowerState',
@@ -64,6 +72,9 @@ MODEL = r'''
 #include <cstdint>
 #include <map>
 #include <string>
+#include <vector>
+#include <functional>
+#define FUXI 1
 #include "fuxi_backlight_logic.h"
 struct OSObject { virtual ~OSObject() = default; };
 struct OSNumber : OSObject {
@@ -79,15 +90,48 @@ struct OSDictionary : OSObject {
 };
 #define OSDynamicCast(t, p) dynamic_cast<t *>(p)
 enum { kIOReturnSuccess, kIOReturnBadArgument, kIOReturnUnsupported, kIOReturnNoMemory };
-enum { BL_PROPERTIES, BL_BRIGHTNESS };
+enum { BL_PROPERTIES, BL_BRIGHTNESS, BL_POWER };
 using IOReturn = int;
+using UInt32 = uint32_t;
+constexpr UInt32 kIOMessageDeviceHasPoweredOn = 0xe0000230;
+constexpr UInt32 kIOMessageDeviceWillPowerOff = 0xe0000210;
 static bool bl_log(unsigned, uint32_t *) { return false; }
 static void bl_value(const char *, uint32_t, const char *, OSObject *) {}
 static void IOLog(const char *, ...) {}
 static unsigned locked;
 static void IOLockLock(void *) { assert(!locked); ++locked; }
 static void IOLockUnlock(void *) { assert(locked == 1); --locked; }
-struct FuxiBacklight {
+static bool boot_present;
+static int boot_value;
+static bool PE_parse_boot_argn(const char *name, void *value, unsigned size) {
+    assert(std::string(name) == "fuxibacklight" && size == sizeof(int));
+    if (boot_present) *static_cast<int *>(value) = boot_value;
+    return boot_present;
+}
+struct OSIterator {
+    std::vector<OSObject *> children;
+    unsigned next = 0, releases = 0;
+    OSObject *getNextObject() { return next < children.size() ? children[next++] : nullptr; }
+    void release() { ++releases; }
+};
+struct IOService : OSObject {
+    OSIterator iterator;
+    unsigned traversals = 0;
+    bool failIterator = false;
+    std::vector<UInt32> messages;
+    std::function<void(UInt32)> observer;
+    OSIterator *getClientIterator() {
+        ++traversals; iterator.next = 0;
+        return failIterator ? nullptr : &iterator;
+    }
+    IOReturn messageClients(UInt32 message) {
+        assert(!locked);
+        messages.push_back(message);
+        if (observer) observer(message);
+        return kIOReturnSuccess;
+    }
+};
+struct FuxiBacklight : IOService {
     void *fLock = nullptr;
     uint32_t fRequested = FUXI_BACKLIGHT_MAX, published = FUXI_BACKLIGHT_MAX;
     bool fail = false;
@@ -98,13 +142,39 @@ struct FuxiBacklight {
     }
     IOReturn setProperties(OSObject *properties);
 };
+static int sweet_fb_display_off;
+struct IOWorkLoop {
+    unsigned calls = 0, depth = 0;
+    using Action = IOReturn (*)(OSObject *, void *, void *, void *, void *);
+    IOReturn runAction(Action action, OSObject *owner, void *state) {
+        ++calls; ++depth;
+        IOReturn result = action(owner, state, nullptr, nullptr, nullptr);
+        --depth;
+        return result;
+    }
+};
+struct AppleCLCD : IOService {
+    void *fLock = nullptr;
+    IOWorkLoop workloop;
+    IOWorkLoop *fWorkLoop = &workloop;
+    bool fPowerOff = false, fDirty = false, fBacklightPowerNotifications = false;
+    unsigned fFadeStep = 7, wakes = 0;
+    void wakePresentLocked() { assert(locked == 1); ++wakes; }
+    IOReturn requestPowerChange(uint64_t);
+    static IOReturn powerChangeAction(OSObject *, void *, void *, void *, void *);
+};
 '''
 MODEL += '\nIOReturn FuxiBacklight::setProperties(OSObject *properties)\n' + function('FuxiBacklight::setProperties')
+MODEL += '\nvoid fuxi_backlight_display_state(IOService *provider, bool on)\n' + notify
+MODEL += '\nIOReturn AppleCLCD::powerChangeAction(OSObject *owner, void *state, void *, void *, void *)\n' + power
+MODEL += '\nIOReturn AppleCLCD::requestPowerChange(uint64_t state)\n' + function('AppleCLCD::requestPowerChange', fb)
 MODEL += r'''
 int main() {
-    for (int value : {-1, 0, 1, 2, 65536}) {
+    for (int value : {-1, 0, 1, 2, 3, 65536}) {
         assert(!fbl_enabled(0, value));
-        assert(fbl_enabled(1, value) == (value == 1));
+        assert(fbl_enabled(1, value) == (value == 1 || value == 2));
+        assert(!fbl_power_notifications(0, value));
+        assert(fbl_power_notifications(1, value) == (value == 2));
     }
     for (uint32_t n = 0; n <= 4096; ++n)
         assert(bool(fbl_log_this(n)) == (n && (n <= 64 || n % 256 == 0)));
@@ -136,6 +206,65 @@ int main() {
     service.fail = true;
     assert(service.setProperties(&flat) == kIOReturnNoMemory);
     assert(service.fRequested == 65536 && service.published == 65536 && !locked);
+
+    // Execute the production notification fanout and framebuffer power action.
+    AppleCLCD fb;
+    IOService unrelated, otherProvider;
+    FuxiBacklight backlight, untouched;
+    fb.iterator.children = {&unrelated, &backlight};
+    otherProvider.iterator.children = {&untouched};
+    for (int value : {-1, 0, 1, 2, 3}) {
+        for (bool present : {false, true}) {
+            boot_present = present; boot_value = value;
+            unsigned traversals = fb.traversals;
+            size_t count = backlight.messages.size();
+            fuxi_backlight_display_state(&fb, true);
+            bool enabled = present && value == 2;
+            assert(fb.traversals == traversals + enabled);
+            assert(backlight.messages.size() == count + enabled);
+        }
+    }
+    backlight.messages.clear();
+    boot_present = true; boot_value = 2;
+    fb.fBacklightPowerNotifications = true;
+    // Interest callbacks may reenter property handling: no framebuffer lock held.
+    backlight.observer = [&](UInt32 message) {
+        assert(fb.workloop.depth == 1);
+        assert(fb.fPowerOff == (message == kIOMessageDeviceWillPowerOff));
+        assert(sweet_fb_display_off == int(fb.fPowerOff));
+        assert(backlight.setProperties(&flat) == kIOReturnSuccess);
+    };
+    for (uintptr_t state : {0u, 1u, 1u, 0u, 4u}) {
+        fb.fDirty = false; fb.fFadeStep = 6;
+        bool changed = fb.fPowerOff != (state == 0);
+        assert(fb.requestPowerChange(state) == kIOReturnSuccess);
+        assert(fb.fPowerOff == (state == 0) && fb.fDirty == changed);
+        assert(fb.fFadeStep == (changed ? 0 : 6));
+    }
+    assert((backlight.messages == std::vector<UInt32>{0xe0000210, 0xe0000230,
+                                                   0xe0000230, 0xe0000210, 0xe0000230}));
+    assert(fb.wakes == 5 && !locked && untouched.messages.empty());
+    // Withholding the child, iterator allocation failure and mode 1 do not
+    // turn a logical power request into an error or change brightness.
+    backlight.observer = nullptr;
+    uint32_t requested = backlight.fRequested, published = backlight.published;
+    fb.failIterator = true;
+    size_t count = backlight.messages.size();
+    assert(fb.requestPowerChange(0) == kIOReturnSuccess);
+    assert(backlight.messages.size() == count);
+    fb.failIterator = false;
+    fb.iterator.children = {&unrelated};
+    fuxi_backlight_display_state(&fb, true);
+    assert(backlight.messages.size() == count);
+    fb.iterator.children = {&backlight};
+    boot_value = 1; fb.fBacklightPowerNotifications = false;
+    unsigned traversals = fb.traversals;
+    unsigned gated = fb.workloop.calls;
+    fb.requestPowerChange(1);
+    assert(fb.workloop.calls == gated);
+    assert(fb.traversals == traversals && backlight.messages.size() == count);
+    assert(fb.iterator.releases == fb.traversals - 1); // one failed iterator
+    assert(backlight.fRequested == requested && backlight.published == published);
 }
 '''
 with tempfile.TemporaryDirectory(prefix='fuxi-backlight-test-') as tmp:
@@ -144,4 +273,4 @@ with tempfile.TemporaryDirectory(prefix='fuxi-backlight-test-') as tmp:
     subprocess.run(['clang++', '-std=c++17', '-Wall', '-Wextra', '-Werror',
                     '-fsanitize=address,undefined', '-I', str(SRC), str(path), '-o', str(exe)], check=True)
     subprocess.run([str(exe)], check=True)
-print('PASS: fuxi backlight (sync, opt-in, registry shape, observation hooks, parser, rate limits)')
+print('PASS: fuxi backlight (sync, opt-in, registry shape, parser, logical power interests, rate limits)')

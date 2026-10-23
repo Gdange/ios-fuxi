@@ -243,6 +243,7 @@ DISPLAY_PREFIX = r'''
 #define kIOTimeOptionsWithLeeway 1
 #define OSSafeReleaseNULL(p) do {if(p){p->release();p=nullptr;}}while(0)
 typedef void OSObject;
+typedef int IOReturn;
 struct IOService {};
 struct IOMemoryMap {};
 struct IOWorkLoop {};

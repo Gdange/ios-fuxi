@@ -1,5 +1,5 @@
 /*
- * FUXI phase 1: observe the backlight-control consumer, never touch hardware.
+ * FUXI backlight-control observer and opt-in logical power notifications.
  * Published by AppleCLCD before its first registerService(), only on opt-in.
  * The small IODisplay metaclass lets the public IODisplayLib parameter helpers
  * resolve this service directly or by walking AppleCLCD's children. It does
@@ -10,6 +10,7 @@
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
+#include <IOKit/IOMessage.h>
 #include <libkern/OSAtomic.h>
 #include <libkern/c++/OSBoolean.h>
 #include <libkern/c++/OSCollectionIterator.h>
@@ -21,7 +22,7 @@
 #include <sys/proc.h>
 #include "fuxi_backlight_logic.h"
 
-enum { BL_READ, BL_SET, BL_PROPERTIES, BL_OPEN, BL_METHOD, BL_BRIGHTNESS, BL_COUNT };
+enum { BL_READ, BL_SET, BL_PROPERTIES, BL_OPEN, BL_METHOD, BL_BRIGHTNESS, BL_POWER, BL_COUNT };
 static volatile SInt32 bl_events[BL_COUNT];
 static bool bl_log(unsigned kind, uint32_t *event)
 {
@@ -130,6 +131,8 @@ bool FuxiBacklight::start(IOService *provider)
 	IOLog("FUXI BACKLIGHT: published observation-only brightness min=0 max=%u value=%u\n",
 	    FUXI_BACKLIGHT_MAX, fRequested);
 	registerService();
+	if (fbl_power_notifications(present, enable))
+		IOLog("FUXI BACKLIGHT: logical power interest notifications enabled\n");
 	return true;
 }
 
@@ -275,5 +278,35 @@ void fuxi_backlight_publish(IOService *provider)
 		service->detach(provider);
 	}
 	service->release(); /* registry attachment owns the successful service */
+}
+
+/* Called on AppleCLCD's workloop gate, after releasing its framebuffer lock.
+ * CoreBrightness's BacklightGeneralInterestNotificationCallback consumes these
+ * exact messages without a payload. This reports accepted logical power, not
+ * panel readiness, brightness, or completion of a BLS transition.
+ */
+void fuxi_backlight_display_state(IOService *provider, bool on)
+{
+	int enable = 0;
+	bool present = PE_parse_boot_argn("fuxibacklight", &enable, sizeof(enable));
+	if (!fbl_power_notifications(present, enable)) return;
+	OSIterator *it = provider->getClientIterator();
+	if (!it) {
+		IOLog("FUXI BACKLIGHT: power notification iterator unavailable\n");
+		return;
+	}
+	OSObject *child;
+	while ((child = it->getNextObject())) {
+		FuxiBacklight *service = OSDynamicCast(FuxiBacklight, child);
+		if (!service) continue;
+		UInt32 message = on ? kIOMessageDeviceHasPoweredOn : kIOMessageDeviceWillPowerOff;
+		IOReturn result = service->messageClients(message);
+		uint32_t event;
+		if (bl_log(BL_POWER, &event))
+			IOLog("FUXI BACKLIGHT: power #%u %s message=0x%x result=0x%x logical-only\n",
+			    event, on ? "on" : "off", message, result);
+		break;
+	}
+	it->release();
 }
 #endif /* FUXI */

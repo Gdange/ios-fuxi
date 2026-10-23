@@ -5,7 +5,11 @@
 #define FUXI_BACKLIGHT_MAX 65536u
 static inline int fbl_enabled(int present, int value)
 {
-	return present && value == 1;
+	return present && (value == 1 || value == 2);
+}
+static inline int fbl_power_notifications(int present, int value)
+{
+	return present && value == 2;
 }
 static inline int fbl_log_this(uint32_t event)
 {
