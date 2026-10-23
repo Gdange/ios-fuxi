@@ -28,7 +28,9 @@
 #ifndef G_RING_INDEX
 #define G_RING_INDEX(w) (w)
 #endif
-
+#include "gpu-clock.h"
+/* XNU sets this once before cold start. Loader probes retain zero. */
+static unsigned g_gpu_selected;
 /* ---- Fuxi-verified physical bases (research/device/probe-09/live.dtb) ---- */
 #define GPU_GCC_BASE      0x00100000ULL   /* gcc kalama-v2 @100000 (clock-controller) */
 #define GPU_GCC_GPU_PAGE  (GPU_GCC_BASE + 0x71000) /* gcc-kalama: gpu branch page */
@@ -529,6 +531,38 @@ static int g_arc_vote(const char *primary, const char *secondary, unsigned level
  *vote = (uint32_t)cdb16(p+pi*2)<<16 | si<<8 | pi;
  return 1;
 }
+/* Opt-in only: require unique, well-formed BCM records from the boot's own
+ * command DB. Reuse no rail aux interpretation or fixed resource addresses. */
+static int g_active_bw(uint32_t bw[160])
+{
+ static const char names[4][8] = {"SH0", "MC0", "ACV", "CN0"};
+ struct g_bcm bcm[3] = {{0}};
+ uint32_t address[4] = {0};
+ for (unsigned s = 0; s < 8; s++) {
+  const uint8_t *h = gpu_cmddb+8+s*16;
+  unsigned slave = cdb16(h), n = cdb16(h+6), at = 144+cdb16(h+2), data = 144+cdb16(h+4);
+  if (!slave) break;
+  if (at > GPU_CMDDB_BYTES || n > (GPU_CMDDB_BYTES-at)/24 || data > GPU_CMDDB_BYTES) return 0;
+  for (unsigned i = 0; i < n; i++) {
+   const uint8_t *p = gpu_cmddb+at+i*24;
+   for (unsigned j = 0; j < 4; j++) {
+    unsigned k; for (k = 0; k < 8; k++) if (p[k] != (uint8_t)names[j][k]) break;
+    if (k != 8) continue;
+    unsigned len = cdb16(p+20), off = data+cdb16(p+22);
+    uint32_t addr = cdb32(p+16);
+    if (address[j] || slave != 5 || !addr || (addr & 3) || ((addr>>16)&7) != slave ||
+        off > GPU_CMDDB_BYTES || len > GPU_CMDDB_BYTES-off || (j < 3 && len != 8)) return 0;
+    address[j] = addr;
+    if (j < 3) {
+     const uint8_t *aux = gpu_cmddb+off;
+     if (aux[7]) return 0;
+     bcm[j] = (struct g_bcm){addr,cdb32(aux),cdb16(aux+4),aux[6]};
+    }
+   }
+  }
+ }
+ return g_gpu_bw_packet(bcm, address[3], bw);
+}
 /* e[40..59]: five command/ACK records {sent, response, returned, error}.
  * Poll shared queue indices as well as interrupt status; reject malformed or
  * unsolicited packets within one bounded deadline (no unbounded drain loop). */
@@ -594,8 +628,6 @@ static int g_start(void)
  for (unsigned i = 0; i < 59; i++) ((volatile uint32_t *)perf)[i] = 0;
  for (unsigned i = 0; i < 160; i++) ((volatile uint32_t *)bw)[i] = 0;
  /* Ascending Linux frequency indices, including OFF at index 0. kHz. */
- static const uint32_t freq[10] = {0,220000,295000,348000,401000,475000,550000,615000,680000,719000};
- static const unsigned level[10] = {0,0x34,0x38,0x3c,0x40,0x50,0x80,0x90,0xc0,0xe0};
  static const uint32_t cfreq[3] = {0,200000,500000};
  static const unsigned clevel[3] = {0,0x40,0x80};
  static const char gfx[8] = "gfx.lvl", mx[8] = "mx.lvl", cx[8] = "cx.lvl", gmxc[8] = "gmxc.lvl";
@@ -603,8 +635,8 @@ static int g_start(void)
  const char *secondary = g_aux(gmxc, &unused) ? gmxc : mx;
  perf[1] = 10; perf[2] = 3;
  for (unsigned i = 0; i < 10; i++) {
-  if (!g_arc_vote(gfx, secondary, level[i], &perf[3+i*3])) { e[3] = 0x908; return 0; }
-  perf[4+i*3] = 0xffffffff; perf[5+i*3] = freq[i]; e[100+i] = perf[3+i*3];
+  if (!g_arc_vote(gfx, secondary, g_gpu_level[i], &perf[3+i*3])) { e[3] = 0x908; return 0; }
+  perf[4+i*3] = 0xffffffff; perf[5+i*3] = g_gpu_freq[i]; e[100+i] = perf[3+i*3];
  }
  for (unsigned i = 0; i < 3; i++) {
   if (!g_arc_vote(cx, mx, clevel[i], &perf[51+i*2])) { e[3] = 0x908; return 0; }
@@ -618,6 +650,8 @@ static int g_start(void)
   if (!bw[24+i]) { e[3] = 0x908; return 0; }
  }
  if (!bw[6]) { e[3] = 0x908; return 0; }
+ g_gpu_selected = g_gpu_select(g_gpu_selected);
+ if (g_gpu_selected && !g_active_bw(bw)) { e[3] = 0x90a; return 0; }
  if (gm_rd(0x5000) != 1 || g_rd(GPU_RSCC_BASE, 0x101*4) || (gm_rd(0x5180)&1)) { e[3] = 0x909; return 0; }
  g_hfi_init(); g_rpmh_init();
  gm_wr(0x9304, 0xffffffff); gm_wr(0x9306, 0xffffffff);
@@ -651,7 +685,7 @@ static void g_gx(void)
 {
  uint32_t *e = gpu_extra[0];
  if (g_rd(GPU_SMMU_BASE, g_cb(g_bank) + 0x58) & 0xc00001feu) { e[60] = 0xa04; return; }
- uint32_t vote[4] = {0,1,1,0}; /* blocking, index1=220MHz, BW0 (only entry) */
+ uint32_t vote[4] = {0,1,g_gpu_selected ? g_gpu_selected : 1,g_gpu_bw_index(g_gpu_selected)};
  int err = g_hfi_send(30, vote, 4, 4);
  if (err) { e[60] = err; return; }
  gm_wr(0x5191, 1u<<31); gm_wr(0x5194, 1u<<30);

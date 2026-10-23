@@ -57,6 +57,11 @@ typedef struct { void (*func)(void *,void *); } thread_call_data_t;
 typedef int DTEntry;
 static uint64_t fg_faults;
 static unsigned fg_state, fg_started, fg_limit, fg_force, fg_access_failed;
+static unsigned fg_clock_measure, g_gpu_selected, clock_logs;
+static const unsigned g_gpu_freq[7]={0,220000,295000,348000,401000,475000,550000};
+#define G_GPU_LEVEL_MAX 6u
+static unsigned g_gpu_select(uint64_t n) {return n<=6 ? n : 0;}
+static void fg_clock_log(void) {clock_logs++;}
 static int fuxi_gpu_ready(void) {return fg_state==1;}
 static unsigned g_bank, g3_bank, g3_asid, g3_next, gpu_stage;
 static uint32_t gpu_report[128], gpu_extra[16][128];
@@ -149,8 +154,12 @@ static void thread_call_setup_with_options(thread_call_data_t *c,void (*f)(void 
 static int thread_call_enter_delayed(thread_call_data_t *c,uint64_t d)
 { assert(c->func && d==123); enqueued++;return 0; }
 static unsigned enable_arg=1;
-static int PE_parse_boot_argn(const char *name,unsigned *p,size_t n)
-{ assert(n==4); if(!strcmp(name,"fuxigpu")) *p=enable_arg; return 0; }
+static uint64_t level_arg;
+static int PE_parse_boot_argn(const char *name,void *p,size_t n)
+{
+ if(!strcmp(name,"fuxigpulevel")) {assert(n==8);memcpy(p,&level_arg,n);return 1;}
+ assert(n==4); if(!strcmp(name,"fuxigpu")) memcpy(p,&enable_arg,n); return 0;
+}
 '''
 
 MODEL = r'''
@@ -164,6 +173,7 @@ static void reset(void)
  live=cursor=removed=0;
  fg_limit=17; enable_arg=1; gPhysSize=FG_RAM_SIZE;
  valid_handoff=abi_inits=abi_publishes=abi_fail=fg_abi_enabled=0;
+ level_arg=clock_logs=g_gpu_selected=fg_clock_measure=0;
 }
 int main(void)
 {
@@ -211,13 +221,18 @@ int main(void)
  reset(); fuxi_gpu_start(G4_FB_PA,1080,2400,4320);
  assert(enqueued==1 && !alloc_calls && !gpu_calls);
  fuxi_gpu_start(G4_FB_PA,1080,2400,4320); assert(enqueued==1);
+ const uint64_t levels[]={1,2,6,7,UINT64_MAX,0x100000001ULL};
+ for(unsigned i=0;i<sizeof(levels)/sizeof(levels[0]);i++) {
+  reset();level_arg=levels[i];fuxi_gpu_start(G4_FB_PA,1080,2400,4320);
+  assert(g_gpu_selected==(level_arg<=6?level_arg:0) && enqueued==1);
+ }
  reset(); fuxi_gpu_start(G4_FB_PA,1080,2400,1); assert(fg_state==2 && !enqueued);
  /* ABI MMIO/table setup must precede publishing ready to the display;
   * service publication must follow it. Failure only withholds the ABI. */
  for(unsigned fail=0;fail<2;fail++) {
   reset();valid_handoff=fg_abi_enabled=1;abi_fail=fail;
   fg_thread(NULL,NULL);
-  assert(fg_state==1 && abi_inits==1 && abi_publishes==!fail);
+  assert(fg_state==1 && abi_inits==1 && abi_publishes==!fail && clock_logs==1);
  }
 #undef printf
  printf("PASS: %zu windows, %llu mapped bytes, all %llu page-insertion failures + VA failures, partial unwind, CPU fallback, static delayed startup\n",

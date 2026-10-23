@@ -2199,6 +2199,10 @@ as Linux does. A740 BW table has one DDR off entry for SH0/MC0/ACV and two CN0
 entries off/on; stage10 requests **BW index0**, the only DDR entry, with GPU
 perf index1 (220 MHz). It never requests the high GPU frequencies.
 
+This remains the default. The later [GPU-CLOCK lane](gpu-clock.md) adds an
+XNU-only `fuxigpulevel=1..6` override with active DDR votes and startup clock
+diagnostics; the loader probe keeps this original policy.
+
 Stage9 cold RSC/PDC sequence uses the A740 sequence-memory offset0x154,
 hidden data0x80000021 and AOP-resident PDC (enable/start only). No warm-resume
 path. GMU chip ID config=0x07020100. It sets FAL veto/TCM retention, boot2,

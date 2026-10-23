@@ -339,6 +339,7 @@ int main(void)
 def main():
     subprocess.run(['python3', str(ROOT / 'tools/sync-fuxi-adreno-shared.py'), '--check'], check=True)
     subprocess.run(['python3', str(ROOT / 'tools/test-fuxi-adreno-mapping.py')], check=True)
+    subprocess.run(['python3', str(ROOT / 'tools/test-fuxi-gpu-clock.py')], check=True)
     subprocess.run(['python3', str(ROOT / 'tools/test-fuxi-scm.py')], check=True)
     subprocess.run(['python3', str(ROOT / 'tools/test-fuxi-adreno-cache.py')], check=True)
     probe = sync.added_file('gpu.c')

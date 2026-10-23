@@ -170,7 +170,89 @@ static void fg_guard_exit(struct fg_guard *g) { if (g->lock) IOLockUnlock(g->loc
 static void fg_scm_call(uint64_t ret[4], unsigned slot, unsigned step,
     uint32_t fn, uint32_t info, uint64_t a, uint64_t b, uint64_t c);
 #include "gpu.c"
-
+static unsigned fg_clock_measure;
+/* Startup diagnostics have their own fault result: an optional readback must
+ * not latch fg_access_failed and poison an otherwise working GPU. Only call
+ * while the proven cold-start power/clock sequence and GPU_SET are retained. */
+static int fg_clock_io(uint64_t pa, uint32_t *word, unsigned write)
+{
+ uintptr_t va = fuxi_gpu_nc_pointer(pa, 4);
+ uint64_t value = *word;
+ if (!va || fuxi_gpu_access(va, &value, write, 0)) return 0;
+ __asm__ volatile("dsb sy" ::: "memory");
+ if (!write) *word = (uint32_t)value;
+ return 1;
+}
+static int fg_clock_counter(uint64_t *value)
+{
+ /* A7xx RBBM counter3 at 0x322/323, high/low/high. Public freedreno
+  * a6xx.xml register documentation; ALWAYS_COUNT selector is zero. */
+ for (unsigned i = 0; i < 8; i++) {
+  uint32_t h = 0, l = 0, again = 0;
+  if (!fg_clock_io(GPU_REG_BASE+0x323*4, &h, 0) ||
+      !fg_clock_io(GPU_REG_BASE+0x322*4, &l, 0) ||
+      !fg_clock_io(GPU_REG_BASE+0x323*4, &again, 0)) return 0;
+  if (h == again) { *value = (uint64_t)h<<32 | l; return 1; }
+ }
+ return 0;
+}
+static void fg_clock_sample(void)
+{
+ uint32_t control = 0, selector = 0;
+ uint64_t first = 0, last = 0, start = 0, end = 0;
+ if (!fg_clock_io(GPU_REG_BASE+0x500*4, &control, 0) ||
+     !fg_clock_io(GPU_REG_BASE+0x50a*4, &selector, 0)) goto unavailable;
+ uint32_t enable = control | 1, always = 0;
+ int ok = fg_clock_io(GPU_REG_BASE+0x50a*4, &always, 1) &&
+     fg_clock_io(GPU_REG_BASE+0x500*4, &enable, 1) && fg_clock_counter(&first);
+ if (ok) {
+  start = rsr("cntpct_el0");
+  delay(1000); /* one startup sample only, before ABI/display publication */
+  ok = fg_clock_counter(&last);
+  end = rsr("cntpct_el0");
+ }
+ /* Counter selection/global enable belong to the pre-publication state.
+  * Restore both even after a failed access; never retry the sample. */
+ int restored = fg_clock_io(GPU_REG_BASE+0x50a*4, &selector, 1);
+ restored &= fg_clock_io(GPU_REG_BASE+0x500*4, &control, 1);
+ uint64_t timer = rsr("cntfrq_el0");
+ if (ok && restored && end > start && timer && last > first &&
+     last-first <= 2000000 && end-start <= timer/10) {
+  printf("FUXI GPU CLOCK: rbbm_count_khz=%llu sample_us=%llu (clock-gated sample)\n",
+      (last-first)*timer/(end-start)/1000, (end-start)*1000000/timer);
+  return;
+ }
+ unavailable:
+ printf("FUXI GPU CLOCK: rbbm_count_khz=unavailable\n");
+}
+static void fg_clock_log(void)
+{
+ unsigned index = g_gpu_selected ? g_gpu_selected : 1, bw = g_gpu_bw_index(g_gpu_selected);
+ printf("FUXI GPU CLOCK: level=%u gpu_index=%u requested_khz=%u gx_arc=%#x bw_index=%u ddr_kBps=%u hfi_ack=1\n",
+     g_gpu_selected,index,g_gpu_freq[index],gpu_extra[0][100+index],bw,g_gpu_ddr[bw]);
+ printf("FUXI GPU CLOCK: GMU table_khz=0/200000/500000 cx_arc=%#x/%#x/%#x (no host GMU perf-index vote)\n",
+     gpu_extra[0][110],gpu_extra[0][111],gpu_extra[0][112]);
+ static const uint32_t offsets[] = {CC_PLL0+PLL_MODE,CC_PLL0+PLL_L_VAL,CC_PLL0+0x14,
+     CC_PLL1+PLL_MODE,CC_PLL1+PLL_OPMODE,CC_PLL1+PLL_L_VAL,CC_PLL1+0x14,CC_GMU_RCGR+4};
+ uint32_t v[8] = {0};
+ for (unsigned i = 0; i < 8; i++)
+  if (!fg_clock_io(GPU_GPUCC_BASE+offsets[i], &v[i], 0)) {
+   printf("FUXI GPU CLOCK: gpucc_readback=unavailable core_measured_khz=unavailable\n"); return;
+  }
+ /* PLL1 main -> GMU source3, HID divider=(field+1)/2, 19.2 MHz XO.
+  * This is register-derived, not a measured frequency or a GPU core rate. */
+ uint64_t pll = ((uint64_t)(v[5]&0xffff)*65536+(v[6]&0xffff))*19200/65536;
+ unsigned gmu = (v[3]&PLL_OUTCTRL) && v[4] == PLL_RUN && ((v[7]>>8)&7) == 3 ?
+     (unsigned)(pll*2/((v[7]&31)+1)) : 0;
+ printf("FUXI GPU CLOCK: PLL0 mode=%#x l=%#x alpha=%#x PLL1 mode=%#x l=%#x alpha=%#x gmu_rcgr=%#x gmu_derived_khz=%u core_measured_khz=unavailable\n",
+     v[0],v[1],v[2],v[3],v[5],v[6],v[7],gmu);
+ if (fg_clock_measure) {
+  uint32_t cx = 0, gx = 0;
+  if (fg_clock_io(GPU_GPUCC_BASE+CC_CX_GDSCR, &cx, 0) && g_gdsc_on(cx) &&
+      fg_clock_io(GPU_GPUCC_BASE+CC_GX_GDSCR, &gx, 0) && g_gdsc_on(gx)) fg_clock_sample();
+  else printf("FUXI GPU CLOCK: rbbm_count_khz=unavailable\n");
+ }
+}
 /* Retain BOTH physical attempts, independently of the shared logical-call
  * report slot. Static storage only; no allocation or firmware in diagnostics. */
 static volatile struct {
@@ -422,6 +504,7 @@ static void fg_thread(thread_call_param_t arg, thread_call_param_t result)
      "fence=%#x TRUST=%#x zap=%#x pixels=%#x\n", fg_limit == 13 ? 13 : 16,
      g_bank, g3_bank, g3_asid, g3_read(G3_FENCE_PA), g3_gr(0xf400),
      gpu_extra[13][2], gpu_extra[11][2]);
+ fg_clock_log();
  if (fg_limit < 17 || fg_force == 1) { fg_fail("diagnostic stop after self-test", fg_limit); goto out; }
  if (g3_read(0xae05014) != G4_FB_PA || g3_read(0xae05024) != 4320 ||
      g3_read(0xae05000) != (2400u<<16 | 1080u) || g3_read(0xae05030) != 0x237ff ||
@@ -429,7 +512,7 @@ static void fg_thread(thread_call_param_t arg, thread_call_param_t result)
      !fg_source_tables()) { fg_fail("scanout geometry/mapping", 4); goto out; }
  uint32_t tlb[128] = {0};
  if (g4_tlb(tlb) || fg_access_failed) { fg_fail("initial TLB sync", 5); goto out; }
- printf("FUXI GPU: ready, BGRA strided rects + one fence, 4 cached backings, 220 MHz, async one-in-flight, no timer sleep\n");
+ printf("FUXI GPU: ready, BGRA strided rects + one fence, 4 cached backings, requested %u kHz, async one-in-flight, no timer sleep\n", g_gpu_freq[g_gpu_selected ? g_gpu_selected : 1]);
  /* Finish all ABI-only MMIO/table setup before the display can submit.
   * Publication may race userspace, so it follows the release of ready. */
  int publish_abi = fg_abi_enabled && fg_abi_init();
@@ -445,6 +528,13 @@ void fuxi_gpu_start(uint64_t fb, unsigned width, unsigned height, unsigned pitch
  (void)PE_parse_boot_argn("fuxigpu", &enable, sizeof(enable));
  if (enable != 1 || fg_started) return;
  fg_started = 1; fg_limit = 17;
+ uint64_t requested_level = 0;
+ (void)PE_parse_boot_argn("fuxigpulevel", &requested_level, sizeof(requested_level));
+ g_gpu_selected = g_gpu_select(requested_level);
+ if (requested_level > G_GPU_LEVEL_MAX)
+  printf("FUXI GPU CLOCK: rejected fuxigpulevel=%llu (allowed 0..%u); legacy level=0\n", requested_level, G_GPU_LEVEL_MAX);
+ (void)PE_parse_boot_argn("fuxigpuclock", &fg_clock_measure, sizeof(fg_clock_measure));
+ fg_clock_measure = fg_clock_measure == 1;
  (void)PE_parse_boot_argn("fuxigpuabi", &fg_abi_enabled, sizeof(fg_abi_enabled));
  fg_abi_enabled = fg_abi_enabled == 1;
  if (fg_abi_enabled && !(fg_ring_lock = IOLockAlloc())) {

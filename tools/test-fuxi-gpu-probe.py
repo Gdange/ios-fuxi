@@ -189,6 +189,7 @@ static void reset_model(void)
  memset(gpu_report, 0, sizeof(gpu_report)); memset(gpu_extra, 0, sizeof(gpu_extra));
  gpu_snapshot_valid = gpu_gmu_started = gpu_m2_attempted = gpu_s8_ok = 0;
  gpu_s9_attempted = gpu_s9_ok = gpu_s10_attempted = 0;
+ g_gpu_selected = 0;
  ticks = firmware_releases = mmio_writes = 0;
  cp_mode=0; blit_mode=0; abort_read=abort_write=0;
  ack_mode = corrupt_readback = tlb_busy = 0; firmware_success = 1;
@@ -326,6 +327,77 @@ static void panel_fixture(void)
  memset((void *)(uintptr_t)G4_FB_PA,0x6b,G4_FB_MAP);
 }
 
+/* Synthetic cmd-db BCM metadata, never captured board data. */
+static void bcm_fixture(void)
+{
+ aux_fixture();
+ static const char names[4][8]={"SH0","MC0","ACV","CN0"};
+ uint8_t *h=gpu_cmddb+24;
+ h[0]=5;h[2]=0;h[3]=0x10;h[4]=0;h[5]=0x11;h[6]=4;
+ for(unsigned j=0;j<4;j++) {
+  uint8_t *p=gpu_cmddb+144+0x1000+j*24;
+  memcpy(p,names[j],8);
+  uint32_t address=0x50000+j*4;memcpy(p+16,&address,4);
+  p[20]=j<3?8:0;p[22]=j*8;
+  uint8_t *aux=gpu_cmddb+144+0x1100+j*8;
+  uint32_t unit=j<2?1000:0;memcpy(aux,&unit,4);
+  aux[4]=j==0?16:j==1?4:0;aux[6]=j?1:0;
+ }
+}
+static void test_clock_votes(void)
+{
+ assert(g_gpu_select(0)==0 && g_gpu_select(6)==6 && !g_gpu_select(7));
+ assert(!g_gpu_select(UINT64_MAX) && !g_gpu_select(0x100000001ULL));
+ /* Actual cold-start messages, ACK path and final fixed vote for each level. */
+ for(unsigned n=0;n<=6;n++) {
+  reset_model();bcm_fixture();g_gpu_selected=n;
+  assert(g_start() && gpu_s9_ok && firmware_releases==1);
+  uint32_t *wire=ptr(G_HFI_PA+4096+60*4);
+  assert(wire[1]==(n?3:1) && wire[2]==1 && wire[3]==3);
+  if(n) {
+   assert(wire[5]==5 && wire[32]==0x40000000 && !wire[33] && wire[34]==0x40000000);
+   /* unit=1000 and matching widths saturate both proportional votes. */
+   assert(wire[40]==0x6fffffff && wire[41]==0x2fffffff && wire[42]==0x60000000);
+   for(unsigned j=56;j<160;j++) assert(!wire[j]);
+  } else assert(wire[5]==7 && wire[32]==0x40000000 && wire[33]==0x40000000);
+  g_gx();assert(gpu_extra[0][60]==1);
+  unsigned wr=*ptr(G_HFI_PA+68);
+  uint32_t *vote=ptr(G_HFI_PA+4096+(wr-4)*4);
+  assert((vote[0]&255)==30 && vote[1]==1 && vote[2]==(n?n:1));
+  assert(vote[3]==(n?(n==1?1:2):0));
+ }
+ /* Each malformed input refuses before CM3 release or a HFI doorbell. */
+ for(unsigned bad=0;bad<12;bad++) {
+  reset_model();bcm_fixture();g_gpu_selected=2;
+  uint8_t *p=gpu_cmddb+144+0x1000,*aux=gpu_cmddb+144+0x1100;
+  switch(bad) {
+   case 0:p[0]='X';break; // SH0 absent
+   case 1:p[20]=7;break; // aux length
+   case 2:memset(aux,0,4);break; // zero unit
+   case 3:aux[7]=1;break; // reserved aux byte
+   case 4:memcpy(p+24,p,24);break; // duplicate SH0
+   case 5:p[16]|=1;break; // unaligned address
+   case 6:p[18]=3;break; // wrong slave
+   case 7:aux[6]=16;break; // VCD cannot fit the controller domain
+   case 8:aux[4]=0;break; // zero proportional width
+   case 9:p[22]=p[23]=255;break; // aux outside snapshot
+   case 10:memcpy(p+24+16,p+16,4);break; // duplicate resource address
+   case 11:p[72]='X';break; // CN0 absent
+  }
+  assert(!g_start() && gpu_extra[0][3]==0x90a && !firmware_releases && !gpu_gmu_started);
+ }
+ // Independent proportional arithmetic: known small non-saturating votes.
+ struct g_bcm b[3]={{0x50000,1000000,16,0},{0x50004,1000000,4,1},{0x50008,0,0,1}};
+ uint32_t out[160];assert(g_gpu_bw_packet(b,0x5000c,out));
+ assert(out[40]==(0x60000000u|(2136u<<14)|2136u));
+ assert(out[41]==(0x20000000u|(2136u<<14)|2136u));
+ b[0].unit=UINT32_MAX;b[0].width=1;
+ assert(g_gpu_bw_packet(b,0x5000c,out) && out[40]==0x60004001);
+ b[0].vcd=b[1].vcd=b[2].vcd;
+ assert(g_gpu_bw_packet(b,0x5000c,out) && out[5]==4 && !out[32] && !out[33]);
+ puts("PASS: GPU levels 0..6, wide-input bounds, exact legacy/active HFI tables/votes, BCM VCD grouping/arithmetic and pre-release metadata refusal");
+}
+
 int main(int argc, char **argv)
 {
  (void)argc; (void)argv;
@@ -341,6 +413,7 @@ int main(int argc, char **argv)
   MAP_ANONYMOUS|MAP_PRIVATE|MAP_FIXED_NOREPLACE,-1,0) != MAP_FAILED);
  assert(mmap((void *)(uintptr_t)G4_FB_PA, G4_FB_MAP, PROT_READ|PROT_WRITE,
   MAP_ANONYMOUS|MAP_PRIVATE|MAP_FIXED_NOREPLACE,-1,0) != MAP_FAILED);
+ test_clock_votes();
  reset_model(); unsigned before=mmio_writes;
  assert(g_snapshot() && before == mmio_writes && g_ncb == 22 && g_nsmr == 24 && g_cbbase == 0x20000);
  /* An active, referenced CB1 must be preserved; select CB2 instead. */
