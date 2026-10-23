@@ -71,6 +71,10 @@ extern "C" { int sweet_fb_display_off; }        /* read by bsd/dev/fuxi_touch.c 
 #include <kern/clock.h>
 #include <sys/proc.h>
 
+#if defined(FUXI)
+extern void fuxi_backlight_publish(IOService *provider);
+#endif
+
 enum {
 	kSweetFBGetLayerDefaultSurface  = 3,
 	kSweetFBSwapBegin               = 4,
@@ -276,6 +280,9 @@ AppleCLCD::start(IOService *provider)
 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
 	setProperty("external", false);
 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+#if defined(FUXI)
+	fuxi_backlight_publish(this);
+#endif
 	registerService();
 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);

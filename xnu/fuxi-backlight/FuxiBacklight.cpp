@@ -1,0 +1,279 @@
+/*
+ * FUXI phase 1: observe the backlight-control consumer, never touch hardware.
+ * Published by AppleCLCD before its first registerService(), only on opt-in.
+ * The small IODisplay metaclass lets the public IODisplayLib parameter helpers
+ * resolve this service directly or by walking AppleCLCD's children. It does
+ * not implement IOGraphics power policy or the private AppleARMBacklight ABI.
+ */
+#if defined(FUXI)
+#include <IOKit/IOService.h>
+#include <IOKit/IOUserClient.h>
+#include <IOKit/IOLib.h>
+#include <IOKit/IOLocks.h>
+#include <libkern/OSAtomic.h>
+#include <libkern/c++/OSBoolean.h>
+#include <libkern/c++/OSCollectionIterator.h>
+#include <libkern/c++/OSData.h>
+#include <libkern/c++/OSDictionary.h>
+#include <libkern/c++/OSNumber.h>
+#include <libkern/c++/OSString.h>
+#include <pexpert/pexpert.h>
+#include <sys/proc.h>
+#include "fuxi_backlight_logic.h"
+
+enum { BL_READ, BL_SET, BL_PROPERTIES, BL_OPEN, BL_METHOD, BL_BRIGHTNESS, BL_COUNT };
+static volatile SInt32 bl_events[BL_COUNT];
+static bool bl_log(unsigned kind, uint32_t *event)
+{
+	*event = (uint32_t)OSIncrementAtomic(&bl_events[kind]);
+	return fbl_log_this(*event);
+}
+
+/* Log values without serializing arbitrary user data or leaking addresses.
+ * Bound dictionary traversal, including hostile self-referential collections.
+ */
+static void bl_value(const char *op, uint32_t event, const char *key,
+    OSObject *value, unsigned depth = 0, unsigned *remaining = NULL)
+{
+	unsigned budget = 64;
+	if (!remaining) remaining = &budget;
+	if (!*remaining) return;
+	--*remaining;
+	OSNumber *number = OSDynamicCast(OSNumber, value);
+	OSBoolean *boolean = OSDynamicCast(OSBoolean, value);
+	OSDictionary *dict = OSDynamicCast(OSDictionary, value);
+	OSData *data = OSDynamicCast(OSData, value);
+	if (number) {
+		IOLog("FUXI BACKLIGHT: %s #%u key=%.96s number=%llu\n", op, event, key,
+		    number->unsigned64BitValue());
+	} else if (boolean) {
+		IOLog("FUXI BACKLIGHT: %s #%u key=%.96s bool=%u\n", op, event, key, boolean->isTrue());
+	} else {
+		IOLog("FUXI BACKLIGHT: %s #%u key=%.96s type=%s count=%u depth=%u\n", op,
+		    event, key, value ? value->getMetaClass()->getClassName() : "missing",
+		    dict ? dict->getCount() : (data ? data->getLength() : 0), depth);
+	}
+	if (!dict || depth >= 3) return;
+	OSCollectionIterator *it = OSCollectionIterator::withCollection(dict);
+	if (!it) return;
+	OSString *child;
+	while (*remaining && (child = OSDynamicCast(OSString, it->getNextObject())))
+		bl_value(op, event, child->getCStringNoCopy(), dict->getObject(child), depth + 1, remaining);
+	it->release();
+}
+
+class IODisplay : public IOService {
+	OSDeclareDefaultStructors(IODisplay);
+};
+OSDefineMetaClassAndStructors(IODisplay, IOService);
+
+class FuxiBacklight : public IODisplay {
+	OSDeclareDefaultStructors(FuxiBacklight);
+	IOLock *fLock;
+	uint32_t fRequested;
+	bool publishBrightness(uint32_t value);
+public:
+	using IOService::getProperty;
+	using IOService::setProperty;
+	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+	void free(void) APPLE_KEXT_OVERRIDE;
+	OSObject *getProperty(const OSSymbol *key) const APPLE_KEXT_OVERRIDE;
+	bool setProperty(const OSSymbol *key, OSObject *value) APPLE_KEXT_OVERRIDE;
+	bool serializeProperties(OSSerialize *s) const APPLE_KEXT_OVERRIDE;
+	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+	IOReturn newUserClient(task_t task, void *securityID, UInt32 type,
+	    OSDictionary *properties, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
+};
+OSDefineMetaClassAndStructors(FuxiBacklight, IODisplay);
+
+class FuxiBacklightUserClient : public IOUserClient {
+	OSDeclareDefaultStructors(FuxiBacklightUserClient);
+public:
+	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
+	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
+};
+OSDefineMetaClassAndStructors(FuxiBacklightUserClient, IOUserClient);
+
+bool FuxiBacklight::publishBrightness(uint32_t value)
+{
+	OSDictionary *params = OSDictionary::withCapacity(1);
+	OSDictionary *brightness = OSDictionary::withCapacity(3);
+	OSNumber *minimum = OSNumber::withNumber(0ULL, 32);
+	OSNumber *maximum = OSNumber::withNumber(FUXI_BACKLIGHT_MAX, 32);
+	OSNumber *current = OSNumber::withNumber(value, 32);
+	bool ok = params && brightness && minimum && maximum && current;
+	if (ok) ok = brightness->setObject("min", minimum) &&
+	    brightness->setObject("max", maximum) && brightness->setObject("value", current) &&
+	    params->setObject("brightness", brightness) && setProperty("IODisplayParameters", params);
+	OSSafeReleaseNULL(current);
+	OSSafeReleaseNULL(maximum);
+	OSSafeReleaseNULL(minimum);
+	OSSafeReleaseNULL(brightness);
+	OSSafeReleaseNULL(params);
+	return ok;
+}
+
+bool FuxiBacklight::start(IOService *provider)
+{
+	/* Defend the gate here as well as before allocation/attachment. */
+	int enable = 0;
+	bool present = PE_parse_boot_argn("fuxibacklight", &enable, sizeof(enable));
+	if (!fbl_enabled(present, enable)) return false;
+	if (!IOService::start(provider)) return false;
+	fLock = IOLockAlloc();
+	fRequested = FUXI_BACKLIGHT_MAX;
+	if (!fLock || !setProperty("backlight-control", kOSBooleanTrue) ||
+	    !publishBrightness(fRequested)) return false;
+	setName("FuxiBacklight");
+	IOLog("FUXI BACKLIGHT: published observation-only brightness min=0 max=%u value=%u\n",
+	    FUXI_BACKLIGHT_MAX, fRequested);
+	registerService();
+	return true;
+}
+
+void FuxiBacklight::free(void)
+{
+	if (fLock) IOLockFree(fLock);
+	IOService::free();
+}
+
+OSObject *FuxiBacklight::getProperty(const OSSymbol *key) const
+{
+	OSObject *value = IOService::getProperty(key);
+	uint32_t event;
+	if (bl_log(BL_READ, &event)) bl_value("read", event, key->getCStringNoCopy(), value);
+	return value;
+}
+
+bool FuxiBacklight::setProperty(const OSSymbol *key, OSObject *value)
+{
+	uint32_t event;
+	if (bl_log(BL_SET, &event)) bl_value("set", event, key->getCStringNoCopy(), value);
+	return IOService::setProperty(key, value);
+}
+
+bool FuxiBacklight::serializeProperties(OSSerialize *s) const
+{
+	/* CreateCFProperties bypasses getProperty: log its entire snapshot too. */
+	uint32_t event;
+	if (bl_log(BL_READ, &event)) {
+		OSDictionary *snapshot = dictionaryWithProperties();
+		bl_value("read-all", event, "*", snapshot);
+		OSSafeReleaseNULL(snapshot);
+	}
+	return IOService::serializeProperties(s);
+}
+
+IOReturn FuxiBacklight::setProperties(OSObject *properties)
+{
+	uint32_t event;
+	if (bl_log(BL_PROPERTIES, &event)) bl_value("setProperties", event, "*", properties);
+	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
+	if (!dict) return kIOReturnBadArgument;
+	OSObject *nested = dict->getObject("IODisplayParameters");
+	if (nested) {
+		dict = OSDynamicCast(OSDictionary, nested);
+		if (!dict) return kIOReturnBadArgument;
+	}
+	OSObject *value = dict->getObject("brightness");
+	if (!value) return kIOReturnUnsupported;
+	OSDictionary *range = OSDynamicCast(OSDictionary, value);
+	if (range) value = range->getObject("value");
+	OSNumber *number = OSDynamicCast(OSNumber, value);
+	uint64_t requested = number ? number->unsigned64BitValue() : 0;
+	bool valid = number && fbl_valid(requested);
+	if (bl_log(BL_BRIGHTNESS, &event))
+		IOLog("FUXI BACKLIGHT: brightness #%u requested=%llu valid=%u hardware=untouched\n",
+		    event, requested, valid);
+	if (!valid) return kIOReturnBadArgument;
+	IOLockLock(fLock);
+	/* Replace the immutable registry dictionary; never mutate a reader's snapshot. */
+	bool ok = publishBrightness((uint32_t)requested);
+	if (ok) fRequested = (uint32_t)requested;
+	IOLockUnlock(fLock);
+	return ok ? kIOReturnSuccess : kIOReturnNoMemory;
+}
+
+IOReturn FuxiBacklight::newUserClient(task_t task, void *securityID, UInt32 type,
+    OSDictionary *properties, IOUserClient **handler)
+{
+	*handler = NULL;
+	FuxiBacklightUserClient *client = new FuxiBacklightUserClient;
+	IOReturn result = kIOReturnNoMemory;
+	if (client) {
+		if (!client->initWithTask(task, securityID, type, properties)) result = kIOReturnBadArgument;
+		else if (!client->attach(this)) result = kIOReturnNoResources;
+		else if (!client->start(this)) {
+			client->detach(this);
+			result = kIOReturnError;
+		} else {
+			*handler = client;
+			result = kIOReturnSuccess;
+		}
+		if (result != kIOReturnSuccess) client->release();
+	}
+	uint32_t event;
+	if (bl_log(BL_OPEN, &event)) {
+		char name[33] = {};
+		proc_selfname(name, sizeof(name));
+		IOLog("FUXI BACKLIGHT: open #%u process=%.32s type=%u -> 0x%x\n",
+		    event, name, type, result);
+	}
+	return result;
+}
+
+IOReturn FuxiBacklightUserClient::clientClose(void)
+{
+	uint32_t event;
+	if (bl_log(BL_OPEN, &event)) IOLog("FUXI BACKLIGHT: close #%u\n", event);
+	terminate();
+	return kIOReturnSuccess;
+}
+
+IOReturn FuxiBacklightUserClient::setProperties(OSObject *properties)
+{
+	FuxiBacklight *service = OSDynamicCast(FuxiBacklight, getProvider());
+	return service ? service->setProperties(properties) : kIOReturnNotAttached;
+}
+
+IOReturn FuxiBacklightUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+    IOExternalMethodDispatch *, OSObject *, void *)
+{
+	uint32_t event;
+	if (bl_log(BL_METHOD, &event)) {
+		char name[33] = {};
+		proc_selfname(name, sizeof(name));
+		IOLog("FUXI BACKLIGHT: method #%u process=%.32s selector=%u scalars=%u struct-in=%llu struct-out=%llu -> unsupported\n",
+		    event, name, selector, args ? args->scalarInputCount : 0,
+		    args ? (uint64_t)args->structureInputSize : 0,
+		    args ? (uint64_t)args->structureOutputSize : 0);
+		if (args && args->scalarInput)
+			for (uint32_t i = 0; i < args->scalarInputCount; i++)
+				IOLog("FUXI BACKLIGHT: method #%u selector=%u scalar[%u]=0x%llx\n",
+				    event, selector, i, args->scalarInput[i]);
+	}
+	/* No guessed selector ABI, no fabricated successful getter results. */
+	if (args) { args->scalarOutputCount = 0; args->structureOutputSize = 0; }
+	return kIOReturnUnsupported;
+}
+
+void fuxi_backlight_publish(IOService *provider)
+{
+	int enable = 0;
+	bool present = PE_parse_boot_argn("fuxibacklight", &enable, sizeof(enable));
+	if (!fbl_enabled(present, enable)) return;
+	FuxiBacklight *service = new FuxiBacklight;
+	if (!service) { IOLog("FUXI BACKLIGHT: allocation failed\n"); return; }
+	if (!service->init()) {
+		IOLog("FUXI BACKLIGHT: init failed\n");
+	} else if (!service->attach(provider)) {
+		IOLog("FUXI BACKLIGHT: attach failed\n");
+	} else if (!service->start(provider)) {
+		IOLog("FUXI BACKLIGHT: start failed\n");
+		service->detach(provider);
+	}
+	service->release(); /* registry attachment owns the successful service */
+}
+#endif /* FUXI */
