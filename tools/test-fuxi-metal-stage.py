@@ -79,6 +79,10 @@ def native_staging_tests():
         with patch.object(m.os,'geteuid',return_value=0),patch.object(m.os,'chown'):
             native_args=dict(native_bundle=native,native_bridge=d/'libnative_metal_bridge.dylib',native_source=d/'nativemetal-source.tar.gz')
             stage(**native_args)
+            with patch.object(m,'backboard_account',return_value=(0,0)),patch.object(m,'prepare_backboard_storage') as storage:
+                stage(prepare_pipeline_cache=True)
+                storage.assert_called_once_with(root.resolve(),(0,0))
+                assert (root/'usr/local/share/fuxi/metal-clients.conf').read_bytes()==b'fuxi-metal-smoke\n'
             assert (root/'usr/local/lib/libnative_metal_bridge.dylib').read_bytes()==(d/'libnative_metal_bridge.dylib').read_bytes()
             assert (root/'System/Library/Extensions/FuxiNativeMetal.bundle/Info.plist').read_bytes()==(native/'Info.plist').read_bytes()
             assert (root/'usr/local/share/fuxi/metal-clients.conf').read_bytes()==b'fuxi-metal-smoke\n'

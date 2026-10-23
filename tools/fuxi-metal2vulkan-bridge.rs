@@ -4,6 +4,7 @@ use std::{ffi::{c_char,c_void,CStr,CString}, panic::{catch_unwind,AssertUnwindSa
 use std::{collections::VecDeque, sync::{Mutex,OnceLock}};
 use ash::vk::{self,Handle};
 use sha2::{Digest,Sha256};
+use metal2vulkan::cache::PipelineArtifact;
 const SLOTS:u32=16;
 use metal2vulkan::{library::Library, device::{Device,DeviceDescription,DevicePolicy,EnableSet,ApiVersion,VkFeature,VkExtension},
     pipeline::{RenderPipelineDescriptor,StageSource,FunctionDescriptor,ColorAttachmentDescriptor},
@@ -100,10 +101,45 @@ pub struct Translation {
 struct Product {blobs:Vec<Vec<u8>>,blob_hashes:Vec<[u8;32]>,vertex:Vec<u32>,fragment:Vec<u32>,vname:CString,fname:CString,
  push_offset:u32,push_size:u32,push_stages:u32,push_bytes:[u8;128],descriptors:Vec<Descriptor>,specs:Vec<Specialization>,spec_data:Vec<u8>,
  descriptor:RenderPipelineDescriptor,options:CompileOptions,variant:metal2vulkan::cache::VariantKey,device:Device,pipeline:metal2vulkan::pipeline::RenderPipeline,bindings:Vec<VertexBinding>,attributes:Vec<VertexAttribute>,format:u32,blend:u32,mask:u32,factors:[u32;6],colors:[ColorBlend;8]}
-// Process-only, at most 8 entries / 16 MiB. No Apple inputs or derived code on disk.
+// Process cache: at most 8 entries / 16 MiB. Optional artifact callbacks below
+// persist compiled products only; library/AIR inputs are never serialized.
 // The key includes AIR function hashes AND library hashes/names, device/driver UUID,
 // and all bounded compile options (the adapter itself is part of the process).
 static CACHE:OnceLock<Mutex<VecDeque<(String,Product)>>> = OnceLock::new();
+type CacheRead=unsafe extern "C" fn(*mut c_void,*const u8,*mut *const u8)->usize;
+type CacheWrite=unsafe extern "C" fn(*mut c_void,*const u8,*const u8,usize);
+type CacheOutcome=unsafe extern "C" fn(*mut c_void,u32);
+#[derive(Clone,Copy)]
+struct ArtifactScope {context:*mut c_void,read:CacheRead,write:CacheWrite,outcome:CacheOutcome}
+struct ArtifactBytes(Vec<u8>);
+impl std::io::Write for ArtifactBytes {
+ fn write(&mut self,bytes:&[u8])->std::io::Result<usize>{
+  if bytes.len()>8*1024*1024-self.0.len(){return Err(std::io::ErrorKind::FileTooLarge.into());}
+  self.0.extend_from_slice(bytes);Ok(bytes.len())
+ }
+ fn flush(&mut self)->std::io::Result<()>{Ok(())}
+}
+thread_local! {static ARTIFACT_SCOPE:std::cell::Cell<Option<ArtifactScope>>=const {std::cell::Cell::new(None)};}
+// Optional ABI-8 extension. All callbacks are synchronous on this thread; no
+// pointers are retained after the caller clears its scope, including on panic.
+#[no_mangle] pub extern "C" fn fuxi_m2v_artifact_scope_v1(context:*mut c_void,read:Option<CacheRead>,write:Option<CacheWrite>,outcome:Option<CacheOutcome>) {
+ ARTIFACT_SCOPE.set(match (context.is_null(),read,write,outcome) {(false,Some(read),Some(write),Some(outcome))=>Some(ArtifactScope{context,read,write,outcome}),_=>None});
+}
+fn cached_render(device:&Device,descriptor:&RenderPipelineDescriptor,variant:&metal2vulkan::cache::VariantKey)->Result<metal2vulkan::pipeline::RenderPipeline,String> {
+ let Some(io)=ARTIFACT_SCOPE.get() else {return device.compile_render_variant(descriptor,variant,&Budget::standard()).map_err(|e|e.to_string());};
+ let key=device.render_variant_key(descriptor,variant,&Budget::standard(),&metal2vulkan::pipeline::StageEntries::new()).map_err(|e|e.to_string())?.pipeline;
+ let mut bytes=std::ptr::null();let n=unsafe{(io.read)(io.context,key.digest().as_ptr(),&mut bytes)};
+ if !bytes.is_null() && n>0 && n<=8*1024*1024 {
+  let decoded=catch_unwind(AssertUnwindSafe(||metal2vulkan::pipeline::RenderPipeline::from_bytes_for_key(unsafe{std::slice::from_raw_parts(bytes,n)},&key,device)));
+  if let Ok(Ok(pipeline))=decoded {unsafe{(io.outcome)(io.context,1)};return Ok(pipeline);}
+ }
+ unsafe{(io.outcome)(io.context,if n>0 {2}else{0})};
+ let pipeline=device.compile_render_variant(descriptor,variant,&Budget::standard()).map_err(|e|e.to_string())?;
+ // Cache encoding/IO is optional. Never let it turn a successful compile into
+ // a refusal. Upstream's codec includes keys, profile, versions and SHA-256.
+ let _=catch_unwind(AssertUnwindSafe(||{let mut bytes=ArtifactBytes(Vec::new());if pipeline.write_to(&mut bytes).is_ok(){unsafe{(io.write)(io.context,key.digest().as_ptr(),bytes.0.as_ptr(),bytes.0.len())};}}));
+ Ok(pipeline)
+}
 // Only these facts may be discharged by the bounded plan/instantiate consumer.
 fn sampling_dependency(d:&RuntimeDependency)->bool {
     match (d.fact,d.mechanism) {
@@ -178,6 +214,9 @@ unsafe fn name<'a>(p:*const c_char)->Result<&'a str,String> {
     let mut h=Sha256::new();
     h.update(b"metal2vulkan:720ef1ce9ae2a2068999a8675717418b9416283e;cache-v1;");
     h.update(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"),"/",file!())));
+    h.update(metal2vulkan::cache::SOURCE_DIGEST.as_bytes());
+    h.update(metal2vulkan::cache::SEMANTICS_VERSION.to_le_bytes());
+    h.update(metal2vulkan::cache::ARTIFACT_FORMAT_VERSION.to_le_bytes());
     std::ptr::copy_nonoverlapping(h.finalize().as_ptr(),out,32);1
 }
 #[no_mangle] pub unsafe extern "C" fn fuxi_m2v_open(p:*const u8,n:usize,err:*mut c_char,cap:usize)->*mut c_void {
@@ -469,7 +508,7 @@ fn reflect_textures(pipeline:&metal2vulkan::pipeline::RenderPipeline,state:&mut 
  u32::MAX
 }
 fn make_product(device:Device,descriptor:RenderPipelineDescriptor,options:&CompileOptions,mut state:BindState,variant:metal2vulkan::cache::VariantKey,initial:bool)->Result<Product,String> {
-        let pipeline=device.compile_render_variant(&descriptor,&variant,&Budget::standard()).map_err(|e|e.to_string())?;
+        let pipeline=cached_render(&device,&descriptor,&variant)?;
         // Refuse resources outside the bounded descriptor/vertex/push consumer.
         // Never discard a binding/plan requirement and pretend its SPIR-V is standalone.
         if pipeline.stages.len()!=2 {return Err(format!("M6 stages count={}",pipeline.stages.len()));}

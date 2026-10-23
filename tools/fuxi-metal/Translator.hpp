@@ -48,6 +48,17 @@ struct Translation {
 class Translator {
  void *dylib{};
 public:
+ using CacheRead=size_t (*)(void *,const uint8_t *,const uint8_t **);
+ using CacheWrite=void (*)(void *,const uint8_t *,const uint8_t *,size_t);
+ using CacheOutcome=void (*)(void *,uint32_t);
+ using CacheScope=void (*)(void *,CacheRead,CacheWrite,CacheOutcome);
+ CacheScope artifactScope{}; // Optional ABI-8 extension; synchronous thread-local callbacks.
+ struct Scope {
+  CacheScope fn;
+  Scope(CacheScope callback,void *context,CacheRead read,CacheWrite write,CacheOutcome outcome):fn(callback){if(fn)fn(context,read,write,outcome);}
+  ~Scope(){if(fn)fn(nullptr,nullptr,nullptr,nullptr);}
+  Scope(const Scope&)=delete;
+ };
  void *(*open)(const uint8_t *,size_t,char *,size_t){};
  void (*close)(void *){};
  int (*function)(void *,const char *,char *,size_t){};
@@ -68,6 +79,7 @@ public:
   LOAD(open) LOAD(close) LOAD(function) LOAD(compile) LOAD(draw) LOAD(variant) LOAD(sampler) LOAD(identity) LOAD(product_hash) LOAD(free)
 #undef LOAD
   texture_type=(decltype(texture_type))dlsym(dylib,"fuxi_m2v_texture_type");
+  artifactScope=(CacheScope)dlsym(dylib,"fuxi_m2v_artifact_scope_v1");
  }
  ~Translator() {if(dylib)dlclose(dylib);}
  Translator(const Translator&)=delete;Translator& operator=(const Translator&)=delete;

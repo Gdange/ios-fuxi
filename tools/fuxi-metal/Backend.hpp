@@ -12,6 +12,8 @@
 #include <mutex>
 #include <atomic>
 #include <chrono>
+#include <thread>
+#include <condition_variable>
 #include "ResourceLimits.hpp"
 #include "ClientSetup.hpp"
 #include "DrawSafety.hpp"
@@ -23,6 +25,7 @@
 #include <vector>
 #include "Translator.hpp"
 #include "PipelineCache.hpp"
+#include "ArtifactCache.hpp"
 #include "BackboardGate.hpp"
 #include "FramebufferFetch.hpp"
 #include "VertexProfile.hpp"
@@ -92,6 +95,30 @@ class Backend {
  VkInstance instance{}; VkPhysicalDevice physical{}; VkDevice device{}; VkQueue queue{};
  bool independentBlend=false;uint32_t maxColorAttachments=1;
  PipelineCache pipelineCache;
+ ArtifactCache artifactCache;CacheMode cacheMode=systemCacheMode();
+ Translator::CacheScope artifactCallbacks{};
+ bool creationFeedback=false,cacheStopping=false;
+ std::thread cacheWorker;std::condition_variable cacheWake;
+ using CacheClock=std::chrono::steady_clock;
+ CacheClock::time_point cacheActivity{},cacheCheckpoint=CacheClock::now();
+ struct CacheActivity {CacheClock::time_point *last;~CacheActivity(){if(last)*last=CacheClock::now();}};
+ uint64_t driverHits=0,driverMisses=0,driverUnknown=0,objectHits=0,objectMisses=0;
+ void cachePeriodUnlocked(bool closing=false) noexcept {
+  if(cacheMode!=CacheMode::persistent || !device || poisoned || backboardGate.blocked())return;
+  auto now=CacheClock::now();
+  // Prefer a quiet render lane. Continuous animation still gets a bounded
+  // checkpoint every 30s; all cache/device access remains serialized.
+  if(closing || now-cacheActivity>=std::chrono::milliseconds(250) || now-cacheCheckpoint>=std::chrono::seconds(30)){
+   pipelineCache.checkpoint();
+   if(backboardGate.blocked())return;
+   artifactCache.checkpoint();cacheCheckpoint=CacheClock::now();
+  }
+  artifactCache.report();
+  fprintf(stderr,"FUXI MTL: cache period driver hits=%llu misses=%llu unknown=%llu objects hits=%llu misses=%llu\n",
+   (unsigned long long)driverHits,(unsigned long long)driverMisses,(unsigned long long)driverUnknown,
+   (unsigned long long)objectHits,(unsigned long long)objectMisses);
+  driverHits=driverMisses=driverUnknown=objectHits=objectMisses=0;
+ }
  ObjectCache<Pipeline> objects;ResourceLimits limits;
  // One synchronous lane, protected by mutex; never reset while GPU ownership is uncertain.
  VkCommandPool commandPool{};VkCommandBuffer command{};VkFence submitFence{};VkQueryPool queryPool{};
@@ -203,6 +230,9 @@ public:
    std::vector<VkExtensionProperties> extensions(extCount);check(EnumerateDeviceExtensionProperties(physical,nullptr,&extCount,extensions.data()));
    for(const auto &ext:extensions)if(!strcmp(ext.extensionName,VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME))hostImport=true;
    std::vector<const char *> enabledExtensions;
+   if(cacheMode==CacheMode::persistent)for(const auto &ext:extensions)if(!strcmp(ext.extensionName,VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME)){
+    creationFeedback=true;enabledExtensions.push_back(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);break;
+   }
    for(const auto &ext:extensions)if(!strcmp(ext.extensionName,VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME))orderedColorAccess=true;
    VkPhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT order{};
    order.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_FEATURES_EXT;
@@ -237,13 +267,28 @@ public:
    VkPhysicalDeviceProperties2 identity{};identity.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;identity.pNext=&driver;
    GetPhysicalDeviceProperties2(physical,&identity);
    uint8_t translator[32]{};bool identified=Translator::cacheIdentity(translator);
-   pipelineCache.open(device,CreatePipelineCache,DestroyPipelineCache,GetPipelineCacheData,props,driver,id,identified?translator:nullptr,client);
+   pipelineCache.open(device,CreatePipelineCache,DestroyPipelineCache,GetPipelineCacheData,props,driver,id,identified?translator:nullptr,client,cacheMode);
+   if(cacheMode==CacheMode::persistent){
+    if(identified)artifactCallbacks=Translator::get().artifactScope;
+    if(artifactCallbacks)artifactCache.open(props,driver,id,translator,client);
+    else fprintf(stderr,"FUXI MTL: translation cache unavailable (bridge capability)\n");
+    fprintf(stderr,"FUXI MTL: persistent caches enabled period=5s driver_feedback=%u\n",unsigned(creationFeedback));
+   }
    requireLive();
    GetDeviceQueue(device,family,0,&queue);if(!queue) throw std::runtime_error("null queue");
+   if(cacheMode==CacheMode::persistent)try {
+    cacheWorker=std::thread([this]{std::unique_lock<std::mutex> lock(mutex);
+     while(!cacheWake.wait_for(lock,std::chrono::seconds(5),[this]{return cacheStopping;}))cachePeriodUnlocked();});
+   }catch(...){fprintf(stderr,"FUXI MTL: cache timer unavailable; shutdown checkpoints only\n");}
   } catch(...) {close();throw;}
  }
  void close() {
+  // Join before device/cache destruction, including poisoned contexts. A sleeping
+  // worker owns no GPU resource and wakes immediately on shutdown.
+  if(cacheWorker.joinable()){{std::lock_guard<std::mutex> guard(mutex);cacheStopping=true;}cacheWake.notify_all();cacheWorker.join();}
   if(poisoned) return; // Unknown GPU ownership: leave reclamation to process death/KMD containment.
+  cachePeriodUnlocked(true);
+  artifactCache.close();
   clearSubmitObjects();clearFrames();clearViews();
   objects.clear([&](Pipeline *p){destroyPipelineUnlocked(p);});
   pipelineCache.close();
@@ -492,13 +537,15 @@ public:
  bool requiresSampling(const Pipeline *p) const {return std::any_of(p->descriptors.begin(),p->descriptors.end(),[](const Descriptor &d){return d.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || d.type==VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;});}
  Pipeline *compilePipeline(void *v,const char *vn,void *f,const char *fn,const CompileOptions &options=CompileOptions{}) {
   std::unique_lock<std::mutex> guard(mutex);requireLive();Translation translated{};auto &tr=Translator::get();char error[2048]{};
+  CacheActivity activity{cacheMode==CacheMode::persistent?&cacheActivity:nullptr};
+  Translator::Scope cacheScope(artifactCallbacks,artifactCache.available()?&artifactCache:nullptr,ArtifactCache::read,ArtifactCache::write,ArtifactCache::outcome);
   auto start=std::chrono::steady_clock::now();
   auto enabledOptions=options;enabledOptions.orderedColorAccess=orderedColorAccess;enabledOptions.independentBlend=independentBlend;
   uint8_t identity[32]{};
   if(!tr.identity(v,vn,f,fn,&enabledOptions,identity,error,sizeof(error)))throw std::runtime_error(error);
   std::string inputKey((const char *)identity,32);
   if(auto *cached=objects.acquire(inputKey)){
-   ++pipelineHits;fprintf(stderr,"FUXI MTL: pipeline cache HIT %.3f ms\n",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count());return cached;
+   ++pipelineHits;++objectHits;fprintf(stderr,"FUXI MTL: pipeline cache HIT %.3f ms\n",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count());return cached;
   }
   int ok=tr.compile(v,vn,f,fn,(void *)gipa,(uint64_t)instance,(uint64_t)physical,&enabledOptions,&translated,error,sizeof(error));
   double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
@@ -509,10 +556,10 @@ public:
   if(!tr.product_hash(translated.handle,hash)){tr.free(translated.handle);throw std::runtime_error("pipeline product hash");}
   std::string productKey=inputKey+std::string((const char *)hash,32);
   if(auto *cached=objects.acquire(productKey,true)){
-   tr.free(translated.handle);++pipelineHits;
+   tr.free(translated.handle);++pipelineHits;++objectHits;
    fprintf(stderr,"FUXI MTL: pipeline cache HIT %.3f ms\n",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count());return cached;
   }
-  ++pipelineMisses;
+  ++pipelineMisses;++objectMisses;
   auto *p=createPipeline(translated,enabledOptions);
   try {objects.insert(inputKey,productKey,p,p->retainedBytes,[&](Pipeline *old){destroyPipelineUnlocked(old);});}
   catch(...){destroyPipelineUnlocked(p);throw;}
@@ -656,8 +703,14 @@ public:
    gi.pViewportState=&vp;gi.pRasterizationState=&raster;gi.pMultisampleState=&ms;gi.pColorBlendState=&bs;gi.layout=p->layout;gi.renderPass=p->render;
    VkDynamicState dynamicStates[]={VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR};VkPipelineDynamicStateCreateInfo dynamic{};dynamic.sType=VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;dynamic.dynamicStateCount=2;dynamic.pDynamicStates=dynamicStates;gi.pDynamicState=&dynamic;
    auto cache=pipelineCache.get();
+   VkPipelineCreationFeedback feedback{};VkPipelineCreationFeedbackCreateInfo feedbackInfo{};
+   if(creationFeedback){feedbackInfo.sType=VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO;feedbackInfo.pPipelineCreationFeedback=&feedback;gi.pNext=&feedbackInfo;}
    VkPipeline result{};auto rc=CreateGraphicsPipelines(device,cache,1,&gi,nullptr,&result);
    if(rc!=VK_SUCCESS){if(result)DestroyPipeline(device,result,nullptr);check(rc);}
+   if(cacheMode==CacheMode::persistent){
+    if(!(feedback.flags&VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT))++driverUnknown;
+    else if(feedback.flags&VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT)++driverHits;else ++driverMisses;
+   }
    cleanup();return result;
   }catch(...){cleanup();throw;}
  }
@@ -675,6 +728,8 @@ public:
   auto submitStart=std::chrono::steady_clock::now();auto submitQueued=submitStart,submitDone=submitStart;
   auto since=[](std::chrono::steady_clock::time_point t){return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-t).count();};
   std::lock_guard<std::mutex> guard(mutex);requireLive();
+  CacheActivity activity{cacheMode==CacheMode::persistent?&cacheActivity:nullptr};
+  Translator::Scope cacheScope(artifactCallbacks,artifactCache.available()?&artifactCache:nullptr,ArtifactCache::read,ArtifactCache::write,ArtifactCache::outcome);
   ops.erase(std::remove_if(ops.begin(),ops.end(),[](const Operation &op){
    bool missing=op.pipeline?(!op.pipeline->translation || !op.pipeline->pipeline || (op.topology==Topology::TriangleStrip && !op.pipeline->stripPipeline)):op.renderDraw;
    if(missing)dropPipelineDraw();return missing;

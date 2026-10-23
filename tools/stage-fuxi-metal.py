@@ -91,7 +91,7 @@ def prepare_backboard_storage(root,account):
     print('staged /private/var/db/fuxi-metal/backboardd-%u uid=%u gid=%u 0700'%(uid,uid,gid))
 
 
-def stage(root,icd,bundle,smoke,conf,clients=Path(__file__).with_name('metal-clients.conf'),translator=None,metallib=None,source=None,ca_smoke=None,ca_conf=Path(__file__).with_name('ca-smoke.conf'),enable_backboardd=False,native_bundle=None,native_bridge=None,native_source=None):
+def stage(root,icd,bundle,smoke,conf,clients=Path(__file__).with_name('metal-clients.conf'),translator=None,metallib=None,source=None,ca_smoke=None,ca_conf=Path(__file__).with_name('ca-smoke.conf'),enable_backboardd=False,native_bundle=None,native_bridge=None,native_source=None,prepare_pipeline_cache=False):
     if os.geteuid()!=0:raise PermissionError('run as root to set root:wheel 0:0')
     root=root.resolve()
     if not (root/'System/Library').is_dir():raise ValueError('expected mounted iOS root')
@@ -104,7 +104,7 @@ def stage(root,icd,bundle,smoke,conf,clients=Path(__file__).with_name('metal-cli
     if metallib is None:metallib=smoke.parent/'metal-smoke.metallib'
     if source is None:source=smoke.parent/'metal2vulkan-source.tar.gz'
     client_data=validate_clients(clients,enable_backboardd)
-    account=backboard_account(root) if enable_backboardd else None
+    account=backboard_account(root) if enable_backboardd or prepare_pipeline_cache else None
     info=plistlib.loads((bundle/'Info.plist').read_bytes())
     if any(info.get(k)!=v for k,v in {'CFBundleExecutable':'FuxiMetal','NSPrincipalClass':'FuxiMTLDevice','CFBundleIdentifier':'org.fuxi.metal'}.items()):
         raise ValueError('unexpected plugin plist')
@@ -174,4 +174,5 @@ if __name__=='__main__':
     ap.add_argument('--native-bridge',type=Path,help='separately replaceable native Rust dylib')
     ap.add_argument('--native-source',type=Path,help='NativeMetal corresponding-source archive')
     ap.add_argument('--enable-backboardd',action='store_true',help='add backboardd allow entry and private storage; also requires boot arg fuxibbgpu=1 (2 is a diagnostic survey; may blank screen for ~20s)')
-    a=ap.parse_args();stage(a.root,a.icd,a.bundle,a.smoke,a.conf,a.clients,a.translator,a.metallib,a.source,a.ca_smoke,a.ca_conf,a.enable_backboardd,a.native_bundle,a.native_bridge,a.native_source)
+    ap.add_argument('--prepare-pipeline-cache',action='store_true',help='pre-create persistent backboardd cache storage using the target launchd UID; does not admit clients or enable fuxigpucache=1')
+    a=ap.parse_args();stage(a.root,a.icd,a.bundle,a.smoke,a.conf,a.clients,a.translator,a.metallib,a.source,a.ca_smoke,a.ca_conf,a.enable_backboardd,a.native_bundle,a.native_bridge,a.native_source,a.prepare_pipeline_cache)

@@ -91,6 +91,15 @@ int main(int argc,char **argv){
  draw.viewport={0,height,width,-float(height),0,1};draw.scissor={{0,0},{width,height}};
  fuxi::Operation get{};get.texture=dst;get.dst=read;b.submit({draw,get});assert(!memcmp(read->contents,upload->contents,bytes));
  auto pixels=Cache::crc32((const uint8_t *)read->contents,bytes);
+ if(getenv("FUXI_MTL_TEST_IDLE_CHECKPOINT")){
+  // The GPU is idle and the device remains alive: checkpoint must not depend
+  // on another pipeline build, submit, atexit or orderly process shutdown.
+  std::this_thread::sleep_for(std::chrono::seconds(6));
+  auto path=std::string(getenv("FUXI_MTL_TEST_CACHE_DIR"))+"/fuxi-m9i-test.translations";
+  struct stat s{};assert(!stat(path.c_str(),&s) && s.st_size>128);
+  puts("PASS: idle checkpoint before teardown");fflush(stdout);
+  if(getenv("FUXI_MTL_TEST_CRASH_AFTER_IDLE"))_exit(0);
+ }
  b.destroy(p);b.destroy(sam);b.destroy(src);b.destroy(dst);b.destroy(upload);b.destroy(read);b.destroy(vertices);b.destroy(indices);b.destroy(ones);tr.close(lib);b.close();
  printf("PASS pixels=%08x load=%llu bytes=%llu save=%llu saved=%llu\n",pixels,(unsigned long long)Cache::loadResult.load(),
   (unsigned long long)Cache::loadBytes.load(),(unsigned long long)Cache::saveResult.load(),(unsigned long long)Cache::saveBytes.load());

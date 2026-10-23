@@ -1,5 +1,9 @@
 # Metal M9i: persistent Vulkan pipeline cache
 
+Follow-up: [GPU-CACHE](metal-gpu-cache.md) documents current private client
+storage and the opt-in translation/driver persistence, idle worker and feedback.
+The implementation notes below describe the historical M9i baseline.
+
 2026-10-22. Source, tests, documentation and compile/static checks only. No
 executable tests, GPU submissions, device access, workflow runs, deployment or
 push. backboardd and SpringBoard remain **DENIED**. Client configuration and
