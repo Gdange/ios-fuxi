@@ -60,6 +60,32 @@ int main(void) {
  reset();
  uint32_t rows[40] = {R(26,4),R(73,4),R(60,4),R(146,1),R(140,4),R(140,4)};
  unsigned khz;
+ /* Idle searches by frequency, including nonmonotonic/turbo/terminator cases. */
+ assert(fp_idle_level(rows,40,0,1401600,&khz)==0 && khz==499200);
+ assert(fp_idle_level(rows,40,500000,1401600,&khz)==2 && khz==1152000);
+ assert(fp_idle_level(rows,40,3000000,1401600,&khz)==1 && khz==1401600);
+ assert(fp_idle_level(rows,40,0,100000,&khz)==-1 && !khz);
+ uint32_t idle_rows[]={R(70,1),0,R(60,4),R(60,4),R(10,4)};
+ assert(fp_idle_level(idle_rows,5,0,1401600,&khz)==1 && khz==300000);
+ assert(fp_idle_level(idle_rows,5,400000,1401600,&khz)==2 && khz==1152000);
+ /* Quiet time starts at ready, even with no hooks yet. Exact MS boundary. */
+ assert(fp_state(0,1,450,1,1,1099,0,0,1500,1000,100,0)==FP_COOL);
+ assert(fp_state(0,1,450,1,1,1100,0,0,1500,1000,100,0)==FP_IDLE);
+ assert(fp_state(0,1,450,1,1,1101,1101,0,1500,1000,100,1100)==FP_HIGH);
+ assert(fp_state(0,1,450,1,1,1101,100,1101,1500,1000,100,1100)==FP_COOL);
+ assert(fp_state(0,1,450,1,1,1102,100,1101,1500,1000,100,1100)==FP_COOL);
+ assert(fp_state(1,1,450,1,1,1100,100,0,1500,1000,100,0)==FP_IDLE);
+ assert(fp_state(0,1,700,0,1,1101,1101,0,1500,1000,100,1100)==FP_COOL);
+ assert(fp_state(0,0,-400,0,1,1101,1101,0,1500,1000,100,1100)==FP_COOL);
+ assert(fp_state(0,1,450,1,0,1101,1101,0,1500,1000,100,1100)==FP_COOL);
+ assert(fp_state(0,1,700,0,1,1100,0,0,1500,1000,100,0)==FP_IDLE);
+ assert(fp_state(0,1,450,1,1,1100,1101,0,1500,1000,100,0)==FP_COOL);
+ /* Disabled policy is exactly the legacy policy across the guard boundaries. */
+ for(int b=0;b<2;b++)for(int v=0;v<2;v++)for(int t=599;t<=681;t++)
+ for(int safe=0;safe<2;safe++)for(int duty=0;duty<2;duty++)
+ for(unsigned n=1999;n<=3501;n++)
+  assert(fp_state(b,v,t,safe,duty,n,2000,2001,1500,0,100,2100)==
+      (safe && duty && fp_want_boost(b,v,t,n,2000,2001,1500)?FP_HIGH:FP_COOL));
  assert(fp_level(rows,40,1401600,&khz)==1 && khz==1401600);
  assert(fp_level(rows,40,UINT32_MAX,&khz)==4 && khz==2688000);
  assert(fp_level(rows,40,100000,&khz)==-1 && !khz);
@@ -298,6 +324,79 @@ int main(void) {
  arg_name="fuxiperffast";arg_value=25;fp_configure();assert(fp_fast_ms==25);
  arg_value=100;fp_configure();assert(fp_fast_ms==25);
  arg_name="fuxiperfbudget";arg_value=123;fp_configure();assert(fp_budget==123);
+ /* Idle boot-arg bounds and optional floor do not implicitly enable idle. */
+ reset();arg_name="fuxiperfidle";arg_value=999;fp_configure();assert(!fp_idle_after);
+ arg_value=60001;fp_configure();assert(!fp_idle_after);
+ arg_value=(unsigned)-1;fp_configure();assert(!fp_idle_after);
+ arg_value=1000;fp_configure();assert(fp_idle_after==1000);
+ arg_value=60000;fp_configure();assert(fp_idle_after==60000);
+ reset();arg_name="fuxiperfidlekhz";arg_value=99999;fp_configure();assert(!fp_idle_floor);
+ arg_value=3000001;fp_configure();assert(!fp_idle_floor);
+ arg_value=100000;fp_configure();assert(fp_idle_floor==100000 && !fp_idle_after);
+ arg_value=3000000;fp_configure();assert(fp_idle_floor==3000000 && !fp_idle_after);
+ /* Actual LUTs and worker: no new periodic wakes; hook wakeups do no MMIO. */
+ reset_init();fp_idle_ms=1000;fp_configure();log_count=0;fp_worker(0,0);
+ assert(fp_ready && fp_idle_start==100 && !fp_idling && scheduled==200);
+ assert(strstr(last_log,"ready idle LUT 307200/499200/595200 kHz"));
+ for(unsigned d=0;d<3;d++)assert(fp_idle[d]==0 && fp_idle_khz[d]<=fp_cool_khz[d]);
+ ticks=1099;fp_worker(0,0);assert(!fp_idling);
+ ticks=1100;fp_worker(0,0);assert(fp_idling && !fp_boosted && scheduled==1200);
+ assert(fp_idle_entries==1 && fp_idle_transitions==1);
+ for(unsigned d=0;d<3;d++)assert(regs[d][0x320/4]==fp_idle[d]);
+ unsigned before_idle_writes[3];memcpy(before_idle_writes,writes,sizeof(writes));
+ ticks=1200;fuxi_perf_swap();assert(scheduled==1200 && fp_swap==1200);
+ assert(!memcmp(before_idle_writes,writes,sizeof(writes)));
+ fp_worker(0,0);assert(!fp_idling && !fp_boosted && fp_idle_time==100 && scheduled==1300);
+ for(unsigned d=0;d<3;d++)assert(regs[d][0x320/4]==fp_cool[d]);
+ for(unsigned n=0;n<100;n++) { /* ~58 Hz shimmer never starts high or idle. */
+  ticks=1217+17*n;fuxi_perf_swap();fp_worker(0,0);assert(!fp_idling && !fp_boosted);
+ }
+ ticks=fp_swap+1000;fp_worker(0,0);assert(fp_idling);
+ memcpy(before_idle_writes,writes,sizeof(writes));
+ ticks++;fuxi_perf_input();assert(scheduled==ticks);
+ assert(!memcmp(before_idle_writes,writes,sizeof(writes)));
+ fp_worker(0,0);assert(!fp_idling && fp_boosted && scheduled==ticks+20);
+ /* The old input is still within hold when a swap wakes a 1000ms idle. */
+ reset_init();fp_idle_ms=1000;fp_configure();fp_worker(0,0);
+ ticks=101;fuxi_perf_input();fp_worker(0,0);assert(fp_boosted);
+ ticks=1101;fp_worker(0,0);assert(fp_idling);
+ ticks=1102;fuxi_perf_swap();fp_worker(0,0);assert(!fp_idling && !fp_boosted);
+ ticks=1103;fp_worker(0,0);assert(!fp_boosted);
+ /* Hot/invalid samples still cut high; an already lower idle stays lower.
+  * A recovered failed domain may also take idle, never high. */
+ reset_init();fp_idle_ms=1000;fp_configure();fp_worker(0,0);
+ ticks=1100;fp_worker(0,0);assert(fp_idling);
+ regs[3][0xa4/4]=(1u<<21)|770;
+ ticks=1200;fp_worker(0,0);assert(fp_idling && fp_blocked && scheduled==1220);
+ for(unsigned d=0;d<3;d++)assert(regs[d][0x320/4]==fp_idle[d]);
+ ticks=1201;fuxi_perf_input();fp_worker(0,0);assert(!fp_idling && !fp_boosted && fp_blocked);
+ ticks=2201;fp_worker(0,0);assert(fp_idling);
+ regs[1][0]=2;ticks++;fp_worker(0,0);assert(fp_domain_failed[1]);
+ regs[1][0]=3;ticks++;fp_worker(0,0);assert(regs[1][0x320/4]==fp_idle[1]);
+ ticks=10100;fp_worker(0,0);
+ assert(strstr(last_log,"state idle idle 8000 ms entries 2"));
+ assert(!fp_idle_time && !fp_idle_entries && fp_idle_transitions==3);
+ ticks=10200;fp_worker(0,0);assert(fp_idle_time==100);
+ /* Floor rounds up per domain and clamps at cool even for a huge floor. */
+ for(unsigned floor=500000;floor<=3000000;floor+=2500000) {
+  reset_init();fp_idle_ms=1000;fp_idle_floor=floor;fp_configure();fp_worker(0,0);
+  for(unsigned d=0;d<3;d++) {
+   assert(fp_idle_khz[d]<=fp_cool_khz[d]);
+   assert(fp_idle_khz[d]>=(floor<fp_cool_khz[d]?floor:fp_cool_khz[d]));
+  }
+ }
+ /* First eight idle transitions and every 64th only; counters span windows. */
+ reset_init();fp_idle_ms=1000;fp_configure();fp_worker(0,0);fp_window=1000000;
+ for(unsigned n=1;n<=66;n++) {
+  ticks+=1000;unsigned logs=log_count;fp_worker(0,0);assert(fp_idling);
+  assert(log_count==logs+(fp_idle_transitions<=8 || !(fp_idle_transitions&63)));
+  ticks++;logs=log_count;fuxi_perf_swap();fp_worker(0,0);assert(!fp_idling && !fp_boosted);
+  assert(log_count==logs+(fp_idle_transitions<=8 || !(fp_idle_transitions&63)));
+ }
+ /* Feature off leaves both log format and swap scheduling unchanged. */
+ reset_init();fp_worker(0,0);ticks=100000;fp_worker(0,0);
+ assert(!fp_idling && !strstr(last_log," idle "));
+ uint64_t old_deadline=scheduled;ticks++;fuxi_perf_swap();assert(scheduled==old_deadline);
  /* 77 C open-loop burst profile: force all 18 sensors to the trace. No
   * thermal model is assumed; assert votes, not an impossible lowering of an
   * externally supplied temperature. Every ceiling breach cuts in <=20 ms. */
@@ -385,6 +484,7 @@ int main(void) {
  for(unsigned i=1;i<20;i++)assert(fp_thermal_guard(1,550+i,100+i,1000000));
  assert(!fp_thermal_guard(1,570,120,1000000));
 #undef printf
+ puts("PASS: opt-in idle boundaries, LUT floor/clamp, legacy equivalence, hook wakeups, thermal/duty precedence, stats and transition rate limit");
  puts("PASS: predictive/rise/62C cutoff, 68C ceiling votes within 20ms of 77C step at every phase, sustained ramp, 51-52C load, 500ms hysteresis, rolling 123/200ms duty, boot-arg bounds and actual timer deadlines");
  puts("PASS: observed TRDY=8/48.1 C worker boost/hot cutoff/quorum/stats; exact CPU sensor read masks; actual worker 60s retries/input gating/no-init-votes/domain enable loss and recovery; real 0097 LUTs/init failures/16K mappings/14-of-18 sensor quorum; LUT decode/duplicates/turbo/nonmonotonic selection, legacy eligibility 60/68 boundaries, input-only entry, swap extension, 1500 ms expiry, per-core vote/readback and signed/invalid CPU sensors");
 }
@@ -404,6 +504,7 @@ static unsigned fp_attempted,fp_retries,fp_enabled,fp_ready;
 static struct { const char *step; unsigned domain,offset; uint64_t pa; uint32_t value; int access,row; } fp_diagnostic;
 static uint64_t fp_input,fp_swap,fp_hold,fp_last,fp_window,fp_window_start,fp_boost_time,fp_boosts;
 static int fp_max_temp,fp_boosted;
+IDLE_GLOBALS
 THERMAL_GLOBALS
 static const char *arg_name;
 static unsigned arg_value;
@@ -469,6 +570,8 @@ static unsigned fuxi_gpu_access(uintptr_t address,uint64_t *v,unsigned wr,unsign
 static void fp_configure(void);
 static void reset(void) {
  fp_hot=620;fp_limit=680;fp_resume=580;fp_rise=100;fp_fast_ms=20;fp_budget_ms=200;
+ fp_idle_ms=fp_idle_floor=fp_idling=0;
+ fp_idle_start=fp_idle_entry=fp_idle_time=fp_idle_entries=fp_idle_transitions=0;
  arg_name=0;fp_configure();
  fp_recover_since=fp_above_time=fp_cuts=fp_active_start=0;
  fp_duty_count=0;fp_prev_temp=fp_prev_valid=fp_blocked=0;
@@ -497,6 +600,8 @@ static void reset_init(void) {
  reset();memset(fp_epss,0,sizeof(fp_epss));memset(fp_tsens,0,sizeof(fp_tsens));
 }
 '''
+idle_globals = actual[actual.index('static unsigned fp_idle[3]'):actual.index('static unsigned fp_percore[3]')]
+REGISTERS = REGISTERS.replace('IDLE_GLOBALS', idle_globals)
 thermal_globals = actual[actual.index('static unsigned fp_hot ='):actual.index('static unsigned fp_enabled, fp_started')]
 REGISTERS = REGISTERS.replace('THERMAL_GLOBALS', thermal_globals)
 policy_caps = '\n'.join(re.findall(r'^static const unsigned fp_(?:cores|cool_cap|high_cap)\[3\].*$', actual, re.M))

@@ -25,6 +25,11 @@ static const unsigned fp_cores[3] = {3,4,1};
 static const unsigned fp_cool_cap[3] = {1228800,1401600,1363200};
 static const unsigned fp_high_cap[3] = {1228800,2400000,2400000};
 static unsigned fp_cool[3], fp_high[3], fp_cool_khz[3], fp_high_khz[3];
+static unsigned fp_idle[3], fp_idle_khz[3], fp_idle_ms, fp_idle_floor;
+static uint64_t fp_idle_after, fp_idle_start, fp_idle_entry;
+static uint64_t fp_idle_time, fp_idle_entries, fp_idle_transitions;
+/* Published only so a swap can queue the existing worker when leaving idle. */
+static unsigned fp_idling;
 static unsigned fp_percore[3], fp_domain_failed[3], fp_applied[3], fp_applied_valid[3];
 static uint64_t fp_retry_interval, fp_retry_at, fp_retry_end;
 static unsigned fp_attempted, fp_retries;
@@ -62,13 +67,13 @@ static int fp_vote(unsigned d, unsigned level)
 {
  for (unsigned c = 0; c < (fp_percore[d] ? fp_cores[d] : 1); c++) {
   /* Power may disappear between samples or per-core votes. Never write a
-   * domain after an unsuccessful/clear enable read; latch it to cool. */
+   * domain after an unsuccessful/clear enable read; latch it at/below cool. */
   uint32_t enable;
   if (!fp_read(fp_epss[d],0,&enable) || !(enable & 1)) {
    fp_domain_failed[d] = 1;
    return 0;
   }
-  if (fp_domain_failed[d]) level = fp_cool[d];
+  if (fp_domain_failed[d] && level != fp_idle[d]) level = fp_cool[d];
   uint64_t v = level;
   unsigned off = 0x320+4*c;
   if (fuxi_gpu_access(fp_epss[d]+off, &v, 1, 0)) return 0;
@@ -129,6 +134,7 @@ static void fp_init_report(const char *outcome)
 static int fp_initialize(void)
 {
  unsigned percore[3], cool_level[3], high_level[3], cool_freq[3], high_freq[3];
+ unsigned idle_level[3], idle_freq[3];
  for (unsigned d = 0; d < 3; d++) {
   if (!fp_epss[d]) fp_epss[d] = ml_io_map(fp_epss_pa[d], 0x1000);
   if (!fp_epss[d]) return fp_init_fail("map",d,fp_epss_pa[d],0,0,0,-1);
@@ -157,6 +163,12 @@ static int fp_initialize(void)
   int high = fp_level(rows,count,fp_high_cap[d],&high_khz);
   if (cool < 0 || high < 0)
    return fp_init_fail("level selection",d,fp_epss_pa[d],0x100+4*(count-1),rows[count-1],1,(int)count-1);
+  if (fp_idle_after) {
+   int idle = fp_idle_level(rows,count,fp_idle_floor,cool_khz,&idle_freq[d]);
+   if (idle < 0)
+    return fp_init_fail("idle selection",d,fp_epss_pa[d],0x100,rows[0],1,0);
+   idle_level[d] = (unsigned)idle;
+  } else { idle_level[d] = (unsigned)cool; idle_freq[d] = cool_khz; }
   cool_level[d] = (unsigned)cool;
   high_level[d] = d ? (unsigned)high : (unsigned)cool;
   cool_freq[d] = cool_khz;
@@ -169,6 +181,7 @@ static int fp_initialize(void)
  /* Commit policy only when every domain and sensor mapping passed. Failed
   * attempts are read-only, including domains discovered on earlier tries. */
  for (unsigned d = 0; d < 3; d++) {
+  fp_idle[d] = idle_level[d]; fp_idle_khz[d] = idle_freq[d];
   fp_percore[d] = percore[d];
   fp_cool[d] = cool_level[d]; fp_high[d] = high_level[d];
   fp_cool_khz[d] = cool_freq[d]; fp_high_khz[d] = high_freq[d];
@@ -185,8 +198,12 @@ static int fp_try_initialize(uint64_t now)
  else fp_retry_end = now + 60*fp_retry_interval;
  if (fp_initialize()) {
   fp_ready = 1;
+  fp_idle_start = now;
   printf("FUXI PERF: ready, LUT cool %u/%u/%u kHz high %u/%u/%u kHz, hold 1500 ms after %u retries\n",
       fp_cool_khz[0],fp_cool_khz[1],fp_cool_khz[2],fp_high_khz[0],fp_high_khz[1],fp_high_khz[2],fp_retries);
+  if (fp_idle_after)
+   printf("FUXI PERF: ready idle LUT %u/%u/%u kHz after %u ms floor %u kHz (clamped to cool)\n",
+       fp_idle_khz[0],fp_idle_khz[1],fp_idle_khz[2],fp_idle_ms,fp_idle_floor);
   return 1;
  }
  if (!fp_attempted) fp_init_report("init retry");
@@ -200,28 +217,29 @@ disabled:
  __atomic_store_n(&fp_enabled,0,__ATOMIC_RELEASE);
  return 0;
 }
-static void fp_update_votes(int boost)
+static void fp_update_votes(int state)
 {
  for (unsigned d = 0; d < 3; d++) {
   unsigned failed = fp_domain_failed[d];
   uint32_t enable;
   /* Check even if the desired vote did not change. A recovered domain may
-   * receive cool, but never resumes boost during this boot. */
+   * receive idle/cool, but never resumes boost during this boot. */
   if (!fp_read(fp_epss[d],0,&enable) || !(enable & 1)) {
    fp_domain_failed[d] = 1;
    fp_applied_valid[d] = 0;
   } else {
-   unsigned level = boost && !failed ? fp_high[d] : fp_cool[d];
+   unsigned level = state == FP_IDLE ? fp_idle[d] :
+       state == FP_HIGH && !failed ? fp_high[d] : fp_cool[d];
    if (!fp_applied_valid[d] || fp_applied[d] != level) {
     if (fp_vote(d,level)) {
-     fp_applied[d] = fp_domain_failed[d] ? fp_cool[d] : level;
+     fp_applied[d] = fp_domain_failed[d] && state != FP_IDLE ? fp_cool[d] : level;
      fp_applied_valid[d] = 1;
     } else {
      fp_domain_failed[d] = 1;
      fp_applied_valid[d] = 0;
      /* A write/readback error may have left a high vote. fp_vote rechecks
-      * enable before each attempted cool write, including this fallback. */
-     (void)fp_vote(d,fp_cool[d]);
+      * enable before each attempted idle/cool write, including fallback. */
+     (void)fp_vote(d,state == FP_IDLE ? fp_idle[d] : fp_cool[d]);
     }
    }
   }
@@ -304,6 +322,9 @@ static void fp_arg(const char *name, unsigned *value, unsigned low, unsigned hig
 }
 static void fp_configure(void)
 {
+ fp_arg("fuxiperfidle",&fp_idle_ms,1000,60000);
+ fp_arg("fuxiperfidlekhz",&fp_idle_floor,100000,3000000);
+ nanoseconds_to_absolutetime((uint64_t)fp_idle_ms*NSEC_PER_MSEC,&fp_idle_after);
  fp_arg("fuxiperflimit",&fp_limit,450,680);
  fp_arg("fuxiperfhot",&fp_hot,400,fp_limit);
  if (fp_hot > fp_limit) fp_hot = fp_limit;
@@ -333,6 +354,8 @@ static void fp_worker(thread_call_param_t arg, thread_call_param_t result)
  uint64_t elapsed = fp_last ? now-fp_last : 0, elapsed_ns;
  absolutetime_to_nanoseconds(elapsed,&elapsed_ns);
  if (fp_boosted) fp_boost_time += elapsed;
+ unsigned was_idle = __atomic_load_n(&fp_idling,__ATOMIC_RELAXED);
+ if (was_idle) fp_idle_time += elapsed;
  int temp = -400;
  int valid = fp_temperature(&temp);
  if (valid && temp > fp_max_temp) fp_max_temp = temp;
@@ -343,11 +366,22 @@ static void fp_worker(thread_call_param_t arg, thread_call_param_t result)
  int safe = fp_thermal_guard(valid,temp,now,elapsed_ns);
  uint64_t used = fp_duty_used(now);
  int duty_ok = used < fp_budget && (fp_boosted || fp_duty_count < 16);
- int boost = safe && duty_ok && fp_want_boost(fp_boosted,valid,temp,now,
+ int state = fp_state(fp_boosted,valid,temp,safe,duty_ok,now,
      __atomic_load_n(&fp_input,__ATOMIC_ACQUIRE),
-     __atomic_load_n(&fp_swap,__ATOMIC_ACQUIRE),fp_hold);
+     __atomic_load_n(&fp_swap,__ATOMIC_ACQUIRE),fp_hold,
+     fp_idle_after,fp_idle_start,fp_idle_entry);
+ int boost = state == FP_HIGH;
  /* First sample also establishes cool votes. No boost without fresh TSENS. */
- fp_update_votes(boost);
+ fp_update_votes(state);
+ unsigned idle = state == FP_IDLE;
+ if (idle != was_idle) {
+  if (idle) { fp_idle_entries++; fp_idle_entry = now; }
+  fp_idle_transitions++;
+  if (fp_idle_transitions <= 8 || !(fp_idle_transitions & 63))
+   printf("FUXI PERF: idle %s state %s transition %llu\n",
+       idle ? "enter" : "leave",idle ? "idle" : boost ? "high" : "cool",fp_idle_transitions);
+ }
+ __atomic_store_n(&fp_idling,idle,__ATOMIC_RELEASE);
  if (boost && !fp_boosted) {
   fp_boosts++;
   fp_active_start = now;
@@ -365,9 +399,17 @@ static void fp_worker(thread_call_param_t arg, thread_call_param_t result)
   uint64_t ns, above_ns;
   absolutetime_to_nanoseconds(fp_boost_time,&ns);
   absolutetime_to_nanoseconds(fp_above_time,&above_ns);
-  printf("FUXI PERF: stats boosts %llu boosted %llu ms max temp %d dC above %u dC %llu ms cuts %llu valid %d state %s\n",
+  if (!fp_idle_after) printf("FUXI PERF: stats boosts %llu boosted %llu ms max temp %d dC above %u dC %llu ms cuts %llu valid %d state %s\n",
       fp_boosts,ns/1000000,fp_max_temp,fp_hot,above_ns/1000000,fp_cuts,
       valid,fp_boosted ? "high" : "cool");
+  else {
+   uint64_t idle_ns;
+   absolutetime_to_nanoseconds(fp_idle_time,&idle_ns);
+   printf("FUXI PERF: stats boosts %llu boosted %llu ms max temp %d dC above %u dC %llu ms cuts %llu valid %d state %s idle %llu ms entries %llu\n",
+       fp_boosts,ns/1000000,fp_max_temp,fp_hot,above_ns/1000000,fp_cuts,
+       valid,idle ? "idle" : fp_boosted ? "high" : "cool",idle_ns/1000000,fp_idle_entries);
+  }
+  fp_idle_time = fp_idle_entries = 0;
   fp_boosts = fp_boost_time = fp_above_time = fp_cuts = 0;
   fp_max_temp = -400;
   fp_window_start = now;
@@ -403,7 +445,10 @@ void fuxi_perf_input(void)
 }
 void fuxi_perf_swap(void)
 {
- if (__atomic_load_n(&fp_enabled,__ATOMIC_ACQUIRE))
+ if (__atomic_load_n(&fp_enabled,__ATOMIC_ACQUIRE)) {
   __atomic_store_n(&fp_swap,mach_absolute_time(),__ATOMIC_RELEASE);
+  if (__atomic_load_n(&fp_idling,__ATOMIC_ACQUIRE))
+   (void)thread_call_enter(&fp_call);
+ }
 }
 #endif

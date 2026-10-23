@@ -167,6 +167,42 @@ otherwise can treat the daemon as a different instance. That this causes any
 of our launchd CPU time is a **guess**; the A/B run below tests it. Logs the
 first eight: `FUXI IDLE: xpcproxy pid P exec keeps pidversion V (fuxixpcid=1)`.
 
+## CPU frequency idle votes (`fuxiperfidle=MS`)
+
+**OBSERVED (reported device run, keys74-perf):** `fuxiperf=1` reached
+`LUT cool 1228800/1401600/1363200 kHz high 1228800/2323200/2342400 kHz`
+and stayed cool on the lock screen, with CPU sensors about 45–47 C and
+average busy time 0–4%. Cool still votes roughly 1.2–1.4 GHz.
+
+Add `fuxiperf=1 fuxiperfidle=5000` to select each domain's lowest eligible
+EPSS LUT frequency after five seconds without input or swaps. The accepted
+timeout is 1000–60000 ms; missing or invalid values leave the feature off,
+including the existing log format and polling behavior. The quiet interval
+starts at governor readiness if neither hook has fired. With the recorded
+LUT fixture, idle selects silver/gold/prime at 307200/499200/595200 kHz;
+the ready log reports the actual choices.
+
+Optional `fuxiperfidlekhz=600000` chooses the lowest eligible LUT entry at
+or above that floor per domain. Accepted values are 100000–3000000 kHz;
+invalid values are ignored. The floor is clamped to each domain's cool
+frequency, so idle never votes above cool. This argument alone enables
+nothing. Input queues the existing worker and follows the boost path;
+a swap wakes idle into cool, including when an older input is still within
+the boost hold. Continuous animation swaps prevent idle entry. Thermal and
+duty guards still veto high; thermal cuts retain an already lower idle
+vote. MMIO stays in the worker, with the existing 100 ms quiet polling
+period (the existing faster thermal guard polling also remains).
+
+With idle enabled, each ten-second `FUXI PERF: stats` window includes
+`idle N ms entries N` and `state idle` when selected. Transition logs cover
+the first eight changes and every 64th thereafter. **GUESS:** lower idle
+votes may reduce settled temperature; responsiveness and power savings
+need a device A/B run. Compare the baseline with five-second idle, then
+with the optional floor; check input wakeups, swap-only wakeups, idle
+residency and CPU temperature. Host verification is
+`python3 tools/test-fuxi-perf.py`; `python3 tools/sync-fuxi-perf.py --check`
+checks the patch 0097 snapshots using the existing sync tooling's format.
+
 ## UniXNU idle and thermal code: nothing ported
 
 `drivers/ArmCpu` is empty in our checkout; its test scripts only show CPU
