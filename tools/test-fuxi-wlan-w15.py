@@ -193,6 +193,27 @@ int main(void) {
         assert(ne==before && nreads==6);
         const unsigned offsets[]={0x128,0x48,0x130,0x134,0x138,0x13c};
         for(unsigned i=0;i<6;i++)assert(reads[i]==WL_BAR0+offsets[i]);
+        assert(strstr(logbuf,"ms since FW_READY: INI send"));
+        assert(strstr(logbuf,"ms since FW_READY: CFG reply"));
+        assert(strstr(logbuf,"ms since FW_READY: MODE reply"));
+        /* Queue a reply and indication, but never consume/credit them here. */
+        wl12_stage=WL15_MODE;
+        reply(wl12_txn,0x22,false);ind(0x7777,NULL,0);
+        uint8_t saved_contexts[16384];memcpy(saved_contexts,(void *)wl_contexts.va,16384);
+        uint8_t *saved_ipcr=malloc(wl_ipcr.size);assert(saved_ipcr);
+        memcpy(saved_ipcr,(void *)wl_ipcr.va,wl_ipcr.size);
+        before=ne;track_reads=true;nreads=0;wl15_timeout_snapshot();track_reads=false;
+        assert(ne==before && nreads==9);
+        assert(!memcmp(saved_contexts,(void *)wl_contexts.va,16384));
+        assert(!memcmp(saved_ipcr,(void *)wl_ipcr.va,wl_ipcr.size));free(saved_ipcr);
+        assert(strstr(logbuf,"pending RX QMI type 0x2 txn 15 msg 0x22 bytes 14"));
+        assert(strstr(logbuf,"pending RX QMI type 0x4 txn 0 msg 0x7777 bytes 7"));
+        assert(strstr(logbuf,"pending RX QMI headers 2 (snapshot only)"));
+        assert(strstr(logbuf,"BHIE_TXVECSTATUS") && strstr(logbuf,"BHIE_RXVECSTATUS"));
+        for(unsigned i=0;i<6;i++)assert(reads[i]==WL_BAR0+offsets[i]);
+        assert(reads[6]==WL_BAR0+0x38 && reads[7]==WL_BAR0+wl_bhie+0x44 && reads[8]==WL_BAR0+wl_bhie+0x78);
+        wl12_stage=WL15_OBSERVE;
+        assert(!wl_w11_events());before=ne;
         if(keep){wl_finish(28);assert(ne==before && !frees);contain();}
         else {wl_finish(28);assert(frees==allocations);dev_on=false;}
     }
@@ -215,6 +236,11 @@ int main(void) {
         assert(strstr(logbuf,"W15 WLAN start diagnostic"));
         if(kind==2||kind==7) {
             assert(sleeps-fwready_ticks==10000 && strstr(logbuf,"(10000 ms)"));
+            if(step==2) {
+                assert(strstr(logbuf,"W15 elapsed 10000 ms since FW_READY: MODE timeout"));
+                assert(strstr(logbuf,"pending QMI txn 15 msg 0x22 reply 0 cmd_pending 0"));
+                assert(strstr(logbuf,"pending RX QMI headers 0 (snapshot only)"));
+            } else assert(!strstr(logbuf,"BHIE_TXVECSTATUS"));
         }
         if(kind==1||kind==5)assert(strstr(logbuf,"error 90 (INCOMPATIBLE_STATE)"));
         check_no_ce();contain();
@@ -239,6 +265,8 @@ int main(void) {
 
 def main():
     assert 'python3 tools/test-fuxi-wlan-w15.py' in (ROOT / 'tools/ci/build.sh').read_text()
+    m6 = w14.w12.w11.w10.m6o.m6
+    m6.PREAMBLE = m6.PREAMBLE.replace('return 0x12345; }', 'return (uint64_t)sleeps*1000000ull; }')
     w14.TESTS = TESTS
     w14.main()
 
