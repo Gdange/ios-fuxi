@@ -22,7 +22,7 @@
   return result;
 --- a/pexpert/arm/pe_serial.c
 +++ b/pexpert/arm/pe_serial.c
-@@ -1,5 +1,8 @@
+@@ -730,5 +730,8 @@
 +extern int fuxi_gpu_scanout_owned(void);
  void fuxi_display_kick(void)
  {

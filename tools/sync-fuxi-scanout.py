@@ -27,6 +27,21 @@ KICK_BEFORE = '''void fuxi_display_kick(void)
     }
 }
 '''
+# First line of fuxi_display_kick in pe_serial.c after 0003/0012/0082/0087.
+# git apply anchors a hunk that starts at line 1 to the top of the file, so the
+# fragment diff must carry the function's real position.
+KICK_LINE = 730
+
+
+def shift(diff, offset):
+    out = []
+    for line in diff.splitlines(True):
+        if line.startswith('@@ '):
+            _, old, new, rest = line.split(' ', 3)
+            a, b = old[1:].split(','); c, d = new[1:].split(',')
+            line = f'@@ -{int(a)+offset},{b} +{int(c)+offset},{d} {rest}'
+        out.append(line)
+    return ''.join(out)
 
 
 def main():
@@ -44,8 +59,9 @@ def main():
     before[console] = KICK_BEFORE
     after = {surface: (ROOT / 'xnu/fuxi-scanout/SweetSurface.cpp').read_text(),
              console: (ROOT / 'xnu/fuxi-scanout/display-kick.c').read_text()}
-    expected = ''.join(''.join(difflib.unified_diff(before[name].splitlines(True),
-        after[name].splitlines(True), fromfile='a/' + name, tofile='b/' + name)) for name in before)
+    expected = ''.join(shift(''.join(difflib.unified_diff(before[name].splitlines(True),
+        after[name].splitlines(True), fromfile='a/' + name, tofile='b/' + name)),
+        KICK_LINE - 1 if name == console else 0) for name in before)
     if args.check:
         assert PATCH.read_text() == expected, 'GPU-SCANOUT differs; run tools/sync-fuxi-scanout.py'
     else:
@@ -54,7 +70,7 @@ def main():
         for name, value in before.items():
             dest = Path(tmp) / name
             dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text(value)
+            dest.write_text('\n' * (KICK_LINE - 1) + value if name == console else value)
         subprocess.run(['git', 'apply', '--check', '-'], input=expected, text=True, cwd=tmp, check=True)
     print('PASS: GPU-SCANOUT sources match 0108; preceding surface stack and overlay apply')
 
