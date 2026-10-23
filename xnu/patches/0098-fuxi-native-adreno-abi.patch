@@ -1123,7 +1123,7 @@
 +#endif
 --- a/bsd/dev/fuxi_gpu_scanout.inc
 +++ b/bsd/dev/fuxi_gpu_scanout.inc
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,176 @@
 +/* SPDX-License-Identifier: MIT
 + * Copyright (c) 2026 NativeMetal contributors
 + * Ported from UniXNU drivers/NativeMetal/GpuScanoutClient.h (MIT).
@@ -1134,8 +1134,10 @@
 +/* GPU-SCANOUT: Fuxi command-mode display ownership. Original implementation.
 + * No panel/DSI reset, address flip, clock change or firmware dependency.
 + * Register meanings already used by the board's inherited-display probe:
-+ * INTF1 AUTOREFRESH_CONFIG +0x2b4 bit31; INT_COUNT_VAL +0x2a8 low16
++ * INTF1 AUTOREFRESH_CONFIG +0x2b4 bit31; TEAR_LINE_COUNT +0x2b0 low16
 + * write line; CTL START +0x1c bit0. Do not copy while a transfer can read RAM.
++ * TEAR_INT_COUNT_VAL +0x2a8 low16 is the panel read pointer, which keeps
++ * counting while idle (logged only; waiting on it never drained on device).
 + */
 +#define FG_SCAN_CTL 0x0ae16000u
 +#define FG_SCAN_INTF 0x0ae36000u
@@ -1202,7 +1204,12 @@
 +  __asm__ volatile("dsb sy" ::: "memory");
 +  fg_scanout_after = rsr("cntpct_el0") + rsr("cntfrq_el0")*FG_SCAN_DRAIN_US/1000000;
 +  fg_scanout_timeout = fg_scanout_after + rsr("cntfrq_el0")/10;
-+  printf("FUXI SCANOUT: owned, autorefresh disabled; draining inherited transfer\n");
++  unsigned rd = 0, wr = 0, st = 0;
++  (void)fg_scanout_read(FG_SCAN_INTF+0x2a8, &rd);
++  (void)fg_scanout_read(FG_SCAN_INTF+0x2b0, &wr);
++  (void)fg_scanout_read(FG_SCAN_CTL+0x1c, &st);
++  printf("FUXI SCANOUT: owned, autorefresh disabled; draining inherited transfer ar=%#x rd=%#x wr=%#x start=%#x\n",
++      ar, rd, wr, st);
 +  return 0;
 + }
 + unsigned ar, line, start;
@@ -1210,10 +1217,15 @@
 +  return fg_scanout_stop("autorefresh changed");
 + if (fg_busy) return 0;
 + if (rsr("cntpct_el0") < fg_scanout_after) return 0;
-+ if (!fg_scanout_read(FG_SCAN_INTF+0x2a8, &line) ||
++ if (!fg_scanout_read(FG_SCAN_INTF+0x2b0, &line) ||
 +     !fg_scanout_read(FG_SCAN_CTL+0x1c, &start)) return fg_scanout_stop("read transfer status");
 + if ((start & 1) || ((line & 65535) != 0 && (line & 65535) < 2400)) {
-+  if (rsr("cntpct_el0") >= fg_scanout_timeout) return fg_scanout_stop("transfer drain timeout");
++  if (rsr("cntpct_el0") >= fg_scanout_timeout) {
++   unsigned rd = 0;
++   (void)fg_scanout_read(FG_SCAN_INTF+0x2a8, &rd);
++   printf("FUXI SCANOUT: drain timeout wr=%#x rd=%#x start=%#x\n", line, rd, start);
++   return fg_scanout_stop("transfer drain timeout");
++  }
 +  return 0;
 + }
 + __asm__ volatile("dsb sy" ::: "memory");

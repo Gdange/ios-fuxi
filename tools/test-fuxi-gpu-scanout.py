@@ -72,9 +72,10 @@ int main(void) {
  assert(intf[0x2b4/4]==1 && writes==1 && !starts);
  assert(fuxi_gpu_scanout_publish()==-1 && !starts);
  ticks+=19999;assert(!fuxi_gpu_scanout_acquire());
- ticks++;intf[0x2a8/4]=100;assert(!fuxi_gpu_scanout_acquire());
- intf[0x2a8/4]=2400;ctl[0x1c/4]=1;assert(!fuxi_gpu_scanout_acquire());
- ctl[0x1c/4]=0;assert(fuxi_gpu_scanout_acquire()==1 && fg_scanout_writable);
+ ticks++;intf[0x2b0/4]=100;assert(!fuxi_gpu_scanout_acquire());
+ intf[0x2b0/4]=2400;ctl[0x1c/4]=1;assert(!fuxi_gpu_scanout_acquire());
+ // The read pointer keeps counting while idle; it must not block the drain.
+ ctl[0x1c/4]=0;intf[0x2a8/4]=1200;assert(fuxi_gpu_scanout_acquire()==1 && fg_scanout_writable);
  // Existing console/display kick must not start an owned transfer, even idle.
  fuxi_display_kick();assert(!ctl[0x1c/4]);
  fg_client_busy=1;abiResult=1;assert(!fuxi_gpu_scanout_reserve() && !fg_scanout_reserved);
