@@ -70,6 +70,11 @@ You need an unlocked bootloader, a rooted recovery for installing the root file,
 
 ## Credits
 
+- **[HackiOS](https://github.com/oosexgang/hackios-xnu-userland)**: MIT ir3 default-rounding fix from
+  `hackios-xnu-userland/tools/mesa/ir3-round-default.patch`, adapted for our pinned
+  Mesa/Turnip compiler. See the [P-MESA audit](docs-lanes/mesa-port.md) for source,
+  retained licence and the other patches reviewed.
+
 - **[metal2vulkan](https://github.com/steelbrain/metal2vulkan)** by Anees Iqbal and contributors: external AIR-to-SPIR-V translator, pinned to `720ef1ce9ae2a2068999a8675717418b9416283e`. Its declared licence is GPL-2.0-or-later OR LGPL-3.0-or-later; the Metal lane selects **LGPL-3.0-or-later** for a separate, replaceable `libmetal2vulkan.dylib` loaded with `dlopen`. No translator source is vendored or statically linked into FuxiMetal/XNU. The ignored build output includes corresponding library/adapter/dependency source, lockfile, LGPL/GPL texts, notices and an offline rebuild recipe. Preserve those materials and the rights/information needed to replace and debug modifications to the library when distributing it; dynamic loading alone does not discharge the obligations. Our original code retains its existing repository terms. See [Metal build, licensing and installation details](docs-lanes/metal.md#m5b-external-translator-and-offscreen-pipeline).
 
 - **[UniXNU](https://github.com/UniXNU/UniXNU) / NativeAdreno and NativeMetal contributors**: MIT NativeAdreno wire ABI and A7xx BR/BV submission framing; retained notice in `xnu/fuxi-adreno/LICENSE.NativeAdreno`. NativeMetal's CA encoder, queue and neutral depth/stencil adapters are adapted in FuxiMetal, with notice in `tools/fuxi-metal/LICENSE.NativeMetal` and the signed/staged bundle. Their cache design informed our process-only Vulkan pipeline cache. See [M9b comparison and provenance](docs-lanes/metal-m9b.md).

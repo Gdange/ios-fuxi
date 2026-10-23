@@ -1,5 +1,8 @@
 # Turnip T1: UniXNU nine-patch baseline
 
+P-MESA appends the HackiOS rounding fix to this baseline; see
+[the patch audit and verification](mesa-port.md). The pins below are unchanged.
+
 2026-10-23. Source rebase and Linux host validation only. Mesa stays pinned at
 `85fda3b36405bcaea8bffc64aa4f2651dc90770d`; UniXNU moves to
 `fb6aad6ab1f50199a4d99d2da1d0ca403b067633`. This is the current Turnip recipe,
