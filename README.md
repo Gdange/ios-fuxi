@@ -70,6 +70,7 @@ You need an unlocked bootloader, a rooted recovery for installing the root file,
 
 ## Credits
 
+- **[HackiOS](https://github.com/oosexgang/hackios-xnu-kernel)** by OOSEX GANG: the APSL-2.0 iOS Wi-Fi interface, Apple80211 ioctl/station bridge, property-only WLAN discovery, network-stack stand-in and WPA2 arithmetic adapted in `xnu/fuxi-wifi-ios/` (patch 0104). Its [MIT userland notes](https://github.com/oosexgang/hackios-xnu-userland) informed the independent opt-in wifid root-edit tool; no userland code was copied. See [P-WIFI provenance, ABI limits and test plan](docs-lanes/wifi-ios.md).
 - **[HackiOS](https://github.com/oosexgang/hackios-xnu-userland)**: MIT ir3 default-rounding fix from
   `hackios-xnu-userland/tools/mesa/ir3-round-default.patch`, adapted for our pinned
   Mesa/Turnip compiler. See the [P-MESA audit](docs-lanes/mesa-port.md) for source,
