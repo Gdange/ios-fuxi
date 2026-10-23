@@ -3791,7 +3791,9 @@ wl14_download(const char *name, struct wl_dma *d, unsigned stage)
 static int
 wl_w14_run(void)
 {
-	if (!wl14_board_valid) { return wl_w11_fail("W14 CAP missing board id"); }
+	// Unprogrammed OTP omits board_info; ath12k then uses board id 0xff. The
+	// BDF here comes from fuxiwlanbdf (or its default), not from the id.
+	if (!wl14_board_valid) { printf("FUXI WLAN: W14 CAP has no board id (OTP unset); ath12k default 0xff, BDF by name\n"); }
 	if (wl14_download("regdb_xiaomi.bin", &wl14_regdb, WL14_REGDB) ||
 	    wl14_download(wl14_bdf_name, &wl14_bdf, WL14_BDF)) { return 1; }
 	unsigned size = 0;

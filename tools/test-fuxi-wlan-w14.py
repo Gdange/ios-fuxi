@@ -134,9 +134,12 @@ int main(void) {
         assert(strstr(logbuf,"ol_cpr_cfg pmu_param_len 9") && strstr(logbuf,"wake_volt 908") && strstr(logbuf,"share_mem_len 3"));
         unsigned before=ne;wl_finish(28);assert(ne==before && !frees);contain();
     }
+    /* Unprogrammed OTP (no board_info TLV, observed on the device): continue with the named BDF. */
+    boot14(21,true);{int e=finish_step();if(e)fprintf(stderr,"%s",logbuf);assert(!e && wl_w11_ok && wl14_ready && strstr(logbuf,"no board id (OTP unset)"));}
+    {unsigned before=ne;wl_finish(28);assert(ne==before && !frees);contain();}
     boot14(0,false);assert(!finish_step());wl_finish(28);assert(frees==allocations);dev_on=false;
     for(unsigned c=1;c<=26;c++) {
-        if(c==8)continue;
+        if(c==8||c==21)continue;
         boot14(c,true);unsigned ticks=sleeps;int e=finish_step();
         if(!e)fprintf(stderr,"unexpected success case %u\n",c);assert(e && !wl_w11_ok && sleeps-ticks<23000);
         if(c<=3)assert(strstr(logbuf,"missing/unreadable file"));
