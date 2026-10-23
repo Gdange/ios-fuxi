@@ -140,12 +140,126 @@ Every `SweetHIDButtons::key` event now passes `kIOHIDEventOptionIsBuiltIn` to th
 keyboard-event constructor. This includes power, volume, home and test events,
 with the existing consumer-page usages unchanged.
 
+## Buttons lane P-BTN (2026-10-23, offline)
+
+Written without device access, CI or push. Everything below the "Device test
+plan" heading is a plan, not an observation.
+
+### Press timestamps and the key arbiter (HackiOS false-Siri item)
+
+Observation from HackiOS (`hackios-xnu-userland/userland/src/inject_sb.c`,
+`lock_long_press()`): SpringBoard's side-button long-press recognizer
+(`-[SBLockHardwareButton longPress:]`, i.e. Siri) is a SpringBoard timer started
+when its main thread sees the press. Waking the display from inside that press
+takes as long as the first lock-screen frame, which on a software renderer is
+longer than the long-press interval, so the timer fires before the release is
+processed. HackiOS saw this even for its tap-to-wake press, whose down and up
+are sent back to back. Their fix drops a long press in SpringBoard when the
+button is no longer held. A kernel cannot do that, and this project has no
+SpringBoard code injection; that part is **not ported**.
+
+What the kernel does instead, so the pair it delivers is right:
+
+- **Timestamps.** `fuxi_key_sample()` records when the new level was first
+  sampled; the HID event (`sweet_hid_key_at()`) carries that time rather than
+  the time of the confirming sample 20 ms later. Timestamps handed to HID never
+  go backwards.
+- **One arbiter.** All Fuxi key events (PMIC poller, test injection,
+  tap-to-wake) pass `fk_deliver()` and the `fuxi_key_arbitrate()` state in
+  `fuxi_key_state.h`. A key is HID-down while any source holds it, so every HID
+  down gets exactly one HID up; repeated downs and unmatched ups from a source
+  produce nothing. The failure shutdown releases through the same path.
+- **No stuck down across display off/on.** This system does not suspend; its
+  "sleep" is the framebuffer `RequestPowerChange(0)` while the PMIC poller keeps
+  running, so a press that turns the display off is released normally. An
+  injected down is released automatically after 10 s.
+- **Held state for a future userland guard.** `debug.fuxikeys.held` (read-only
+  int): bits 0-2 = keys HID has down (power, volume up, volume down), bits 8-10
+  held by the PMIC, 16-18 by injection, 24-26 by tap-to-wake. A SpringBoard
+  guard like HackiOS's would read bit 0 when the long press begins.
+- The up log line now says how long the key was held, as HackiOS does:
+  `FUXI KEYS: power up (pon=0 gpio6=0x1) held 143 ms`.
+
+Sweet (`sweet_keys.c`) only gets the new `fuxi_key_sample()` argument; it keeps
+its dispatch-time stamps and its direct `sweet_hid_key()` calls.
+
+### Test injection (`fuxikeyinject=1`)
+
+`debug.fuxikeys.inject` is an int sysctl. Writes need root (the oid has no
+`CTLFLAG_ANYBODY`; the handler checks `kauth_cred_issuser` again) **and** boot-arg
+`fuxikeyinject=1`; otherwise a write returns `ENOTSUP` and changes nothing. A read
+returns the keys currently held by injection. Injected events enter the same
+arbiter and HID path as the PMIC keys (built-in, not marked injected), so iOS
+cannot tell them apart.
+
+Command word: `key | op << 8 | hold_ms << 16`, key 0 power, 1 volume up,
+2 volume down; op 1 down, 2 up, 3 click (down, wait `hold_ms`, up; 0 means
+100 ms, at most 2000). Bits 28-31 must be zero; a hold is only allowed with a
+click. Anything else is `EINVAL`.
+
+| Word | Action |
+| --- | --- |
+| `0x300` (768) | power click, 100 ms |
+| `0x3e80300` (65536768) | power click, 1000 ms (long press: Siri expected) |
+| `0x301` / `0x302` | volume up / volume down click |
+| `0x100`, then `0x200` | power down, power up (any hold; auto-release at 10 s) |
+
+Stock iOS has no `sysctl` command; a root test program calls
+`sysctlbyname("debug.fuxikeys.inject", NULL, NULL, &word, sizeof(word))`.
+Each injection logs `FUXI KEYS: inject <key> <down|up> -> hid <down|up|unchanged>`.
+
+### Tap-to-wake (`fuxitaptowake=1`)
+
+Ported from HackiOS `userland/src/inject.c` (MIT). backboardd sets
+`TouchDetectionMode` on the touch service; HackiOS observed `0xff`/`0xfe` during
+boot, `0x1` with the display on and `0x1fe` after the lock button, low byte
+`0xfe` meaning "display off, a tap is to wake it". `SweetHIDTouch::setProperties`
+stores that value (`sweet_hid_touch_mode()`, -1 until set) and logs each change
+and the first 24 distinct property names the event system sets.
+
+`fuxi_touch.c` already reads the FIFO while the display is off and drops the
+events. With H1 it tracks those contacts; a new one calls
+`fuxi_keys_touch_wake()`, which with `fuxitaptowake=1`, mode low byte `0xfe`,
+power not held and no wake press in the last 1.5 s sends a power down and up at
+the touch time (source TAP) and returns true. The contacts of that off period
+then stay hidden from iOS until each lifts, so the waking finger does not start
+a touch mid-contact once the display is on. Without a wake press nothing is
+hidden (the previous behavior). Controller resets and repeated FIFO read errors
+clear the filter. `fuxitouch_offsuppress=0` reports touches while the display is
+off, so tap-to-wake then never triggers.
+
+### HID usage audit
+
+| Key | Page / usage sent | HackiOS (iOS 16.5, works) | iOS consumer |
+| --- | --- | --- | --- |
+| Side (power) | Consumer 0x0C / Power 0x30 | 0x0C / 0x30 | SpringBoard `SBLockHardwareButton` (lock, wake, Siri) |
+| Volume up | 0x0C / Volume Increment 0xE9 | 0x0C / 0xE9 | volume HUD |
+| Volume down | 0x0C / Volume Decrement 0xEA | 0x0C / 0xEA | volume HUD |
+| Home (sweethidtest only) | 0x0C / Menu 0x40 | 0x0C / 0x40 | home button |
+| Ringer switch | none (phone has none) | none | Telephony 0x0B not sent |
+
+The service publishes the Consumer / Consumer Control (0x0C/0x01) usage pair and
+`Built-In`, as HackiOS's virtual button service does, and every event carries
+the built-in option. No mismatch was found, so no usage changed. This is
+checked against HackiOS's working mapping and the IOHIDFamily-1915 usage tables
+in patch 0058, not against a disassembly of the installed 20H392 backboardd.
+
+### UniXNU comparison
+
+`research/UniXNU/drivers/NativeHidInput` and `NativeKeyStoreEvents` are empty
+submodule directories in the local checkout; nothing was downloaded. Its docs
+only say NativeHidInput turns Novatek touch snapshots into digitizer reports. No
+button, key-event or wake handling was available to compare, so nothing was
+ported from UniXNU in this lane.
+
 | Boot arg | Default | Effect |
 | --- | --- | --- |
 | `fuxiamfi=0` | H1 compatibility enabled (`1`) | Omit syscall-only AMFI policy and restore Sandbox request 4 to `ENOENT` |
 | `fuxikeys=0` | Fuxi buttons enabled (`1`) | Existing Fuxi button driver disable |
 | `fuxikeys_gpiocfg=1` | `0` | Existing opt-in GPIO6 input setup, only for a recognized peripheral owned by EE 0 |
 | `sweetkeys=0` | Sweet buttons enabled (`1`) | Existing legacy button driver disable |
+| `fuxikeyinject=1` | `0` (writes `ENOTSUP`) | Allow root writes to `debug.fuxikeys.inject` |
+| `fuxitaptowake=1` | `0` | Touch while the display is off and `TouchDetectionMode` is 0xfe sends a power press |
 
 ## Host validation
 
@@ -155,7 +269,14 @@ ASan/UBSan. It tests AMFI layouts/results, unknown operations, copy faults,
 disabled behavior, concurrent log-once calls, container argv rejection, missing
 homes, pidversion validation, exact/short buffer bounds, malformed string
 fuzzing, VM failure cleanup, held keys, release arming, bounce, failed samples,
-failure reset, eight-failure shutdown and balancing HID releases. The test also
+failure reset, eight-failure shutdown and balancing HID releases. P-BTN adds
+press timestamps (first sample of the run), a randomized arbiter pairing check,
+timestamp monotonicity, command-word decoding, the tap-to-wake mode/rate policy
+and contact filter, and compiles the real `fk_deliver`, inject/expiry, sysctl
+handler and `fuxi_keys_touch_wake` functions against mocks: default `ENOTSUP`,
+non-root `EPERM`, click hold timing, merging with a PMIC press, unmatched ups,
+10 s expiry, tap-to-wake off by default, mode 0xfe only, 1.5 s rate limit and no
+press while power is held. The test also
 checks source integration and invokes the patch consistency check.
 
 Validation results:
@@ -234,6 +355,36 @@ A full linked XNU build and device verification remain outstanding.
    invalid-sample debounce reset, and concurrent battery/key readers. Exercise
    the existing optional GPIO setup only in a separately planned opt-in run.
 
+### P-BTN device test plan (not executed)
+
+Build the stack (0103 now also carries `bsd/dev/fuxi_touch.c`) and boot with the
+current command line first: nothing may change except the `held N ms` suffix,
+the HID timestamps and, once backboardd sets them, the touch property lines:
+
+```text
+SWEET HID: touch property "TouchDetectionMode" set by the event system
+SWEET HID: touch detection mode 0x1
+```
+
+1. Press each key; per press expect `FUXI KEYS: power down (...)` then
+   `FUXI KEYS: power up (pon=0 gpio6=0x1) held <ms> ms` and one `SWEET HID: key 0x30
+   down`/`up` pair. Lock the display with power and record the mode lines
+   (expected low byte 0xfe while off, if Tap to Wake is on). Wake by power and
+   note whether Siri appears and the `held` time; a short press that still
+   opens Siri confirms the SpringBoard-side cause.
+2. Boot with `fuxikeyinject=1`. As root write `0x300`: expect
+   `FUXI KEYS: inject power down -> hid down`, `... up -> hid up`, one HID pair
+   and the display toggling. `0x301`/`0x302` show the volume HUD. Write `0x100`
+   and wait: after 10 s `FUXI KEYS: inject auto-release mask=0x1 after 10000 ms`.
+   Without the boot-arg the write fails with `ENOTSUP`; as mobile, `EPERM`.
+   Read `debug.fuxikeys.held` while holding a key (bit 0/8 for power).
+3. Boot with `fuxitaptowake=1`. Lock, wait for the fade, tap the panel once:
+   `FUXI KEYS: tap-to-wake power click (touch mode 0x1fe)` (or `0xfe`), the lock
+   screen appears and the tap does not act as a touch. A quick double tap must
+   not lock again. With Tap to Wake off in Settings (mode not 0xfe) a tap must do
+   nothing. Holding a finger through the wake and lifting it later must not
+   produce a touch.
+
 ## Reference credit
 
 [HackiOS kernel](https://github.com/oosexgang/hackios-xnu-kernel), APSL 2.0:
@@ -244,3 +395,11 @@ peripheral-validation and bus-serialization ideas. H1 was written independently
 in this repository's style; no HackiOS source files or verbatim code were pasted.
 The device addresses and consumer HID mapping remain this project's existing
 Fuxi implementation. No GPL source, firmware or Apple binaries were added.
+
+P-BTN: [HackiOS userland](https://github.com/oosexgang/hackios-xnu-userland),
+MIT, `userland/src/inject.c`: TouchDetectionMode values and the tap-to-wake
+press with the waking touch withheld (ported into `fuxi_key_state.h`,
+`fuxi_keys.c`, `fuxi_touch.c`, `SweetHID.cpp`, with the MIT notice), the
+consumer usage map used for the audit; `userland/src/inject_sb.c`: the false-Siri
+analysis (not ported, SpringBoard hook). HackiOS kernel `redwood_buttons.c`
+(APSL 2.0): press start time and held duration.
