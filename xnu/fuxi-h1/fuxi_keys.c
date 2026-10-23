@@ -18,7 +18,8 @@
  * All HID key events of this file pass one arbiter (fuxi_key_state.h):
  * the PMIC poller, the root-only test injection sysctl debug.fuxikeys.inject
  * (boot-arg fuxikeyinject=1) and tap-to-wake (boot-arg fuxitaptowake=1,
- * driven by bsd/dev/fuxi_touch.c). Each HID event carries the time its new
+ * driven by bsd/dev/fuxi_touch.c), plus the boot-time key script
+ * (boot-arg fuxikeyscript=S) that uses the injection path. Each HID event carries the time its new
  * level was first sampled. debug.fuxikeys.held reports what HID has seen.
  * Ported from HackiOS hackios-xnu-userland userland/src/inject.c (MIT):
  * tap-to-wake (fuxi_keys_touch_wake).
@@ -351,6 +352,48 @@ terminate:
 	thread_block(THREAD_CONTINUE_NULL);
 }
 
+/*
+ * fuxikeyscript=S: S seconds after the key thread starts, press Power (lock),
+ * Power (wake), Volume Up twice and Volume Down once through the injection
+ * path, so a boot without anyone at the phone shows how iOS maps each key.
+ * Only for device tests; it does not need fuxikeyinject=1.
+ */
+static int fk_script_chan;
+static const struct { unsigned key, gap_ms; const char *why; } fk_script_steps[] = {
+	{0, 8000, "power (expect lock)"},
+	{0, 8000, "power (expect wake)"},
+	{1, 4000, "volume-up"},
+	{1, 4000, "volume-up"},
+	{2, 4000, "volume-down"},
+};
+
+static void
+fk_script_sleep(unsigned ms)
+{
+	uint64_t deadline;
+	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
+	(void)assert_wait_deadline(&fk_script_chan, THREAD_UNINT, deadline);
+	thread_block(THREAD_CONTINUE_NULL);
+}
+
+static void
+fk_script(void *arg, wait_result_t wr)
+{
+	(void)wr;
+	unsigned delay = (unsigned)(uintptr_t)arg;
+	printf("FUXI KEYS: script starts in %u s\n", delay);
+	fk_script_sleep(delay * 1000u);
+	for (unsigned i = 0; i < sizeof(fk_script_steps) / sizeof(fk_script_steps[0]); ++i) {
+		struct fuxi_key_inject cmd = {fk_script_steps[i].key, FUXI_KEY_INJECT_CLICK, 120};
+		printf("FUXI KEYS: script step %u %s\n", i + 1, fk_script_steps[i].why);
+		(void)fk_inject(&cmd);
+		fk_script_sleep(fk_script_steps[i].gap_ms);
+	}
+	printf("FUXI KEYS: script done\n");
+	(void)thread_terminate(current_thread());
+	thread_block(THREAD_CONTINUE_NULL);
+}
+
 void
 fuxi_keys_init(void)
 {
@@ -369,6 +412,14 @@ fuxi_keys_init(void)
 		thread_deallocate(thread);
 	} else {
 		printf("FUXI KEYS: kernel_thread_start failed\n");
+	}
+	unsigned script = 0;
+	if (PE_parse_boot_argn("fuxikeyscript", &script, sizeof(script)) && script > 0 && script < 3600) {
+		if (kernel_thread_start(fk_script, (void *)(uintptr_t)script, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+		} else {
+			printf("FUXI KEYS: script thread_start failed\n");
+		}
 	}
 }
 /* Injected downs are released at the latest FUXI_KEY_INJECT_HOLD_MAX_MS later. */
