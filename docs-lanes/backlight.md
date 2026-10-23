@@ -694,3 +694,201 @@ against saved XNU headers for backlight/framebuffer/UFS and framebuffer
 without FUXI; both kernel-profile CI dry runs; shell syntax and diff whitespace.
 No kernel link or device boot was performed. The precise stall and a
 performance change remain unfinished.
+
+## Round 4: Night Shift registration, timing and a preference experiment
+
+**Result:** the inspected path contains synchronous dependencies, but neither
+the supplied trace nor static analysis establishes a five-second Night Shift
+stall. There is an exact preference for disabling scheduling; it does **not**
+prevent SunriseSunsetProvider construction or CoreDuet registration. No
+registry-based bypass was established, so no `fuxibacklightnonight` argument
+or driver change is introduced. A startup-performance fix remains unproven.
+
+### OBSERVED: the new trace materially limits the hypothesis
+
+In `research/it/trace87.log`, mode 1 plus tracing gives backboardd reads
+39–64 at monotonic uptimes 56,471,584–56,529,249 us: **57.665 ms**. Registry
+operations take 0–2 us in the supplied trace. This rules out a five-second
+registry read/set in that burst; it does not profile work before the burst.
+
+The original, unnormalised NSLog prefixes also contain thread identifiers and
+relative timing that the sorted/normalised message comparison removes:
+
+| Message | Thread | Displayed fractional timestamp, same second |
+| --- | --- | --- |
+| `Night mode init` | 259 | -513 |
+| `SunriseSunsetProvider initialisation` | 259 | -512 |
+| `CoreDuet loaded dynamically` | 259 | -511 |
+| `Creating defaults status info` | 259 | -509 |
+| `Identifier called: com.apple.CoreBrightness.registrationForSunsetSunrise` | 309 | -508 |
+| `dataDictionary : { status = 0; }` | 350 | -506 |
+
+The boot wall clock's fractional formatting is abnormal around its epoch;
+these same-second differences span approximately **7 ms**, and the messages
+are independently bracketed by the monotonic read stamps above. In particular,
+the provider constructor and its registration call have returned before the
+same thread prints `Creating defaults status info`, about 4 ms after
+`Night mode init`. The dictionary dump is on a different thread. It is not
+evidence that the startup thread waited for a location result for five seconds.
+The earlier comparison remains real: first frame is about 12.4–13.3 s with
+the service versus 7.6 s without; this boot reports 13,249.543 ms.
+
+### OBSERVED: local cache and Ghidra call paths
+
+These are cache-specific unslid addresses. CoreBrightness was inspected with
+the existing offline disassembler and Ghidra headless decompiler; the matching
+CoreDuetContext and libEDR code was inspected offline as well. Extracted Apple
+images and long analysis output remain ignored and outside the commit.
+
+| Entry point | Blocking behavior / ordering |
+| --- | --- |
+| `-[BLControl start]`, `0x1af0a14e8` (dispatch at `0x1af0a1574`) | Synchronously dispatches startup to its internal queue. Its startup block enumerates displays/backlights. A slow nested call can hold up the caller. |
+| `-[BLControl findBacklight]`, `0x1af0a21f0` | After a discovered container successfully starts, calls `addDisplayContainer:` at `0x1af0a2424`. No discovered container means this call is skipped. |
+| `-[BLControl addDisplayContainer:]`, `0x1af0a77c4` | Constructs the shared NightModeControl if absent, or adds the new support object if already present. **No Night Shift capability or saved-schedule test guards construction here.** |
+| `-[NightModeControl initWithSupportObject:queue:callback:]`, `0x1af0428e8` | Constructs SunriseSunsetProvider at `0x1af042a40`, then reads saved status at `0x1af042d54`. The timeout stored at object `+0x18` is 20 milliseconds. Status/scheduling preferences cannot skip the earlier constructor. |
+| `-[SunriseSunsetProvider initWithCallback:]`, `0x1af129e30` | Calls `dlopen` for CoreDuetContext, `_CDClientContext userContext`, builds the sunrise/sunset change registration and calls `registerCallback:` at `0x1af12a054`, inline. Its semaphore is created with count **1**; construction does not wait on it. |
+| CoreDuetContext `+[_CDClientContext userContext]`, `0x190ae2bec`; `initWithEndpoint:`, `0x190ae2610` | Singleton `dispatch_once`; initialization synchronously dispatches connection setup at `0x190ae2808`. `currentConnection`, `0x190ae49d8`, also uses `dispatch_sync`. These can block the calling thread; neither inspected queue operation specifies a five-second deadline. |
+| CoreDuetContext `-[_CDClientContext registerCallback:]`, `0x190aed2d0` | Runs `retryTimes:3 block:` inline at `0x190aed518`. Its block at `0x190b02048` gets a `synchronousRemoteObjectProxyWithErrorHandler:` and sends `registerCallback:` at `0x190b020e0`. This is a real synchronous XPC dependency, not a CoreBrightness five-second semaphore. |
+| CoreDuetContext `retryTimes:block:`, `0x190ae9b14` | On a retryable error, sleeps **1 second**, then multiplies the next sleep by `1 + arc4random_uniform(3)`. Up to three failed attempts can sleep 3–13 seconds in total, including a sleep after the last failure; some sequences total 5 s. No error means no retry sleep. The observed constructor timing does not support these sleeps on this boot. |
+| `copySunriseSunsetInfo:`, `0x1af027df8`; worker at `0x1af12a5a4` | First semaphore acquisition uses NOW; context lookup runs on a global worker. The explicit semaphore deadline is the supplied milliseconds, normally **20 ms**. The worker calls `copySunsetSunriseInfoFromContext`, `0x1af129aec`, whose dictionary subscript ultimately uses synchronous CoreDuet XPC. It does that lookup before acquiring the provider monitor. A blocked worker is not automatically a blocked startup thread; monitor acquisition itself has no explicit timeout. |
+| Provider registration callback, `0x1af12a108`; `updateSunriseSunsetInfo`, `0x1af12a6ec` | `Identifier called:` is printed by the delivered change callback, not by an entry/exit probe around registration. The update uses semaphore NOW and queues the context lookup on a global worker (`0x1af12a828`). NightModeControl's supplied callback (`0x1af04343c`) also forwards asynchronously. This explains the different logged threads without a five-second startup wait. |
+| Provider `dealloc`, `0x1af12a43c` | Does contain a semaphore **FOREVER** wait at `0x1af12a480`, after entering the provider monitor. It can block teardown while a query is outstanding. The retained startup provider is not observed being destroyed here; this is not a demonstrated startup timeout. |
+| `copyStatusDictionaryFromPrefs`, `0x1af042384` | `NSUserDefaults initWithSuiteName:"com.apple.CoreBrightness"`, then `synchronize` at `0x1af0423e0`, then reads `CBBlueReductionStatus`. This synchronous preference access precedes the observed defaults-status message; it did not consume five seconds between provider construction and that message here. |
+
+The registration error block sets the retry Boolean when its NSError is
+non-null. A missing/slow context service can therefore block this synchronous
+chain in other circumstances. The client connection setup inspected here
+does not set an explicit five-second XPC timeout. It would be incorrect to
+label the observed delay a fixed five-second CoreDuet timeout.
+Default-status creation builds an in-memory dictionary; its log alone does
+not establish a `saveStatusToPrefs:` call or another preference synchronize.
+
+The caller dependency is statically real: backboardd creates BrightnessSystem
+in its shared brightness-controller initialization (`0x100079d24`), and
+BrightnessSystemInternal initialization calls BLControl start
+(`0x1af05229c`). Runtime **thread identity for the delayed first frame remains
+unmeasured**: the Metal first-frame marker has no thread ID or stack. The
+NSLog thread IDs above demonstrate that the extra messages are not all on
+one thread. No sampled stack or entry/exit timing places the five-second
+increment inside this call chain.
+
+Other matching constants are not proof either. BLControl's ALS-arrival wait
+is five seconds but precedes enumeration and uses a device-type gate.
+CBAPEndpoint property/command methods also have explicit five-second
+semaphore deadlines (for example `copyProperty:` waits at `0x1af03f2e4`);
+no observed call establishes their involvement here. QuartzCore's
+`CA::EDRClient::client`, `0x18833a168`, becomes eligible when a backlight exists,
+but calls libEDR's **asynchronous** client-creation wrapper with timeout 0.
+libEDR's separate synchronous default of 5000 ms is not that call. None of
+these constants can be substituted for a measured startup stack.
+
+### OBSERVED: capability names are not a registry bypass
+
+`CBU_IsNightShiftSupported` (`0x1af09b004`) calls `MGGetBoolAnswer` with the
+opaque key `F1Xz9g1JORibBS9DYPUPrg`. `CBColorModuleiOS initColorStruct`
+(`0x1af07c598`) uses that result to **publish** `SupportsNightMode` inside
+its own `SupportedColorFX` dictionary. It does not read either name from
+FuxiBacklight. `SupportsAmbientColorAdaptation` is another computed module
+output. Publishing those names with false on the kernel service would not
+change these inspected tests, and addDisplayContainer still constructs
+NightModeControl independently of this capability result.
+
+`BlueLightReductionDisableFlags` is removed from saved status during
+initialization (`0x1af042e00`); it is not a persistent initialization-disable
+switch. `CBDisplayPresetDisableNightShift` is handled after construction and
+changes policy, not the earlier provider-registration call. No exact registry
+property/value was found that safely bypasses this path while preserving the
+backlight discovery contract. Defaults and modes 1–3 therefore remain intact;
+mode 1 still sends **no interest messages**.
+
+### Proposed root edit: disable Night Shift scheduling, not registration
+
+For a separate preference experiment, merge the following top-level entry into
+**`/var/mobile/Library/Preferences/com.apple.CoreBrightness.plist`** before a
+fresh boot, preserving all unrelated entries, ownership and permissions.
+The trace's Metal gate reports backboardd **uid=501**, and the inspected
+local launchd plist names its user `mobile`; the NSUserDefaults suite uses
+the current user. The root user's
+`/var/root/Library/Preferences/com.apple.CoreBrightness.plist` is not the
+target for this observed mobile process. This is an on-device plist location,
+not a host artifact path. No root/image edits were made in this round.
+
+```xml
+<key>CBBlueReductionStatus</key>
+<dict>
+    <key>Version</key><integer>1</integer>
+    <key>BlueReductionEnabled</key><integer>0</integer>
+    <key>BlueReductionMode</key><integer>0</integer>
+    <key>BlueReductionSunScheduleAllowed</key><integer>0</integer>
+    <key>BlueLightReductionSchedule</key>
+    <dict>
+        <key>NightStartHour</key><integer>22</integer>
+        <key>NightStartMinute</key><integer>0</integer>
+        <key>DayStartHour</key><integer>7</integer>
+        <key>DayStartMinute</key><integer>0</integer>
+    </dict>
+    <key>BlueLightReductionRevertToSunriseSunset</key><integer>0</integer>
+    <key>BlueLightReductionAlgoOverride</key><integer>0</integer>
+</dict>
+```
+
+All shown leaves are **plist integers**, matching the NSNumber/intValue
+checks in `parseStatusDictionary:intoStruct:shouldUpdatePrefs:`
+(`0x1af0416c0`), not guessed Boolean property names. Version 1, enabled, mode,
+sun permission and the four schedule fields are required even with mode 0;
+a short dictionary containing only the mode is rejected. Zero mode is the
+unscheduled branch; mode 1 selects sunrise/sunset in `updateTransitionTimes:`
+(`0x1af045070`). Zero enabled clears the manual-on state. Zero override/revert
+avoids restoring a previously forced transition. The hours are the constructor's
+defaults and are inactive with mode 0. A valid existing status can instead be
+merged with these fields; preserve a backup of the original whole entry for
+rollback, including any absent-file/absent-key state.
+
+This is the cheapest **verified scheduling control found**, not a verified
+way to suppress initialization. The constructor sets the internal
+`AutoBlueReductionEnabled`/`BlueReductionAvailable` availability outputs true
+even after valid status parsing; setting those saved fields false is not an
+initialization gate. Provider construction, CoreDuet callback registration,
+and preference synchronization still happen with the proposed status. Default
+status already has mode 0 and enabled false in this cache, so the observed
+`Creating defaults status info` boot was already unscheduled. **GUESS:**
+preseeding valid status could change later work/timing, but a five-second
+startup improvement is not predicted by the inspected scheduling branch.
+
+### Acceptance experiment, logs and unresolved measurement
+
+Keep **`fuxibacklight=1`** and all other kernel/root/GPU/cache settings matched.
+Compare repeated baseline boots against the proposed status, with no input
+before initial spontaneous off. Use `fuxibacklighttrace=1` on a separate
+localization pair; keep tracing identical within each pair. Do not combine
+this with interest modes 2/3 or an attention-preference change.
+
+Look for `Defaults found and valid` instead of `Creating defaults status info`
+or `Defaults found and invalid`. `Night mode init`, provider initialization,
+the registration identifier and a dictionary dump can still appear: **their
+disappearance is not an expected result of disabling the schedule**. An
+invalid/defaults message means the intended preference was not consumed as
+a valid status. Retain the published-brightness line, first-frame marker and
+`SWEET FB: display on/off` lines. Acceptance requires both
+**`first_frame_ms <= 8500`** and spontaneous off **approximately 30 seconds
+after SpringBoard display-on** (record the actual 20–40 s baseline range),
+with the service present and mode 1 sending no power interests. Restore the
+original status before a rollback boot. The existing post-wake failure is
+separate and remains open.
+
+If this does not meet both targets, it is a failed performance experiment,
+not evidence to add invented capability properties. The next discriminating
+measurement is paired monotonic entry/exit markers and thread IDs around
+backboardd's BrightnessSystem initialization/BLControl start, the provider
+constructor/registration, and the first render/submit. Capture a stack during
+any actual multi-second interval, including the waiting caller and owning
+queue. That distinguishes an earlier ALS wait, XPC retry, another synchronous
+dependency, or rendering setup from fast Night Shift messages. **Cause remains
+GUESS; no five-second Night Shift stall or accepted mitigation is claimed.**
+
+Round 4 validation passed: backlight ASan/UBSan, framebuffer/UFS, HID/keys,
+idle and governor host tests; all eleven patch sync checks; both kernel-profile
+CI dry runs, CI shell syntax and diff whitespace. The documented XML parses
+as a plist with the stated integer values. No kernel source or generated patch
+changed, so no new kernel-gate host test is applicable. No kernel link, device
+experiment, root edit or performance acceptance result is claimed.
