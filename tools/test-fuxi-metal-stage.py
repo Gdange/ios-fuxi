@@ -21,7 +21,8 @@ def policy_storage_tests():
         assert m.validate_clients(clients,True)==b'fuxi-ca-smoke\nbackboardd\n'
         clients.write_bytes(b'backboardd\n')
         assert m.validate_clients(clients,True)==b'backboardd\n'
-        for data in (b'backboardd\n',b'SpringBoard\n',b'census backboardd\n',b'census SpringBoard\n'):
+        for data in (b'backboardd\n',b'SpringBoard\n',b'census backboardd\n',b'census SpringBoard\n',
+                     b'mediaserverd\n',b'census mediaserverd\n'):
             clients.write_bytes(data)
             try:m.validate_clients(clients);raise AssertionError('default compositor accepted')
             except ValueError:pass

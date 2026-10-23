@@ -39,7 +39,8 @@ def validate_clients(path,enable_backboardd=False):
         mode='allow'
         if line.startswith(b'census '):mode='census';line=line[7:].lstrip(b' \t')
         if not re.fullmatch(rb'[A-Za-z0-9_.-]{1,63}',line):raise ValueError('invalid client name')
-        if line==b'SpringBoard':raise ValueError('SpringBoard is permanently denied')
+        # ClientGate.hpp hiddenClient(): both abort on any visible device (docs-lanes/cooling.md).
+        if line in (b'SpringBoard',b'mediaserverd'):raise ValueError(line.decode()+' is permanently denied')
         if line==b'backboardd' and (not enable_backboardd or mode!='allow'):
             raise ValueError('backboardd requires --enable-backboardd and an allow entry')
         if line in seen and seen[line]!=mode:raise ValueError('conflicting client modes')

@@ -27,6 +27,13 @@ int main() {
      "fuxibbgpu=1 fuxibbgpu=0", "fuxibbgpu=0 fuxibbgpu=1", "fuxibbgpu=1 fuxibbgpu=1"})
   assert(parse("backboardd\n","backboardd",args)==M::deny);
  for(const char *config:{"SpringBoard\n","census SpringBoard\n"}){assert(parse(config,"SpringBoard",armed)==M::deny);assert(parse(config,"SpringBoard","fuxibbgpu=2")==M::deny);}
+ // Cooling (HackiOS): mediaserverd's shader preload and SpringBoard's Siri orb
+ // abort on any visible device, so neither an allow nor a census line admits them.
+ for(const char *config:{"mediaserverd\n","census mediaserverd\n","fuxi-ca-smoke\nmediaserverd\n"})
+  for(const char *args:{(const char *)nullptr,armed,"fuxibbgpu=2"})assert(parse(config,"mediaserverd",args)==M::deny);
+ assert(fuxi::hiddenClient("SpringBoard") && fuxi::hiddenClient("mediaserverd"));
+ assert(!fuxi::hiddenClient("mediaserverd2") && !fuxi::hiddenClient("backboardd") && !fuxi::hiddenClient("fuxi-ca-smoke"));
+ assert(parse("fuxi-ca-smoke\nmediaserverd\n","fuxi-ca-smoke")==M::allow);
  assert(parse("# comment\n\tfuxi-metal-smoke \r\n")==M::allow);
  assert(parse("census backboardd\n","backboardd")==M::deny);
  assert(parse("backboardd\ncensus backboardd\n","backboardd")==M::deny);
@@ -42,5 +49,5 @@ int main() {
  chmod(path,0600);std::string link=std::string(path)+"-link";assert(!symlink(path,link.c_str()));
  assert(fuxi::readClients(link.c_str(),"fuxi-metal-smoke")==M::deny);unlink(link.c_str());unlink(path);
  assert(fuxi::readClients(path,"fuxi-metal-smoke")==M::deny);
- puts("PASS: exact clients, census/conflicts, malformed/NUL, missing/untrusted/writable/symlink policy fail closed");
+ puts("PASS: exact clients, hidden SpringBoard/mediaserverd, census/conflicts, malformed/NUL, missing/untrusted/writable/symlink policy fail closed");
 }

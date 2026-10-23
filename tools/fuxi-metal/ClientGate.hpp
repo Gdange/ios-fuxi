@@ -36,9 +36,17 @@ static inline bool clientName(const char *s) {
      (s[i]>='0'&&s[i]<='9')||s[i]=='_'||s[i]=='-'||s[i]=='.'))return false;
  return true;
 }
+// Processes that must never see a Metal device, not even a census one. HackiOS
+// (hackios-xnu-userland, MIT) observed both aborting on a visible device:
+// mediaserverd's CMCapture preloads AppleCVAPhoto's shader library (28 aborts
+// per boot) and SpringBoard's Siri orb prewarms its shaders (abort every
+// 8.3 s). A denied device init returns nil, which is what both expect here.
+static inline bool hiddenClient(const char *s) {
+ return !strcmp(s,"SpringBoard") || !strcmp(s,"mediaserverd");
+}
 static inline ClientMode parseClients(char *data,size_t length,const char *process,const char *bootargs=nullptr) {
  bool backboard=!strcmp(process,"backboardd");
- if(!strcmp(process,"SpringBoard") || (backboard && !backboardArmed(bootargs)))return ClientMode::deny;
+ if(hiddenClient(process) || (backboard && !backboardArmed(bootargs)))return ClientMode::deny;
  if(!clientName(process)||memchr(data,0,length))return ClientMode::deny;
  data[length]=0;ClientMode result=ClientMode::deny;
  for(char *line=data;line;) {
