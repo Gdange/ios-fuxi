@@ -14,12 +14,27 @@
  * channels. With boot-arg fuxikeys_gpiocfg=1, and only if GPIO6 is not an
  * enabled input, the Linux pinctrl defaults for that one pin are written
  * through its RW channel (volatile PMIC GPIO config, nothing else).
+ *
+ * All HID key events of this file pass one arbiter (fuxi_key_state.h):
+ * the PMIC poller, the root-only test injection sysctl debug.fuxikeys.inject
+ * (boot-arg fuxikeyinject=1) and tap-to-wake (boot-arg fuxitaptowake=1,
+ * driven by bsd/dev/fuxi_touch.c). Each HID event carries the time its new
+ * level was first sampled. debug.fuxikeys.held reports what HID has seen.
+ * Ported from HackiOS hackios-xnu-userland userland/src/inject.c (MIT):
+ * tap-to-wake (fuxi_keys_touch_wake).
+ * Ported from HackiOS hackios-xnu-kernel xnu/files/bsd/dev/redwood_buttons.c
+ * (APSL 2.0): the held-duration log. Notices and details in fuxi_key_state.h.
  */
 #if defined(FUXI)
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/errno.h>
+#include <sys/kauth.h>
+#include <sys/sysctl.h>
 #include <kern/clock.h>
+#include <kern/locks.h>
 #include <kern/thread.h>
+#include <kern/thread_call.h>
 #include <kern/sched_prim.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
@@ -28,9 +43,11 @@
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern kern_return_t thread_terminate(thread_t);
-extern void sweet_hid_key(int key, int down);
+extern void sweet_hid_key_at(int key, int down, uint64_t timestamp);
+extern int sweet_hid_touch_mode(void);
 extern void fuxi_perf_input(void);
 void fuxi_keys_init(void);
+bool fuxi_keys_touch_wake(void);
 
 #define FK_CORE_PA     0x0c400000u
 #define FK_CNFG_PA     0x0c42d000u
@@ -52,6 +69,42 @@ static bool fk_started;
 /* A late completion after timeout must never be mistaken for a new sample. */
 static bool fk_timed_out[1024];
 static int fk_chan;
+static const char *const fk_names[FUXI_KEYS] = {"power", "volume-up", "volume-down"};
+
+static LCK_GRP_DECLARE(fk_lck_grp, "fuxi-keys");
+static LCK_MTX_DECLARE(fk_hid_lock, &fk_lck_grp);
+static struct fuxi_key_arbiter fk_arb;        /* fk_hid_lock */
+static uint64_t fk_tap_last;                  /* fk_hid_lock */
+static thread_call_t fk_inject_call;
+static int fk_inject_chan;
+
+static uint64_t
+fk_ms(uint64_t abs)
+{
+	uint64_t ns;
+	absolutetime_to_nanoseconds(abs, &ns);
+	return ns / NSEC_PER_MSEC;
+}
+
+/* With fk_hid_lock held: the one place that hands Fuxi keys to HID. */
+static int
+fk_deliver_locked(unsigned key, unsigned source, bool down, uint64_t at)
+{
+	int change = fuxi_key_arbitrate(&fk_arb, key, source, down);
+	if (change) {
+		sweet_hid_key_at((int)key, change > 0, fuxi_key_stamp(&fk_arb, at));
+	}
+	return change;
+}
+
+static int
+fk_deliver(unsigned key, unsigned source, bool down, uint64_t at)
+{
+	lck_mtx_lock(&fk_hid_lock);
+	int change = fk_deliver_locked(key, source, down, at);
+	lck_mtx_unlock(&fk_hid_lock);
+	return change;
+}
 
 static uint32_t
 fk_rd(vm_offset_t base, uint32_t off)
@@ -250,8 +303,7 @@ fk_setup(void)
 static void
 fk_thread(void *arg, wait_result_t result)
 {
-	static const char *names[3] = {"power", "volume-up", "volume-down"};
-	struct fuxi_key_state keys[3] = {0};
+	struct fuxi_key_state keys[FUXI_KEYS] = {0};
 	unsigned errors = 0;
 	(void)arg;
 	(void)result;
@@ -260,6 +312,7 @@ fk_thread(void *arg, wait_result_t result)
 	}
 	for (;;) {
 		uint8_t pon = 0, gpio = 1;
+		uint64_t t = mach_absolute_time();
 		bool pok = fk_read(fk_pon_apid, FK_PON_RT, &pon);
 		bool gok = fk_read(fk_gpio_apid, 0x10, &gpio);
 		bool ok[3] = {pok, gok, pok};
@@ -268,21 +321,25 @@ fk_thread(void *arg, wait_result_t result)
 		    (fk_gpio_apid != FK_NO_APID && !gok);
 		if (fuxi_keys_failed(&errors, failed)) {
 			/* Balance delivered downs, so HID cannot retain a stuck key. */
-			for (int k = 0; k < 3; ++k) {
+			for (unsigned k = 0; k < FUXI_KEYS; ++k) {
 				if (keys[k].down) {
-					sweet_hid_key(k, 0);
+					(void)fk_deliver(k, FUXI_KEY_SRC_HW, false, mach_absolute_time());
 				}
 			}
 			printf("FUXI KEYS: stopped after %u consecutive read failures st=%#x\n",
 			    errors, fk_last_status);
 			goto terminate;
 		}
-		for (int k = 0; k < 3; ++k) {
-			if (fuxi_key_sample(&keys[k], ok[k], now[k])) {
-				printf("FUXI KEYS: %s %s (pon=%#x gpio6=%#x)\n", names[k],
-				    keys[k].down ? "down" : "up", pon, gpio);
+		for (unsigned k = 0; k < FUXI_KEYS; ++k) {
+			if (fuxi_key_sample(&keys[k], ok[k], now[k], t)) {
+				if (keys[k].down) {
+					printf("FUXI KEYS: %s down (pon=%#x gpio6=%#x)\n", fk_names[k], pon, gpio);
+				} else {
+					printf("FUXI KEYS: %s up (pon=%#x gpio6=%#x) held %llu ms\n", fk_names[k],
+					    pon, gpio, fk_ms(keys[k].at - keys[k].since));
+				}
 				fuxi_perf_input();
-				sweet_hid_key(k, keys[k].down);
+				(void)fk_deliver(k, FUXI_KEY_SRC_HW, keys[k].down, keys[k].at);
 			}
 		}
 		fk_sleep(20);
@@ -313,5 +370,165 @@ fuxi_keys_init(void)
 	} else {
 		printf("FUXI KEYS: kernel_thread_start failed\n");
 	}
+}
+/* Injected downs are released at the latest FUXI_KEY_INJECT_HOLD_MAX_MS later. */
+static void
+fk_inject_expire(thread_call_param_t p0, thread_call_param_t p1)
+{
+	(void)p0;
+	(void)p1;
+	uint64_t now = mach_absolute_time();
+	lck_mtx_lock(&fk_hid_lock);
+	unsigned mask = fuxi_key_held_mask(&fk_arb, FUXI_KEY_SRC_INJECT);
+	for (unsigned k = 0; k < FUXI_KEYS; ++k) {
+		if (mask & (1u << k)) {
+			(void)fk_deliver_locked(k, FUXI_KEY_SRC_INJECT, false, now);
+		}
+	}
+	lck_mtx_unlock(&fk_hid_lock);
+	if (mask) {
+		printf("FUXI KEYS: inject auto-release mask=%#x after %u ms\n", mask,
+		    FUXI_KEY_INJECT_HOLD_MAX_MS);
+	}
+}
+
+static int
+fk_inject_one(unsigned key, bool down)
+{
+	int change = fk_deliver(key, FUXI_KEY_SRC_INJECT, down, mach_absolute_time());
+	printf("FUXI KEYS: inject %s %s -> hid %s\n", fk_names[key], down ? "down" : "up",
+	    change > 0 ? "down" : change < 0 ? "up" : "unchanged");
+	if (change) {
+		fuxi_perf_input();
+	}
+	return change;
+}
+
+static int
+fk_inject(const struct fuxi_key_inject *cmd)
+{
+	if (!fk_inject_call) {
+		thread_call_t call = thread_call_allocate(fk_inject_expire, NULL);
+		if (!call) {
+			return ENOMEM;
+		}
+		lck_mtx_lock(&fk_hid_lock);
+		if (!fk_inject_call) {
+			fk_inject_call = call;
+			call = NULL;
+		}
+		lck_mtx_unlock(&fk_hid_lock);
+		if (call) {
+			(void)thread_call_free(call);
+		}
+	}
+	if (cmd->op != FUXI_KEY_INJECT_UP) {
+		uint64_t deadline;
+		clock_interval_to_deadline(FUXI_KEY_INJECT_HOLD_MAX_MS, NSEC_PER_MSEC, &deadline);
+		(void)thread_call_enter_delayed(fk_inject_call, deadline);
+		(void)fk_inject_one(cmd->key, true);
+	}
+	if (cmd->op == FUXI_KEY_INJECT_CLICK) {
+		uint64_t deadline;
+		clock_interval_to_deadline(cmd->hold_ms, NSEC_PER_MSEC, &deadline);
+		(void)assert_wait_deadline(&fk_inject_chan, THREAD_UNINT, deadline);
+		thread_block(THREAD_CONTINUE_NULL);
+	}
+	if (cmd->op != FUXI_KEY_INJECT_DOWN) {
+		(void)fk_inject_one(cmd->key, false);
+	}
+	return 0;
+}
+
+/*
+ * debug.fuxikeys.inject: write a command word (fuxi_key_state.h) to press or
+ * release a key through the same arbiter and HID path as the PMIC keys.
+ * Root only (no CTLFLAG_ANYBODY, checked again here) and only with boot-arg
+ * fuxikeyinject=1; otherwise writes fail with ENOTSUP. Reads return the
+ * keys currently held by injection.
+ */
+static int
+fk_sysctl_inject SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	lck_mtx_lock(&fk_hid_lock);
+	int value = (int)fuxi_key_held_mask(&fk_arb, FUXI_KEY_SRC_INJECT), changed = 0;
+	lck_mtx_unlock(&fk_hid_lock);
+	int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
+	if (error || !changed) {
+		return error;
+	}
+	int enabled = 0;
+	if (!PE_parse_boot_argn("fuxikeyinject", &enabled, sizeof(enabled)) || enabled != 1) {
+		return ENOTSUP;
+	}
+	if (!kauth_cred_issuser(kauth_cred_get())) {
+		return EPERM;
+	}
+	struct fuxi_key_inject cmd;
+	if ((error = fuxi_key_inject_decode(value, &cmd))) {
+		return error;
+	}
+	return fk_inject(&cmd);
+}
+
+/*
+ * debug.fuxikeys.held: bits 0-2 the keys HID has down (power, volume up,
+ * volume down); bits 8-10 held by the PMIC, 16-18 by injection, 24-26 by
+ * tap-to-wake. A SpringBoard-side long-press guard can read bit 0.
+ */
+static int
+fk_sysctl_held SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	lck_mtx_lock(&fk_hid_lock);
+	int value = (int)(fuxi_key_held_mask(&fk_arb, ~0u) |
+	    fuxi_key_held_mask(&fk_arb, FUXI_KEY_SRC_HW) << 8 |
+	    fuxi_key_held_mask(&fk_arb, FUXI_KEY_SRC_INJECT) << 16 |
+	    fuxi_key_held_mask(&fk_arb, FUXI_KEY_SRC_TAP) << 24);
+	lck_mtx_unlock(&fk_hid_lock);
+	return SYSCTL_OUT(req, &value, sizeof(value));
+}
+
+SYSCTL_NODE(_debug, OID_AUTO, fuxikeys, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "Fuxi buttons");
+SYSCTL_PROC(_debug_fuxikeys, OID_AUTO, inject, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, fk_sysctl_inject, "I", "inject a key event (root, boot-arg fuxikeyinject=1)");
+SYSCTL_PROC(_debug_fuxikeys, OID_AUTO, held, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
+    0, 0, fk_sysctl_held, "I", "keys held as HID sees them, and by which source");
+
+/*
+ * Called by bsd/dev/fuxi_touch.c for a new contact while the display is off.
+ * With boot-arg fuxitaptowake=1 and TouchDetectionMode 0xfe, press and
+ * release power (as HackiOS does) and return true: the touch driver then
+ * keeps the rest of that contact from iOS. Not while power is held.
+ */
+bool
+fuxi_keys_touch_wake(void)
+{
+	static int enabled = -1;
+	static uint64_t interval;
+	if (enabled < 0) {
+		int on = 0;
+		(void)PE_parse_boot_argn("fuxitaptowake", &on, sizeof(on));
+		nanoseconds_to_absolutetime(1500 * NSEC_PER_MSEC, &interval);
+		enabled = on == 1;
+	}
+	if (!enabled) {
+		return false;
+	}
+	int mode = sweet_hid_touch_mode();
+	uint64_t now = mach_absolute_time();
+	lck_mtx_lock(&fk_hid_lock);
+	bool go = fk_arb.held[0] == 0 && fuxi_tap_wake_allowed(mode, now, &fk_tap_last, interval);
+	if (go) {
+		(void)fk_deliver_locked(0, FUXI_KEY_SRC_TAP, true, now);
+		(void)fk_deliver_locked(0, FUXI_KEY_SRC_TAP, false, now);
+	}
+	lck_mtx_unlock(&fk_hid_lock);
+	if (go) {
+		fuxi_perf_input();
+		printf("FUXI KEYS: tap-to-wake power click (touch mode %#x)\n", mode);
+	}
+	return go;
 }
 #endif /* FUXI */

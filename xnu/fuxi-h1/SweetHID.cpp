@@ -12,14 +12,26 @@
  *   SweetHIDButtons  consumer-control keys (power, volume, home)
  *   SweetHIDTouch    the built-in touch screen (digitizer collections)
  *
- * Hardware drivers feed them through the C entry points sweet_hid_key()
- * and sweet_hid_touch(). Boot-arg sweethidtest=N (seconds) presses Home
+ * Hardware drivers feed them through the C entry points sweet_hid_key(),
+ * sweet_hid_key_at() (with the press time as event timestamp) and
+ * sweet_hid_touch(). Boot-arg sweethidtest=N (seconds) presses Home
  * every N seconds, to test the event path without input hardware.
+ *
+ * SweetHIDTouch records backboardd's TouchDetectionMode property for
+ * tap-to-wake (sweet_hid_touch_mode(), used by bsd/dev/fuxi_keys.c).
+ * Ported from HackiOS hackios-xnu-userland userland/src/inject.c (MIT):
+ * the TouchDetectionMode values HackiOS observed (0x1 report touches, low
+ * byte 0xfe display off with tap-to-wake, 0xff nothing). Copyright (c) 2026
+ * OOSEX GANG; MIT notice in bsd/dev/fuxi_key_state.h.
  */
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <libkern/c++/OSArray.h>
+#include <libkern/c++/OSCollectionIterator.h>
+#include <libkern/c++/OSNumber.h>
+#include <libkern/c++/OSSet.h>
+#include <libkern/c++/OSString.h>
 #include <pexpert/pexpert.h>
 
 #include "IOHIDEventService.h"
@@ -323,13 +335,19 @@ IOHIDEventService::newUserClient(task_t owningTask, void *securityID, UInt32 typ
 
 /*
  * Buttons. iOS takes the side/volume/home buttons as consumer-control
- * keyboard events (AppleM68Buttons publishes the same usage pair).
+ * keyboard events (AppleM68Buttons publishes the same usage pair). Usages,
+ * all on the Consumer page 0x0C, the same as HackiOS sends to the iOS 16
+ * backboardd (hackios-xnu-userland userland/src/inject.c send_button()):
+ * side button Power 0x30 (SpringBoard's SBLockHardwareButton: lock, wake,
+ * long press = Siri), Volume Increment 0xE9, Volume Decrement 0xEA, Menu
+ * 0x40 (home, sweethidtest only). The phone has no ringer switch, so no
+ * Telephony page (0x0B) or mute usage is ever sent.
  */
 class SweetHIDButtons : public IOHIDEventService {
 	OSDeclareDefaultStructors(SweetHIDButtons);
 public:
 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
-	void key(UInt32 usage, bool down);
+	void key(UInt32 usage, bool down, uint64_t timestamp);
 protected:
 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Consumer; }
 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Csmr_ConsumerControl; }
@@ -360,6 +378,7 @@ class SweetHIDTouch : public IOHIDEventService {
 	OSDeclareDefaultStructors(SweetHIDTouch);
 public:
 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+	virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
 	void touch(int finger, bool down, int x, int y);
 protected:
 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Digitizer; }
@@ -367,6 +386,7 @@ protected:
 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 2; }
 private:
 	IOLock *fLock;
+	OSSet *fSeenKeys;	/* property names backboardd has set, logged once each */
 	int fLogicalW, fLogicalH, fOffX, fOffY;
 	bool fDown[SWEET_TOUCH_FINGERS];
 	bool fEdge[SWEET_TOUCH_FINGERS];
@@ -377,6 +397,8 @@ OSDefineMetaClassAndStructors(SweetHIDTouch, IOHIDEventService);
 
 static SweetHIDButtons *gSweetButtons;
 static SweetHIDTouch *gSweetTouch;
+static volatile SInt32 gSweetTouchMode = -1;	/* TouchDetectionMode, -1 never set */
+#define SWEET_TOUCH_SEEN_KEYS 24
 
 bool
 SweetHIDButtons::start(IOService *provider)
@@ -397,9 +419,9 @@ SweetHIDButtons::start(IOService *provider)
 }
 
 void
-SweetHIDButtons::key(UInt32 usage, bool down)
+SweetHIDButtons::key(UInt32 usage, bool down, uint64_t timestamp)
 {
-	IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(), kHIDPage_Consumer, usage, down,
+	IOHIDEvent *event = IOHIDEvent::keyboardEvent(timestamp, kHIDPage_Consumer, usage, down,
 	    kIOHIDEventOptionIsBuiltIn);
 
 	if (event) {
@@ -420,7 +442,7 @@ SweetHIDButtons::testFired(OSObject *owner, IOTimerEventSource *sender)
 	 * screen waits for it. Even counts press, odd counts release.
 	 */
 	bool press = (self->fTestCount & 1) == 0;
-	self->key(kHIDUsage_Csmr_Menu, press);
+	self->key(kHIDUsage_Csmr_Menu, press, mach_absolute_time());
 	if (++self->fTestCount < 60) {
 		sender->setTimeoutMS(press ? 100 : self->fTestSecs * 1000);
 	}
@@ -443,10 +465,49 @@ SweetHIDTouch::start(IOService *provider)
 	setProperty("DisplayIntegrated", kOSBooleanTrue);
 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
 	setProperty("SurfaceHeight", (unsigned long long)(151 << 16), 32);
+	fSeenKeys = OSSet::withCapacity(SWEET_TOUCH_SEEN_KEYS);
 	gSweetTouch = this;
 	registerService();
 	IOLog("SWEET HID: touch registered\n");
 	return true;
+}
+
+/*
+ * The event system pushes its settings here. TouchDetectionMode is kept for
+ * tap-to-wake; every other property is accepted and ignored as before. The
+ * first SWEET_TOUCH_SEEN_KEYS distinct names are logged once each.
+ */
+IOReturn
+SweetHIDTouch::setProperties(OSObject *properties)
+{
+	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
+
+	if (!dict) {
+		return kIOReturnBadArgument;
+	}
+	OSNumber *mode = OSDynamicCast(OSNumber, dict->getObject("TouchDetectionMode"));
+	if (mode) {
+		SInt32 value = (SInt32)(mode->unsigned32BitValue() & 0x7fffffff);
+		SInt32 old = gSweetTouchMode;
+		gSweetTouchMode = value;
+		if (old != value) {
+			IOLog("SWEET HID: touch detection mode %#x\n", (unsigned)value);
+		}
+	}
+	OSCollectionIterator *it = fSeenKeys ? OSCollectionIterator::withCollection(dict) : NULL;
+	if (it) {
+		OSString *name;
+		IOLockLock(fLock);
+		while ((name = OSDynamicCast(OSString, it->getNextObject()))) {
+			if (fSeenKeys->getCount() < SWEET_TOUCH_SEEN_KEYS && !fSeenKeys->containsObject(name)) {
+				fSeenKeys->setObject(name);
+				IOLog("SWEET HID: touch property \"%s\" set by the event system\n", name->getCStringNoCopy());
+			}
+		}
+		IOLockUnlock(fLock);
+		it->release();
+	}
+	return kIOReturnSuccess;
 }
 
 void
@@ -541,7 +602,7 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
 
 /* key: 0 power (side button), 1 volume up, 2 volume down, 3 home */
 extern "C" void
-sweet_hid_key(int key, int down)
+sweet_hid_key_at(int key, int down, uint64_t timestamp)
 {
 	static const UInt32 usages[] = {
 		kHIDUsage_Csmr_Power, kHIDUsage_Csmr_VolumeIncrement,
@@ -549,8 +610,20 @@ sweet_hid_key(int key, int down)
 	};
 
 	if (gSweetButtons && key >= 0 && key < (int)(sizeof(usages) / sizeof(usages[0]))) {
-		gSweetButtons->key(usages[key], down != 0);
+		gSweetButtons->key(usages[key], down != 0, timestamp);
 	}
+}
+
+extern "C" void
+sweet_hid_key(int key, int down)
+{
+	sweet_hid_key_at(key, down, mach_absolute_time());
+}
+
+extern "C" int
+sweet_hid_touch_mode(void)
+{
+	return gSweetTouchMode;
 }
 
 extern "C" void

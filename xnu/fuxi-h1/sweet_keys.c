@@ -113,6 +113,7 @@ keys_thread(void *arg, wait_result_t result)
 	(void)result;
 	for (;;) {
 		uint8_t pon = 0, gpio = 0;
+		uint64_t t = mach_absolute_time();
 		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
 		bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
 		int now[3] = {!!(pon & 1u), !(gpio & 1u), !!(pon & 2u)};
@@ -131,7 +132,7 @@ keys_thread(void *arg, wait_result_t result)
 			return;
 		}
 		for (int k = 0; k < 3; ++k) {
-			if (fuxi_key_sample(&keys[k], k == 1 ? gok : pok, now[k])) {
+			if (fuxi_key_sample(&keys[k], k == 1 ? gok : pok, now[k], t)) {
 				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio4:c110=%#x\n",
 				    k, keys[k].down, pon, gpio);
 				sweet_hid_key(k, keys[k].down);

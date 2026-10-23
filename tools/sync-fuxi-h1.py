@@ -14,6 +14,7 @@ FILES = {
     'bsd/dev/fuxi_keys.c': 'fuxi_keys.c',
     'bsd/dev/sweet_keys.c': 'sweet_keys.c',
     'bsd/dev/sweet_spmi.c': 'sweet_spmi.c',
+    'bsd/dev/fuxi_touch.c': 'fuxi_touch.c',
     'iokit/Kernel/arm/hid/SweetHID.cpp': 'SweetHID.cpp',
     'bsd/kern/fuxi_amfi.h': 'fuxi_amfi.h',
     'bsd/dev/fuxi_key_state.h': 'fuxi_key_state.h',

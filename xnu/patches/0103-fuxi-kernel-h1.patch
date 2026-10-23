@@ -56,7 +56,31 @@
  #endif /* ARM64_BOARD_CONFIG_SWEET */
 --- a/bsd/dev/fuxi_keys.c
 +++ b/bsd/dev/fuxi_keys.c
-@@ -23,6 +23,8 @@
+@@ -14,21 +14,40 @@
+  * channels. With boot-arg fuxikeys_gpiocfg=1, and only if GPIO6 is not an
+  * enabled input, the Linux pinctrl defaults for that one pin are written
+  * through its RW channel (volatile PMIC GPIO config, nothing else).
++ *
++ * All HID key events of this file pass one arbiter (fuxi_key_state.h):
++ * the PMIC poller, the root-only test injection sysctl debug.fuxikeys.inject
++ * (boot-arg fuxikeyinject=1) and tap-to-wake (boot-arg fuxitaptowake=1,
++ * driven by bsd/dev/fuxi_touch.c). Each HID event carries the time its new
++ * level was first sampled. debug.fuxikeys.held reports what HID has seen.
++ * Ported from HackiOS hackios-xnu-userland userland/src/inject.c (MIT):
++ * tap-to-wake (fuxi_keys_touch_wake).
++ * Ported from HackiOS hackios-xnu-kernel xnu/files/bsd/dev/redwood_buttons.c
++ * (APSL 2.0): the held-duration log. Notices and details in fuxi_key_state.h.
+  */
+ #if defined(FUXI)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/kauth.h>
++#include <sys/sysctl.h>
+ #include <kern/clock.h>
++#include <kern/locks.h>
+ #include <kern/thread.h>
++#include <kern/thread_call.h>
  #include <kern/sched_prim.h>
  #include <machine/machine_routines.h>
  #include <pexpert/pexpert.h>
@@ -65,16 +89,62 @@
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  extern kern_return_t thread_terminate(thread_t);
-@@ -47,6 +49,8 @@
+-extern void sweet_hid_key(int key, int down);
++extern void sweet_hid_key_at(int key, int down, uint64_t timestamp);
++extern int sweet_hid_touch_mode(void);
+ extern void fuxi_perf_input(void);
+ void fuxi_keys_init(void);
++bool fuxi_keys_touch_wake(void);
+ 
+ #define FK_CORE_PA     0x0c400000u
+ #define FK_CNFG_PA     0x0c42d000u
+@@ -47,7 +66,45 @@
  static uint16_t fk_pon_apid = FK_NO_APID, fk_gpio_apid = FK_NO_APID;
  static uint32_t fk_last_status;
  static bool fk_started;
 +/* A late completion after timeout must never be mistaken for a new sample. */
 +static bool fk_timed_out[1024];
  static int fk_chan;
++static const char *const fk_names[FUXI_KEYS] = {"power", "volume-up", "volume-down"};
++
++static LCK_GRP_DECLARE(fk_lck_grp, "fuxi-keys");
++static LCK_MTX_DECLARE(fk_hid_lock, &fk_lck_grp);
++static struct fuxi_key_arbiter fk_arb;        /* fk_hid_lock */
++static uint64_t fk_tap_last;                  /* fk_hid_lock */
++static thread_call_t fk_inject_call;
++static int fk_inject_chan;
++
++static uint64_t
++fk_ms(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++/* With fk_hid_lock held: the one place that hands Fuxi keys to HID. */
++static int
++fk_deliver_locked(unsigned key, unsigned source, bool down, uint64_t at)
++{
++	int change = fuxi_key_arbitrate(&fk_arb, key, source, down);
++	if (change) {
++		sweet_hid_key_at((int)key, change > 0, fuxi_key_stamp(&fk_arb, at));
++	}
++	return change;
++}
++
++static int
++fk_deliver(unsigned key, unsigned source, bool down, uint64_t at)
++{
++	lck_mtx_lock(&fk_hid_lock);
++	int change = fk_deliver_locked(key, source, down, at);
++	lck_mtx_unlock(&fk_hid_lock);
++	return change;
++}
  
  static uint32_t
-@@ -79,9 +83,9 @@
+ fk_rd(vm_offset_t base, uint32_t off)
+@@ -79,9 +136,9 @@
  }
  
  static bool
@@ -87,7 +157,7 @@
  		return false;
  	}
  	uint32_t off = 0x20u * apid;
-@@ -100,12 +104,22 @@
+@@ -100,12 +157,22 @@
  		}
  		delay(1);
  	}
@@ -111,7 +181,7 @@
  {
  	*(volatile uint32_t *)(chan + 0x10u) = val;           /* WDATA0 */
  	__asm__ volatile("dmb oshst" ::: "memory");
-@@ -122,6 +136,15 @@
+@@ -122,6 +189,15 @@
  }
  
  static bool
@@ -127,7 +197,7 @@
  fk_gpio_input(uint8_t subtype, uint8_t mode, uint8_t en)
  {
  	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
-@@ -133,8 +156,9 @@
+@@ -133,8 +209,9 @@
  fk_gpio_dump(const char *when, uint8_t *subtype, uint8_t *mode, uint8_t *en)
  {
  	uint8_t type = 0, vin = 0, pull = 0, rt = 0;
@@ -138,7 +208,7 @@
  	    fk_read(fk_gpio_apid, 0x40, mode) &&
  	    fk_read(fk_gpio_apid, 0x41, &vin) &&
  	    fk_read(fk_gpio_apid, 0x42, &pull) &&
-@@ -176,8 +200,8 @@
+@@ -176,8 +253,8 @@
  	fk_pon_apid = fk_find_apid(FK_PON_PPID, count, &pon_owner);
  	fk_gpio_apid = fk_find_apid(FK_GPIO_PPID, count, &gpio_owner);
  	uint8_t ptype = 0, psub = 0, pon = 0;
@@ -149,16 +219,22 @@
  	    fk_read(fk_pon_apid, FK_PON_RT, &pon);
  	printf("FUXI KEYS: arb=%#x apids=%u pon-apid=%u/ee%u gpio6-apid=%u/ee%u pon ok=%d type=%#x subtype=%#x rt=%#x st=%#x\n",
  	    version, count, fk_pon_apid, pon_owner, fk_gpio_apid, gpio_owner,
-@@ -227,7 +251,7 @@
+@@ -226,8 +303,7 @@
+ static void
  fk_thread(void *arg, wait_result_t result)
  {
- 	static const char *names[3] = {"power", "volume-up", "volume-down"};
+-	static const char *names[3] = {"power", "volume-up", "volume-down"};
 -	int state[3] = {0, 0, 0}, last[3] = {0, 0, 0};
-+	struct fuxi_key_state keys[3] = {0};
++	struct fuxi_key_state keys[FUXI_KEYS] = {0};
  	unsigned errors = 0;
  	(void)arg;
  	(void)result;
-@@ -240,32 +264,32 @@
+@@ -236,36 +312,41 @@
+ 	}
+ 	for (;;) {
+ 		uint8_t pon = 0, gpio = 1;
++		uint64_t t = mach_absolute_time();
+ 		bool pok = fk_read(fk_pon_apid, FK_PON_RT, &pon);
  		bool gok = fk_read(fk_gpio_apid, 0x10, &gpio);
  		bool ok[3] = {pok, gok, pok};
  		int now[3] = {!!(pon & FK_PON_PWR), !(gpio & 1u), !!(pon & FK_PON_RESIN)};
@@ -171,31 +247,38 @@
 +		    (fk_gpio_apid != FK_NO_APID && !gok);
 +		if (fuxi_keys_failed(&errors, failed)) {
 +			/* Balance delivered downs, so HID cannot retain a stuck key. */
-+			for (int k = 0; k < 3; ++k) {
++			for (unsigned k = 0; k < FUXI_KEYS; ++k) {
 +				if (keys[k].down) {
-+					sweet_hid_key(k, 0);
++					(void)fk_deliver(k, FUXI_KEY_SRC_HW, false, mach_absolute_time());
 +				}
  			}
 -		} else {
 -			errors = 0;
-+			printf("FUXI KEYS: stopped after %u consecutive read failures st=%#x\n",
-+			    errors, fk_last_status);
-+			goto terminate;
- 		}
- 		for (int k = 0; k < 3; ++k) {
+-		}
+-		for (int k = 0; k < 3; ++k) {
 -			/* Two equal samples 20 ms apart before a change counts. */
 -			if (ok[k] && now[k] == last[k] && now[k] != state[k]) {
 -				state[k] = now[k];
-+			if (fuxi_key_sample(&keys[k], ok[k], now[k])) {
- 				printf("FUXI KEYS: %s %s (pon=%#x gpio6=%#x)\n", names[k],
+-				printf("FUXI KEYS: %s %s (pon=%#x gpio6=%#x)\n", names[k],
 -				    state[k] ? "down" : "up", pon, gpio);
-+				    keys[k].down ? "down" : "up", pon, gpio);
++			printf("FUXI KEYS: stopped after %u consecutive read failures st=%#x\n",
++			    errors, fk_last_status);
++			goto terminate;
++		}
++		for (unsigned k = 0; k < FUXI_KEYS; ++k) {
++			if (fuxi_key_sample(&keys[k], ok[k], now[k], t)) {
++				if (keys[k].down) {
++					printf("FUXI KEYS: %s down (pon=%#x gpio6=%#x)\n", fk_names[k], pon, gpio);
++				} else {
++					printf("FUXI KEYS: %s up (pon=%#x gpio6=%#x) held %llu ms\n", fk_names[k],
++					    pon, gpio, fk_ms(keys[k].at - keys[k].since));
++				}
  				fuxi_perf_input();
 -				sweet_hid_key(k, state[k]);
 -			}
 -			if (ok[k]) {
 -				last[k] = now[k];
-+				sweet_hid_key(k, keys[k].down);
++				(void)fk_deliver(k, FUXI_KEY_SRC_HW, keys[k].down, keys[k].at);
  			}
  		}
  		fk_sleep(20);
@@ -206,6 +289,171 @@
  	(void)thread_terminate(current_thread());
  	thread_block(THREAD_CONTINUE_NULL);
  }
+@@ -290,4 +371,164 @@
+ 		printf("FUXI KEYS: kernel_thread_start failed\n");
+ 	}
+ }
++/* Injected downs are released at the latest FUXI_KEY_INJECT_HOLD_MAX_MS later. */
++static void
++fk_inject_expire(thread_call_param_t p0, thread_call_param_t p1)
++{
++	(void)p0;
++	(void)p1;
++	uint64_t now = mach_absolute_time();
++	lck_mtx_lock(&fk_hid_lock);
++	unsigned mask = fuxi_key_held_mask(&fk_arb, FUXI_KEY_SRC_INJECT);
++	for (unsigned k = 0; k < FUXI_KEYS; ++k) {
++		if (mask & (1u << k)) {
++			(void)fk_deliver_locked(k, FUXI_KEY_SRC_INJECT, false, now);
++		}
++	}
++	lck_mtx_unlock(&fk_hid_lock);
++	if (mask) {
++		printf("FUXI KEYS: inject auto-release mask=%#x after %u ms\n", mask,
++		    FUXI_KEY_INJECT_HOLD_MAX_MS);
++	}
++}
++
++static int
++fk_inject_one(unsigned key, bool down)
++{
++	int change = fk_deliver(key, FUXI_KEY_SRC_INJECT, down, mach_absolute_time());
++	printf("FUXI KEYS: inject %s %s -> hid %s\n", fk_names[key], down ? "down" : "up",
++	    change > 0 ? "down" : change < 0 ? "up" : "unchanged");
++	if (change) {
++		fuxi_perf_input();
++	}
++	return change;
++}
++
++static int
++fk_inject(const struct fuxi_key_inject *cmd)
++{
++	if (!fk_inject_call) {
++		thread_call_t call = thread_call_allocate(fk_inject_expire, NULL);
++		if (!call) {
++			return ENOMEM;
++		}
++		lck_mtx_lock(&fk_hid_lock);
++		if (!fk_inject_call) {
++			fk_inject_call = call;
++			call = NULL;
++		}
++		lck_mtx_unlock(&fk_hid_lock);
++		if (call) {
++			(void)thread_call_free(call);
++		}
++	}
++	if (cmd->op != FUXI_KEY_INJECT_UP) {
++		uint64_t deadline;
++		clock_interval_to_deadline(FUXI_KEY_INJECT_HOLD_MAX_MS, NSEC_PER_MSEC, &deadline);
++		(void)thread_call_enter_delayed(fk_inject_call, deadline);
++		(void)fk_inject_one(cmd->key, true);
++	}
++	if (cmd->op == FUXI_KEY_INJECT_CLICK) {
++		uint64_t deadline;
++		clock_interval_to_deadline(cmd->hold_ms, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline(&fk_inject_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++	if (cmd->op != FUXI_KEY_INJECT_DOWN) {
++		(void)fk_inject_one(cmd->key, false);
++	}
++	return 0;
++}
++
++/*
++ * debug.fuxikeys.inject: write a command word (fuxi_key_state.h) to press or
++ * release a key through the same arbiter and HID path as the PMIC keys.
++ * Root only (no CTLFLAG_ANYBODY, checked again here) and only with boot-arg
++ * fuxikeyinject=1; otherwise writes fail with ENOTSUP. Reads return the
++ * keys currently held by injection.
++ */
++static int
++fk_sysctl_inject SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	lck_mtx_lock(&fk_hid_lock);
++	int value = (int)fuxi_key_held_mask(&fk_arb, FUXI_KEY_SRC_INJECT), changed = 0;
++	lck_mtx_unlock(&fk_hid_lock);
++	int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	int enabled = 0;
++	if (!PE_parse_boot_argn("fuxikeyinject", &enabled, sizeof(enabled)) || enabled != 1) {
++		return ENOTSUP;
++	}
++	if (!kauth_cred_issuser(kauth_cred_get())) {
++		return EPERM;
++	}
++	struct fuxi_key_inject cmd;
++	if ((error = fuxi_key_inject_decode(value, &cmd))) {
++		return error;
++	}
++	return fk_inject(&cmd);
++}
++
++/*
++ * debug.fuxikeys.held: bits 0-2 the keys HID has down (power, volume up,
++ * volume down); bits 8-10 held by the PMIC, 16-18 by injection, 24-26 by
++ * tap-to-wake. A SpringBoard-side long-press guard can read bit 0.
++ */
++static int
++fk_sysctl_held SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	lck_mtx_lock(&fk_hid_lock);
++	int value = (int)(fuxi_key_held_mask(&fk_arb, ~0u) |
++	    fuxi_key_held_mask(&fk_arb, FUXI_KEY_SRC_HW) << 8 |
++	    fuxi_key_held_mask(&fk_arb, FUXI_KEY_SRC_INJECT) << 16 |
++	    fuxi_key_held_mask(&fk_arb, FUXI_KEY_SRC_TAP) << 24);
++	lck_mtx_unlock(&fk_hid_lock);
++	return SYSCTL_OUT(req, &value, sizeof(value));
++}
++
++SYSCTL_NODE(_debug, OID_AUTO, fuxikeys, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "Fuxi buttons");
++SYSCTL_PROC(_debug_fuxikeys, OID_AUTO, inject, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, fk_sysctl_inject, "I", "inject a key event (root, boot-arg fuxikeyinject=1)");
++SYSCTL_PROC(_debug_fuxikeys, OID_AUTO, held, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, fk_sysctl_held, "I", "keys held as HID sees them, and by which source");
++
++/*
++ * Called by bsd/dev/fuxi_touch.c for a new contact while the display is off.
++ * With boot-arg fuxitaptowake=1 and TouchDetectionMode 0xfe, press and
++ * release power (as HackiOS does) and return true: the touch driver then
++ * keeps the rest of that contact from iOS. Not while power is held.
++ */
++bool
++fuxi_keys_touch_wake(void)
++{
++	static int enabled = -1;
++	static uint64_t interval;
++	if (enabled < 0) {
++		int on = 0;
++		(void)PE_parse_boot_argn("fuxitaptowake", &on, sizeof(on));
++		nanoseconds_to_absolutetime(1500 * NSEC_PER_MSEC, &interval);
++		enabled = on == 1;
++	}
++	if (!enabled) {
++		return false;
++	}
++	int mode = sweet_hid_touch_mode();
++	uint64_t now = mach_absolute_time();
++	lck_mtx_lock(&fk_hid_lock);
++	bool go = fk_arb.held[0] == 0 && fuxi_tap_wake_allowed(mode, now, &fk_tap_last, interval);
++	if (go) {
++		(void)fk_deliver_locked(0, FUXI_KEY_SRC_TAP, true, now);
++		(void)fk_deliver_locked(0, FUXI_KEY_SRC_TAP, false, now);
++	}
++	lck_mtx_unlock(&fk_hid_lock);
++	if (go) {
++		fuxi_perf_input();
++		printf("FUXI KEYS: tap-to-wake power click (touch mode %#x)\n", mode);
++	}
++	return go;
++}
+ #endif /* FUXI */
 --- a/bsd/dev/sweet_keys.c
 +++ b/bsd/dev/sweet_keys.c
 @@ -12,8 +12,11 @@
@@ -261,7 +509,7 @@
  static void
  keys_wait(void)
  {
-@@ -93,7 +107,7 @@
+@@ -93,29 +107,35 @@
  static void
  keys_thread(void *arg, wait_result_t result)
  {
@@ -270,7 +518,9 @@
  	unsigned errors = 0;
  	(void)arg;
  	(void)result;
-@@ -102,20 +116,25 @@
+ 	for (;;) {
+ 		uint8_t pon = 0, gpio = 0;
++		uint64_t t = mach_absolute_time();
  		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
  		bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
  		int now[3] = {!!(pon & 1u), !(gpio & 1u), !!(pon & 2u)};
@@ -297,7 +547,7 @@
  		for (int k = 0; k < 3; ++k) {
 -			if ((k == 1 ? gok : pok) && now[k] != state[k]) {
 -				state[k] = now[k];
-+			if (fuxi_key_sample(&keys[k], k == 1 ? gok : pok, now[k])) {
++			if (fuxi_key_sample(&keys[k], k == 1 ? gok : pok, now[k], t)) {
  				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio4:c110=%#x\n",
 -				    k, state[k], pon, gpio);
 -				sweet_hid_key(k, state[k]);
@@ -306,7 +556,7 @@
  			}
  		}
  		keys_wait();
-@@ -153,9 +172,19 @@
+@@ -153,9 +173,19 @@
  	}
  	keys_pon_apid = keys_find_apid(0x008, count);
  	keys_gpio_apid = keys_find_apid(0x4c1, count);
@@ -328,7 +578,7 @@
  	bool mok = keys_read(keys_gpio_apid, 0xc140, &mode);
  	bool eok = keys_read(keys_gpio_apid, 0xc146, &en);
  	bool sok = keys_read(keys_gpio_apid, 0xc105, &subtype);
-@@ -169,8 +198,9 @@
+@@ -169,8 +199,9 @@
  		printf("SWEET KEYS: GPIO2 not confirmed enabled as input; volume-up withheld, PMIC unchanged\n");
  		keys_gpio_apid = KEYS_NO_APID;
  	}
@@ -437,18 +687,272 @@
  	return -1;
  }
  #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/fuxi_touch.c
++++ b/bsd/dev/fuxi_touch.c
+@@ -19,6 +19,14 @@
+  * reported while the display is off (boot-arg fuxitouch_offsuppress=0 keeps
+  * reporting). Boot-arg fuxitouch_poll_us sets the active period (default
+  * 4000), fuxitouch_idle_us the idle one (default 8000).
++ *
++ * Tap-to-wake (H1, boot-arg fuxitaptowake=1, default off): a new contact
++ * while the display is off asks bsd/dev/fuxi_keys.c for a power press,
++ * which it sends only while backboardd's TouchDetectionMode is 0xfe. After
++ * such a press the contacts of that off period stay hidden from iOS until
++ * they lift. Without a wake press nothing changes.
++ * Ported from HackiOS hackios-xnu-userland userland/src/inject.c (MIT):
++ * the waking touch is kept from iOS. MIT notice in fuxi_key_state.h.
+  */
+ #if defined(FUXI)
+ #include <sys/param.h>
+@@ -32,6 +40,7 @@
+ #include <vm/vm_kern.h>
+ #include <vm/pmap.h>
+ #include <arm/caches_internal.h>
++#include "fuxi_key_state.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+@@ -40,6 +49,7 @@
+ extern kern_return_t kernel_thread_start_priority(thread_continue_t continuation,
+     void *parameter, integer_t priority, thread_t *new_thread);
+ extern int sweet_fb_display_off;       /* iokit/Kernel/arm/SweetFramebuffer.cpp */
++extern bool fuxi_keys_touch_wake(void); /* bsd/dev/fuxi_keys.c */
+ void fuxi_touch_init(void);
+ 
+ #define FT_SE_PA     0x00a90000u
+@@ -70,6 +80,7 @@
+ 	/* Per-contact statistics (first finger down -> last finger up). */
+ 	uint64_t c_start, c_last, c_poll_sum, c_poll_max;
+ 	unsigned c_reports, c_polls, contacts;
++	struct fuxi_wake_touch wake;   /* tap-to-wake contact filter */
+ } ft;
+ static int ft_chan;
+ 
+@@ -535,6 +546,15 @@
+ 		if ((ev[0] != FT_EV_ENTER && ev[0] != FT_EV_MOTION && ev[0] != FT_EV_LEAVE) ||
+ 		    id >= FT_MAX || (type == 0 && ev[0] != FT_EV_LEAVE)) {
+ 			continue;
++		}
++		bool touching = ev[0] != FT_EV_LEAVE && type != FT_TYPE_HOVER, fresh;
++		if (fuxi_wake_touch_event(&ft.wake, !deliver, id, touching, &fresh)) {
++			if (fresh && fuxi_keys_touch_wake()) {
++				fuxi_wake_touch_woke(&ft.wake);
++			}
++			if (deliver) {
++				continue;      /* a contact that woke the display: not for iOS */
++			}
+ 		}
+ 		/* Super-resolution coordinates, 10x the 1080x2400 panel. */
+ 		int x = ((ev[3] << 8) | ev[2]) / 10, y = ((ev[5] << 8) | ev[4]) / 10;
+@@ -641,6 +661,7 @@
+ 		bool off = offsup && sweet_fb_display_off;
+ 		if (off != was_off) {
+ 			was_off = off;
++			fuxi_wake_touch_display(&ft.wake, off);
+ 			if (off && ft.active) {
+ 				ft_report(0);   /* release fingers held when the display went off */
+ 			}
+@@ -670,6 +691,9 @@
+ 				/* Do not leave a finger stuck down while reads fail. */
+ 				if (errors >= 2 && ft.active) {
+ 					ft_report(0);
++				}
++				if (errors >= 2) {
++					fuxi_wake_touch_reset(&ft.wake);
+ 				}
+ 				/* A timed-out transfer leaves TREs queued: reset the GPII rings. */
+ 				if (errors == 3 || (errors % 50u) == 0) {
+@@ -688,6 +712,7 @@
+ 				if (ft.active) {
+ 					ft_report(0);
+ 				}
++				fuxi_wake_touch_reset(&ft.wake);
+ 				int serr = ft_tx(sense, 3, false);
+ 				printf("FUXI TOUCH: controller reset event, sense on again -> %d\n", serr);
+ 			}
 --- a/iokit/Kernel/arm/hid/SweetHID.cpp
 +++ b/iokit/Kernel/arm/hid/SweetHID.cpp
-@@ -399,7 +399,8 @@
+@@ -12,14 +12,26 @@
+  *   SweetHIDButtons  consumer-control keys (power, volume, home)
+  *   SweetHIDTouch    the built-in touch screen (digitizer collections)
+  *
+- * Hardware drivers feed them through the C entry points sweet_hid_key()
+- * and sweet_hid_touch(). Boot-arg sweethidtest=N (seconds) presses Home
++ * Hardware drivers feed them through the C entry points sweet_hid_key(),
++ * sweet_hid_key_at() (with the press time as event timestamp) and
++ * sweet_hid_touch(). Boot-arg sweethidtest=N (seconds) presses Home
+  * every N seconds, to test the event path without input hardware.
++ *
++ * SweetHIDTouch records backboardd's TouchDetectionMode property for
++ * tap-to-wake (sweet_hid_touch_mode(), used by bsd/dev/fuxi_keys.c).
++ * Ported from HackiOS hackios-xnu-userland userland/src/inject.c (MIT):
++ * the TouchDetectionMode values HackiOS observed (0x1 report touches, low
++ * byte 0xfe display off with tap-to-wake, 0xff nothing). Copyright (c) 2026
++ * OOSEX GANG; MIT notice in bsd/dev/fuxi_key_state.h.
+  */
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOTimerEventSource.h>
+ #include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSCollectionIterator.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSSet.h>
++#include <libkern/c++/OSString.h>
+ #include <pexpert/pexpert.h>
+ 
+ #include "IOHIDEventService.h"
+@@ -323,13 +335,19 @@
+ 
+ /*
+  * Buttons. iOS takes the side/volume/home buttons as consumer-control
+- * keyboard events (AppleM68Buttons publishes the same usage pair).
++ * keyboard events (AppleM68Buttons publishes the same usage pair). Usages,
++ * all on the Consumer page 0x0C, the same as HackiOS sends to the iOS 16
++ * backboardd (hackios-xnu-userland userland/src/inject.c send_button()):
++ * side button Power 0x30 (SpringBoard's SBLockHardwareButton: lock, wake,
++ * long press = Siri), Volume Increment 0xE9, Volume Decrement 0xEA, Menu
++ * 0x40 (home, sweethidtest only). The phone has no ringer switch, so no
++ * Telephony page (0x0B) or mute usage is ever sent.
+  */
+ class SweetHIDButtons : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDButtons);
+ public:
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+-	void key(UInt32 usage, bool down);
++	void key(UInt32 usage, bool down, uint64_t timestamp);
+ protected:
+ 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Consumer; }
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Csmr_ConsumerControl; }
+@@ -360,6 +378,7 @@
+ 	OSDeclareDefaultStructors(SweetHIDTouch);
+ public:
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	void touch(int finger, bool down, int x, int y);
+ protected:
+ 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Digitizer; }
+@@ -367,6 +386,7 @@
+ 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 2; }
+ private:
+ 	IOLock *fLock;
++	OSSet *fSeenKeys;	/* property names backboardd has set, logged once each */
+ 	int fLogicalW, fLogicalH, fOffX, fOffY;
+ 	bool fDown[SWEET_TOUCH_FINGERS];
+ 	bool fEdge[SWEET_TOUCH_FINGERS];
+@@ -377,6 +397,8 @@
+ 
+ static SweetHIDButtons *gSweetButtons;
+ static SweetHIDTouch *gSweetTouch;
++static volatile SInt32 gSweetTouchMode = -1;	/* TouchDetectionMode, -1 never set */
++#define SWEET_TOUCH_SEEN_KEYS 24
+ 
+ bool
+ SweetHIDButtons::start(IOService *provider)
+@@ -397,9 +419,10 @@
+ }
+ 
  void
- SweetHIDButtons::key(UInt32 usage, bool down)
- {
+-SweetHIDButtons::key(UInt32 usage, bool down)
+-{
 -	IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(), kHIDPage_Consumer, usage, down);
-+	IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(), kHIDPage_Consumer, usage, down,
++SweetHIDButtons::key(UInt32 usage, bool down, uint64_t timestamp)
++{
++	IOHIDEvent *event = IOHIDEvent::keyboardEvent(timestamp, kHIDPage_Consumer, usage, down,
 +	    kIOHIDEventOptionIsBuiltIn);
  
  	if (event) {
  		IOLog("SWEET HID: key 0x%x %s (%u clients)\n", (unsigned)usage, down ? "down" : "up",
+@@ -419,7 +442,7 @@
+ 	 * screen waits for it. Even counts press, odd counts release.
+ 	 */
+ 	bool press = (self->fTestCount & 1) == 0;
+-	self->key(kHIDUsage_Csmr_Menu, press);
++	self->key(kHIDUsage_Csmr_Menu, press, mach_absolute_time());
+ 	if (++self->fTestCount < 60) {
+ 		sender->setTimeoutMS(press ? 100 : self->fTestSecs * 1000);
+ 	}
+@@ -442,10 +465,49 @@
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+ 	setProperty("SurfaceHeight", (unsigned long long)(151 << 16), 32);
++	fSeenKeys = OSSet::withCapacity(SWEET_TOUCH_SEEN_KEYS);
+ 	gSweetTouch = this;
+ 	registerService();
+ 	IOLog("SWEET HID: touch registered\n");
+ 	return true;
++}
++
++/*
++ * The event system pushes its settings here. TouchDetectionMode is kept for
++ * tap-to-wake; every other property is accepted and ignored as before. The
++ * first SWEET_TOUCH_SEEN_KEYS distinct names are logged once each.
++ */
++IOReturn
++SweetHIDTouch::setProperties(OSObject *properties)
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++
++	if (!dict) {
++		return kIOReturnBadArgument;
++	}
++	OSNumber *mode = OSDynamicCast(OSNumber, dict->getObject("TouchDetectionMode"));
++	if (mode) {
++		SInt32 value = (SInt32)(mode->unsigned32BitValue() & 0x7fffffff);
++		SInt32 old = gSweetTouchMode;
++		gSweetTouchMode = value;
++		if (old != value) {
++			IOLog("SWEET HID: touch detection mode %#x\n", (unsigned)value);
++		}
++	}
++	OSCollectionIterator *it = fSeenKeys ? OSCollectionIterator::withCollection(dict) : NULL;
++	if (it) {
++		OSString *name;
++		IOLockLock(fLock);
++		while ((name = OSDynamicCast(OSString, it->getNextObject()))) {
++			if (fSeenKeys->getCount() < SWEET_TOUCH_SEEN_KEYS && !fSeenKeys->containsObject(name)) {
++				fSeenKeys->setObject(name);
++				IOLog("SWEET HID: touch property \"%s\" set by the event system\n", name->getCStringNoCopy());
++			}
++		}
++		IOLockUnlock(fLock);
++		it->release();
++	}
++	return kIOReturnSuccess;
+ }
+ 
+ void
+@@ -540,7 +602,7 @@
+ 
+ /* key: 0 power (side button), 1 volume up, 2 volume down, 3 home */
+ extern "C" void
+-sweet_hid_key(int key, int down)
++sweet_hid_key_at(int key, int down, uint64_t timestamp)
+ {
+ 	static const UInt32 usages[] = {
+ 		kHIDUsage_Csmr_Power, kHIDUsage_Csmr_VolumeIncrement,
+@@ -548,8 +610,20 @@
+ 	};
+ 
+ 	if (gSweetButtons && key >= 0 && key < (int)(sizeof(usages) / sizeof(usages[0]))) {
+-		gSweetButtons->key(usages[key], down != 0);
+-	}
++		gSweetButtons->key(usages[key], down != 0, timestamp);
++	}
++}
++
++extern "C" void
++sweet_hid_key(int key, int down)
++{
++	sweet_hid_key_at(key, down, mach_absolute_time());
++}
++
++extern "C" int
++sweet_hid_touch_mode(void)
++{
++	return gSweetTouchMode;
+ }
+ 
+ extern "C" void
 --- /dev/null
 +++ b/bsd/kern/fuxi_amfi.h
 @@ -0,0 +1,212 @@
@@ -666,28 +1170,74 @@
 +#endif /* FUXI_AMFI_H */
 --- /dev/null
 +++ b/bsd/dev/fuxi_key_state.h
-@@ -0,0 +1,45 @@
-+/* H1 polled-key state, shared by both PMIC readers and native host tests. */
+@@ -0,0 +1,270 @@
++/*
++ * H1 polled-key state, shared by both PMIC readers, the Fuxi touch driver
++ * and native host tests.
++ *
++ * Ported from HackiOS hackios-xnu-userland userland/src/inject.c (MIT):
++ * the tap-to-wake policy (TouchDetectionMode low byte 0xfe: a touch while
++ * the display is off becomes a side-button press and the rest of that touch
++ * is kept from iOS). Its licence:
++ *
++ * MIT License
++ *
++ * Copyright (c) 2026 OOSEX GANG
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ *
++ * Ported from HackiOS hackios-xnu-kernel xnu/files/bsd/dev/redwood_buttons.c
++ * (APSL 2.0): the press start time and held-duration bookkeeping. Adapted
++ * from a backboardd virtual service and a record queue to this kernel's
++ * SweetHIDButtons path; the arbiter and injection word are this tree's.
++ */
 +#ifndef FUXI_KEY_STATE_H
 +#define FUXI_KEY_STATE_H
 +
 +#define FUXI_KEYS_FAILURE_LIMIT 8u
++#define FUXI_KEYS 3u                    /* 0 power, 1 volume up, 2 volume down */
 +struct fuxi_key_state {
 +	bool armed;       /* two released samples seen since polling began */
 +	bool sampled;
 +	bool last;
 +	bool down;        /* state delivered to HID */
++	uint64_t first;   /* time of the first sample of the current steady run */
++	uint64_t at;      /* timestamp of the last delivered transition */
++	uint64_t since;   /* timestamp of the delivered press that is (or was) down */
 +};
 +
-+/* Return true only when a debounced HID transition is ready. */
-+static bool
-+fuxi_key_sample(struct fuxi_key_state *key, bool valid, bool pressed)
++/*
++ * Return true only when a debounced HID transition is ready. Its timestamp
++ * (key->at) is when the new level was first sampled, not when the second,
++ * confirming sample arrived: the HID event carries the press time.
++ */
++static inline bool
++fuxi_key_sample(struct fuxi_key_state *key, bool valid, bool pressed, uint64_t now)
 +{
 +	if (!valid) {
 +		key->sampled = false; /* a failed read breaks consecutive samples */
 +		return false;
 +	}
 +	bool steady = key->sampled && pressed == key->last;
++	if (!steady) {
++		key->first = now;
++	}
 +	key->sampled = true;
 +	key->last = pressed;
 +	if (!steady) {
@@ -701,15 +1251,194 @@
 +		return false;
 +	}
 +	key->down = pressed;
++	key->at = key->first;
++	if (pressed) {
++		key->since = key->at;
++	}
 +	return true;
 +}
 +
 +/* A failed active peripheral counts even when another one still works. */
-+static bool
++static inline bool
 +fuxi_keys_failed(unsigned *consecutive, bool failed)
 +{
 +	*consecutive = failed ? *consecutive + 1 : 0;
 +	return *consecutive >= FUXI_KEYS_FAILURE_LIMIT;
++}
++
++/*
++ * Every Fuxi key event goes through one arbiter: the PMIC poller, the
++ * test injection sysctl and tap-to-wake are separate sources. A key is down
++ * for HID while any source holds it, so each HID down gets exactly one HID
++ * up whatever the sources do, and repeated downs or unmatched ups from one
++ * source produce nothing. Timestamps given to HID never go backwards.
++ */
++#define FUXI_KEY_SRC_HW     0x1u
++#define FUXI_KEY_SRC_INJECT 0x2u
++#define FUXI_KEY_SRC_TAP    0x4u
++struct fuxi_key_arbiter {
++	uint8_t held[FUXI_KEYS];  /* FUXI_KEY_SRC_* bits per key */
++	uint64_t last;            /* last timestamp handed to HID */
++};
++
++/* 1: deliver an HID down, -1: deliver an HID up, 0: no HID event. */
++static inline int
++fuxi_key_arbitrate(struct fuxi_key_arbiter *arb, unsigned key, unsigned source, bool down)
++{
++	if (key >= FUXI_KEYS) {
++		return 0;
++	}
++	bool was = arb->held[key] != 0;
++	if (down) {
++		arb->held[key] |= (uint8_t)source;
++	} else {
++		arb->held[key] &= (uint8_t)~source;
++	}
++	bool now = arb->held[key] != 0;
++	return now == was ? 0 : now ? 1 : -1;
++}
++
++static inline uint64_t
++fuxi_key_stamp(struct fuxi_key_arbiter *arb, uint64_t at)
++{
++	if (at < arb->last) {
++		at = arb->last;
++	}
++	arb->last = at;
++	return at;
++}
++
++/* Bit k: key k held by a source in mask (any source: what HID last saw). */
++static inline unsigned
++fuxi_key_held_mask(const struct fuxi_key_arbiter *arb, unsigned sources)
++{
++	unsigned mask = 0;
++	for (unsigned k = 0; k < FUXI_KEYS; ++k) {
++		if (arb->held[k] & sources) {
++			mask |= 1u << k;
++		}
++	}
++	return mask;
++}
++
++/*
++ * debug.fuxikeys.inject command word: bits 0-7 key (0 power, 1 volume up,
++ * 2 volume down), bits 8-15 operation, bits 16-27 click hold in ms (0 means
++ * 100 ms, at most FUXI_KEY_INJECT_CLICK_MAX_MS), bits 28-31 zero.
++ */
++#define FUXI_KEY_INJECT_DOWN  1u
++#define FUXI_KEY_INJECT_UP    2u
++#define FUXI_KEY_INJECT_CLICK 3u
++#define FUXI_KEY_INJECT_CLICK_DEFAULT_MS 100u
++#define FUXI_KEY_INJECT_CLICK_MAX_MS 2000u
++#define FUXI_KEY_INJECT_HOLD_MAX_MS 10000u /* an injected down is released after this */
++struct fuxi_key_inject {
++	unsigned key, op, hold_ms;
++};
++
++static inline int
++fuxi_key_inject_decode(int value, struct fuxi_key_inject *cmd)
++{
++	uint32_t word = (uint32_t)value;
++	cmd->key = word & 0xffu;
++	cmd->op = (word >> 8) & 0xffu;
++	cmd->hold_ms = (word >> 16) & 0xfffu;
++	if ((word >> 28) != 0 || cmd->key >= FUXI_KEYS ||
++	    cmd->op < FUXI_KEY_INJECT_DOWN || cmd->op > FUXI_KEY_INJECT_CLICK ||
++	    (cmd->op != FUXI_KEY_INJECT_CLICK && cmd->hold_ms != 0) ||
++	    cmd->hold_ms > FUXI_KEY_INJECT_CLICK_MAX_MS) {
++		return EINVAL;
++	}
++	if (cmd->op == FUXI_KEY_INJECT_CLICK && cmd->hold_ms == 0) {
++		cmd->hold_ms = FUXI_KEY_INJECT_CLICK_DEFAULT_MS;
++	}
++	return 0;
++}
++
++/*
++ * Tap-to-wake: backboardd sets TouchDetectionMode on the touch service; its
++ * low byte is 0xfe while the display is off and a tap is to wake it (0x1
++ * with the display on, 0xff for no touch at all; -1 here: never set). At
++ * most one wake press per interval, so a double tap cannot wake and then
++ * lock again before the display has come on.
++ */
++#define FUXI_TOUCH_MODE_WAKE 0xfe
++static inline bool
++fuxi_tap_wake_allowed(int mode, uint64_t now, uint64_t *last, uint64_t interval)
++{
++	if (mode < 0 || (mode & 0xff) != FUXI_TOUCH_MODE_WAKE) {
++		return false;
++	}
++	if (*last != 0 && now - *last < interval) {
++		return false;
++	}
++	*last = now ? now : 1;
++	return true;
++}
++
++/*
++ * Touch side of tap-to-wake. While the display is off every contact is
++ * tracked (and dropped, as before). Once a wake press has been sent in this
++ * off period, the contacts present then and later stay hidden from iOS
++ * until each lifts, so the waking finger does not start a touch mid-contact
++ * when the display comes on. Without a wake press nothing is hidden.
++ */
++struct fuxi_wake_touch {
++	uint32_t off;     /* contacts down while the display is off */
++	uint32_t swallow; /* contacts kept from iOS until they lift */
++	bool woke;        /* a wake press was sent in this off period */
++};
++
++static inline void
++fuxi_wake_touch_display(struct fuxi_wake_touch *w, bool off)
++{
++	w->off = 0;
++	if (off) {
++		w->woke = false;
++	}
++}
++
++static inline void
++fuxi_wake_touch_woke(struct fuxi_wake_touch *w)
++{
++	w->woke = true;
++	w->swallow |= w->off;
++}
++
++static inline void
++fuxi_wake_touch_reset(struct fuxi_wake_touch *w)
++{
++	w->off = 0;
++	w->swallow = 0;
++}
++
++/* True when the event must not reach iOS; *fresh: a new contact while off. */
++static inline bool
++fuxi_wake_touch_event(struct fuxi_wake_touch *w, bool off, unsigned id, bool touching,
++    bool *fresh)
++{
++	uint32_t bit = 1u << (id & 31u);
++	*fresh = false;
++	if (off) {
++		if (touching && !(w->off & bit)) {
++			w->off |= bit;
++			*fresh = true;
++			if (w->woke) {
++				w->swallow |= bit;
++			}
++		} else if (!touching) {
++			w->off &= ~bit;
++			w->swallow &= ~bit;
++		}
++		return true;
++	}
++	if (w->swallow & bit) {
++		if (!touching) {
++			w->swallow &= ~bit;
++		}
++		return true;
++	}
++	return false;
 +}
 +#endif /* FUXI_KEY_STATE_H */
 --- /dev/null
