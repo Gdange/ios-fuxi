@@ -1,0 +1,25 @@
+#!/bin/bash
+# Build the P-SYS userland pieces on a Mac with Xcode (iPhoneOS SDK):
+#   OUT/FuxiAudio.driver   AudioServerPlugIn bundle for mediaserverd's HAL
+#   OUT/libfuxi-sb.dylib   SpringBoard snapshot-format library
+# Install them with tools/fuxi-sys-root.py (see docs-lanes/sys-port.md).
+set -euo pipefail
+cd "$(dirname "$0")/.."
+[[ $(uname -s) == Darwin ]] || { echo 'requires a Mac with Xcode' >&2; exit 1; }
+out=${1:-tools/out/sys}
+sdk=$(xcrun --sdk iphoneos --show-sdk-path)
+cc=$(xcrun --sdk iphoneos --find clang)
+flags=(-target arm64-apple-ios16.0 -isysroot "$sdk" -O2 -Wall -Wextra -Werror -fstack-protector-strong)
+bundle=$out/FuxiAudio.driver
+rm -rf "$bundle"
+mkdir -p "$bundle"
+cp tools/fuxi-audio/Info.plist "$bundle/Info.plist"
+"$cc" "${flags[@]}" -bundle tools/fuxi-audio/FuxiAudio.c -framework CoreFoundation -o "$bundle/FuxiAudio"
+"$cc" "${flags[@]}" -dynamiclib tools/fuxi-sb/FuxiSnapshots.c -lobjc \
+ -install_name /usr/local/lib/fuxi/libfuxi-sb.dylib -o "$out/libfuxi-sb.dylib"
+for binary in "$bundle" "$out/libfuxi-sb.dylib"; do
+ codesign -f -s - "$binary"
+ codesign --verify --strict "$binary"
+done
+shasum -a 256 "$bundle/FuxiAudio" "$bundle/Info.plist" "$out/libfuxi-sb.dylib" > "$out/SYS-SHA256SUMS"
+cat "$out/SYS-SHA256SUMS"

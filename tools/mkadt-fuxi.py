@@ -4,6 +4,16 @@
 Uses the same iPhone X userland identity and generic providers as ios-sweet.
 Hardware values come from measured Fuxi probes. UFS is absent by default; an
 explicit option adds the node used by the read-only storage diagnostic.
+
+Opt-in /product children (docs-lanes/sys-port.md), copied at build time from
+the real D22AP tree (an Apple artifact, never in git; --d22ap-adt):
+  --product-haptics  /product/haptics (closed-loop, supports-3rd-party-haptics):
+                     MobileGestalt DeviceSupportsClosedLoopHaptics, so iOS plays
+                     haptics as waveforms on an "Actuator" HAL device (FuxiAudio)
+                     instead of looking for an IOKit vibration motor
+  --product-camera   an empty /product/camera node, no flash (there is no torch);
+                     MobileGestalt then reports a camera node; for A/B only
+Both work on a fresh build and on --template.
 """
 import argparse
 import importlib.util
@@ -111,6 +121,41 @@ def build(ufs_readonly=False, root_props=(), smp=False, gpu_reserve=False, mem_s
     return root
 
 
+def d22ap_product_child(name, path):
+    """Properties of /product/NAME in the D22AP tree, minus node bookkeeping and
+    the syscfg placeholders iBoot fills in (flag bit set)."""
+    source, _ = adt.parse(Path(path).read_bytes())
+    product = next((c for c in source.children if c.name == 'product'), None)
+    child = product and next((c for c in product.children if c.name == name), None)
+    if child is None:
+        raise ValueError(f'{path}: no /product/{name} node')
+    return [(k, v) for k, f, v in child.props if not f and k not in ('name', 'AAPL,phandle')]
+
+
+def max_phandle(node):
+    value = node.prop('AAPL,phandle')
+    own = struct.unpack('<I', value)[0] if value and len(value) == 4 else 0
+    return max([own] + [max_phandle(c) for c in node.children])
+
+
+def add_product_children(root, haptics=False, camera=False, d22ap=mkadt.D22AP_ADT):
+    """Add /product/haptics (from D22AP) and/or an empty /product/camera.
+    Replaces a child of the same name, so a template can be rebuilt."""
+    wanted = ([('haptics', d22ap_product_child('haptics', d22ap))] if haptics else []) + \
+        ([('camera', [])] if camera else [])
+    if not wanted:
+        return root
+    product = next((c for c in root.children if c.name == 'product'), None)
+    if product is None:
+        raise ValueError('ADT has no /product node (D22AP tree missing at build time?)')
+    phandle = max_phandle(root)
+    for name, props in wanted:
+        product.children = [c for c in product.children if c.name != name]
+        phandle += 1
+        product.children.append(mkadt.node(name, [('AAPL,phandle', struct.pack('<I', phandle))] + props))
+    return root
+
+
 def reserve_gpu(root, mem_size=MEM_SIZE):
     """Preserve an integration ADT's identity/root extents while excluding scratch."""
     chosen = next(n for n in root.children if n.name == 'chosen')
@@ -134,6 +179,9 @@ def main():
     ap.add_argument('--gpu-reserve', action='store_true', help='declare the top-of-bank 32 MiB GPU scratch (always excluded from XNU)')
     ap.add_argument('--smp',action='store_true',help='add cores 2-7 (cpu@100 stays with the USB monitor)')
     ap.add_argument('--ram-layout', choices=('full', '1g'), default='full', help='full = 5088 MiB; 1g = original 1 GiB XNU window')
+    ap.add_argument('--product-haptics', action='store_true', help='add /product/haptics copied from the D22AP tree')
+    ap.add_argument('--product-camera', action='store_true', help='add an empty /product/camera node (no flash)')
+    ap.add_argument('--d22ap-adt', type=Path, default=Path(mkadt.D22AP_ADT), help='real D22AP device tree (not in git)')
     args = ap.parse_args()
     mem_size = MEM_SIZE if args.ram_layout == 'full' else LEGACY_SIZE
     try:
@@ -148,15 +196,19 @@ def main():
             root = reserve_gpu(root, mem_size)
         else:
             root = build(args.ufs_readonly, root_props, args.smp, args.gpu_reserve, mem_size)
+        root = add_product_children(root, args.product_haptics, args.product_camera, args.d22ap_adt)
         has_ufs = any(n.name == 'fuxi-ufs' for n in root.children)
         validate_live(args.live_fdt, has_ufs)
         blob = adt.serialize(root)
-    except (ValueError, KeyError, struct.error) as error:
+    except (ValueError, KeyError, struct.error, OSError) as error:
         ap.exit(1, str(error) + '\n')
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_bytes(blob)
     cpu_count = len(next(n for n in root.children if n.name == 'cpus').children)
-    print(f'{args.out}: {len(blob)} bytes; RAM {PHYS_BASE:#x}+{mem_size:#x}; CPUs {cpu_count}; UFS={"present" if has_ufs else "absent"}')
+    product = next((n for n in root.children if n.name == 'product'), None)
+    extra = sorted(c.name for c in product.children) if product else []
+    print(f'{args.out}: {len(blob)} bytes; RAM {PHYS_BASE:#x}+{mem_size:#x}; CPUs {cpu_count}; UFS={"present" if has_ufs else "absent"}'
+          + (f'; /product children {",".join(extra)}' if extra else ''))
 
 
 if __name__ == '__main__':
