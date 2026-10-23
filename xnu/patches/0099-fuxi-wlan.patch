@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,4842 @@
+@@ -0,0 +1,4934 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -55,6 +55,8 @@
 + *   fuxiwlanmlo=1  ath12k PHY_CAP/MLO negotiation; =2 omit MLO (W12+; default unchanged)
 + *   fuxiwlanqrtr=1  W11 capability-only diagnostic; =2 W12 setup; =3 W13 small-chunk negotiation; =4 W14 downloads; =5 W15 config/mode
 + *   fuxiwlanw15=1  W15 only: omit WLAN_CFG shadow-v3 TLV (default 0)
++ *   fuxiwlanw16=N  qrtr=5 only: 1 larger IPCR, 2 doorbell redrive, 3 both,
++ *                 4 diagnostics only; all include MODE context diagnostics
 + * Steps 17..28 probe DMA safety and load rootfs firmware through BHI/BHIe.
 + * Completion is polled; M6o can enable MSI to a RAM sink. W11 channels/QMI are opt-in;
 + * see docs-lanes/wlan-bt.md M6.
@@ -750,7 +752,8 @@
 +static struct wl_dma wl_image, wl_vectors, wl_contexts, wl_tables;
 +static struct wl_dma wl_amss; /* full file when BHI uses a separate prefix */
 +static bool wl_qrtr, wl_w12, wl_w13, wl_w14, wl_w15, wl_w11_attempted, wl_w11_ok;
-+static unsigned wl15_variant, wl12_mlo_variant;
++static unsigned wl15_variant, wl16_variant, wl12_mlo_variant;
++static bool wl16_large, wl16_redrive;
 +/* W12/W13 allocate after an accepted REQUEST_MEM; retain partial allocations until
 + * containment is proven. Limit includes XNU page rounding, not just wire sizes. */
 +#define WL13_CHUNK_LIMIT (2u * 1024u * 1024u)
@@ -893,12 +896,23 @@
 +		}
 +	}
 +	wl15_variant = 0;
++	wl16_variant = 0; wl16_large = wl16_redrive = false;
 +	if (wl_w15) {
 +		int variant = 0;
 +		(void)PE_parse_boot_argn("fuxiwlanw15", &variant, sizeof(variant));
 +		if (variant < 0 || variant > 1) { wl_variant_invalid = true; }
 +		else { wl15_variant = (unsigned)variant; }
 +		printf("FUXI WLAN: W15 variant %u (0 default, 1 omit shadow v3) valid %u\n", wl15_variant, !wl_variant_invalid);
++		variant = 0;
++		(void)PE_parse_boot_argn("fuxiwlanw16", &variant, sizeof(variant));
++		if (variant < 0 || variant > 4) { wl_variant_invalid = true; }
++		else { wl16_variant = (unsigned)variant; }
++		wl16_large = wl16_variant == 1 || wl16_variant == 3;
++		wl16_redrive = wl16_variant == 2 || wl16_variant == 3;
++		if (variant) {
++			printf("FUXI WLAN: W16 variant %d large-IPCR %u doorbell-redrive %u diagnostics %u valid %u\n",
++			    variant, wl16_large, wl16_redrive, !!wl16_variant, !wl_variant_invalid);
++		}
 +	}
 +	wl_stop22 = stop22 == 1; wl_keep = keep == 1;
 +	if (wl_w14) {
@@ -979,6 +993,10 @@
 +	uint64_t base, len, rp, wp;
 +} __attribute__((packed));
 +_Static_assert(sizeof(struct wl_context) == 44, "MHI context stride");
++_Static_assert(__builtin_offsetof(struct wl_context, base) == 12 &&
++    __builtin_offsetof(struct wl_context, len) == 20 &&
++    __builtin_offsetof(struct wl_context, rp) == 28 &&
++    __builtin_offsetof(struct wl_context, wp) == 36, "MHI context wire offsets");
 +struct wl_vector { uint64_t addr, size; };
 +_Static_assert(sizeof(struct wl_vector) == 16, "BHIe vector stride");
 +/* Within a single 16 KiB page: 128 disabled channels, two event contexts,
@@ -2931,10 +2949,13 @@
 + * WLFW IDs/TLV layouts: ath12k qmi.h/qmi.c (BSD-3-Clause-Clear), Linux Foundation
 + * (2018-2021), Qualcomm Innovation Center (2021-2022). No Linux core code used.
 + * Sources, ownership and unsupported operations: docs-lanes/wlan-w11.md. */
-+#define WL_IPCR_N 16u
-+#define WL_IPCR_MTU 4096u
++/* W16 capacity facts: ath12k v6.12 mhi.c, WCN7850 (BSD-3-Clause-Clear,
++ * The Linux Foundation 2020-2021; Qualcomm Innovation Center 2021-2024).
++ * Selected before allocation/publication; never resize a live ring. */
++#define WL_IPCR_N (wl16_large ? 64u : 16u)
++#define WL_IPCR_MTU (wl16_large ? 8192u : 4096u)
 +#define WL_IPCR_TXR 0u
-+#define WL_IPCR_RXR 0x100u
++#define WL_IPCR_RXR (WL_IPCR_N * 16u)
 +#define WL_IPCR_TXBUF 0x1000u
 +#define WL_IPCR_TXMTU (wl_w14 ? 8192u : WL_IPCR_MTU)
 +#define WL_IPCR_RXBUF (WL_IPCR_TXBUF + WL_IPCR_N * WL_IPCR_TXMTU)
@@ -2944,12 +2965,14 @@
 +#define WL_QRTR_PORT 0x4000u
 +struct wl_tre { uint64_t ptr; uint32_t d0, d1; };
 +_Static_assert(sizeof(struct wl_tre) == 16, "MHI ring element stride");
-+_Static_assert(WL_IPCR_N * 16 == WL_IPCR_RXR, "IPCR rings do not overlap");
++_Static_assert(2 * 64 * 16 <= WL_IPCR_TXBUF, "largest IPCR rings before buffers");
 +static unsigned wl_er_read[2], wl_tx_read, wl_tx_write, wl_rx_read, wl_rx_write;
 +static unsigned wl_cmd_write, wl_chan_attempts;
 +static uint64_t wl_cmd_pending;
 +static unsigned wl_cmd_channel, wl_cmd_opcode;
 +static uint32_t wl_chdb, wl_erdb, wl_server_node, wl_server_port, wl_peer_node;
++static unsigned wl16_xfers[2], wl16_oob[2], wl16_dbmode[2];
++static struct wl_tre wl16_last[2];
 +static bool wl_cmd_done, wl_hello, wl_cap_sent, wl_cap_done, wl_w11_stopping;
 +static unsigned wl_w11_error;
 +enum { WL12_DISCOVERY, WL12_IND, WL12_HOST, WL12_REQUEST, WL12_RESPOND,
@@ -2993,6 +3016,33 @@
 +static struct wl_context *wl_channel(unsigned ch) { return (void *)(wl_contexts.va + ch * sizeof(struct wl_context)); }
 +static struct wl_tre *wl_ipcr_ring(unsigned off) { return (void *)(wl_ipcr.va + off); }
 +static void wl_w11_barrier(void) { __asm__ volatile("dsb sy" ::: "memory"); }
++
++/* RAM-only snapshot: channel RP is diagnostic, never used to reclaim TREs.
++ * Completion events remain authoritative. Do not repair a live device-owned
++ * RP even when it resembles type/ER words (as in try15c/try15d). */
++static void
++wl16_snapshot(const char *phase)
++{
++	if (!wl16_variant || !wl_contexts.va || !wl_contexts.nc || !wl_ipcr.va) { return; }
++	wl_w11_barrier();
++	printf("FUXI WLAN: W16 %s variant %u txn %u msg %#x IPCR entries %u TX/RX bytes %u/%u\n",
++	    phase, wl16_variant, wl12_txn, wl12_msg, WL_IPCR_N, WL_IPCR_TXMTU, WL_IPCR_MTU);
++	for (unsigned i = 0; i < 2; i++) {
++		struct wl_context c = *wl_channel(20+i);
++		uint64_t base = wl_ipcr.iova + (i ? WL_IPCR_RXR : WL_IPCR_TXR);
++		bool rp_valid = c.rp >= base && c.rp < base+WL_IPCR_N*16 && !((c.rp-base)&15);
++		printf("FUXI WLAN: W16 ch %u cfg %#x type %u ER %u base %#llx len %#llx RP %#llx WP %#llx layout-ok %u rp-in-ring %u host-r/w %u/%u xfers %u OOB %u DB_MODE %u last %#llx/%#x/%#x\n",
++		    20+i, c.cfg, c.type, c.index, c.base, c.len, c.rp, c.wp,
++		    c.type == (i ? 2u : 1u) && c.index == 1 && c.base == base && c.len == WL_IPCR_N*16,
++		    rp_valid, i ? wl_rx_read : wl_tx_read, i ? wl_rx_write : wl_tx_write,
++		    wl16_xfers[i], wl16_oob[i], wl16_dbmode[i], wl16_last[i].ptr, wl16_last[i].d0, wl16_last[i].d1);
++		/* Fixed eleven words, no buffer contents; exposes offset/stride errors. */
++		const uint8_t *raw = (const uint8_t *)wl_channel(20+i);
++		printf("FUXI WLAN: W16 ch %u context words", 20+i);
++		for (unsigned j = 0; j < 11; j++) { printf(" %08x", wl_get32(raw+j*4)); }
++		printf("\n");
++	}
++}
 +
 +static int
 +wl_w11_fail(const char *reason)
@@ -3045,6 +3095,21 @@
 +	    wl_mrd(0x20) != wl_erdb || (wl_prd(WL_EPCFG+4) & 0x406) != 0x406 ||
 +	    wl_smmu_fault(0) || fw_faults) { return wl_w11_fail("AMSS/M0, ownership, discovery or access/SMMU fault"); }
 +	return 0;
++}
++
++/* Original opt-in recovery for queued IPCR TREs: re-publish only the already
++ * committed WP. OOB/DB_MODE are notifications, not transfer completions.
++ * Never derive a doorbell from the suspect shared channel RP. */
++static int
++wl16_kick(unsigned ch)
++{
++	unsigned read = ch == 20 ? wl_tx_read : wl_rx_read;
++	unsigned write = ch == 20 ? wl_tx_write : wl_rx_write;
++	if (!wl16_redrive || wl_w11_stopping || read == write) { return 0; }
++	uint64_t wp = wl_ipcr.iova + (ch == 20 ? WL_IPCR_TXR : WL_IPCR_RXR) + write*16;
++	if (wl_channel(ch)->wp != wp) { return wl_w11_fail("W16 doorbell WP changed"); }
++	wl_w11_barrier(); wl_mwr64(wl_chdb+ch*8, wp);
++	return fw_faults ? wl_w11_fail("W16 redrive doorbell access") : 0;
 +}
 +
 +static int
@@ -3291,7 +3356,21 @@
 +				wl_cmd_pending = 0; wl_cmd_done = true;
 +			} else if (type == 0x22) {
 +				if (ch != 20 && ch != 21) { return wl_w11_fail("transfer event channel"); }
-+				/* OOB/DB_MODE convey no completed TRE; burst mode is disabled. */
++				if (wl16_variant) {
++					unsigned c = ch-20;
++					wl16_last[c] = ev;
++					if (cc == 5) { wl16_oob[c]++; }
++					else if (cc == 6) { wl16_dbmode[c]++; }
++					else { wl16_xfers[c]++; }
++					if ((cc == 5 || cc == 6) && wl16_oob[c]+wl16_dbmode[c] <= 4) {
++						printf("FUXI WLAN: W16 ch %u notification %u redrive %u host-r/w %u/%u\n",
++						    ch, cc, wl16_redrive, ch == 20 ? wl_tx_read : wl_rx_read,
++						    ch == 20 ? wl_tx_write : wl_rx_write);
++					}
++				}
++				/* Legacy ignores OOB/DB_MODE; W16 optionally re-rings pending
++				 * TREs without reclaiming/reposting or changing any channel context. */
++				if ((cc == 5 || cc == 6) && wl16_kick(ch)) { return 1; }
 +				if (cc != 5 && cc != 6) {
 +					if (cc != 2) { return wl_w11_fail("transfer completion code (requires EOT)"); }
 +					unsigned ri = ch == 20 ? wl_tx_read : wl_rx_read;
@@ -3392,6 +3471,8 @@
 +	if (wl_w11_attempted) { return wl_w11_fail("one conversation per boot"); }
 +	wl_w11_attempted = true; wl_w11_ok = false; wl_w11_error = 0; wl_w11_stopping = false;
 +	wl_cmd_pending = 0; wl_cmd_write = wl_chan_attempts = 0;
++	bzero(wl16_xfers, sizeof(wl16_xfers)); bzero(wl16_oob, sizeof(wl16_oob));
++	bzero(wl16_dbmode, sizeof(wl16_dbmode)); bzero(wl16_last, sizeof(wl16_last));
 +	wl_tx_read = wl_tx_write = wl_rx_read = 0; wl_rx_write = WL_IPCR_N-1;
 +	wl_er_read[0] = wl_er_read[1] = 0;
 +	wl_server_node = wl_server_port = wl_peer_node = 0; wl_hello = wl_cap_sent = wl_cap_done = false;
@@ -3447,6 +3528,7 @@
 +	wl_w11_barrier(); wl_mwr64(wl_chdb+21*8, wl_channel(21)->wp);
 +	if (fw_faults) { return wl_w11_fail("RX doorbell access"); }
 +	printf("FUXI WLAN: W11 RX posted %u buffers of %u bytes; polling RAM-sink MSI\n", WL_IPCR_N-1, WL_IPCR_MTU);
++	wl16_snapshot("channels started/RX posted");
 +	if (wl_qrtr_control(2, ~0u, 0, 0) || wl_qrtr_control(10, ~0u, 0x45, 1)) { return 1; }
 +	printf("FUXI WLAN: W11 QRTR hello sent; lookup service 0x45 version 1\n");
 +	int e = wl_w11_wait(1, "QRTR HELLO/WLFW server");
@@ -3508,7 +3590,9 @@
 +	e->data[0] = 0; wl_put16(e->data+1, wl12_txn);
 +	wl_put16(e->data+3, msg); wl_put16(e->data+5, e->len-7);
 +	printf("FUXI WLAN: %s send txn %u msg %#x stage %u\n", wl_w15 && stage >= WL15_INI ? "W15" : "W12", wl12_txn, msg, stage);
-+	return wl_qrtr_send(1, wl_server_node, wl_server_port, e->data, e->len);
++	int error = wl_qrtr_send(1, wl_server_node, wl_server_port, e->data, e->len);
++	if (!error && stage == WL15_MODE) { wl16_snapshot("MODE queued"); }
++	return error;
 +}
 +
 +/* Adapted wire facts/behavior from Linux v6.12 ath12k qmi.c/qmi.h:
@@ -3951,6 +4035,7 @@
 +wl15_timeout_snapshot(void)
 +{
 +	if (!wl_w15 || wl12_stage != WL15_MODE) { return; }
++	wl16_snapshot("MODE timeout");
 +	wl15_elapsed("MODE timeout");
 +	wl_wlfw_diagnostics("W15 MODE timeout");
 +	unsigned faults = fw_faults;
@@ -4018,6 +4103,7 @@
 +			return 1;
 +		}
 +		if (what == 0 ? wl12_reply : what == 1 ? wl12_requested : what == 2 ? wl12_ready : wl14_ready) { return 0; }
++		if (wl16_variant && wl12_stage == WL15_MODE && ms == 1000) { wl16_snapshot("MODE pending 1000 ms"); }
 +		if (ms < 10000) { wl_sleep(10); }
 +	}
 +	if (wl12_mlo_variant == 1 && wl12_msg == 0x57) {
@@ -4174,6 +4260,11 @@
 +	if (wl15_encode_cfg(&e) || wl12_send(&e, 0x23, WL15_CFG) ||
 +	    wl12_wait(0, "WLAN_CFG reply") || wl_w11_wait(3, "W15 CFG TX drain")) { return 1; }
 +	printf("FUXI WLAN: W15 wlan cfg ok\n");
++	wl16_snapshot("CFG reply/before MODE");
++	if (wl16_redrive) {
++		printf("FUXI WLAN: W16 before MODE re-ring posted RX; no CE init before MODE (ath12k v6.12 order)\n");
++		if (wl_w11_guard() || wl16_kick(21)) { return 1; }
++	}
 +	bzero(&e, sizeof(e)); e.len = 7;
 +	/* qmi_wlanfw_wlan_mode_req_msg_v01 / *_ei: mandatory 0x01 u32
 +	 * ATH12K_FIRMWARE_MODE_NORMAL=0; optional 0x10 hw_debug u8=0. */
@@ -4182,6 +4273,7 @@
 +	    wl12_send(&e, 0x22, WL15_MODE) || wl12_wait(0, "WLAN_MODE reply") ||
 +	    wl_w11_wait(3, "W15 MODE TX drain") || wl_w11_guard()) { return 1; }
 +	printf("FUXI WLAN: W15 wlan mode normal ok; stop before CE/HTC\n");
++	wl16_snapshot("MODE reply");
 +	wl12_stage = WL15_OBSERVE;
 +	printf("FUXI WLAN: W15 observing indications 2000 ms (reported only)\n");
 +	/* Transport consumes/reposts IPCR RX buffers as usual, but indication

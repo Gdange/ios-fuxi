@@ -98,6 +98,7 @@ static void fw_delay(unsigned us) { clock_delays+=us; }
 static bool PE_parse_boot_argn(const char *name, void *out, int size) {
     if(!strcmp(name,"fuxiwlanmlo")) { if(mlo_present)memcpy(out,&mlo_arg,size); return mlo_present; }
     if(!strcmp(name,"fuxiwlanw15")) { assert(size==sizeof(int)); return false; }
+    if(!strcmp(name,"fuxiwlanw16")) { assert(size==sizeof(int)); return false; }
     if(!strcmp(name,"fuxiwlanprobe")) {
         if(probe_arg) { strncpy(out,probe_arg,size); return true; }
         return false;

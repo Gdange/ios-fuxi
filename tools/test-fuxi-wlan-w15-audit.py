@@ -247,7 +247,8 @@ def main():
     w15.TESTS = tests
     m6 = w15.w14.w12.w11.w10.m6o.m6
     m6.PREAMBLE = m6.PREAMBLE.replace('static bool PE_parse_boot_argn(', 'static int w15_arg;\nstatic bool PE_parse_boot_argn(')
-    m6.PREAMBLE = m6.PREAMBLE.replace('assert(size==sizeof(int)); return false; }', 'assert(size==sizeof(int)); memcpy(out,&w15_arg,size); return true; }')
+    m6.PREAMBLE = m6.PREAMBLE.replace('if(!strcmp(name,"fuxiwlanw15")) { assert(size==sizeof(int)); return false; }',
+                                    'if(!strcmp(name,"fuxiwlanw15")) { assert(size==sizeof(int)); memcpy(out,&w15_arg,size); return true; }')
     w15.main()
     spec = importlib.util.spec_from_file_location('w15_mlo', ROOT/'tools/test-fuxi-wlan-w15.py')
     fresh = importlib.util.module_from_spec(spec)
