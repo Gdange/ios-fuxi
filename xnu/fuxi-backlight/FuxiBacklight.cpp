@@ -131,7 +131,9 @@ bool FuxiBacklight::start(IOService *provider)
 	IOLog("FUXI BACKLIGHT: published observation-only brightness min=0 max=%u value=%u\n",
 	    FUXI_BACKLIGHT_MAX, fRequested);
 	registerService();
-	if (fbl_power_notifications(present, enable))
+	if (enable == 3)
+		IOLog("FUXI BACKLIGHT: OFF-only interest experiment enabled; ON withheld\n");
+	else if (fbl_power_notifications(present, enable))
 		IOLog("FUXI BACKLIGHT: logical power interest notifications enabled\n");
 	return true;
 }
@@ -284,12 +286,20 @@ void fuxi_backlight_publish(IOService *provider)
  * CoreBrightness's BacklightGeneralInterestNotificationCallback consumes these
  * exact messages without a payload. This reports accepted logical power, not
  * panel readiness, brightness, or completion of a BLS transition.
+ * Mode 3 deliberately withholds ON to isolate its effect from OFF and gating;
+ * it is a diagnostic protocol violation, not a completed backlight driver.
  */
 void fuxi_backlight_display_state(IOService *provider, bool on)
 {
 	int enable = 0;
 	bool present = PE_parse_boot_argn("fuxibacklight", &enable, sizeof(enable));
 	if (!fbl_power_notifications(present, enable)) return;
+	if (fbl_withhold_on(present, enable, on)) {
+		uint32_t event;
+		if (bl_log(BL_POWER, &event))
+			IOLog("FUXI BACKLIGHT: power #%u on message=0xe0000230 withheld experiment=off-only\n", event);
+		return;
+	}
 	OSIterator *it = provider->getClientIterator();
 	if (!it) {
 		IOLog("FUXI BACKLIGHT: power notification iterator unavailable\n");

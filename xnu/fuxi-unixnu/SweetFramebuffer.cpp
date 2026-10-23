@@ -290,7 +290,7 @@ AppleCLCD::start(IOService *provider)
 #if defined(FUXI)
 	int backlight = 0;
 	PE_parse_boot_argn("fuxibacklight", &backlight, sizeof(backlight));
-	fBacklightPowerNotifications = backlight == 2;
+	fBacklightPowerNotifications = backlight == 2 || backlight == 3;
 	fuxi_backlight_publish(this);
 #endif
 	registerService();
@@ -881,7 +881,7 @@ AppleCLCD::requestPowerChange(uint64_t state)
 {
 	void *argument = (void *)(uintptr_t)state;
 #if defined(FUXI)
-	/* Serialize mode 2 requests and interest delivery with each other.
+	/* Serialize modes 2/3 requests and interest delivery with each other.
 	 * Never call arbitrary interest clients holding fLock. */
 	if (fBacklightPowerNotifications)
 		return fWorkLoop->runAction(&AppleCLCD::powerChangeAction, this, argument);

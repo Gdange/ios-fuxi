@@ -64,8 +64,8 @@ direct `IODisplay` conformance handles the public helper's discovery rule.
 
 ## Published contract
 
-Phase 1 uses **`fuxibacklight=1`**. Mode 2, described below, also publishes the
-service. Absent, zero, and values other than 1 or 2
+Phase 1 uses **`fuxibacklight=1`**. Modes 2 and 3 below also publish the
+service. Absent, zero, and values other than 1, 2, or 3
 return before allocation, attachment, property publication, or probe logging.
 Both publication and start verify the argument; all code and the AppleCLCD
 call are FUXI-only. The built-in source is in `iokit/conf/files.arm64`.
@@ -297,3 +297,246 @@ and M9i compile-only check passed separately. ARM64 syntax checks passed for
 both changed translation units against saved XNU 8796 headers, and for the
 framebuffer without FUXI. Both kernel-profile CI dry runs and shell syntax
 checks passed. No kernel link or device boot was performed.
+
+## Round 2: isolate ON delivery; do not infer a missing brightness acknowledgement
+
+### OBSERVED device results
+
+These results supersede the untested mode 2 hypothesis above. Mode 1 remains
+the preferred existing configuration. Durations are the supplied observations,
+not timestamps reconstructed from console line numbers.
+
+| Trace / mode | After SpringBoard display-on | Scripted Power result |
+| --- | --- | --- |
+| `research/it/bl79.log`, mode 1 | Initial auto-off, roughly 20–40 s across the mode 1 runs | First click wakes; this older script also has later clicks |
+| `research/it/wake80.log`, mode 1 | Initial on/off at lines 2487/3462 | Single click wakes at 3546; no re-lock for 420 s |
+| `research/it/bl2w81.log`, mode 2 | On at 2489; no auto-off for about 100 s | Click locks at 3820 |
+| `research/it/bl2long82.log`, mode 2 | On at 2480; no auto-off for about 250 s | Click locks at 3885 |
+
+Mode 2's startup off/on and scripted off have matching interest log lines,
+all `result=0x0`: kernel fanout success, not a userland acknowledgement.
+Neither mode 2 run measures auto-lock **after a Power wake**; its single click
+turned an already-on display off. The startup off before SpringBoard's on
+is distinct from the later mode 1 idle off.
+
+All four traces lack a backlight `setProperties`, user-client open or external
+method request. Publication's `set #1 ... IODisplayParameters` is our own
+initial dictionary; `set #2 ... IOGeneralInterest` installs a notifier.
+Neither is a userland brightness request. The first such request would be
+logged, so this absence is meaningful.
+
+### OBSERVED static paths: power, transition completion, and attention timeout
+
+These findings are from the same supplied cache/root images inspected offline.
+They establish conditional paths, not runtime branch selection. Extracted
+images and long disassembly remain only in ignored `research/idle/`.
+
+**CoreBrightness:** the interest callback (`0x1af0e29e4`) sets context `+0x68`
+to 1 for ON or 0 for OFF. Apart from logging, it neither writes brightness nor
+calls a fade/BLS completion. `_DisplayCreateWithID` initializes this word from
+the advertised brightness, so mode 1's initial 65536 can already seed it to 1.
+Absence of an ON message does not mean the latch is off.
+
+`___DisplayFadeUpdateFactorFade` (`0x1af001adc`) delays a positive-target ramp
+only when its gated-fade argument is set, context `+0x54 != 0`, `+0x68 == 0`
+and `+0x58 == 0`. It stores the wait start at `+0x60`. For **less than 1.0 s**
+it moves the fade start time to now and returns. At one second it logs
+`Ramp delay hit timeout` and falls through to interpolation. ON removes this
+delay. It does not start an infinite wait for a brightness write.
+
+When the elapsed fade portion reaches 1, it stores the target (capped at 1),
+clears the gated-fade flag at `+0x58`, calls the callback at fade `+0x28` with
+its `+0x30` context (`0x1af002088` onward), and clears the fade period. It does
+not poll `IODisplayParameters` or await a hardware acknowledgement. Its caller,
+`___DisplayFadeCallback` (`0x1aefe2f58`), applies the factor separately. A legacy
+physical-brightness path calls `IORegistryEntrySetCFProperties`
+(`0x1af0eec08`) synchronously. Our parser already returns success and updates
+the dictionary for valid brightness requests; none was observed here.
+An upstream path failing to reach that setter remains possible.
+
+**BLS/CBDisplayStateClient:**
+`BLSHBacklightOSInterfaceProvider transitionToDisplayMode:withDuration:`
+(`0x1ef791c48`) selects CBDisplayStateClient when supported. Its support query
+uses the CoreBrightness property `DisplayStateControlSupported`; its completion
+handler (`0x1af11cc84`) dispatches
+`didCompleteTransitionToDisplayMode:withError:` to its delegate. This is a
+CoreBrightness client/service contract, not a registry property to invent on
+FuxiBacklight. The legacy branch calls
+`BKSHIDServicesSetBacklightFactorWithFadeDurationAsync` and schedules its own
+completion timer; its block (`0x1ef792240`) calls that same delegate method.
+No brightness write therefore does not prove this branch is stuck.
+
+Scene completion is separate:
+`BLSHEnvironmentTransitionState animationCompleteToTarget:forEvent:animated:`
+(`0x1ef798f18`) conditionally reports the completed target to its owner.
+A framebuffer selector-12 ON does not prove any of these callbacks occurred.
+
+A concrete idle dependency exists in
+`BLSHBacklightIdleProvider backlight:didCompleteUpdateToState:forEvent:`
+(`0x1ef795e70`). It compares old/new states and a resume condition logged as
+`needToResumeIdleTimer`. On a change or needed resume it calls
+`updateForBacklightState:` (`0x1ef79519c`), which updates the AW idle timeout
+with reset requested and activates the provider for the interactive state
+when permitted. The completion path also reports `backlightTurnedOnForEvent:`.
+SpringBoard's separate `backlight:didCompleteUpdateToState:forEvent:`
+(`0x1c5e2f218`) invokes its pending change completion; the request completion
+then notifies transition observers. These are actual completion boundaries
+to measure after display-on, rather than equating ON interest with readiness.
+
+**SpringBoard/attention:** `SBIdleTimerFactory` (`0x1c5aa8278`) uses the shared
+`SBBacklightIdleTimer` for timer modes 0–2; mode 3 is a disabled timer.
+The active timer wraps `ITAttentionAwareIdleTimer` from IdleTimerHosting,
+which configures an AW client. No ordinary NSTimer fallback appears in the
+inspected resume/reconfiguration paths when the AW client fails. SB timer
+`reset` (`0x1c5b3447c`) enables it, resets its expectation and reconfigures
+with reset requested. Expiration arrives via
+`idleTimer:attentionLostTimeoutDidExpire:` (`0x1c5b34500`); the policy
+aggregator subsequently requests a fade-out. Physical display-on alone
+does not perform this reset/timeout sequence.
+
+Face detection is only one event source. In
+`_reconfigureAttentionClientAndReset:` (`0x1c5b34fdc`), recovery masks are
+`0xa5e` for timer mode 1 and `0x856` otherwise. Finite nonzero sampling adds
+**0x80** to the maintenance mask. IT translates this descriptor into AW
+timeouts and sampling configuration. Disabling Face ID attention removes
+sensor sampling but still uses AW for HID timeouts. Missing Face ID hardware
+and a missing/nonfunctional attention service are different failure modes.
+iPhone X identity alone proves neither that sampling was enabled nor that
+attention stayed true: `SBAttentionAwarenessSettings` also checks supported
+events bit 7, accessibility and managed settings.
+
+**backboardd:** `BKUserEventTimer isSafeToResetIdleTimer` (`0x100031e50`)
+reads its `+0x39` byte. The block queued by `systemShellDidFinishLaunching:`
+sets it and posts the safe-to-set notification. The inspected per-wake path
+does not clear/re-acknowledge it. `resetTimer:mode:` queues its own timer
+work; this is distinct from SpringBoard's IT/AW timer. Forcing this startup
+gate or injecting recurring HID activity is not justified by these results.
+
+### GUESS: one explanation for both observations, not an established cause
+
+The leading shared explanation is **initial timer configuration succeeds,
+while a later interactive transition/reset path fails to finish or re-arm**.
+Mode 1 can expire its initial timeout, then remain physically on after a
+Power wake if a BLS/scene completion, SB reset, descriptor/disable assertion,
+or AW reconfiguration prevents the next timeout. The 20–40 s boot interval
+is consistent with a short idle policy; it does not establish a 30 s effective
+auto-lock preference. Lock-screen policy has its own timeouts/sanitization.
+
+Mode 2 changes both OFF/ON latch transitions and request scheduling. ON can
+remove the one-second ramp-start delay and expose a completion/attention-reset
+ordering problem that initial setup otherwise avoids. Its boot could then
+resemble mode 1's failed post-wake cycle. Other interest subscribers or the
+workloop change could also matter. The inspected callback does not disable
+the idle timer, and mode 1 can already start with its latch set. Thus the
+existing comparison **does not isolate ON as the cause** or prove this race.
+
+"Nobody sets brightness, so our driver never completes the nonzero fade" is
+not established: this factor fade completes by elapsed time and its off-latch
+delay is bounded. A missing upstream display-ready/factor/scene completion
+remains plausible, but no kernel acknowledgement ABI has been demonstrated.
+Do not invent a ready property, selector reply, brightness request or periodic
+power-off workaround. Missing Face ID is another testable hypothesis, not
+proof of permanent attention. Console logs do not expose live BLS/IT/AW state.
+If the initial off really is an AW idle expiration, a completely absent AW
+service throughout boot would be a poor sole explanation for the asymmetry;
+the source of that first off and the live service state still need measurement.
+
+### Change: `fuxibacklight=3`, OFF-only interest diagnostic
+
+Mode 3 publishes the same service/brightness as modes 1/2. It preserves mode
+2's serialized framebuffer path and sends OFF after every accepted zero-state
+request, including duplicates. For nonzero requests it updates framebuffer
+power normally, **withholds ON**, logs the decision, and returns success
+without traversing interest clients. This deliberately leaves an OFF latch
+stale after wake; it is a discriminator, not a correct power protocol or a
+claimed auto-lock repair. The bounded ramp-delay path remains available if
+its other predicates hold.
+
+Absent/0/unknown values remain disabled; mode 1's direct path and mode 2's
+both-message path are unchanged. No publication notification, delayed ON,
+timer, brightness mutation on power changes or hardware access is added.
+Later positive brightness requests are stored but never release an ON.
+Power logs retain the first-64/each-256 sampling policy.
+
+### Exact acceptance experiment
+
+Compare **modes 1, 2, 3** with the same root, other boot arguments and GPU
+configuration, using `fuxikeyscript=300 fuxikeyscriptn=1` for each. No touches
+or other keys, and no attention preference change during this comparison.
+Repeat the triplet under similar cooling/boot conditions. Record startup and
+at least 420 s after the single scripted Power release.
+
+1. Record SpringBoard display-on, spontaneous off before the script and the
+   click's actual direction. Script text `expect lock` does not measure it.
+2. Mode 3 must log `FUXI BACKLIGHT: OFF-only interest experiment enabled; ON withheld`.
+   For each sampled on, require `FUXI BACKLIGHT: power #... on message=0xe0000230 withheld experiment=off-only`.
+   OFF still logs `message=0xe0000210 result=0x0 logical-only`.
+   No mode 3 ON should report a fanout result. Retain brightness/open/method
+   diagnostics: a new request changes the evidence.
+3. If mode 3 restores initial auto-off while mode 2 reproduces suppression,
+   ON delivery is implicated independently of retained OFF/gating. If mode 3
+   still suppresses it, isolate OFF/gating next; an ON-only explanation has
+   failed this test. Neither result measures the userland completion state.
+4. If initial auto-off occurs, the click wakes. Require another spontaneous
+   off within 120 s and retain the full 420 s. Initial recovery without
+   post-wake recovery leaves the original failure unresolved. Without initial
+   auto-off the click locks, so post-wake acceptance is **not measured**.
+   A separate `fuxikeyscript=300 fuxikeyscriptn=2` run can then lock and wake
+   (the two clicks are eight seconds apart); verify directions from FB logs
+   and record 420 s after the second release.
+5. A possible workaround requires repeatable initial **and** post-wake
+   auto-off plus working explicit Power transitions and no new errors.
+   Even success does not validate a deliberately missing ON as a final driver.
+
+If wake idle still fails, the next direct measurement is a temporary userland
+observer: BLS requested/completed states, scene/ramp completion, pending SB
+completion, active idle descriptor/disable assertions, SB timer reset, IT
+enabled state, AW resume/reset errors, timeout callbacks and configuration
+generation. Capture before/after Power release and at +60/+120 s through a
+verified console sink; ordinary stderr/OS-log silence proves nothing.
+No observer or device experiment was run in this offline round.
+
+### Proposed root experiment, not applied
+
+In the mobile user's **`/var/mobile/Library/Preferences/com.apple.springboard.plist`**,
+merge this Boolean entry, preserving other entries and ownership, before a
+fresh boot to avoid cfprefsd/SpringBoard cached values:
+
+```xml
+<key>SBDisableAttentionAwareness</key>
+<true/>
+```
+
+The spelling/type/default false are supported by `SBIdleTimerDefaults`
+`_bindAndRegisterDefaults` (`0x18e6547ac`, binding at `0x18e654900` onward).
+The abstract domain initializes to `com.apple.springboard` (`0x18e613714`).
+`SBIdleTimerDescriptorFactory _shouldUseAttentionSensor` (`0x1c57f6290`)
+explicitly returns NO when this setting is true. It disables sensor sampling
+for this policy; it does **not** replace the AW timer or repair an absent AW
+service. Do not substitute a guessed auto-lock key or change timeout settings
+in the same experiment.
+
+Use a separate matched pair with **mode 1**, `fuxikeyscript=300 fuxikeyscriptn=1`,
+key absent/default versus true. Retain 420 s after wake and require both
+initial and post-wake auto-off. Restore the saved original entry (or remove
+the newly added key) before a fresh boot. If a verified userland log sink is
+available, `_shouldUseAttentionSensor: NO because SBDisableAttentionAwareness is set`
+confirms consumption; it is not expected on the kernel console. A negative
+result does not rule out AW service failure. No root preference/image edits
+were made here.
+
+### Round 2 validation
+
+The ASan/UBSan host test executes production parser, notification and framebuffer
+request/action bodies. It covers gates, duplicates/nonzero states, mode 2's
+unchanged message sequence, mode 3's OFF-only fanout and withheld log lines,
+callback re-entry outside the framebuffer lock on the gate, no delayed ON
+after brightness writes, missing children and iterator failure. Canonical
+sources regenerate patches 0109 and 0106. Host tests cannot prove iOS timer
+re-arm or device acceptance.
+
+Round 2 checks passed: the backlight ASan/UBSan test, framebuffer/UFS host
+test, HID/key, idle and governor tests, all eleven patch sync checks, ARM64
+syntax of both changed translation units against the saved XNU headers, and
+framebuffer syntax without FUXI. Both kernel-profile CI dry runs and shell
+syntax passed. No kernel link, device boot or root edit was performed.

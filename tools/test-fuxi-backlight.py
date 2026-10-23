@@ -33,12 +33,14 @@ assert start.index('if (!fbl_enabled(present, enable)) return false;') < start.i
 assert start.index('setProperty("backlight-control", kOSBooleanTrue)') < start.index('registerService();')
 assert start.index('publishBrightness(fRequested)') < start.index('registerService();')
 assert fb.index('fuxi_backlight_publish(this);') < fb.index('\n\tregisterService();')
-assert 'fBacklightPowerNotifications = backlight == 2;' in fb
+assert 'fBacklightPowerNotifications = backlight == 2 || backlight == 3;' in fb
 assert 'runAction(&AppleCLCD::powerChangeAction, this, argument)' in fb
 power = function('AppleCLCD::powerChangeAction', fb)
 assert power.index('IOLockUnlock(fb->fLock);') < power.index('fuxi_backlight_display_state(fb, !off)')
 notify = function('fuxi_backlight_display_state')
 assert notify.index('if (!fbl_power_notifications(present, enable)) return;') < notify.index('getClientIterator()')
+assert notify.index('fbl_withhold_on(present, enable, on)') < notify.index('getClientIterator()')
+assert 'OFF-only interest experiment enabled; ON withheld' in start
 assert 'on ? kIOMessageDeviceHasPoweredOn : kIOMessageDeviceWillPowerOff' in notify
 assert 'service->messageClients(message)' in notify
 assert 'class FuxiBacklight : public IODisplay' in source
@@ -74,6 +76,8 @@ MODEL = r'''
 #include <string>
 #include <vector>
 #include <functional>
+#include <cstdarg>
+#include <cstdio>
 #define FUXI 1
 #include "fuxi_backlight_logic.h"
 struct OSObject { virtual ~OSObject() = default; };
@@ -95,9 +99,17 @@ using IOReturn = int;
 using UInt32 = uint32_t;
 constexpr UInt32 kIOMessageDeviceHasPoweredOn = 0xe0000230;
 constexpr UInt32 kIOMessageDeviceWillPowerOff = 0xe0000210;
-static bool bl_log(unsigned, uint32_t *) { return false; }
+static bool bl_log(unsigned, uint32_t *event) { *event = 1; return true; }
 static void bl_value(const char *, uint32_t, const char *, OSObject *) {}
-static void IOLog(const char *, ...) {}
+static std::vector<std::string> logs;
+static void IOLog(const char *format, ...) {
+    char buffer[512];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    logs.emplace_back(buffer);
+}
 static unsigned locked;
 static void IOLockLock(void *) { assert(!locked); ++locked; }
 static void IOLockUnlock(void *) { assert(locked == 1); --locked; }
@@ -170,11 +182,15 @@ MODEL += '\nIOReturn AppleCLCD::powerChangeAction(OSObject *owner, void *state, 
 MODEL += '\nIOReturn AppleCLCD::requestPowerChange(uint64_t state)\n' + function('AppleCLCD::requestPowerChange', fb)
 MODEL += r'''
 int main() {
-    for (int value : {-1, 0, 1, 2, 3, 65536}) {
+    for (int value : {-1, 0, 1, 2, 3, 4, 65536}) {
         assert(!fbl_enabled(0, value));
-        assert(fbl_enabled(1, value) == (value == 1 || value == 2));
+        assert(fbl_enabled(1, value) == (value >= 1 && value <= 3));
         assert(!fbl_power_notifications(0, value));
-        assert(fbl_power_notifications(1, value) == (value == 2));
+        assert(fbl_power_notifications(1, value) == (value == 2 || value == 3));
+        for (bool on : {false, true}) {
+            assert(!fbl_withhold_on(0, value, on));
+            assert(fbl_withhold_on(1, value, on) == (value == 3 && on));
+        }
     }
     for (uint32_t n = 0; n <= 4096; ++n)
         assert(bool(fbl_log_this(n)) == (n && (n <= 64 || n % 256 == 0)));
@@ -213,15 +229,17 @@ int main() {
     FuxiBacklight backlight, untouched;
     fb.iterator.children = {&unrelated, &backlight};
     otherProvider.iterator.children = {&untouched};
-    for (int value : {-1, 0, 1, 2, 3}) {
+    for (int value : {-1, 0, 1, 2, 3, 4}) {
         for (bool present : {false, true}) {
-            boot_present = present; boot_value = value;
-            unsigned traversals = fb.traversals;
-            size_t count = backlight.messages.size();
-            fuxi_backlight_display_state(&fb, true);
-            bool enabled = present && value == 2;
-            assert(fb.traversals == traversals + enabled);
-            assert(backlight.messages.size() == count + enabled);
+            for (bool on : {false, true}) {
+                boot_present = present; boot_value = value;
+                unsigned traversals = fb.traversals;
+                size_t count = backlight.messages.size();
+                fuxi_backlight_display_state(&fb, on);
+                bool enabled = present && (value == 2 || (value == 3 && !on));
+                assert(fb.traversals == traversals + enabled);
+                assert(backlight.messages.size() == count + enabled);
+            }
         }
     }
     backlight.messages.clear();
@@ -265,6 +283,40 @@ int main() {
     assert(fb.traversals == traversals && backlight.messages.size() == count);
     assert(fb.iterator.releases == fb.traversals - 1); // one failed iterator
     assert(backlight.fRequested == requested && backlight.published == published);
+
+    // Mode 3 preserves the entire mode 2 power sequence and workloop gate,
+    // including duplicates; only ON fanout is removed. Brightness writes do
+    // not release a deferred message (there is no deferred state or timer).
+    boot_value = 3; fb.fBacklightPowerNotifications = true;
+    backlight.messages.clear(); logs.clear();
+    backlight.observer = [&](UInt32 message) {
+        assert(fb.workloop.depth == 1 && !locked);
+        assert(message == kIOMessageDeviceWillPowerOff && fb.fPowerOff);
+        assert(sweet_fb_display_off == 1);
+    };
+    gated = fb.workloop.calls;
+    traversals = fb.traversals;
+    for (uintptr_t state : {0u, 1u, 1u, 0u, 4u, 0u}) {
+        fb.fDirty = false; fb.fFadeStep = 6;
+        bool changed = fb.fPowerOff != (state == 0);
+        assert(fb.requestPowerChange(state) == kIOReturnSuccess);
+        assert(fb.fPowerOff == (state == 0) && fb.fDirty == changed);
+        assert(sweet_fb_display_off == int(state == 0));
+        assert(fb.fFadeStep == (changed ? 0 : 6));
+    }
+    assert(fb.workloop.calls == gated + 6 && fb.traversals == traversals + 3);
+    assert((backlight.messages == std::vector<UInt32>{0xe0000210, 0xe0000210, 0xe0000210}));
+    unsigned withheld = 0;
+    for (const auto &log : logs)
+        withheld += log.find("on message=0xe0000230 withheld experiment=off-only") != std::string::npos;
+    assert(withheld == 3);
+    flat.values["brightness"] = &maximum;
+    assert(backlight.setProperties(&flat) == kIOReturnSuccess);
+    assert(backlight.fRequested == 65536 && backlight.messages.size() == 3);
+    fb.failIterator = true;
+    assert(fb.requestPowerChange(1) == kIOReturnSuccess && !fb.fPowerOff);
+    assert(fb.requestPowerChange(0) == kIOReturnSuccess && fb.fPowerOff);
+    assert(backlight.messages.size() == 3 && !locked);
 }
 '''
 with tempfile.TemporaryDirectory(prefix='fuxi-backlight-test-') as tmp:

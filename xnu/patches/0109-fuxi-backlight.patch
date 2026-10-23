@@ -10,7 +10,7 @@
  iokit/Kernel/arm/FuxiNetworkStack.cpp                            optional iokitcpp
 --- /dev/null
 +++ b/iokit/Kernel/arm/FuxiBacklight.cpp
-@@ -0,0 +1,312 @@
+@@ -0,0 +1,322 @@
 +/*
 + * FUXI backlight-control observer and opt-in logical power notifications.
 + * Published by AppleCLCD before its first registerService(), only on opt-in.
@@ -144,7 +144,9 @@
 +	IOLog("FUXI BACKLIGHT: published observation-only brightness min=0 max=%u value=%u\n",
 +	    FUXI_BACKLIGHT_MAX, fRequested);
 +	registerService();
-+	if (fbl_power_notifications(present, enable))
++	if (enable == 3)
++		IOLog("FUXI BACKLIGHT: OFF-only interest experiment enabled; ON withheld\n");
++	else if (fbl_power_notifications(present, enable))
 +		IOLog("FUXI BACKLIGHT: logical power interest notifications enabled\n");
 +	return true;
 +}
@@ -297,12 +299,20 @@
 + * CoreBrightness's BacklightGeneralInterestNotificationCallback consumes these
 + * exact messages without a payload. This reports accepted logical power, not
 + * panel readiness, brightness, or completion of a BLS transition.
++ * Mode 3 deliberately withholds ON to isolate its effect from OFF and gating;
++ * it is a diagnostic protocol violation, not a completed backlight driver.
 + */
 +void fuxi_backlight_display_state(IOService *provider, bool on)
 +{
 +	int enable = 0;
 +	bool present = PE_parse_boot_argn("fuxibacklight", &enable, sizeof(enable));
 +	if (!fbl_power_notifications(present, enable)) return;
++	if (fbl_withhold_on(present, enable, on)) {
++		uint32_t event;
++		if (bl_log(BL_POWER, &event))
++			IOLog("FUXI BACKLIGHT: power #%u on message=0xe0000230 withheld experiment=off-only\n", event);
++		return;
++	}
 +	OSIterator *it = provider->getClientIterator();
 +	if (!it) {
 +		IOLog("FUXI BACKLIGHT: power notification iterator unavailable\n");
@@ -325,7 +335,7 @@
 +#endif /* FUXI */
 --- /dev/null
 +++ b/iokit/Kernel/arm/fuxi_backlight_logic.h
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,27 @@
 +/* Observation-only backlight policy; no panel units or hardware access. */
 +#ifndef FUXI_BACKLIGHT_LOGIC_H
 +#define FUXI_BACKLIGHT_LOGIC_H
@@ -333,11 +343,16 @@
 +#define FUXI_BACKLIGHT_MAX 65536u
 +static inline int fbl_enabled(int present, int value)
 +{
-+	return present && (value == 1 || value == 2);
++	return present && (value == 1 || value == 2 || value == 3);
 +}
 +static inline int fbl_power_notifications(int present, int value)
 +{
-+	return present && value == 2;
++	return present && (value == 2 || value == 3);
++}
++static inline int fbl_withhold_on(int present, int value, int on)
++{
++	/* Mode 3 isolates ON delivery; OFF and framebuffer ordering match mode 2. */
++	return present && value == 3 && on;
 +}
 +static inline int fbl_log_this(uint32_t event)
 +{
