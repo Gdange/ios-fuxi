@@ -230,7 +230,7 @@
  	unsigned errors = 0;
  	(void)arg;
  	(void)result;
-@@ -236,36 +313,83 @@
+@@ -236,36 +313,84 @@
  	}
  	for (;;) {
  		uint8_t pon = 0, gpio = 1;
@@ -297,6 +297,7 @@
 + * path, so a boot without anyone at the phone shows how iOS maps each key.
 + * Only for device tests; it does not need fuxikeyinject=1.
 + */
++static int fk_inject(const struct fuxi_key_inject *cmd);
 +static int fk_script_chan;
 +static const struct { unsigned key, gap_ms; const char *why; } fk_script_steps[] = {
 +	{0, 8000, "power (expect lock)"},
@@ -332,7 +333,7 @@
  	(void)thread_terminate(current_thread());
  	thread_block(THREAD_CONTINUE_NULL);
  }
-@@ -289,5 +413,173 @@
+@@ -289,5 +414,173 @@
  	} else {
  		printf("FUXI KEYS: kernel_thread_start failed\n");
  	}

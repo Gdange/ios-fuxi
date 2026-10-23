@@ -358,6 +358,7 @@ terminate:
  * path, so a boot without anyone at the phone shows how iOS maps each key.
  * Only for device tests; it does not need fuxikeyinject=1.
  */
+static int fk_inject(const struct fuxi_key_inject *cmd);
 static int fk_script_chan;
 static const struct { unsigned key, gap_ms; const char *why; } fk_script_steps[] = {
 	{0, 8000, "power (expect lock)"},
