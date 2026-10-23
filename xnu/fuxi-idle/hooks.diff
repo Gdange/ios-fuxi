@@ -1,0 +1,197 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -6692,7 +6692,34 @@ handle_mac_transition:
+ 	}
+ 
+ 	/* Update the process' identity version and set the security token */
++#if defined(FUXI)
++	/*
++	 * fuxixpcid=1 (patch 0105): xpcproxy execs the real daemon in place. Keep
++	 * the pid version of that exec so the audit token launchd recorded for
++	 * the spawn still names the daemon; otherwise launchd can treat the job
++	 * as a new instance and respawn it (HackiOS xnu/redwood.patch, APSL 2.0).
++	 * p_comm is still the old image name here (set_proc_name runs later).
++	 */
++	{
++		static int fuxi_xpcid = -1;
++		static uint32_t fuxi_xpcid_logged;
++		if (fuxi_xpcid < 0) {
++			uint32_t v = 0;
++			fuxi_xpcid = (PE_parse_boot_argn("fuxixpcid", &v, sizeof(v)) && v == 1) ? 1 : 0;
++		}
++		if (fuxi_xpcid == 1 && strcmp(p->p_comm, "xpcproxy") == 0) {
++			if (fuxi_xpcid_logged < 8) {
++				fuxi_xpcid_logged++;
++				printf("FUXI IDLE: xpcproxy pid %d exec keeps pidversion %d (fuxixpcid=1)\n",
++				    proc_getpid(p), proc_pidversion(p));
++			}
++		} else {
++			proc_setpidversion(p, OSIncrementAtomic(&nextpidversion));
++		}
++	}
++#else
+ 	proc_setpidversion(p, OSIncrementAtomic(&nextpidversion));
++#endif
+ 	task_set_uniqueid(task);
+ 	set_security_token_task_internal(p, task);
+ 
+--- a/iokit/Kernel/IOPMrootDomain.cpp
++++ b/iokit/Kernel/IOPMrootDomain.cpp
+@@ -556,6 +556,15 @@ static uint32_t         gDarkWakeFlags = kDarkWakeFlagPromotionEarly;
+ 
+ static uint32_t         gNoIdleFlag = 0;
+ static uint32_t         gSleepDisabledFlag = 0;
++#if defined(FUXI)
++/* fuxinosleep=1 (patch 0105): refuse every system sleep. The port has no
++ * working sleep/wake path; powerd asks for idle sleep after the display goes
++ * off and IOCPUSleepKernel then hangs (HackiOS xnu/redwood.patch, APSL 2.0).
++ * Kept apart from gSleepDisabledFlag, which "sleep-disabled" in the device
++ * tree overwrites at boot complete. */
++static uint32_t         gFuxiNoSleep = 0;
++static uint64_t         gFuxiNoSleepCount = 0;
++#endif
+ static uint32_t         gSwdPanic = 1;
+ static uint32_t         gSwdSleepTimeout = 0;
+ static uint32_t         gSwdWakeTimeout = 0;
+@@ -1592,6 +1601,15 @@ IOPMrootDomain::start( IOService * nub )
+ 	PE_parse_boot_argn("swd_timeout", &gSwdSleepWakeTimeout, sizeof(gSwdSleepWakeTimeout));
+ 	PE_parse_boot_argn("haltmspanic", &gHaltTimeMaxPanic, sizeof(gHaltTimeMaxPanic));
+ 	PE_parse_boot_argn("haltmslog", &gHaltTimeMaxLog, sizeof(gHaltTimeMaxLog));
++#if defined(FUXI)
++	{
++		uint32_t nosleep = 0;
++		if (PE_parse_boot_argn("fuxinosleep", &nosleep, sizeof(nosleep)) && nosleep == 1) {
++			gFuxiNoSleep = 1;
++			IOLog("FUXI IDLE: system sleep refused (fuxinosleep=1)\n");
++		}
++	}
++#endif
+ 
+ 	// read noidle setting from Device Tree
+ 	if (PE_get_default("no-idle", &gNoIdleFlag, sizeof(gNoIdleFlag))) {
+@@ -7380,6 +7398,17 @@ IOPMrootDomain::checkSystemSleepAllowed( IOOptionBits options,
+ 	// Conditions that prevent idle and demand system sleep.
+ 
+ 	do {
++#if defined(FUXI)
++		if (gFuxiNoSleep) {
++			gFuxiNoSleepCount++;
++			if (gFuxiNoSleepCount && !(gFuxiNoSleepCount & (gFuxiNoSleepCount - 1))) {
++				IOLog("FUXI IDLE: system sleep refused (fuxinosleep=1) reason %u options 0x%x count %llu\n",
++				    sleepReason, (unsigned)options, gFuxiNoSleepCount);
++			}
++			err = kPMConfigPreventSystemSleep;
++			break;
++		}
++#endif
+ 		if (gSleepDisabledFlag) {
+ 			err = kPMConfigPreventSystemSleep;
+ 			break;
+--- a/osfmk/arm/cpu_common.c
++++ b/osfmk/arm/cpu_common.c
+@@ -572,6 +572,10 @@ cpu_has_SIGPdebug_pending(void)
+ 	return cpu_data_ptr->cpu_signal & SIGPdebug;
+ }
+ 
++#if defined(FUXI)
++extern void fuxi_idle_ipi_seen(unsigned int signal);	/* osfmk/arm64/fuxi_idle.c (patch 0105) */
++#endif
++
+ void
+ cpu_signal_handler_internal(boolean_t disable_signal)
+ {
+@@ -591,6 +595,9 @@ cpu_signal_handler_internal(boolean_t di
+ 	 * handlers.
+ 	 */
+ 	cpu_signal = os_atomic_or(&cpu_data_ptr->cpu_signal, 0, acquire);
++#if defined(FUXI)
++	fuxi_idle_ipi_seen(cpu_signal);	/* fuxicpuload: ipirx line */
++#endif
+ 
+ 	if ((!(cpu_signal & SIGPdisabled)) && (disable_signal == TRUE)) {
+ 		os_atomic_or(&cpu_data_ptr->cpu_signal, SIGPdisabled, relaxed);
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -111,6 +111,10 @@ extern void typhoon_return_from_wfi(void
+ extern void arm64_retention_wfi(void);
+ #endif
+ 
++#if defined(FUXI)
++extern void fuxi_idle_cache_enter(void);	/* osfmk/arm64/fuxi_idle.c (patch 0105) */
++#endif
++
+ sysreg_restore_t sysreg_restore __attribute__((section("__DATA, __const"))) = {
+ 	.tcr_el1 = TCR_EL1_BOOT,
+ };
+@@ -569,8 +573,13 @@ cpu_idle(void)
+ 
+ 	if (wfi) {
+ #if !defined(APPLE_ARM64_ARCH_FAMILY)
++#if defined(FUXI)
++		/* Same flush unless fuxinoidleflush=1; fuxicpuload also times it. */
++		fuxi_idle_cache_enter();
++#else
+ 		platform_cache_idle_enter();
+ #endif
++#endif
+ 
+ #if DEVELOPMENT || DEBUG
+ 		// When simulating wfi overhead,
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -258,6 +258,10 @@ void cpu_signal_handler(void);
+ extern unsigned int gFastIPI;
+ #endif /* defined(HAS_IPI) */
+ 
++#if defined(FUXI)
++extern void fuxi_idle_sgi(unsigned int intid);	/* osfmk/arm64/fuxi_idle.c (patch 0105) */
++#endif
++
+ static arm_saved_state64_t *original_faulting_state = NULL;
+ 
+ TUNABLE(bool, fp_exceptions_enabled, "-fp_exceptions", false);
+@@ -1891,6 +1895,11 @@ sleh_irq(arm_saved_state_t *state)
+ 		/* Ack before handling so an IPI raised meanwhile is not lost */
+ 		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+ 		__builtin_arm_isb(ISB_SY);
++#if defined(FUXI)
++		if (intid != SWEET_IPI_SGI) {
++			fuxi_idle_sgi(intid);	/* fuxicpuload: ipirx g */
++		}
++#endif
+ 		cpu_signal_handler();
+ 	} else {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -42,6 +42,7 @@ osfmk/arm/arm_timer.c		standard
+ osfmk/arm/arm_init.c	optional config_pmap_ppl
+ osfmk/arm64/arm_vm_init.c	optional config_pmap_ppl
+ osfmk/arm64/sweet_early.c	standard
++osfmk/arm64/fuxi_idle.c	standard
+ osfmk/arm64/arm64_hypercall.c	standard
+ osfmk/arm/io_map.c		standard
+ osfmk/arm64/loose_ends.c	standard
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -4740,6 +4740,10 @@ sched_ipi_deferred_policy(processor_set_
+ 	return SCHED_IPI_NONE;
+ }
+ 
++#if defined(FUXI)
++extern void fuxi_idle_ipi_wake(thread_t thread, int ipi_type);	/* osfmk/arm64/fuxi_idle.c (patch 0105) */
++#endif
++
+ sched_ipi_type_t
+ sched_ipi_action(processor_t dst, thread_t thread, sched_ipi_event_t event)
+ {
+@@ -4773,6 +4777,9 @@ sched_ipi_action(processor_t dst, thread
+ 		bit_set(pset->pending_AST_PREEMPT_cpu_mask, dst->cpu_id);
+ 		break;
+ 	}
++#if defined(FUXI)
++	fuxi_idle_ipi_wake(thread, (int)ipi_type);	/* fuxicpuload: ipiwake line */
++#endif
+ 	return ipi_type;
+ }
+ 

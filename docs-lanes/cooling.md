@@ -21,6 +21,8 @@ and the Metal change only tightens a gate that already returned no GPU.
 | Per-CPU idle log | patch 0105, `osfmk/arm64/fuxi_idle.c` | `fuxicpuload=N` (seconds, 1..3600) |
 | Refuse system sleep | patch 0105, `IOPMrootDomain.cpp` | `fuxinosleep=1` |
 | xpcproxy keeps its pid version | patch 0105, `kern_exec.c` | `fuxixpcid=1` |
+| No L1 flush before each WFI | patch 0105, `osfmk/arm64/cpu.c` | `fuxinoidleflush=1` |
+| IPI kinds, idle flush cost, who wakes whom | patch 0105 hooks | with `fuxicpuload=N` |
 | A/B summary of runs | `tools/fuxi-thermal-summary.py` | offline, on monitor output |
 
 ## 1. Daemons on demand (`launchd-on-demand.py`)
@@ -82,10 +84,14 @@ is not needed because SpringBoard never gets a Metal device here.
 
 ## 3. Kernel patch 0105 (`xnu/patches/0105-fuxi-idle.patch`)
 
-All three parts compile only with `FUXI` and act only when their boot-arg
+All parts compile only with `FUXI` and act only when their boot-arg
 is set exactly as shown; without them the kernel behaves as before (the
-patch adds lines only, the stock pid-version bump stays in place). Sources
-are kept in `xnu/fuxi-idle/`. Remember the loader command line limit (under
+patch adds lines only, the stock pid-version bump and idle flush stay in
+place). Sources are kept in `xnu/fuxi-idle/`: the two new files plus
+`hooks.diff` (the hunks for upstream files); `tools/sync-fuxi-idle.py`
+writes the patch from them (`--check` compares, `--tree DIR` also dry-runs
+it on a tree with patches up to 0104), `tools/test-fuxi-idle.py` tests it.
+Remember the loader command line limit (under
 608 bytes, see `build-fuxi-metal-images.sh`) when adding them.
 
 **`fuxicpuload=N`** (from HackiOS `redwood_cpufreq.c` `cpuload=MS` and
@@ -103,6 +109,43 @@ recount idle time, so interrupt time counts as busy), `u`/`s` user and system
 run share, then `i`/`p`/`t` interrupts, IPIs and timer interrupts per second
 (cpu_stat counters). The header totals are per second over all CPUs. A CPU
 not yet registered prints `-`. Use 10 or more: the line is about 400 bytes.
+On FUXI the ADT has 7 CPUs (c0 = MPIDR 0x000, c1..c6 = 0x200..0x700);
+cpu@100 runs the loader's USB monitor and is never in the list.
+
+Three more lines follow each cpuload line (same period, rates per second):
+
+```
+FUXI IDLE: ipirx 10s | c0 n2900 a41 x0 d0 o0 g0 | c1 ... | c6 ...
+FUXI IDLE: idleflush 10s on | c0 n3007 a1000 m3 | c1 ... | c6 ...
+FUXI IDLE: ipiwake 10s imm 40 idle 9100 def 0 | launchd[1]>mediaserverd[93] 3100 | ... | rest 112
+```
+
+- `ipirx`, received IPIs by the `cpu_signal` bits the handler found:
+  `n` none (the scheduler's SIGPnop idle kick), `a` AST, `x` cross-call,
+  `d` decrementer, `o` other, `g` SGIs with an id other than
+  `SWEET_IPI_SGI` (a subset of `n`; non-zero means someone else, e.g. the
+  hypervisor, sends SGIs). Every SGI below 16 counts in the cpuload `p`.
+- `idleflush`, WFI idle entries per CPU (`n`) and, while the flush is on,
+  the average ns of `platform_cache_idle_enter()` before each WFI (`a`) and
+  its share of the interval in per mille (`m`). That time is accounted as
+  idle by recount, so the cpuload busy % does not show it.
+- `ipiwake`, `sched_ipi_action()` results by type (immediate, idle,
+  deferred) and the top four (waker task > woken task) pairs, where the
+  waker is the task running on the CPU that asked for the IPI (in an
+  interrupt this is whoever was interrupted) and `[-]` is no thread
+  (rebalance). `rest` is every other pair plus those that did not fit the
+  per-CPU 32-entry tables.
+
+**`fuxinoidleflush=1`** (new, not from HackiOS). SWEET is not
+`__ARM_COHERENT_IO__`, so `cpu_idle()` runs the non-coherent
+`platform_cache_idle_enter()` before every WFI: `FlushPoU_Dcache`, a set/way
+clean+invalidate of the whole L1 D-cache (with LoUIS = 0 the loop still does
+level 0). Our idle is WFI only, with no PSCI CPU_SUSPEND, so the core keeps
+its L1 and stays coherent with the others; the flush costs time on every
+idle entry (thousands per second per CPU at idle) and refills after wake.
+The arg skips it and logs `FUXI IDLE: idle L1 flush skipped (fuxinoidleflush=1)`.
+That this lowers temperature is a **guess**; the `idleflush` line measures
+the cost first.
 
 **`fuxinosleep=1`** (from HackiOS `redwood.patch`, which sets
 `gSleepDisabledFlag` by default and re-enables sleep with `syssleep=1`).
@@ -178,7 +221,8 @@ same ADT and command line as the current boot plus the args named per run.
 
 1. **A, baseline:** current root, `fuxicpuload=10`. Expect the start line
    `FUXI IDLE: cpuload every 10s over 8 CPUs (fuxicpuload=10)` and one
-   `FUXI IDLE: cpuload 10s up ...` line every ~10 s; no other `FUXI IDLE`
+   `FUXI IDLE: cpuload 10s up ...` line every ~10 s, each followed by the
+   `ipirx`, `idleflush 10s on` and `ipiwake` lines; no other `FUXI IDLE`
    lines; boot otherwise identical to the current one.
 2. **B, daemons on demand:** on the mounted root run the tool with
    `--dry-run`, then for real. Expect a summary line
@@ -197,6 +241,12 @@ same ADT and command line as the current boot plus the args named per run.
    time out and count `... refused ... reason R options 0x... count N` lines.
 5. If B breaks something, `--keep` the missing job or `--undo`, and record
    the job in the keep list with its reason.
+6. **E, idle flush off:** the current command line plus `fuxinoidleflush=1`
+   (with `fuxicpuload=10`), compared with a run without it. Expect
+   `FUXI IDLE: idle L1 flush skipped (fuxinoidleflush=1)` once, then
+   `FUXI IDLE: idleflush 10s off | c0 n...` lines; the baseline run prints
+   `idleflush 10s on` with `a`/`m` values. A hang, random user crashes or
+   data corruption would mean the flush mattered: drop the arg.
 
 Host tests: `tools/test-launchd-on-demand.py`, `tools/test-fuxi-idle.py`,
 `tools/test-fuxi-thermal-summary.py`, `tools/fuxi-metal/ClientGateTests.cpp`

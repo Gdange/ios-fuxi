@@ -48,8 +48,36 @@ assert '+#else\n \tproc_setpidversion(p, OSIncrementAtomic(&nextpidversion));\n+
 assert 'strcmp(p->p_comm, "xpcproxy") == 0' in exec_block
 pm = added('iokit/Kernel/IOPMrootDomain.cpp')
 assert 'err = kPMConfigPreventSystemSleep;' in pm and 'gFuxiNoSleep = 1;' in pm
-for path in ('iokit/Kernel/IOPMrootDomain.cpp', 'bsd/kern/kern_exec.c', 'osfmk/conf/files.arm64'):
+HOOKS = {  # upstream file -> the fuxi_idle.c function it calls
+    'osfmk/arm64/cpu.c': 'fuxi_idle_cache_enter',
+    'osfmk/arm/cpu_common.c': 'fuxi_idle_ipi_seen',
+    'osfmk/arm64/sleh.c': 'fuxi_idle_sgi',
+    'osfmk/kern/sched_prim.c': 'fuxi_idle_ipi_wake',
+}
+for path, fn in HOOKS.items():
+    text = added(path)
+    assert text.startswith('#if defined(FUXI)\n'), path
+    assert text.count('#if defined(FUXI)') == text.count('#endif') == 2, path
+    assert re.search(r'^extern void %s\(' % fn, text, re.M) and re.search(r'^\t+%s\(' % fn, text, re.M), path
+    assert re.search(r'^void\n%s\(' % fn, source, re.M), fn
+# The stock flush stays the non-FUXI path; FUXI calls it unless fuxinoidleflush=1.
+assert ('+#if defined(FUXI)\n+\t\t/* Same flush unless fuxinoidleflush=1; fuxicpuload also times it. */\n'
+        '+\t\tfuxi_idle_cache_enter();\n+#else\n \t\tplatform_cache_idle_enter();\n #endif\n+#endif\n'
+        in block('osfmk/arm64/cpu.c'))
+assert 'PE_parse_boot_argn("fuxinoidleflush", &noflush, sizeof(noflush)) && noflush == 1' in source
+assert 'FUXI IDLE: idle L1 flush skipped (fuxinoidleflush=1)' in source
+cache_enter = re.search(r'^fuxi_idle_cache_enter\(void\)\n\{\n(.*?)^\}', source, re.M | re.S)[1]
+assert cache_enter.count('platform_cache_idle_enter();') == 2 and 'if (fi_noflush) {\n\t\treturn;' in cache_enter
+# Diagnostic hooks do nothing until fuxicpuload armed fi_seconds.
+for fn in ('fuxi_idle_ipi_seen', 'fuxi_idle_sgi'):
+    body = re.search(r'^%s\(.*?\)\n\{\n(.*?)^\}' % fn, source, re.M | re.S)[1]
+    assert 'fi_seconds ? fi_here() : NULL' in body, fn
+assert 'if (!fi_seconds || ipi_type < SCHED_IPI_IMMEDIATE' in source
+assert 'if (intid != SWEET_IPI_SGI) {' in block('osfmk/arm64/sleh.c')
+for path in ('iokit/Kernel/IOPMrootDomain.cpp', 'bsd/kern/kern_exec.c', 'osfmk/conf/files.arm64', *HOOKS):
     assert not [l for l in block(path).splitlines()[2:] if l.startswith('-')], path  # additions only
+# The patch is generated: tools/sync-fuxi-idle.py --check.
+subprocess.run(['python3', str(ROOT/'tools/sync-fuxi-idle.py'), '--check'], check=True, capture_output=True)
 
 TEST = r'''
 #include <stdint.h>
@@ -100,6 +128,96 @@ int main(void)
 	n = fi_format(small, sizeof(small), 10, 1, wall, 10000, prev, cur, 8);
 	assert(n == sizeof(small) - 1 && strlen(small) == n && !strcmp(small, "FUXI IDLE: cpuload "));
 	assert(fi_format(small, 0, 10, 1, wall, 10000, prev, cur, 8) == 0);
+
+	/* cpu_signal bits -> kinds; SIGPdisabled alone is a plain kick. */
+	struct fi_xcount k = {0};
+	fi_classify(&k, 0); fi_classify(&k, FI_SIGP_DISABLED); fi_classify(&k, FI_SIGP_AST);
+	fi_classify(&k, FI_SIGP_XCALL | FI_SIGP_AST); fi_classify(&k, FI_SIGP_XCALL_IMM);
+	fi_classify(&k, FI_SIGP_DEC | FI_SIGP_DISABLED); fi_classify(&k, 0x10); fi_classify(&k, 0x100 | FI_SIGP_AST);
+	assert(k.nop == 2 && k.ast == 3 && k.xc == 2 && k.dec == 1 && k.other == 2 && k.sgi == 0);
+
+	struct fi_xcount xp[FI_MAX_CPUS] = {0}, xc[FI_MAX_CPUS] = {0};
+	int valid[FI_MAX_CPUS] = { 1, 0, 1 };
+	xc[0].nop = 29000; xc[0].ast = 410;
+	xc[0].idles = 30070; xc[0].flush = 721680;     /* 1000 ns per flush at 24 MHz */
+	xc[2] = (struct fi_xcount){ 10, 5, 20, 30, 40, 7, 0, 0 };
+	char l2[640];
+	n = fi_format_ipirx(l2, sizeof(l2), 10, 10000, xp, xc, valid, 3);
+	want = "FUXI IDLE: ipirx 10s | c0 n2900 a41 x0 d0 o0 g0 | c1 - | c2 n1 a1 x2 d3 o4 g1";
+	if (strcmp(l2, want)) {
+		printf("got  %s\nwant %s\n", l2, want);
+		return 1;
+	}
+	assert(n == strlen(want));
+	n = fi_format_flush(l2, sizeof(l2), 10, 1, wall, 10000000000ull, xp, xc, valid, 3);
+	want = "FUXI IDLE: idleflush 10s on | c0 n3007 a1000 m3 | c1 - | c2 n0 a0 m0";
+	if (strcmp(l2, want)) {
+		printf("got  %s\nwant %s\n", l2, want);
+		return 1;
+	}
+	assert(n == strlen(want));
+	(void)fi_format_flush(l2, sizeof(l2), 10, 0, wall, 10000000000ull, xp, xc, valid, 3);
+	assert(!strcmp(l2, "FUXI IDLE: idleflush 10s off | c0 n3007 | c1 - | c2 n0"));
+	assert(fi_ticks_ns(24000, 24000, 1000000) == 1000000 && fi_ticks_ns(5, 0, 7) == 0);
+	assert(fi_ticks_ns(UINT64_MAX / 2, UINT64_MAX / 2, 3600000000000ull) == 3600000000000ull);
+
+	/* Wake pairs: merge, a full table refuses, top-k with ties by index. */
+	struct fi_wake t[4] = {{0}};
+	assert(fi_wake_add(t, 4, 1, 93, 20000) && fi_wake_add(t, 4, 50, -1, 2000) && fi_wake_add(t, 4, 0, 1, 31000));
+	assert(fi_wake_add(t, 4, 1, 93, 11000) && fi_wake_add(t, 4, 7, 7, 1000) && !fi_wake_add(t, 4, 9, 9, 1));
+	assert(t[0].count == 31000);
+	unsigned top[FI_WAKE_TOP];
+	assert(fi_wake_top(t, 4, top, 3) == 3 && top[0] == 0 && top[1] == 2 && top[2] == 1);
+	assert(fi_wake_top(t, 4, top, FI_WAKE_TOP) == 4);
+	struct fi_wake none[2] = {{0}};
+	assert(fi_wake_top(none, 2, top, 2) == 0);
+	char names[2 * FI_WAKE_TOP][FI_NAME] = { "launchd", "mediaserverd", "kernel_task", "launchd", "", "" };
+	uint64_t types[3] = { 400, 91000, 0 };
+	assert(fi_wake_top(t, 4, top, 3) == 3);
+	n = fi_format_wake(l2, sizeof(l2), 10, 10000, types, t, 4, top, 3, (const char (*)[FI_NAME])names, 120);
+	want = "FUXI IDLE: ipiwake 10s imm 40 idle 9100 def 0 | launchd[1]>mediaserverd[93] 3100"
+	    " | kernel_task[0]>launchd[1] 3100 | ?[50]>?[-] 200 | rest 112";
+	if (strcmp(l2, want)) {
+		printf("got  %s\nwant %s\n", l2, want);
+		return 1;
+	}
+	assert(n == strlen(want));
+	n = fi_format_wake(l2, sizeof(l2), 10, 10000, types, none, 2, top, 0, (const char (*)[FI_NAME])names, 0);
+	assert(!strcmp(l2, "FUXI IDLE: ipiwake 10s imm 40 idle 9100 def 0 | rest 0"));
+
+	/* 1e8 events/s on 8 CPUs for an hour still fit the kernel's 640-byte buffer. */
+	const uint64_t ev = 100000000ull * 3600, hour_ms = 3600000, hour = 3600 * 1000 * MS;
+	for (unsigned c = 0; c < FI_MAX_CPUS; c++) {
+		valid[c] = 1;
+		xc[c] = (struct fi_xcount){ ev, ev, ev, ev, ev, ev, ev, hour };
+	}
+	n = fi_format_ipirx(l2, sizeof(l2), 3600, hour_ms, xp, xc, valid, 12);
+	assert(n == strlen(l2) && n < sizeof(l2) - 1 && strstr(l2, "| c7 n100000000 a100000000"));
+	n = fi_format_flush(l2, sizeof(l2), 3600, 1, hour, hour_ms * 1000000, xp, xc, valid, 12);
+	assert(n == strlen(l2) && n < sizeof(l2) - 1 && strstr(l2, "| c7 n100000000 a10 m1000"));
+	/* Overflowing counters only cost digits: the line stays terminated. */
+	for (unsigned c = 0; c < FI_MAX_CPUS; c++) {
+		xc[c] = (struct fi_xcount){ UINT64_MAX / 4, UINT64_MAX / 4, UINT64_MAX / 4, UINT64_MAX / 4,
+		    UINT64_MAX / 4, UINT64_MAX / 4, UINT64_MAX / 4, UINT64_MAX / 4 };
+	}
+	n = fi_format_ipirx(l2, sizeof(l2), 3600, 1, xp, xc, valid, 12);
+	assert(n == sizeof(l2) - 1 && strlen(l2) == n);
+	char longnames[2 * FI_WAKE_TOP][FI_NAME];
+	memset(longnames, 'x', sizeof(longnames));
+	for (unsigned i = 0; i < 2 * FI_WAKE_TOP; i++) {
+		longnames[i][FI_NAME - 1] = 0;
+	}
+	struct fi_wake big[FI_WAKE_TOP];
+	for (unsigned i = 0; i < FI_WAKE_TOP; i++) {
+		big[i] = (struct fi_wake){ INT32_MAX, INT32_MAX, ev };
+		top[i] = i;
+	}
+	uint64_t bigtypes[3] = { ev, ev, ev };
+	n = fi_format_wake(l2, sizeof(l2), 3600, hour_ms, bigtypes, big, FI_WAKE_TOP, top, FI_WAKE_TOP,
+	    (const char (*)[FI_NAME])longnames, 0);
+	assert(n == strlen(l2) && n < sizeof(l2) - 1 && strstr(l2, " | rest "));
+	n = fi_format_wake(small, sizeof(small), 10, 10000, types, t, 4, top, 0, (const char (*)[FI_NAME])names, 0);
+	assert(n == sizeof(small) - 1 && strlen(small) == n);
 	return 0;
 }
 '''
@@ -111,4 +229,4 @@ with tempfile.TemporaryDirectory() as d:
                     '-I', str(ROOT/'xnu/fuxi-idle'), str(src), '-o', str(exe)], check=True)
     subprocess.run([str(exe)], check=True)
 
-print('PASS: fuxi idle patch 0105 (snapshots, FUXI + boot-arg gating, cpuload line formatter)')
+print("PASS: fuxi idle patch 0105 (sync, snapshots, FUXI + boot-arg gating, idle-flush and IPI hooks, line formatters)")

@@ -87,6 +87,81 @@
  		if (gSleepDisabledFlag) {
  			err = kPMConfigPreventSystemSleep;
  			break;
+--- a/osfmk/arm/cpu_common.c
++++ b/osfmk/arm/cpu_common.c
+@@ -572,6 +572,10 @@ cpu_has_SIGPdebug_pending(void)
+ 	return cpu_data_ptr->cpu_signal & SIGPdebug;
+ }
+ 
++#if defined(FUXI)
++extern void fuxi_idle_ipi_seen(unsigned int signal);	/* osfmk/arm64/fuxi_idle.c (patch 0105) */
++#endif
++
+ void
+ cpu_signal_handler_internal(boolean_t disable_signal)
+ {
+@@ -591,6 +595,9 @@ cpu_signal_handler_internal(boolean_t di
+ 	 * handlers.
+ 	 */
+ 	cpu_signal = os_atomic_or(&cpu_data_ptr->cpu_signal, 0, acquire);
++#if defined(FUXI)
++	fuxi_idle_ipi_seen(cpu_signal);	/* fuxicpuload: ipirx line */
++#endif
+ 
+ 	if ((!(cpu_signal & SIGPdisabled)) && (disable_signal == TRUE)) {
+ 		os_atomic_or(&cpu_data_ptr->cpu_signal, SIGPdisabled, relaxed);
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -111,6 +111,10 @@ extern void typhoon_return_from_wfi(void
+ extern void arm64_retention_wfi(void);
+ #endif
+ 
++#if defined(FUXI)
++extern void fuxi_idle_cache_enter(void);	/* osfmk/arm64/fuxi_idle.c (patch 0105) */
++#endif
++
+ sysreg_restore_t sysreg_restore __attribute__((section("__DATA, __const"))) = {
+ 	.tcr_el1 = TCR_EL1_BOOT,
+ };
+@@ -569,8 +573,13 @@ cpu_idle(void)
+ 
+ 	if (wfi) {
+ #if !defined(APPLE_ARM64_ARCH_FAMILY)
++#if defined(FUXI)
++		/* Same flush unless fuxinoidleflush=1; fuxicpuload also times it. */
++		fuxi_idle_cache_enter();
++#else
+ 		platform_cache_idle_enter();
+ #endif
++#endif
+ 
+ #if DEVELOPMENT || DEBUG
+ 		// When simulating wfi overhead,
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -258,6 +258,10 @@ void cpu_signal_handler(void);
+ extern unsigned int gFastIPI;
+ #endif /* defined(HAS_IPI) */
+ 
++#if defined(FUXI)
++extern void fuxi_idle_sgi(unsigned int intid);	/* osfmk/arm64/fuxi_idle.c (patch 0105) */
++#endif
++
+ static arm_saved_state64_t *original_faulting_state = NULL;
+ 
+ TUNABLE(bool, fp_exceptions_enabled, "-fp_exceptions", false);
+@@ -1891,6 +1895,11 @@ sleh_irq(arm_saved_state_t *state)
+ 		/* Ack before handling so an IPI raised meanwhile is not lost */
+ 		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+ 		__builtin_arm_isb(ISB_SY);
++#if defined(FUXI)
++		if (intid != SWEET_IPI_SGI) {
++			fuxi_idle_sgi(intid);	/* fuxicpuload: ipirx g */
++		}
++#endif
+ 		cpu_signal_handler();
+ 	} else {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
 --- a/osfmk/conf/files.arm64
 +++ b/osfmk/conf/files.arm64
 @@ -42,6 +42,7 @@ osfmk/arm/arm_timer.c		standard
@@ -97,9 +172,32 @@
  osfmk/arm64/arm64_hypercall.c	standard
  osfmk/arm/io_map.c		standard
  osfmk/arm64/loose_ends.c	standard
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -4740,6 +4740,10 @@ sched_ipi_deferred_policy(processor_set_
+ 	return SCHED_IPI_NONE;
+ }
+ 
++#if defined(FUXI)
++extern void fuxi_idle_ipi_wake(thread_t thread, int ipi_type);	/* osfmk/arm64/fuxi_idle.c (patch 0105) */
++#endif
++
+ sched_ipi_type_t
+ sched_ipi_action(processor_t dst, thread_t thread, sched_ipi_event_t event)
+ {
+@@ -4773,6 +4777,9 @@ sched_ipi_action(processor_t dst, thread
+ 		bit_set(pset->pending_AST_PREEMPT_cpu_mask, dst->cpu_id);
+ 		break;
+ 	}
++#if defined(FUXI)
++	fuxi_idle_ipi_wake(thread, (int)ipi_type);	/* fuxicpuload: ipiwake line */
++#endif
+ 	return ipi_type;
+ }
+ 
 --- a/osfmk/arm64/fuxi_idle_logic.h
 +++ b/osfmk/arm64/fuxi_idle_logic.h
-@@ -0,0 +1,175 @@
+@@ -0,0 +1,426 @@
 +/* Pure helpers of osfmk/arm64/fuxi_idle.c (patch 0105), shared with the host
 + * test tools/test-fuxi-idle.py. No kernel headers: integers in, text out.
 + *
@@ -260,7 +358,258 @@
 +	return at;
 +}
 +
-+/* fuxinosleep / fuxixpcid: a boot-arg value is on only when it is exactly 1. */
++/*
++ * IPI diagnostics (fuxicpuload) and the idle L1 flush (fuxinoidleflush).
++ * FI_SIGP_* mirror osfmk/arm/cpu_internal.h (fuxi_idle.c asserts they match).
++ */
++#define FI_SIGP_DEC             0x00000001u
++#define FI_SIGP_XCALL           0x00000004u
++#define FI_SIGP_AST             0x00000008u
++#define FI_SIGP_XCALL_IMM       0x00000200u
++#define FI_SIGP_DISABLED        0x80000000u
++
++/* Per-CPU event counters; they only increase. Times are mach_absolute_time() units. */
++struct fi_xcount {
++	uint64_t nop;           /* IPIs with no signal bit: a SIGPnop idle kick (or a foreign SGI) */
++	uint64_t ast, xc, dec;  /* IPIs carrying SIGPast, SIGPxcall/xcallImm, SIGPdec */
++	uint64_t other;         /* IPIs carrying any other bit (debug, kppet) */
++	uint64_t sgi;           /* SGIs other than SWEET_IPI_SGI (also counted as nop) */
++	uint64_t idles;         /* cpu_idle() WFI entries */
++	uint64_t flush;         /* time spent in platform_cache_idle_enter() */
++};
++
++/* Classify one IPI by the cpu_signal bits the handler found pending. */
++static inline void
++fi_classify(struct fi_xcount *c, unsigned signal)
++{
++	signal &= ~FI_SIGP_DISABLED;
++	if (!signal) {
++		c->nop++;
++		return;
++	}
++	if (signal & FI_SIGP_AST) {
++		c->ast++;
++	}
++	if (signal & (FI_SIGP_XCALL | FI_SIGP_XCALL_IMM)) {
++		c->xc++;
++	}
++	if (signal & FI_SIGP_DEC) {
++		c->dec++;
++	}
++	if (signal & ~(FI_SIGP_AST | FI_SIGP_XCALL | FI_SIGP_XCALL_IMM | FI_SIGP_DEC)) {
++		c->other++;
++	}
++}
++
++static inline void
++fi_header(char *buf, unsigned size, unsigned *at, const char *what, unsigned period)
++{
++	buf[0] = 0;
++	*at = 0;
++	fi_append(buf, size, at, "FUXI IDLE: ");
++	fi_append(buf, size, at, what);
++	fi_append(buf, size, at, " ");
++	fi_append_u(buf, size, at, period);
++	fi_append(buf, size, at, "s");
++}
++
++static inline void
++fi_field(char *buf, unsigned size, unsigned *at, const char *key, uint64_t v)
++{
++	fi_append(buf, size, at, key);
++	fi_append_u(buf, size, at, v);
++}
++
++/*
++ * Received IPIs per second by kind, one group per CPU:
++ *   FUXI IDLE: ipirx 10s | c0 n2900 a41 x0 d0 o0 g0 | c1 - | ...
++ * n = no signal bit (idle kick), a = AST, x = xcall, d = decrementer,
++ * o = other bits, g = foreign SGI id (a subset of n). One IPI can carry
++ * several bits, so n+a+x+d+o can exceed the p rate of the cpuload line.
++ */
++static inline unsigned
++fi_format_ipirx(char *buf, unsigned size, unsigned period, uint64_t wall_ms,
++    const struct fi_xcount *prev, const struct fi_xcount *cur, const int *valid, unsigned ncpu)
++{
++	unsigned at = 0;
++	if (!size) {
++		return 0;
++	}
++	fi_header(buf, size, &at, "ipirx", period);
++	if (ncpu > FI_MAX_CPUS) {
++		ncpu = FI_MAX_CPUS;
++	}
++	for (unsigned c = 0; c < ncpu; c++) {
++		fi_field(buf, size, &at, " | c", c);
++		if (!valid[c]) {
++			fi_append(buf, size, &at, " -");
++			continue;
++		}
++		fi_field(buf, size, &at, " n", fi_rate(fi_delta(cur[c].nop, prev[c].nop), wall_ms));
++		fi_field(buf, size, &at, " a", fi_rate(fi_delta(cur[c].ast, prev[c].ast), wall_ms));
++		fi_field(buf, size, &at, " x", fi_rate(fi_delta(cur[c].xc, prev[c].xc), wall_ms));
++		fi_field(buf, size, &at, " d", fi_rate(fi_delta(cur[c].dec, prev[c].dec), wall_ms));
++		fi_field(buf, size, &at, " o", fi_rate(fi_delta(cur[c].other, prev[c].other), wall_ms));
++		fi_field(buf, size, &at, " g", fi_rate(fi_delta(cur[c].sgi, prev[c].sgi), wall_ms));
++	}
++	return at;
++}
++
++/* Ticks to nanoseconds with the interval's own ratio (no timebase constant). */
++static inline uint64_t
++fi_ticks_ns(uint64_t ticks, uint64_t wall, uint64_t wall_ns)
++{
++	if (!wall) {
++		return 0;
++	}
++	return (uint64_t)(((unsigned __int128)ticks * wall_ns + wall / 2) / wall);
++}
++
++/*
++ * WFI idle entries per second and the L1 D-cache flush done before each:
++ *   FUXI IDLE: idleflush 10s on | c0 n3007 a812 m2 | ...
++ * n = idle entries per second, a = average ns per flush, m = flush time in
++ * per mille of the interval. "off" (fuxinoidleflush=1) prints n only.
++ */
++static inline unsigned
++fi_format_flush(char *buf, unsigned size, unsigned period, int flushing, uint64_t wall, uint64_t wall_ns,
++    const struct fi_xcount *prev, const struct fi_xcount *cur, const int *valid, unsigned ncpu)
++{
++	unsigned at = 0;
++	uint64_t wall_ms = wall_ns / 1000000u;
++	if (!size) {
++		return 0;
++	}
++	fi_header(buf, size, &at, "idleflush", period);
++	fi_append(buf, size, &at, flushing ? " on" : " off");
++	if (ncpu > FI_MAX_CPUS) {
++		ncpu = FI_MAX_CPUS;
++	}
++	for (unsigned c = 0; c < ncpu; c++) {
++		fi_field(buf, size, &at, " | c", c);
++		if (!valid[c]) {
++			fi_append(buf, size, &at, " -");
++			continue;
++		}
++		uint64_t n = fi_delta(cur[c].idles, prev[c].idles);
++		uint64_t t = fi_delta(cur[c].flush, prev[c].flush);
++		fi_field(buf, size, &at, " n", fi_rate(n, wall_ms));
++		if (flushing) {
++			fi_field(buf, size, &at, " a", n ? fi_ticks_ns(t, wall, wall_ns) / n : 0);
++			fi_field(buf, size, &at, " m", !wall ? 0 : t >= wall ? 1000 : (t * 1000 + wall / 2) / wall);
++		}
++	}
++	return at;
++}
++
++/*
++ * Scheduler IPI attribution: who (task of the thread running on the CPU that
++ * asked for the IPI) woke whom (task of the thread the IPI is for; -1 = no
++ * thread, e.g. a rebalance). Fixed tables, linear scan; overflow is "rest".
++ */
++#define FI_WAKE_SLOTS   32
++#define FI_WAKE_MERGE   64
++#define FI_WAKE_TOP     4       /* keeps the line near 256 bytes */
++#define FI_NAME         17      /* MAXCOMLEN + 1 */
++
++struct fi_wake {
++	int32_t waker, woken;
++	uint64_t count;
++};
++
++/* Add n to the (waker, woken) slot; returns 0 when the table is full. */
++static inline int
++fi_wake_add(struct fi_wake *t, unsigned slots, int32_t waker, int32_t woken, uint64_t n)
++{
++	for (unsigned i = 0; i < slots; i++) {
++		if (!t[i].count) {
++			t[i].waker = waker;
++			t[i].woken = woken;
++			t[i].count = n;
++			return 1;
++		}
++		if (t[i].waker == waker && t[i].woken == woken) {
++			t[i].count += n;
++			return 1;
++		}
++	}
++	return 0;
++}
++
++/* Indices of up to k largest slots, largest first (ties: lower index). Returns how many. */
++static inline unsigned
++fi_wake_top(const struct fi_wake *t, unsigned slots, unsigned *out, unsigned k)
++{
++	unsigned found = 0;
++	while (found < k) {
++		unsigned best = slots;
++		for (unsigned i = 0; i < slots; i++) {
++			int taken = 0;
++			for (unsigned j = 0; j < found; j++) {
++				taken |= out[j] == i;
++			}
++			if (!taken && t[i].count && (best == slots || t[i].count > t[best].count)) {
++				best = i;
++			}
++		}
++		if (best == slots) {
++			break;
++		}
++		out[found++] = best;
++	}
++	return found;
++}
++
++static inline void
++fi_append_task(char *buf, unsigned size, unsigned *at, const char *name, int32_t pid)
++{
++	fi_append(buf, size, at, name[0] ? name : "?");
++	fi_append(buf, size, at, "[");
++	if (pid < 0) {
++		fi_append(buf, size, at, "-");
++	} else {
++		fi_append_u(buf, size, at, (uint64_t)pid);
++	}
++	fi_append(buf, size, at, "]");
++}
++
++/*
++ *   FUXI IDLE: ipiwake 10s imm 40 idle 9100 def 0 | launchd[1]>mediaserverd[93] 3100 | ... | rest 12
++ * Totals by sched_ipi_type (immediate, idle, deferred) and the top pairs,
++ * all per second; rest = the other pairs plus those that did not fit.
++ * names[2*i] / names[2*i+1] are the waker / woken names of top[i] ("" = unknown).
++ */
++static inline unsigned
++fi_format_wake(char *buf, unsigned size, unsigned period, uint64_t wall_ms, const uint64_t *types,
++    const struct fi_wake *t, unsigned slots, const unsigned *top, unsigned ntop,
++    const char (*names)[FI_NAME], uint64_t lost)
++{
++	unsigned at = 0;
++	uint64_t shown = 0, all = lost;
++	if (!size) {
++		return 0;
++	}
++	for (unsigned i = 0; i < slots; i++) {
++		all += t[i].count;
++	}
++	fi_header(buf, size, &at, "ipiwake", period);
++	fi_field(buf, size, &at, " imm ", fi_rate(types[0], wall_ms));
++	fi_field(buf, size, &at, " idle ", fi_rate(types[1], wall_ms));
++	fi_field(buf, size, &at, " def ", fi_rate(types[2], wall_ms));
++	for (unsigned i = 0; i < ntop; i++) {
++		const struct fi_wake *w = &t[top[i]];
++		fi_append(buf, size, &at, " | ");
++		fi_append_task(buf, size, &at, names[2 * i], w->waker);
++		fi_append(buf, size, &at, ">");
++		fi_append_task(buf, size, &at, names[2 * i + 1], w->woken);
++		fi_field(buf, size, &at, " ", fi_rate(w->count, wall_ms));
++		shown += w->count;
++	}
++	fi_field(buf, size, &at, " | rest ", fi_rate(all - shown, wall_ms));
++	return at;
++}
++
++/* fuxinosleep / fuxixpcid / fuxinoidleflush: a boot-arg value is on only when it is exactly 1. */
 +static inline int
 +fi_flag(int present, unsigned value)
 +{
@@ -277,7 +626,7 @@
 +#endif /* FUXI_IDLE_LOGIC_H */
 --- a/osfmk/arm64/fuxi_idle.c
 +++ b/osfmk/arm64/fuxi_idle.c
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,305 @@
 +/* FUXI cooling diagnostics (patch 0105). Off unless a boot-arg asks.
 + *
 + * fuxicpuload=N  every N seconds (1..3600) one console line with each CPU's
@@ -285,13 +634,26 @@
 + *                count as busy), user/system share, and its interrupt, IPI
 + *                and timer-interrupt rates per second (cpu_stat counters).
 + *                Used to attribute idle heat (docs-lanes/cooling.md).
++ *                Three more lines follow it: received IPIs by signal kind
++ *                (ipirx), WFI idle entries and the idle L1 flush cost
++ *                (idleflush), and which task asked the scheduler for IPIs to
++ *                which task's threads (ipiwake). See fuxi_idle_logic.h.
++ *
++ * fuxinoidleflush=1  cpu_idle() skips platform_cache_idle_enter(), the
++ *                set/way clean+invalidate of the L1 D-cache before every WFI.
++ *                SWEET is not __ARM_COHERENT_IO__, so the stock non-coherent
++ *                variant runs on each idle entry of each CPU. With WFI-only
++ *                idle (no PSCI CPU_SUSPEND, the core keeps its L1 and answers
++ *                snoops) the clusters are hardware coherent, so the flush only
++ *                costs time and cache refills. Unset: unchanged.
 + *
 + * Ported from HackiOS hackios-xnu-kernel xnu/files/bsd/dev/redwood_cpufreq.c
 + * (cpuload=MS, load_thread) and xnu/redwood.patch ml_cpu_idle_time() (APSL 2.0).
 + * SPDX-License-Identifier: APSL-2.0
 + * Changes: seconds instead of milliseconds, a blocking wait with 100 ms timer
 + * leeway so the logger does not add its own wakeups, per-CPU irq/ipi/timer
-+ * rates and user/system split, printf instead of the loader log.
++ * rates and user/system split, printf instead of the loader log; the IPI,
++ * idle-flush and wake-attribution lines and fuxinoidleflush are new.
 + */
 +#include <pexpert/arm64/board_config.h>
 +#if defined(FUXI)
@@ -304,22 +666,135 @@
 +#include <kern/recount.h>
 +#include <kern/sched_prim.h>
 +#include <kern/startup.h>
++#include <kern/task.h>
 +#include <kern/thread.h>
++#include <arm/caches_internal.h>
 +#include <arm/cpu_data_internal.h>
++#include <arm/cpu_internal.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
 +#include "fuxi_idle_logic.h"
 +
++_Static_assert(FI_SIGP_DEC == SIGPdec && FI_SIGP_XCALL == SIGPxcall && FI_SIGP_AST == SIGPast &&
++    FI_SIGP_XCALL_IMM == SIGPxcallImm && FI_SIGP_DISABLED == SIGPdisabled, "cpu_internal.h SIGP bits");
++_Static_assert(SCHED_IPI_IMMEDIATE == 1 && SCHED_IPI_IDLE == 2 && SCHED_IPI_DEFERRED == 3, "sched_ipi_type_t");
++
++extern void proc_name(int pid, char *buf, int size);   /* bsd/kern/kern_proc.c */
++
++/* Hooks (patch 0105): osfmk/arm64/cpu.c, osfmk/arm/cpu_common.c, osfmk/arm64/sleh.c, osfmk/kern/sched_prim.c */
++void fuxi_idle_cache_enter(void);
++void fuxi_idle_ipi_seen(unsigned int signal);
++void fuxi_idle_sgi(unsigned int intid);
++void fuxi_idle_ipi_wake(thread_t thread, int ipi_type);
++
 +static unsigned fi_seconds;
 +static unsigned fi_ncpu;
++static int fi_noflush;
 +static struct fi_sample fi_prev[FI_MAX_CPUS], fi_cur[FI_MAX_CPUS];
 +
++/*
++ * Written only by their own CPU with interrupts masked. The logger reads them
++ * without locks: a count can be off by the events of the copy itself.
++ * The wake table and types restart whenever the CPU sees a new fi_epoch.
++ */
++struct fi_xcpu {
++	struct fi_xcount n;
++	uint32_t epoch;
++	uint64_t types[3];              /* SCHED_IPI_IMMEDIATE, _IDLE, _DEFERRED */
++	uint64_t lost;                  /* wake pairs that did not fit */
++	struct fi_wake wake[FI_WAKE_SLOTS];
++} __attribute__((aligned(128)));
++static struct fi_xcpu fi_x[FI_MAX_CPUS];
++static uint32_t fi_epoch;
++static struct fi_xcount fi_xprev[FI_MAX_CPUS], fi_xcur[FI_MAX_CPUS];
++static struct fi_wake fi_merge[FI_WAKE_MERGE];
++static char fi_names[2 * FI_WAKE_TOP][FI_NAME];
++
++static inline struct fi_xcpu *
++fi_here(void)
++{
++	unsigned c = (unsigned)cpu_number();
++	return c < FI_MAX_CPUS ? &fi_x[c] : NULL;
++}
++
++/* cpu_idle(), interrupts masked, just before WFI. */
++void
++fuxi_idle_cache_enter(void)
++{
++	struct fi_xcpu *x = fi_seconds ? fi_here() : NULL;
++	uint64_t start;
++
++	if (x) {
++		x->n.idles++;
++	}
++	if (fi_noflush) {
++		return;
++	}
++	if (!x) {
++		platform_cache_idle_enter();
++		return;
++	}
++	start = mach_absolute_time();
++	platform_cache_idle_enter();
++	x->n.flush += mach_absolute_time() - start;
++}
++
++/* cpu_signal_handler_internal(), interrupts masked: the pending bits of one IPI. */
++void
++fuxi_idle_ipi_seen(unsigned int signal)
++{
++	struct fi_xcpu *x = fi_seconds ? fi_here() : NULL;
++
++	if (x) {
++		fi_classify(&x->n, signal);
++	}
++}
++
++/* sleh_irq(), interrupts masked: an SGI that is not SWEET_IPI_SGI. */
++void
++fuxi_idle_sgi(unsigned int intid __unused)
++{
++	struct fi_xcpu *x = fi_seconds ? fi_here() : NULL;
++
++	if (x) {
++		x->n.sgi++;
++	}
++}
++
++/* sched_ipi_action() decided to signal another CPU for thread (may be NULL). */
++void
++fuxi_idle_ipi_wake(thread_t thread, int ipi_type)
++{
++	if (!fi_seconds || ipi_type < SCHED_IPI_IMMEDIATE || ipi_type > SCHED_IPI_DEFERRED) {
++		return;
++	}
++	boolean_t istate = ml_set_interrupts_enabled(FALSE);
++	struct fi_xcpu *x = fi_here();
++	if (x) {
++		uint32_t epoch = os_atomic_load(&fi_epoch, relaxed);
++		if (x->epoch != epoch) {
++			memset(x->types, 0, sizeof(x->types));
++			memset(x->wake, 0, sizeof(x->wake));
++			x->lost = 0;
++			os_atomic_store(&x->epoch, epoch, release);
++		}
++		int32_t waker = task_pid(current_task());
++		int32_t woken = thread != THREAD_NULL ? task_pid(get_threadtask(thread)) : -1;
++		x->types[ipi_type - 1]++;
++		if (!fi_wake_add(x->wake, FI_WAKE_SLOTS, waker, woken, 1)) {
++			x->lost++;
++		}
++	}
++	ml_set_interrupts_enabled(istate);
++}
++
 +static void
-+fi_sample_all(struct fi_sample *s)
++fi_sample_all(struct fi_sample *s, struct fi_xcount *xs)
 +{
 +	for (unsigned c = 0; c < fi_ncpu; c++) {
 +		processor_t p = processor_array[c];
 +		cpu_data_t *cd = CpuDataEntries[c].cpu_data_vaddr;
++		xs[c] = fi_x[c].n;
 +		if (p == PROCESSOR_NULL || cd == NULL) {
 +			s[c].valid = 0;
 +			continue;
@@ -337,27 +812,92 @@
 +	}
 +}
 +
++/* Merge every CPU's wake table of the current epoch, then start the next one. */
++static uint64_t
++fi_collect_wake(uint64_t *types)
++{
++	uint32_t epoch = os_atomic_load(&fi_epoch, relaxed);
++	uint64_t lost = 0;
++
++	memset(fi_merge, 0, sizeof(fi_merge));
++	types[0] = types[1] = types[2] = 0;
++	for (unsigned c = 0; c < fi_ncpu; c++) {
++		struct fi_xcpu *x = &fi_x[c];
++		if (os_atomic_load(&x->epoch, acquire) != epoch) {
++			continue;       /* sent no scheduler IPI this interval */
++		}
++		for (unsigned t = 0; t < 3; t++) {
++			types[t] += x->types[t];
++		}
++		lost += x->lost;
++		for (unsigned i = 0; i < FI_WAKE_SLOTS; i++) {
++			struct fi_wake w = x->wake[i];
++			if (w.count && !fi_wake_add(fi_merge, FI_WAKE_MERGE, w.waker, w.woken, w.count)) {
++				lost += w.count;
++			}
++		}
++	}
++	os_atomic_store(&fi_epoch, epoch + 1, relaxed);
++	return lost;
++}
++
++static void
++fi_task_name(int32_t pid, char *name)
++{
++	name[0] = 0;
++	if (pid == 0) {
++		strlcpy(name, "kernel_task", FI_NAME);
++	} else if (pid > 0) {
++		proc_name(pid, name, FI_NAME);
++	}
++}
++
 +static void
 +fi_thread(void *arg __unused, wait_result_t wr __unused)
 +{
 +	static char line[640];
++	static int valid[FI_MAX_CPUS];
 +	uint64_t then = mach_absolute_time();
 +
-+	fi_sample_all(fi_prev);
++	fi_sample_all(fi_prev, fi_xprev);
++	(void)fi_collect_wake((uint64_t[3]){ 0 });
 +	for (;;) {
-+		uint64_t now, wall_ns, up_ns;
++		uint64_t now, wall_ns, up_ns, types[3], lost;
++		unsigned top[FI_WAKE_TOP], ntop;
 +
 +		assert_wait_timeout_with_leeway((event_t)&fi_seconds, THREAD_UNINT,
 +		    TIMEOUT_URGENCY_SYS_NORMAL | TIMEOUT_URGENCY_LEEWAY, fi_seconds * 1000, 100, NSEC_PER_MSEC);
 +		thread_block(THREAD_CONTINUE_NULL);
 +		now = mach_absolute_time();
-+		fi_sample_all(fi_cur);
++		fi_sample_all(fi_cur, fi_xcur);
++		lost = fi_collect_wake(types);
 +		absolutetime_to_nanoseconds(now - then, &wall_ns);
 +		absolutetime_to_nanoseconds(now, &up_ns);
 +		(void)fi_format(line, sizeof(line), fi_seconds, up_ns / NSEC_PER_SEC, now - then,
 +		    wall_ns / NSEC_PER_MSEC, fi_prev, fi_cur, fi_ncpu);
 +		printf("%s\n", line);
++
++		for (unsigned c = 0; c < fi_ncpu; c++) {
++			valid[c] = fi_prev[c].valid && fi_cur[c].valid;
++		}
++		(void)fi_format_ipirx(line, sizeof(line), fi_seconds, wall_ns / NSEC_PER_MSEC,
++		    fi_xprev, fi_xcur, valid, fi_ncpu);
++		printf("%s\n", line);
++		(void)fi_format_flush(line, sizeof(line), fi_seconds, !fi_noflush, now - then, wall_ns,
++		    fi_xprev, fi_xcur, valid, fi_ncpu);
++		printf("%s\n", line);
++
++		ntop = fi_wake_top(fi_merge, FI_WAKE_MERGE, top, FI_WAKE_TOP);
++		for (unsigned i = 0; i < ntop; i++) {
++			fi_task_name(fi_merge[top[i]].waker, fi_names[2 * i]);
++			fi_task_name(fi_merge[top[i]].woken, fi_names[2 * i + 1]);
++		}
++		(void)fi_format_wake(line, sizeof(line), fi_seconds, wall_ns / NSEC_PER_MSEC, types,
++		    fi_merge, FI_WAKE_MERGE, top, ntop, fi_names, lost);
++		printf("%s\n", line);
++
 +		memcpy(fi_prev, fi_cur, sizeof(fi_prev));
++		memcpy(fi_xprev, fi_xcur, sizeof(fi_xprev));
 +		then = now;
 +	}
 +}
@@ -365,19 +905,23 @@
 +static void
 +fuxi_idle_init(void)
 +{
-+	unsigned seconds = 0;
++	unsigned seconds = 0, noflush = 0;
 +	thread_t thread;
 +	int max;
 +
++	if (PE_parse_boot_argn("fuxinoidleflush", &noflush, sizeof(noflush)) && noflush == 1) {
++		fi_noflush = 1;
++		printf("FUXI IDLE: idle L1 flush skipped (fuxinoidleflush=1)\n");
++	}
 +	if (!PE_parse_boot_argn("fuxicpuload", &seconds, sizeof(seconds)) || !fi_period(seconds)) {
 +		return;
 +	}
-+	fi_seconds = fi_period(seconds);
 +	max = ml_get_max_cpu_number();
 +	fi_ncpu = max < 0 ? 1 : (unsigned)max + 1;
 +	if (fi_ncpu > FI_MAX_CPUS) {
 +		fi_ncpu = FI_MAX_CPUS;
 +	}
++	fi_seconds = fi_period(seconds);        /* also arms the IPI and idle hooks */
 +	if (kernel_thread_start(fi_thread, NULL, &thread) != KERN_SUCCESS) {
 +		printf("FUXI IDLE: cpuload thread NOT started\n");
 +		return;
