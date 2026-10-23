@@ -210,8 +210,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--ath12k-src', type=Path)
     args = parser.parse_args()
+    import fuxi_wlan_mlo_test as mlo
     if args.ath12k_src:
         check_upstream(args.ath12k_src)
+        mlo.check_upstream(args.ath12k_src)
     spec = importlib.util.spec_from_file_location('w15', ROOT/'tools/test-fuxi-wlan-w15.py')
     w15 = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(w15)
@@ -247,6 +249,11 @@ def main():
     m6.PREAMBLE = m6.PREAMBLE.replace('static bool PE_parse_boot_argn(', 'static int w15_arg;\nstatic bool PE_parse_boot_argn(')
     m6.PREAMBLE = m6.PREAMBLE.replace('assert(size==sizeof(int)); return false; }', 'assert(size==sizeof(int)); memcpy(out,&w15_arg,size); return true; }')
     w15.main()
+    spec = importlib.util.spec_from_file_location('w15_mlo', ROOT/'tools/test-fuxi-wlan-w15.py')
+    fresh = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fresh)
+    fresh.TESTS = mlo.tests(fresh.TESTS, w15=True)
+    fresh.main()
     print('Independent EI bytes and opt-in shadow omission passed against production C')
 
 

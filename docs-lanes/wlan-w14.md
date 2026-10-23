@@ -199,8 +199,10 @@ drain its TX completion before sending the next. Other selectors retain
 
 The existing single outstanding txn/node/port/message correlation and result
 checks apply: missing/duplicate/malformed common results and either nonzero
-result or error fail. Only W13's empty-memory negotiation retains its special
+result or error fail. W13's empty-memory negotiation retains its special
 result-nonzero/error-zero acceptance; downloads never use that exception.
+The opt-in optional PHY_CAP has ath12k's result-only check and fallback
+semantics described below.
 A 512-request guard bounds W14 (two maximum-size files need at most 342
 segments, plus setup and M3). WLFW waits are ten seconds with 10-ms polls;
 TX drains retain two-second deadlines. No request/segment is retried.
@@ -506,7 +508,7 @@ unproven. Do not add CE programming before MODE based on this failure alone.
 | --- | --- | --- |
 | PCI/MSI | [pci.c:55](https://github.com/torvalds/linux/blob/v6.12/drivers/net/wireless/ath/ath12k/pci.c#L55) assigns 16 vectors: MHI 0–2, CE 3–7, DP 8–15; one-vector fallback shares vector 0. `power_up` enables MSI at pci.c:1276. | `fuxi_wlan.c:2549–2555` enables 32 MSI vectors into an owned RAM sink when `seq=msi`; polling, no IRQ handler. Default disables MSI/INTx (`:2142–2154`); no CE/DP vectors serviced. |
 | QMI MSI config | qmi.c:2069–2114 leaves `wake_msi_valid` zero; qmi.c:2893–2943 sets host_version, target/service arrays and shadow v3 only. | Same omission. There is no missing MSI TLV in either HOST_CAP or CFG for this path (`fuxi_wlan.c:4117`, `:3571`). CE MSI ring programming occurs after MODE. |
-| PHY/MLO capability | [qmi.c:3082](https://github.com/torvalds/linux/blob/v6.12/drivers/net/wireless/ath/ath12k/qmi.c#L3082) sends PHY_CAP before IND_REGISTER/HOST_CAP. qmi.c:2147–2205 uses num_phy and single_chip_mlo_support; fallback def_num_link=2. qmi.c:2019–2066 conditionally populates MLO. | Earlier W12 setup has no PHY_CAP; HOST_CAP always advertises MLO with two links, chip/group 0, max peers 32 (`fuxi_wlan.c:4117–4130`). Matches fallback, may differ from this firmware's PHY_CAP. CAP's two MACs are not proof of PHY_CAP response. |
+| PHY/MLO capability | [qmi.c:3082](https://github.com/torvalds/linux/blob/v6.12/drivers/net/wireless/ath/ath12k/qmi.c#L3082) sends PHY_CAP before IND_REGISTER/HOST_CAP. qmi.c:2147–2205 uses num_phy and single_chip_mlo_support; fallback def_num_link=2. qmi.c:2019–2066 conditionally populates MLO. | Default W12 setup has no PHY_CAP; HOST_CAP advertises two links, chip/group 0, max peers 32. `fuxiwlanmlo=1` now follows PHY_CAP negotiation; `=2` omits all MLO TLVs. See the detailed comparison below. Default matches fallback, but may differ from this firmware's PHY_CAP. CAP's two MACs are not proof of PHY_CAP response. |
 | HOST_CAP other fields | qmi.c:2069–2114: one client, memory mode 0, BDF/M3/cache support 1, cal_done 0 on fresh boot; WCN internal-clock nm_modem bits 1/2/3 and features 3/4 (hw.c:945,989). | Same values in `fuxi_wlan.c:4117–4130`. This audit found no omitted upstream-required wake MSI field. |
 | ASPM / L1 | [pci.c:916](https://github.com/torvalds/linux/blob/v6.12/drivers/net/wireless/ath/ath12k/pci.c#L916) clears endpoint L0s/L1 before MHI boot; restore only in HIF start (pci.c:1152), after MODE. | Default clears L0s/L1 at **both** RC/EP; `aspm=1` retains inherited state; `pre=l1ss` also clears four L1SS enable bits (`fuxi_wlan.c:1437–1470`). No normal restore before MODE. |
 | Boot register writes | [pci.c:328](https://github.com/torvalds/linux/blob/v6.12/drivers/net/wireless/ath/ath12k/pci.c#L328): LTSSM/hot-reset workaround, interrupt clear, QFPROM VDD4BLOW clear, BHI vector clear, warm entry clear/reset-cause read, SoC global reset, MHI reset. | Comparable sequence is optional `pre=reset`, not default (`fuxi_wlan.c:1230–1288`). `pre=qfprom` uses a different mask (5 versus reset's 4). Existing sequence/POR flags add independent deltas; this audit does not assume the supplied run selected them. |
@@ -519,8 +521,8 @@ unproven. Do not add CE programming before MODE based on this failure alone.
 The strongest narrow CFG isolation available without adding host ring writes
 is to remove shadow v3. This tests whether this firmware/build/board combination
 rejects applying the otherwise matching address set during MODE. It is a
-hypothesis, not a known ath12k fix. PHY_CAP/MLO negotiation and RX capacity are
-separate candidates for a later experiment if shadow omission changes nothing.
+hypothesis, not a known ath12k fix. The PHY_CAP/MLO variants below and RX capacity are separate candidates;
+no causal link to the observed MODE failure has been established.
 
 ### Opt-in experiment and read-only timeout evidence
 
@@ -577,3 +579,164 @@ preservation of context/IPCR memory. The independent audit test also exercises
 the full no-shadow conversation and invalid/non-W15 selector behavior. W10–W15
 and the independent audit entrypoint pass with the existing ASan/UBSan harness;
 the new test is registered in the host check list (no CI was invoked).
+
+
+## PHY_CAP / HOST_CAP experiment (`fuxiwlanmlo`)
+
+This is a host-only implementation/validation milestone, with **no new device
+observations**. The MODE timeout and ERRDBG pair above remain unexplained.
+Append one selector to the existing boot arguments:
+
+| Boot argument | Behavior for `fuxiwlanqrtr=2..5` |
+| --- | --- |
+| Absent or `fuxiwlanmlo=0` | Exact previous behavior: no PHY_CAP, fixed two-link MLO HOST_CAP, same bytes/order/transaction IDs and logs. |
+| `fuxiwlanmlo=1` | PHY_CAP → IND_REGISTER → derived HOST_CAP → existing selected lane. |
+| `fuxiwlanmlo=2` | Skip PHY_CAP; omit the entire HOST_CAP TLV set `0x21`–`0x26`. |
+
+For the MODE experiment use `fuxiwlanqrtr=5 fuxiwlanmlo=1` or
+`fuxiwlanqrtr=5 fuxiwlanmlo=2`, preserving the caller's other arguments.
+`fuxiwlanw15=1` remains an independent shadow-v3 omission selector. Negative
+and unknown MLO values refuse W12+ before bring-up; the selector is ignored
+outside W12+. No other HOST_CAP opt-in was needed: the audit found no other
+field/value/presence mismatch for a WCN7850 fresh boot.
+
+### Exact ath12k behavior and wire layout
+
+Adapted from Linux v6.12 BSD-3-Clause-Clear ath12k, credited in the source:
+The Linux Foundation (2018–2021), Qualcomm Innovation Center, Inc.
+(2021–2024). Sources/functions:
+
+* [ath12k_qmi_event_server_arrive](https://github.com/torvalds/linux/blob/v6.12/drivers/net/wireless/ath/ath12k/qmi.c#L3082)
+  calls PHY_CAP before IND_REGISTER and HOST_CAP, after WLFW discovery.
+* [ath12k_qmi_phy_cap_send](https://github.com/torvalds/linux/blob/v6.12/drivers/net/wireless/ath/ath12k/qmi.c#L2146)
+  sends message `0x57`; its request EI contains only EOTI, **no TLVs**.
+  Full first QMI request: `00 01 00 57 00 00 00`.
+* [PHY response EI](https://github.com/torvalds/linux/blob/v6.12/drivers/net/wireless/ath/ath12k/qmi.c#L539):
+  mandatory result `0x02` = u16 result + u16 error; optional `0x10` = u8
+  num_phy; `0x11` = u32 board_id; `0x13` = u8 single_chip_mlo_support.
+  There is no `0x12` in this EI. Top-level valid flags are presence only,
+  never payload bytes. The complete all-fields body is 22 bytes despite
+  qmi.h's stale response MAX_LEN=18; the decoder accepts all four fields.
+* [ath12k_core_alloc](https://github.com/torvalds/linux/blob/v6.12/drivers/net/wireless/ath/ath12k/core.c#L1286)
+  starts with intra-device MLO enabled and device_id=0.
+  [WCN7850 hw_params](https://github.com/torvalds/linux/blob/v6.12/drivers/net/wireless/ath/ath12k/hw.c#L933)
+  gives def_num_link=2 and max_mlo_peer=32.
+* [ath12k_host_cap_parse_mlo](https://github.com/torvalds/linux/blob/v6.12/drivers/net/wireless/ath/ath12k/qmi.c#L2019)
+  omits all six MLO TLVs if support is disabled or num_radios is 0/255.
+  Otherwise it sets capable=1, chip/group=0, max peers=32, num chips=1.
+  `0x26` is a **static** three-chip array of six bytes per chip: u8 chip_id,
+  u8 num_local_links, hw_link_id[2], valid_mlo_link_id[2]. Only chip zero
+  is populated. For one link it is `00 01 00 00 01 00` plus twelve zeros;
+  for two links `00 02 00 01 01 01` plus twelve zeros. No array count.
+
+On successful PHY result, an explicit support field sets/clears MLO; absent
+support preserves enabled. This occurs **before** checking num_phy presence.
+Absent num_phy selects the fallback two links while retaining any explicit
+support-disable. A rejected result ignores all optional fields; unavailable
+or undecodable PHY_CAP and a ten-second timeout select fallback two links.
+PHY result follows ath12k's result-only success check (the error value is
+still decoded/logged); the existing strict result/error checks for all other
+requests remain. PHY board_id is logged only: ath12k does not use it here to
+select BDF or replace the later CAP board ID.
+
+Port bounds: duplicate recognized fields, wrong scalar lengths, missing common
+result, truncated headers/values and trailing partial TLVs invalidate the
+whole correlated PHY reply, without applying partial fields. Unknown optional
+TLVs are skipped/reported. This port completes malformed optional replies
+immediately with fallback, rather than waiting for Linux QMI's decode failure
+to time out. Transport/MMIO/SMMU errors still contain; no fault is cleared to
+continue. For enabled MLO and num_phy 3–254, the port contains before HOST_CAP:
+upstream's unbounded loop would overrun its two-element link arrays. Counts
+0/255 follow upstream omission; a disabled-MLO reply with any count also
+omits MLO. This is an explicit memory-safety boundary, not a guessed firmware
+capability. No request is retried.
+
+With `=1`, PHY_CAP is transaction 1 and every later QMI transaction increases
+by one (IND_REGISTER 2, HOST_CAP 3). The existing request guard gains exactly
+one slot for this selector; memory/DMA/download/ready sequencing is unchanged.
+With `=2`, transaction IDs are unchanged. HOST_CAP body lengths: 85 bytes
+with one/two links, 42 with MLO omitted (92/49 including QMI header).
+
+### HOST_CAP comparison (all fields, WCN7850 fresh boot)
+
+[ath12k_qmi_host_cap_send](https://github.com/torvalds/linux/blob/v6.12/drivers/net/wireless/ath/ath12k/qmi.c#L2069)
+zero-initializes its request and sets only the fields below. The full
+[HOST_CAP EI](https://github.com/torvalds/linux/blob/v6.12/drivers/net/wireless/ath/ath12k/qmi.c#L64)
+is checked by the independent audit test. Scalars are little endian; widths
+below exclude the three-byte TLV header.
+
+| Field / TLV | ath12k v6.12 WCN7850 | Fuxi / difference |
+| --- | --- | --- |
+| num_clients `0x10` u32 | 1 | 1; match |
+| wake_msi `0x11` u32 | Absent | Absent; match |
+| gpios `0x12` u8 count + u32 array | Absent | Absent; match |
+| nm_modem `0x13` u8 | `0x0e`: internal sleep clock bit 1, HOST_CSTATE bit 2, PCIe global reset bit 3 | Same, from internal_sleep_clock=true; match. This is upstream's non-Qualcomm-platform notification even on fuxi. |
+| bdf_support `0x14` u8 | 1 | 1; match |
+| bdf_cache_support `0x15` u8 | Absent | Absent; match |
+| m3_support `0x16` u8 | 1 | 1; match |
+| m3_cache_support `0x17` u8 | 1 | 1; match |
+| cal_filesys_support `0x18`, cal_cache_support `0x19` u8 | Absent | Absent; match |
+| cal_done `0x1a` u8 | 0 on fresh boot; may become 1 during upstream calibration lifecycle | 0; fresh-boot match; lane has no calibration lifecycle |
+| mem_bucket `0x1b` u32 | Absent | Absent; match |
+| mem_cfg_mode `0x1c` u8 | target_mem_mode = default 0, set in ath12k_qmi_init_service | 0; match |
+| cal_duration `0x1d` u16 | Absent (native field spelling cal_duraiton) | Absent; match |
+| platform_name `0x1e` string | Absent | Absent; match |
+| ddr_range `0x1f` static three start/size u64 pairs | Absent | Absent; match |
+| host_build_type `0x20` four-byte enum | Absent, not a transmitted zero | Absent; match |
+| mlo_capable/chip_id/group_id/max_mlo_peer/num_chips `0x21`–`0x25`, widths 1/2/1/2/1 | Conditional 1/0/0/32/1 | Default fixed; `=1` follows PHY reply; `=2` all absent |
+| mlo_chip_info `0x26`, 18 bytes | Conditional, links from PHY or fallback 2 | Default two links; `=1` derived as above; `=2` absent |
+| feature_list `0x27` u64 | `0x18`: CNSS_QDSS_CFG_MISS bit 3 + CNSS_PCIE_PERST_NO_PULL bit 4 | Same hw_params bitmap; match |
+| fw_mem_mode | **No separate HOST_CAP field/TLV** in ath12k v6.12; host memory mode is mem_cfg_mode `0x1c` | No extra TLV; match |
+
+### Expected log lines (templates, not device observations)
+
+Default/`=0` adds no log line. Nonzero selector configuration:
+
+```text
+FUXI WLAN: W12 mlo variant <N> (1 PHY_CAP, 2 omit MLO) valid <0|1>
+```
+
+For `=1`, the exact send/decode/selection formats are:
+
+```text
+FUXI WLAN: W12 send txn 1 msg 0x57 stage 0
+FUXI WLAN: W12 phy cap result <result> error <error> num_phy valid <0|1> value <n> board_id valid <0|1> value <hex> single_chip_mlo_support valid <0|1> value <n>
+FUXI WLAN: W12 phy cap unknown TLV <hex> bytes <n>
+FUXI WLAN: W12 phy cap fallback num_phy 2 (rejected)
+FUXI WLAN: W12 phy cap fallback num_phy 2 (absent num_phy)
+FUXI WLAN: W12 phy cap fallback num_phy 2 (malformed reply)
+FUXI WLAN: W12 phy cap fallback num_phy 2 (timeout 10000 ms)
+FUXI WLAN: W12 host cap MLO TLVs <present|omitted> num_phy <n>
+FUXI WLAN: W12 host cap ok
+FUXI WLAN: W12 failure: PHY_CAP num_phy exceeds two-link EI capacity; contain, no retry
+```
+
+Fallback/unknown/failure lines appear only for their respective condition.
+Zero formatted with `%#x` prints `0`; nonzero hex includes `0x`.
+For `=2` the selection line is exactly:
+
+```text
+FUXI WLAN: W12 host cap MLO TLVs omitted num_phy 2
+```
+
+### Host validation and remaining uncertainty
+
+W12 and W15's independent audit run production C with ASan/UBSan against
+synthetic peers. A shared independent EI metadata encoder checks every
+HOST_CAP field's TLV/type/presence, PHY's empty request, static chip/link
+arrays, and complete request bytes before the old peer normalizes transaction
+IDs to reuse its existing memory/download/INI/CFG/MODE checks. Cases cover
+absent/explicit-zero selectors, omission, one/two links, disabled/absent
+support, absent num_phy/board, 0/255 radio counts, nonboolean support, unknown
+TLVs, rejected/error responses, exactly ten-second optional timeout, stale
+transaction/message, out-of-capacity counts and malformed/duplicate/scalar/
+truncated replies with atomic fallback. The optional `--ath12k-src` audit
+checks the metadata against the local v6.12 EI declarations and hw_params.
+The original literal default fixtures remain unchanged. All seven
+`tools/test-fuxi-wlan-w1*.py` entrypoints passed, including the optional
+upstream-source audit. The patch C hunk matches the source byte-for-byte,
+with its new-file line count checked.
+
+No phone, CI, firmware staging, image build or push was used. Firmware's
+actual PHY_CAP reply, acceptance of the variants, MODE success/failure, and
+any causal interpretation of BHI ERRDBG2/3 remain unverified.

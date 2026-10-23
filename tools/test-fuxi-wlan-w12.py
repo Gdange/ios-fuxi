@@ -283,3 +283,10 @@ def main():
 
 if __name__ == '__main__':
     main()
+    import fuxi_wlan_mlo_test as mlo
+    # Harness builders mutate imported preambles; use a fresh module graph.
+    spec = importlib.util.spec_from_file_location('w12_mlo', __file__)
+    fresh = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fresh)
+    fresh.TESTS = mlo.tests(fresh.PEER)
+    fresh.main()

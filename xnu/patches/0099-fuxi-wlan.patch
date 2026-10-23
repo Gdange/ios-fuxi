@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,4745 @@
+@@ -0,0 +1,4842 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -52,6 +52,7 @@
 + *   fuxiwlanseq=cyclerails  also cycle shared rails (froze the SoC once)
 + *   fuxiwlanstop22=1  retain the BHI-only diagnostic stop (default: continue)
 + *   fuxiwlankeep=1  retain DMA/device only after complete selected milestone success
++ *   fuxiwlanmlo=1  ath12k PHY_CAP/MLO negotiation; =2 omit MLO (W12+; default unchanged)
 + *   fuxiwlanqrtr=1  W11 capability-only diagnostic; =2 W12 setup; =3 W13 small-chunk negotiation; =4 W14 downloads; =5 W15 config/mode
 + *   fuxiwlanw15=1  W15 only: omit WLAN_CFG shadow-v3 TLV (default 0)
 + * Steps 17..28 probe DMA safety and load rootfs firmware through BHI/BHIe.
@@ -749,7 +750,7 @@
 +static struct wl_dma wl_image, wl_vectors, wl_contexts, wl_tables;
 +static struct wl_dma wl_amss; /* full file when BHI uses a separate prefix */
 +static bool wl_qrtr, wl_w12, wl_w13, wl_w14, wl_w15, wl_w11_attempted, wl_w11_ok;
-+static unsigned wl15_variant;
++static unsigned wl15_variant, wl12_mlo_variant;
 +/* W12/W13 allocate after an accepted REQUEST_MEM; retain partial allocations until
 + * containment is proven. Limit includes XNU page rounding, not just wire sizes. */
 +#define WL13_CHUNK_LIMIT (2u * 1024u * 1024u)
@@ -881,6 +882,16 @@
 +	(void)PE_parse_boot_argn("fuxiwlankeep", &keep, sizeof(keep));
 +	(void)PE_parse_boot_argn("fuxiwlanqrtr", &qrtr, sizeof(qrtr));
 +	wl_w15 = qrtr == 5; wl_w14 = qrtr == 4 || wl_w15; wl_w13 = qrtr == 3 || wl_w14; wl_w12 = qrtr == 2 || wl_w13; wl_qrtr = qrtr == 1 || wl_w12; wl_w11_attempted = wl_w11_ok = false;
++	wl12_mlo_variant = 0;
++	if (wl_w12) {
++		int variant = 0;
++		(void)PE_parse_boot_argn("fuxiwlanmlo", &variant, sizeof(variant));
++		if (variant < 0 || variant > 2) { wl_variant_invalid = true; }
++		else { wl12_mlo_variant = (unsigned)variant; }
++		if (variant) {
++			printf("FUXI WLAN: W12 mlo variant %d (1 PHY_CAP, 2 omit MLO) valid %u\n", variant, !wl_variant_invalid);
++		}
++	}
 +	wl15_variant = 0;
 +	if (wl_w15) {
 +		int variant = 0;
@@ -2947,6 +2958,9 @@
 +static unsigned wl12_stage;
 +static uint16_t wl12_txn, wl12_msg;
 +static bool wl12_reply, wl12_requested, wl12_ready;
++/* WCN7850 core_alloc initial MLO support and hw_params.def_num_link. */
++static bool wl12_mlo_enabled;
++static unsigned wl12_num_phy;
 +static bool wl13_delayed, wl13_negotiated;
 +static bool wl14_ready, wl14_init_done, wl14_board_valid;
 +static uint64_t wl15_ready_time;
@@ -3486,7 +3500,7 @@
 +static int
 +wl12_send(struct wl12_encoder *e, unsigned msg, unsigned stage)
 +{
-+	if (e->len < 7 || e->len > sizeof(e->data) || wl12_txn >= (wl_w14 ? 512 : wl_w13 ? 5 : 4) || wl_w11_guard()) {
++	if (e->len < 7 || e->len > sizeof(e->data) || wl12_txn >= (unsigned)((wl_w14 ? 512 : wl_w13 ? 5 : 4) + (wl12_mlo_variant == 1)) || wl_w11_guard()) {
 +		return wl_w11_fail("QMI request bounds/one attempt");
 +	}
 +	wl12_stage = stage; wl12_msg = msg; wl12_txn++; wl12_reply = false;
@@ -3495,6 +3509,85 @@
 +	wl_put16(e->data+3, msg); wl_put16(e->data+5, e->len-7);
 +	printf("FUXI WLAN: %s send txn %u msg %#x stage %u\n", wl_w15 && stage >= WL15_INI ? "W15" : "W12", wl12_txn, msg, stage);
 +	return wl_qrtr_send(1, wl_server_node, wl_server_port, e->data, e->len);
++}
++
++/* Adapted wire facts/behavior from Linux v6.12 ath12k qmi.c/qmi.h:
++ * ath12k_qmi_phy_cap_send(), ath12k_host_cap_parse_mlo(),
++ * ath12k_qmi_host_cap_send(); core.c ath12k_core_alloc(), hw.c WCN7850.
++ * BSD-3-Clause-Clear. Copyright (c) 2018-2021 The Linux Foundation;
++ * Copyright (c) 2021-2024 Qualcomm Innovation Center, Inc.
++ * Independent bounded codec; no Linux QMI helpers/native packing.
++ * PHY board_id is reported only (ath12k does not use it for BDF selection). */
++static int
++wl12_phy_reply(const uint8_t *p, unsigned len)
++{
++	unsigned seen = 0, num = 0, support = 0, result = 0, error = 0;
++	uint32_t board = 0;
++	if (len < 7 || wl_get16(p+5) != len-7) { goto malformed; }
++	for (unsigned off = 7; off < len;) {
++		if (len-off < 3) { goto malformed; }
++		unsigned type = p[off], n = wl_get16(p+off+1); off += 3;
++		if (n > len-off) { goto malformed; }
++		unsigned bit = type == 2 ? 1 : type == 0x10 ? 2 : type == 0x11 ? 4 : type == 0x13 ? 8 : 0;
++		if (bit) {
++			if ((seen & bit) || n != (bit == 1 || bit == 4 ? 4u : 1u)) { goto malformed; }
++			seen |= bit;
++			if (bit == 1) { result = wl_get16(p+off); error = wl_get16(p+off+2); }
++			else if (bit == 2) { num = p[off]; }
++			else if (bit == 4) { board = wl_get32(p+off); }
++			else { support = p[off]; }
++		} else { printf("FUXI WLAN: W12 phy cap unknown TLV %#x bytes %u\n", type, n); }
++		off += n;
++	}
++	if (!(seen & 1)) { goto malformed; }
++	printf("FUXI WLAN: W12 phy cap result %u error %u num_phy valid %u value %u board_id valid %u value %#x single_chip_mlo_support valid %u value %u\n",
++	    result, error, !!(seen & 2), num, !!(seen & 4), board, !!(seen & 8), support);
++	/* Match ath12k's result check and order: support applies before the
++	 * missing-num_phy fallback. Absent support retains initial support. */
++	if (!result) {
++		if (seen & 8) { wl12_mlo_enabled = support != 0; }
++		if (seen & 2) { wl12_num_phy = num; wl12_reply = true; return 0; }
++	}
++	printf("FUXI WLAN: W12 phy cap fallback num_phy 2 (%s)\n", result ? "rejected" : "absent num_phy");
++	wl12_reply = true;
++	return 0;
++malformed:
++	/* ath12k treats decode failure like an unavailable PHY response. Do
++	 * not apply partially decoded fields; close this optional transaction. */
++	printf("FUXI WLAN: W12 phy cap fallback num_phy 2 (malformed reply)\n");
++	wl12_reply = true;
++	return 0;
++}
++
++static int
++wl12_host_cap(struct wl12_encoder *e)
++{
++	/* ath12k_qmi_host_cap_send: fresh boot cal_done=0, memory mode=0,
++	 * internal clock bits 1/2/3, hw_params CNSS feature bits 3/4. */
++	if (wl12_tlv(e, 0x10, 1, 4) || wl12_tlv(e, 0x13, 0x0e, 1) ||
++	    wl12_tlv(e, 0x14, 1, 1) || wl12_tlv(e, 0x16, 1, 1) ||
++	    wl12_tlv(e, 0x17, 1, 1) || wl12_tlv(e, 0x1a, 0, 1) ||
++	    wl12_tlv(e, 0x1c, 0, 1)) { return 1; }
++	bool mlo = wl12_mlo_variant != 2 && wl12_mlo_enabled && wl12_num_phy && wl12_num_phy != 255;
++	if (mlo) {
++		/* Upstream's arrays hold TWO links. Refuse unsupported counts
++		 * instead of reproducing its unchecked array writes for 3..254. */
++		if (wl12_num_phy > 2) { return wl_w11_fail("PHY_CAP num_phy exceeds two-link EI capacity"); }
++		if (wl12_tlv(e, 0x21, 1, 1) || wl12_tlv(e, 0x22, 0, 2) ||
++		    wl12_tlv(e, 0x23, 0, 1) || wl12_tlv(e, 0x24, 32, 2) ||
++		    wl12_tlv(e, 0x25, 1, 1)) { return 1; }
++		/* EI STATIC_ARRAY: three chips, each chip_id, num_local_links,
++		 * hw_link_id[2], valid_mlo_link_id[2]. No count/valid prefixes. */
++		if (e->len > sizeof(e->data)-21) { return wl_w11_fail("HOST_CAP MLO bounds"); }
++		e->data[e->len++] = 0x26; wl_put16(e->data+e->len, 18); e->len += 2;
++		uint8_t info[18] = {0}; info[1] = wl12_num_phy;
++		for (unsigned i = 0; i < wl12_num_phy; i++) { info[2+i] = i; info[4+i] = 1; }
++		memcpy(e->data+e->len, info, sizeof(info)); e->len += sizeof(info);
++	}
++	if (wl12_mlo_variant) {
++		printf("FUXI WLAN: W12 host cap MLO TLVs %s num_phy %u\n", mlo ? "present" : "omitted", wl12_num_phy);
++	}
++	return wl12_tlv(e, 0x27, 0x18, 8);
 +}
 +
 +/* W15 variable arrays: one u8 count followed by explicitly LE u32 fields.
@@ -3711,6 +3804,10 @@
 +wl_qmi_w12(const uint8_t *p, unsigned len)
 +{
 +	const char *lane = wl_w15 && wl12_stage >= WL15_INI ? "W15" : "W12";
++	if (len >= 7 && p[0] == 2 && wl12_mlo_variant == 1 && wl12_msg == 0x57 &&
++	    !wl12_reply && wl_get16(p+1) == wl12_txn && wl_get16(p+3) == 0x57) {
++		return wl12_phy_reply(p, len);
++	}
 +	if (len < 7 || wl_get16(p+5) != len-7) { return wl_w11_fail("QMI header length"); }
 +	unsigned flag = p[0], txn = wl_get16(p+1), msg = wl_get16(p+3);
 +	bool indication = flag == 4;
@@ -3922,6 +4019,10 @@
 +		}
 +		if (what == 0 ? wl12_reply : what == 1 ? wl12_requested : what == 2 ? wl12_ready : wl14_ready) { return 0; }
 +		if (ms < 10000) { wl_sleep(10); }
++	}
++	if (wl12_mlo_variant == 1 && wl12_msg == 0x57) {
++		printf("FUXI WLAN: W12 phy cap fallback num_phy 2 (timeout 10000 ms)\n");
++		return 0; /* ath12k_qmi_phy_cap_send is optional; transport faults are fatal above. */
 +	}
 +	printf("FUXI WLAN: %s timeout %s (10000 ms); contain, no retry\n", wl_w15 && wl12_stage >= WL15_INI ? "W15" : "W12", stage);
 +	if (wl_w15 && wl12_stage == WL15_MODE) { wl15_timeout_snapshot(); }
@@ -4136,6 +4237,14 @@
 +	static struct wl12_encoder e;
 +	bzero(&e, sizeof(e)); e.len = 7;
 +	wl_target_n = 0; wl_target_total = 0;
++	wl12_num_phy = 2; wl12_mlo_enabled = true;
++	/* ath12k_qmi_event_server_arrive: PHY_CAP before IND_REGISTER/HOST_CAP.
++	 * Its request EI is EOTI only: zero TLVs, seven-byte QMI header.
++	 * Discovery stage stays zero until IND_REGISTER; old stage IDs unchanged. */
++	if (wl12_mlo_variant == 1) {
++		if (wl12_send(&e, 0x57, WL12_DISCOVERY) || wl12_wait(0, "PHY_CAP reply")) { return 1; }
++		bzero(&e, sizeof(e)); e.len = 7;
++	}
 +	/* IND_REGISTER: exactly the five enables + client ID set by ath12k.
 +	 * Pin/cal-download/cal-update/MSA/XO/rejuvenate TLVs remain absent. */
 +	if (wl12_tlv(&e, 0x10, 1, 1) || wl12_tlv(&e, 0x15, 0x4b4e454c, 4) ||
@@ -4144,19 +4253,7 @@
 +	    wl12_send(&e, 0x20, WL12_IND) || wl12_wait(0, "IND_REGISTER reply")) { return 1; }
 +	printf("FUXI WLAN: W12 ind register ok\n");
 +	bzero(&e, sizeof(e)); e.len = 7;
-+	/* HOST_CAP: WCN7850 v6.6 defaults, including its internal-clock/MLO
-+	 * fields and CNSS feature bits 3|4. cal_done=0 on a fresh boot. */
-+	if (wl12_tlv(&e, 0x10, 1, 4) || wl12_tlv(&e, 0x13, 0x0e, 1) ||
-+	    wl12_tlv(&e, 0x14, 1, 1) || wl12_tlv(&e, 0x16, 1, 1) ||
-+	    wl12_tlv(&e, 0x17, 1, 1) || wl12_tlv(&e, 0x1a, 0, 1) ||
-+	    wl12_tlv(&e, 0x1c, 0, 1) || wl12_tlv(&e, 0x21, 1, 1) ||
-+	    wl12_tlv(&e, 0x22, 0, 2) || wl12_tlv(&e, 0x23, 0, 1) ||
-+	    wl12_tlv(&e, 0x24, 32, 2) || wl12_tlv(&e, 0x25, 1, 1)) { return 1; }
-+	/* Static three-chip array: first chip has two links, others zero. */
-+	e.data[e.len++] = 0x26; wl_put16(e.data+e.len, 18); e.len += 2;
-+	const uint8_t mlo[18] = {0, 2, 0, 1, 1, 1};
-+	memcpy(e.data+e.len, mlo, sizeof(mlo)); e.len += sizeof(mlo);
-+	if (wl12_tlv(&e, 0x27, 0x18, 8) || wl12_send(&e, 0x34, WL12_HOST) ||
++	if (wl12_host_cap(&e) || wl12_send(&e, 0x34, WL12_HOST) ||
 +	    wl12_wait(0, "HOST_CAP reply")) { return 1; }
 +	printf("FUXI WLAN: W12 host cap ok\n");
 +	wl12_stage = WL12_REQUEST;
