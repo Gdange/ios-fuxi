@@ -540,3 +540,24 @@ test, HID/key, idle and governor tests, all eleven patch sync checks, ARM64
 syntax of both changed translation units against the saved XNU headers, and
 framebuffer syntax without FUXI. Both kernel-profile CI dry runs and shell
 syntax passed. No kernel link, device boot or root edit was performed.
+
+## Device results (modes 1–3, attention awareness)
+
+**OBSERVED** on the device, with no input apart from one scripted Power
+click (`fuxikeyscript=S fuxikeyscriptn=1`):
+
+| Configuration | Auto-off after SpringBoard turns the display on | Re-lock after a Power wake | backboardd first frame |
+| --- | --- | --- | --- |
+| No backlight service | none within 330 s (one boot went off after ~290 s) | not measured | 7.6 s |
+| `fuxibacklight=1` | after ~20–40 s | none within 420 s | 12.4–12.8 s |
+| `fuxibacklight=2` | none within 250 s | not measured | 12.6–18.3 s |
+| `fuxibacklight=3` | none within 260 s | not measured | 13.3 s |
+| `fuxibacklight=1` + `SBDisableAttentionAwareness=true` | after ~30 s | none within 270 s | 12.4 s |
+
+Delivering the OFF interest message during the boot-time display off is
+enough to suppress the later auto-off. Turning attention awareness off
+does not restore the re-lock. With the display off, the settled CPU
+temperature was about 4 C lower than in a run that left it on
+(**GUESS:** both panel and scanout power; back-to-back boots add residual
+heat). Mode 1 stays the recommended setting despite the slower first
+frame; re-lock after wake remains open.
