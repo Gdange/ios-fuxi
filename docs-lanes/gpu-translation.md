@@ -418,3 +418,171 @@ cached XNU headers. These host checks do not replace the device experiment.
   migrating the thread. Refusals log
   `FUXI PERF: compile refused reason=N` (1 busy, 2 not ready, 3 thermal,
   4 duty, 5 no online fast core).
+
+## Frame time breakdown
+
+### OBSERVED: supplied interaction and synchronous submission
+
+The supplied `research/ft/use89.log` ends at 502 completed surface frames,
+255 late frames (50.8%), and zero recorded failures. Interaction windows include
+`hz=4.84 gpu_ms=4.180`, `hz=11.41 gpu_ms=5.516`, and
+`hz=22.98 gpu_ms=6.650`. These are completion-window averages, not per-frame
+percentiles. Low GPU execution time alone does not establish where the CPU
+spent time. The user reports very laggy swiping.
+
+`Frontend.mm` commits synchronously: it acquires surface writer leases, copies
+no-copy buffer shadows, submits operation segments around process-local events,
+then publishes Completed and delivers handlers. `Backend::submit` holds its
+mutex through preparation, queue submission, fence completion and invalidation.
+A pipeline compilation or cache checkpoint can contend for that same mutex.
+
+The blocking/cost audit below refers to the implementation in this change;
+all paths are conditional unless described as every nonempty submit. Vulkan
+object creation and cache maintenance are synchronous CPU calls, not additional
+explicit GPU completion waits.
+
+| Location | Blocking wait or synchronous work |
+| --- | --- |
+| `tools/fuxi-metal/Backend.hpp:758` | Backend mutex, held through the fence wait; shared with resource creation, compilation and cache maintenance. |
+| `tools/fuxi-metal/Backend.hpp:1100` | `vkQueueSubmit`; driver CPU work can itself block. No async worker is introduced. |
+| `tools/fuxi-metal/Backend.hpp:1104` and `:1106` | The **only explicit Vulkan completion wait**: `vkWaitForFences`, once per nonempty operation segment, production timeout 2 seconds. Host-only macro can extend it. A Metal command with events may have several segments/waits. |
+| `tools/fuxi-metal/Backend.hpp:1110` | Timestamp `vkGetQueryPoolResults` after the successful fence wait, without `VK_QUERY_RESULT_WAIT_BIT`; no extra wait requested. |
+| `tools/fuxi-metal/Backend.hpp:896`–`:897`, `:1116`–`:1117` | Synchronous whole-allocation flush before queue submission and invalidate after completion for each noncoherent referenced buffer/mapped image. HOST_COHERENT skips these calls. No per-frame map for ordinary persistent resources. |
+| `tools/fuxi-metal/Backend.hpp:882`–`:892`, `:322`–`:323` | Alias-copy snapshot and translator neutral buffers call `allocateUnlocked`: buffer creation, `vkAllocateMemory`, bind, `vkMapMemory`, CPU zeroing. Default: transient allocation each applicable submit, destroyed during cleanup. Opt-in scratch reuse covers only the bounded alias buffer. Neutral buffers remain transient. |
+| `tools/fuxi-metal/Backend.hpp:900`–`:906` | Command pool/buffer, fence and timestamp query pool are **already reused**. Created on first use or after recovery; reset on subsequent submits, after the prior fence completed. No default per-frame command-buffer creation. |
+| `tools/fuxi-metal/Backend.hpp:923`–`:939`, `:990` | Descriptor pool is **already reused**, geometrically grown for new type/set capacity, reset per submit. Descriptor sets are still allocated and updated per draw. |
+| `tools/fuxi-metal/Backend.hpp:981`, `:1017`, `:1040` | Framebuffers and sampled image views have bounded caches. Cache misses/overflow create objects; partial empty passes create transient render-pass/framebuffer objects. |
+| `tools/fuxi-metal/Backend.hpp:944`, `:1056`, `:1067`, `:1074`, `:1078` | GPU staging: sampled linear shadows refresh buffer-to-image; aliases snapshot image-to-buffer then buffer-to-image; explicit texture uploads/readbacks copy to/from buffers. These commands share the segment's single fence wait. |
+| `tools/fuxi-metal/Backend.hpp:857`, `:858`, `:862`, `:735` | Submission can synchronously translate/create runtime pipeline variants and lazy topology pipelines. Not unconditional per-frame pipeline creation. |
+
+There are **no `vkQueueWaitIdle` or `vkDeviceWaitIdle` calls** in this backend.
+Resource creation outside submit can also allocate/map memory (buffer import,
+image import and ordinary texture allocation); it is not an unconditional
+per-submit operation. Frontend IOSurface locks (`Frontend.mm:1230`), shadow
+`memcpy` (`Frontend.mm:1237`), and explicit process-local event waits
+(`Frontend.mm:1242`, up to 2 seconds) are additional possible stalls.
+`waitUntilCompleted` (`Frontend.mm:1280`) can wait for a configured completion
+queue's handlers; that wait is outside the measured commit interval.
+
+### Opt-in diagnostics and log format
+
+`fuxigpuframetrace=1` enables the additional line from the existing five-second
+backboardd reporter. Default is off, with no environment-variable fallback.
+Both new options use `translationOption`: only one exact `=1` token enables;
+`=0`, malformed values and duplicate occurrences disable, including duplicate
+`=1` tokens. Whitespace tokenization matches the existing translation options.
+No diagnostic thread, per-frame heap storage, or per-frame printing is added.
+
+Example **format only**, not a device measurement:
+
+```text
+FUXI MTL: frame trace n=100 samples=100 wall=12.000/25.000/80.000 ms cpu_before_commit=4.000/9.000 shadow_copy=0.100/0.300 lease_lock=0.200/0.800 backend_submit=2.000/8.000 gpu_wait=4.000/7.000 gpu_exec=3.000/6.000 draws/frame=8.00 render_passes/frame=8.00 pipelines/frame=0.10 descriptors/frame=8.00 allocations/frame=0.20 cpu_hist=0:10,1:10,2:20,3:20,4:10,5:10,6:20,7:0,unknown:0 encode_counts_unknown=0 gpu_exec_unavailable=0
+```
+
+- `n`: successfully completed command buffers storing a defined IOSurface
+  render target, matching the existing gate's frame definition. It is a
+  **window** count; a command is not necessarily a display refresh. Failures,
+  non-surface commands and native-backend commands have no frame-trace sample.
+  The existing `FUXI MTL: backboardd frames=...` line is preserved.
+- All slash pairs are p50/p90 in milliseconds; `wall` adds the maximum.
+  Host phases use `steady_clock` elapsed time and include descheduling.
+  `wall` runs from commit to successful synchronous completion, including
+  lease release, before user handlers and gate persistence/reporting work.
+- `cpu_before_commit`: command-buffer creation to commit, the elapsed CA encode
+  interval. It includes scheduling gaps and CPU waits; it is not CPU usage.
+  Compilation before command-buffer creation and intervals between commands
+  are outside it.
+- `shadow_copy`: the frontend resource scan and shadow `memcpy` loop.
+  `lease_lock`: surface lease acquisition plus backend mutex acquisition over
+  all operation segments. Surface unlock and post-fence retirement contribute
+  to wall but are not included in this pair.
+- `backend_submit`: after acquiring the backend mutex through return from
+  `vkQueueSubmit`, including validation, flush, allocation, translation,
+  recording and descriptor work. `gpu_wait`: time inside `vkWaitForFences`.
+  Explicit Metal event waits and post-fence invalidation/cleanup contribute to
+  wall, outside these pairs.
+- `gpu_exec`: existing Vulkan top/bottom timestamps, converted with the device
+  timestamp period and valid-bit mask, summed across segments. This is GPU
+  elapsed time, **overlaps** the CPU fence wait, and must not be added to it.
+  `gpu_exec_unavailable` counts frames without timestamp samples; their stored
+  value is zero. It is not an engine utilization counter.
+- Draw/pass counts are actual recorded Vulkan draws/render passes. A Metal
+  encoder with many draws currently becomes many Vulkan passes; full-image
+  clear-only operations can instead use `vkCmdClearColorImage` (zero passes).
+  Count fields are window arithmetic means per completed surface command.
+- `pipelines`, `descriptors`, `allocations`: successful
+  `vkCreateGraphicsPipelines` pipeline objects, `vkAllocateDescriptorSets` sets
+  (not descriptor writes/pool creation), and `vkAllocateMemory` objects.
+  Thread-local counters cover creation-to-completion on the committing thread.
+  They exclude work on other threads. Overlapping command-buffer lifetimes can
+  attribute the same intervening thread activity to multiple commands. If
+  creation and commit occur on different threads, only commit-time counts are
+  available and `encode_counts_unknown` increments. These counts are diagnostic
+  attribution, not process totals or host malloc counts.
+- Percentiles retain the latest 1,024 samples per reporting window in a fixed
+  array; `samples` exposes truncation. Maximum wall, means and CPU histogram
+  cover **all** `n` samples. Reporting sorts a fixed scratch array, then resets
+  window counters, including idle windows (`n=0`).
+
+**CPU convention verified against visible XNU sources:**
+`osfmk/arm64/machine_machdep.h:35`–`:43` specifies the logical CPU in the low
+12 bits of **TPIDR_EL0**, mask `0xfff`. `libsyscall/os/tsd.h:70`–`:79`
+implements `_os_cpu_number()` by reading that register. TPIDRRO_EL0 holds the
+cthread pointer in those sources; using its low bits would produce a misleading
+histogram. The instrumentation reads TPIDR_EL0 once at commit entry on arm64
+Darwin; unsupported/host-test builds report unknown. This is a hint only:
+threads can migrate immediately before/after the read. Logical 0–1 are A510,
+2–5 A715/A710, 6 X3 in the supplied topology; the histogram neither pins threads
+nor establishes residency throughout encode/commit.
+
+### Opt-in conservative speedup and host evidence
+
+`fuxigpupipelined=1` currently enables **alias-copy scratch reuse only**. It
+retains one buffer per Backend, up to 1 MiB of requested payload, charged to
+existing resource limits (driver alignment can add padding). Larger requests
+use the original transient path. Growth destroys the quiescent smaller buffer
+before allocation; clean close reclaims it. The existing mutex and fence wait
+prove that previous GPU use has finished before reuse or growth. Every copy
+still records the full required snapshot and existing barriers. Pre-submit
+failure leaves reusable scratch; uncertain queue/fence ownership poisons the
+backend and retains resources until process death as before.
+
+This deliberately does not make commit asynchronous: status publication,
+completion handlers, CPU readback, event ordering and IOSurface ownership still
+follow the original synchronous contract. Retained scratch can consume quota
+between alias copies. With the flag absent, invalid or duplicated, allocation
+and completion behavior follow the default transient path.
+
+`tools/test-fuxi-metal-frametrace.py` uses the production Backend on lavapipe
+with ASan/UBSan. Twelve 128x128 overlapping same-image snapshots with changing
+CPU input allocate **12 objects by default versus 1 with reuse**, and full-image
+readback matches CPU snapshot references. Controls cover
+growth, >1 MiB transient fallback, pre-submit failure/retry, empty submission,
+partial empty render passes, scheduled callback after submission, clean close
+accounting, and refusal after an injected uncertain queue attempt. Duplicate and
+malformed pipeline flags select the default path. `FrameTraceTests.cpp` checks
+percentiles, reset, overflow, full-window maximum, log fields, the CPU bit mask,
+and nested/thread-local attribution. Traced M9o authored shader controls also
+verify pipeline, descriptor, draw and pass counters with unchanged pixels.
+Timing output is informational; no noisy wall-time threshold is a correctness
+assertion.
+
+Host validation passed 20 script suites: `test-fuxi-metal{,2,2g,2h}`, backend,
+frontend (its Linux controls), M6, M9a/M9b, M9g/M9h/M9i/M9k/M9l/M9m/M9n/M9o,
+cache, translation, and the new frametrace suite. M9a ran through M9b, including
+eight offline Rust adapter unit tests and SPIR-V validation. Available C++
+controls use ASan/UBSan. Native macOS frontend/defaults builds, real signed
+artifact staging/certification, and Apple-library suites were not run here.
+
+### GUESS / unverified
+
+Running encode/commit on A510 cores, pipeline compilation, shared-mutex
+contention, surface locking, shadow/staging copies, or CPU scheduling gaps could
+explain low completion Hz despite short GPU execution. The supplied log does
+not distinguish them, and this change makes no scheduler/affinity adjustment.
+The new trace must be collected during equivalent interaction to rank them.
+Alias reuse helps only commands using that path; its frequency and benefit to
+backboardd are unmeasured. No asynchronous commit change is justified by the
+host evidence alone. macOS Objective-C++ build, target register values, Turnip
+performance, actual frame percentiles and perceived UI improvement remain
+unverified; no device or hosted execution was performed.

@@ -11,9 +11,9 @@ inline bool translationOption(const char *args,const char *key,bool *present=nul
  }
  if(present)*present=count!=0;return count==1 && enabled;
 }
-struct TranslationPolicy {bool stages=false,trace=false,async=false,compileBoost=false;};
+struct TranslationPolicy {bool stages=false,trace=false,async=false,compileBoost=false,frameTrace=false,pipelined=false;};
 inline TranslationPolicy translationPolicy(const char *args) {
- return {translationOption(args,"fuxigpustages="),translationOption(args,"fuxigputrace="),translationOption(args,"fuxigpuasync="),translationOption(args,"fuxicompileboost=")};
+ return {translationOption(args,"fuxigpustages="),translationOption(args,"fuxigputrace="),translationOption(args,"fuxigpuasync="),translationOption(args,"fuxicompileboost="),translationOption(args,"fuxigpuframetrace="),translationOption(args,"fuxigpupipelined=")};
 }
 inline TranslationPolicy systemTranslationPolicy() {
  static const auto policy=[] {
@@ -24,7 +24,7 @@ inline TranslationPolicy systemTranslationPolicy() {
   systemString("kern.bootargs",args,sizeof(args));
 #endif
   bool stages=false,trace=false,async=false;
-  TranslationPolicy p{translationOption(args,"fuxigpustages=",&stages),translationOption(args,"fuxigputrace=",&trace),translationOption(args,"fuxigpuasync=",&async),translationOption(args,"fuxicompileboost=")};
+  TranslationPolicy p{translationOption(args,"fuxigpustages=",&stages),translationOption(args,"fuxigputrace=",&trace),translationOption(args,"fuxigpuasync=",&async),translationOption(args,"fuxicompileboost="),translationOption(args,"fuxigpuframetrace="),translationOption(args,"fuxigpupipelined=")};
   // Explicit boot keys, including =0/invalid/duplicates, take precedence.
   if(!stages){const char *v=getenv("FUXI_MTL_STAGE_CACHE");p.stages=v && !strcmp(v,"1");}
   if(!trace){const char *v=getenv("FUXI_MTL_TRANSLATION_TRACE");p.trace=v && !strcmp(v,"1");}

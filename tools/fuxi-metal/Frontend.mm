@@ -25,6 +25,7 @@
 #include "ClientSetup.hpp"
 #include "DrawSafety.hpp"
 #include "BackboardGate.hpp"
+#include <thread>
 #include "Survey.hpp"
 #include "Translator.hpp"
 #include "CAState.hpp"
@@ -899,6 +900,7 @@ static thread_local FuxiCommandBuffer *completionCommand;
 @end
 @interface FuxiCommandBuffer : FuxiLabeledObject {
  @public FuxiQueue *_queue; NSMutableArray *_resources,*_handlers,*_scheduledHandlers; NSError *_error;dispatch_group_t _completionGroup;
+ BOOL _frameTrace;fuxi::FrameClock::time_point _traceCreated;fuxi::FrameCounts _traceCounts;std::thread::id _traceThread;
  std::vector<FuxiEventPoint> _events;std::vector<fuxi::Operation> _ops; MTLCommandBufferStatus _status; BOOL _encoding,_rejected,_enqueued,_scheduled;
 }
 @end
@@ -1090,6 +1092,9 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
 - (id)device {CENSUS();return _device;}
 - (id)commandBuffer {CENSUS();
  FuxiCommandBuffer *b=[FuxiCommandBuffer new];b->_queue=[self retain];
+ if(fuxi::systemTranslationPolicy().frameTrace && !strcmp(clientProcess,"backboardd")){
+  b->_frameTrace=true;b->_traceCreated=fuxi::FrameClock::now();b->_traceCounts=fuxi::frameCounts;b->_traceThread=std::this_thread::get_id();
+ }
  b->_resources=[NSMutableArray new];b->_handlers=[NSMutableArray new];b->_scheduledHandlers=[NSMutableArray new];b->_completionGroup=dispatch_group_create();return [b autorelease];
 }
 // NativeMetal retains owners even for the unretained entry point. Resources
@@ -1209,20 +1214,28 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  _status=MTLCommandBufferStatusCommitted;
  bool backboard=!strcmp(clientProcess,"backboardd");
  auto frameStart=std::chrono::steady_clock::now();uint64_t gpuBefore=backboard?fuxi::Backend::gpuNanos.load():0;
+ fuxi::FrameSample trace;bool surfaceFrame=false;
+ auto countsBefore=fuxi::frameCounts;
+ if(_frameTrace){trace.cpuBeforeCommit=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(frameStart-_traceCreated).count());trace.cpu=fuxi::frameCPU();
+  trace.encodeCountsUnknown=_traceThread!=std::this_thread::get_id();if(!trace.encodeCountsUnknown)countsBefore=_traceCounts;
+ }
+ {fuxi::FrameTraceScope traceScope(_frameTrace?&trace:nullptr);
  // Deliberately synchronous M4 queue: no dispatch worker or asynchronous promise.
  if(backboardSurvey.active() && fuxi::backboardGate.blocked()){
   for(const auto &point:_events)if(point.signal)[point.event setSignaledValue:point.value];
   _scheduled=YES;_status=MTLCommandBufferStatusCompleted;[_error release];_error=nil;finishSurvey();
  }else try {if(fuxi::backboardGate.blocked())throw std::runtime_error("backboardd failure latched: CPU on next respawn");if(!strcmp(clientProcess,"fuxi-ca-smoke") && failureCount.load())throw std::runtime_error("CA diagnostic failure latched: GPU submission refused");if(_rejected)throw std::runtime_error("unsupported command: GPU submission refused");if(clientMode==fuxi::ClientMode::census)throw std::runtime_error("census: no GPU submission");auto *backend=owner(_queue->_device)->backend;size_t begin=0;
  if(gpuScanout)backend->requireLive();
+ auto leaseStart=_frameTrace?fuxi::FrameClock::now():fuxi::FrameClock::time_point{};
  fuxi::SurfaceLease lease(gpuScanout,lockScanoutSurface,unlockScanoutSurface,&backend->poisoned);
  if(gpuScanout)for(id resource in _resources)if([resource isKindOfClass:[FuxiTexture class]])
   lease.add((uintptr_t)[(FuxiTexture *)resource iosurface]);
+ if(_frameTrace)trace.leaseLock+=fuxi::frameNanos(leaseStart);
  auto shadowStart=std::chrono::steady_clock::now();
  for(id r in _resources){FuxiBuffer *s=nil;
   if([r isKindOfClass:[FuxiBuffer class]])s=r;else if([r isKindOfClass:[FuxiTexture class]])s=[(FuxiTexture *)r buffer];
   if(s && s->_shadow)memcpy(s->_buffer->contents,s->_wrapped,s->_wrappedLength);}
- fuxi::Backend::shadowCopyNanos+=(uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-shadowStart).count();
+ auto shadowNanos=fuxi::frameNanos(shadowStart);fuxi::Backend::shadowCopyNanos+=shadowNanos;if(_frameTrace)trace.shadowCopy+=shadowNanos;
  for(const auto &point:_events){
   if(point.operation>begin){backend->submit(std::vector<fuxi::Operation>(_ops.begin()+begin,_ops.begin()+point.operation),[&]{_scheduled=YES;});begin=point.operation;}
   if(point.signal)[point.event setSignaledValue:point.value];
@@ -1231,7 +1244,6 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  if(begin<_ops.size() || _events.empty())backend->submit(std::vector<fuxi::Operation>(_ops.begin()+begin,_ops.end()),[&]{_scheduled=YES;});
  else _scheduled=YES;
  for(const auto &op:_ops)if(op.pipeline)completedDraws.fetch_add(1);
- bool surfaceFrame=false;
  if(backboard)for(id r in _resources) {
   if(![r isKindOfClass:[FuxiTexture class]] || ![(FuxiTexture *)r iosurface])continue;
   auto *texture=((FuxiTexture *)r)->_texture;if(!texture)continue;
@@ -1239,8 +1251,9 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
   if(surfaceFrame)break;
  }
  _status=MTLCommandBufferStatusCompleted;
- if(surfaceFrame)fuxi::backboardGate.completed(fuxi::Backend::gpuNanos.load()-gpuBefore,
-  std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-frameStart).count());}
+ if(surfaceFrame && !_frameTrace)fuxi::backboardGate.completed(fuxi::Backend::gpuNanos.load()-gpuBefore,
+  std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-frameStart).count());
+ }
  catch(const std::exception &e) {
   failureLog("FUXI MTL: submit FAIL %s\n",e.what());_status=MTLCommandBufferStatusError;
   if(!_error)_error=[[NSError alloc] initWithDomain:MTLCommandBufferErrorDomain code:MTLCommandBufferErrorInternal
@@ -1250,6 +1263,12 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
   _scheduled=YES;_status=MTLCommandBufferStatusCompleted;[_error release];_error=nil;
   for(const auto &point:_events)if(point.signal)[point.event setSignaledValue:point.value];
  }
+ if(_frameTrace && surfaceFrame && _status==MTLCommandBufferStatusCompleted){
+  trace.wall=fuxi::frameNanos(frameStart);
+  trace.counts={fuxi::frameCounts.pipelines-countsBefore.pipelines,fuxi::frameCounts.descriptors-countsBefore.descriptors,fuxi::frameCounts.allocations-countsBefore.allocations};
+  fuxi::backboardGate.completed(fuxi::Backend::gpuNanos.load()-gpuBefore,trace.wall/1e6,&trace);
+ }
+ } // Restore trace attribution before user callbacks can submit another command.
  // Deliver outside Backend's mutex; handlers may create resources/commands.
  // On successful submission this callback may arrive after GPU completion.
  if(_scheduled){NSArray *scheduled=[_scheduledHandlers copy];[_scheduledHandlers removeAllObjects];

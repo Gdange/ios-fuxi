@@ -124,6 +124,8 @@ class Backend {
  ObjectCache<Pipeline> objects;ResourceLimits limits;
  // One synchronous lane, protected by mutex; never reset while GPU ownership is uncertain.
  VkCommandPool commandPool{};VkCommandBuffer command{};VkFence submitFence{};VkQueryPool queryPool{};
+ Buffer *aliasScratch=nullptr;
+ static constexpr size_t aliasScratchLimit=1024*1024;
  VkDescriptorPool descriptorPool{};uint32_t descriptorSets{};std::vector<VkDescriptorPoolSize> descriptorCapacity;
  struct FrameEntry {std::array<Texture *,8> textures;VkRenderPass render;std::array<uint32_t,8> levels;VkFramebuffer frame;};
  struct ViewEntry {Texture *texture;VkFormat format;std::array<uint32_t,4> components;uint32_t base,count;VkImageView view;};
@@ -291,7 +293,7 @@ public:
   if(poisoned) return; // Unknown GPU ownership: leave reclamation to process death/KMD containment.
   cachePeriodUnlocked(true);
   artifactCache.close();
-  clearSubmitObjects();clearFrames();clearViews();
+  clearSubmitObjects();clearFrames();clearViews();destroyUnlocked(aliasScratch);aliasScratch=nullptr;
   objects.clear([&](Pipeline *p){destroyPipelineUnlocked(p);});
   pipelineCache.close();
   if(device && DestroyDevice) DestroyDevice(device,nullptr);
@@ -317,7 +319,7 @@ public:
    if(type==memory.memoryTypeCount) throw std::runtime_error("no host-visible memory");
    VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.allocationSize=req.size;ai.memoryTypeIndex=type;b->memoryType=type;
    limits.reserve(ai.allocationSize);b->charged=ai.allocationSize;
-   check(AllocateMemory(device,&ai,nullptr,&b->memory));++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;b->memoryBytes=ai.allocationSize;check(BindBufferMemory(device,b->buffer,b->memory,0));
+   check(AllocateMemory(device,&ai,nullptr,&b->memory));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;b->memoryBytes=ai.allocationSize;check(BindBufferMemory(device,b->buffer,b->memory,0));
    check(MapMemory(device,b->memory,0,VK_WHOLE_SIZE,0,&b->contents));memset(b->contents,0,(length+15)&~size_t(15));return b;
   } catch(...) {destroyUnlocked(b);throw;}
  }
@@ -344,7 +346,7 @@ public:
    VkImportMemoryHostPointerInfoEXT hi{};hi.sType=VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;hi.handleType=VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;hi.pHostPointer=base;
    VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.pNext=&hi;ai.allocationSize=bytes;ai.memoryTypeIndex=type;
    limits.reserve(ai.allocationSize);b->charged=ai.allocationSize;
-   importCheck(AllocateMemory(device,&ai,nullptr,&b->memory));++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;b->memoryBytes=ai.allocationSize;b->allocated=bytes;b->memoryType=type;check(BindBufferMemory(device,b->buffer,b->memory,0));
+   importCheck(AllocateMemory(device,&ai,nullptr,&b->memory));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;b->memoryBytes=ai.allocationSize;b->allocated=bytes;b->memoryType=type;check(BindBufferMemory(device,b->buffer,b->memory,0));
    check(MapMemory(device,b->memory,0,VK_WHOLE_SIZE,0,&b->contents));return b;
   }catch(...){destroyUnlocked(b);throw;}
  }
@@ -462,7 +464,7 @@ public:
    VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.pNext=&hi;ai.allocationSize=bytes;ai.memoryTypeIndex=type;t->memoryType=type;
    limits.reserve(ai.allocationSize);t->charged=ai.allocationSize;
    // Import/charge the whole surface, binding the image at its plane's offset.
-   check(AllocateMemory(device,&ai,nullptr,&t->memory));++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;t->memoryBytes=ai.allocationSize;t->allocated=bytes;check(BindImageMemory(device,t->image,t->memory,offset));
+   check(AllocateMemory(device,&ai,nullptr,&t->memory));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;t->memoryBytes=ai.allocationSize;t->allocated=bytes;check(BindImageMemory(device,t->image,t->memory,offset));
    check(MapMemory(device,t->memory,0,VK_WHOLE_SIZE,0,&t->mapped));
    VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=t->image;vi.viewType=VK_IMAGE_VIEW_TYPE_2D;vi.format=info.format;
    vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};check(CreateImageView(device,&vi,nullptr,&t->view));return t;
@@ -506,7 +508,7 @@ public:
    if(memoryType==memory.memoryTypeCount)throw std::runtime_error("no device-local texture memory");
    VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.allocationSize=req.size;ai.memoryTypeIndex=memoryType;t->memoryType=memoryType;
    limits.reserve(ai.allocationSize);t->charged=ai.allocationSize;
-   check(AllocateMemory(device,&ai,nullptr,&t->memory));++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;t->memoryBytes=ai.allocationSize;check(BindImageMemory(device,t->image,t->memory,0));
+   check(AllocateMemory(device,&ai,nullptr,&t->memory));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;t->memoryBytes=ai.allocationSize;check(BindImageMemory(device,t->image,t->memory,0));
    VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=t->image;vi.viewType=t->textureType==0?VK_IMAGE_VIEW_TYPE_1D:VK_IMAGE_VIEW_TYPE_2D;vi.format=ii.format;
    vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,levels,0,1};check(CreateImageView(device,&vi,nullptr,&t->view));return t;
   }catch(...) {destroyTextureUnlocked(t);throw;}
@@ -731,6 +733,7 @@ public:
    VkPipelineCreationFeedback feedback{};VkPipelineCreationFeedbackCreateInfo feedbackInfo{};
    if(creationFeedback){feedbackInfo.sType=VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO;feedbackInfo.pPipelineCreationFeedback=&feedback;gi.pNext=&feedbackInfo;}
    VkPipeline result{};auto rc=CreateGraphicsPipelines(device,cache,1,&gi,nullptr,&result);
+   if(rc==VK_SUCCESS && systemTranslationPolicy().frameTrace)++frameCounts.pipelines;
    if(rc!=VK_SUCCESS){if(result)DestroyPipeline(device,result,nullptr);check(rc);}
    if(cacheMode==CacheMode::persistent){
     if(!(feedback.flags&VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT))++driverUnknown;
@@ -753,6 +756,7 @@ public:
   auto submitStart=std::chrono::steady_clock::now();auto submitQueued=submitStart,submitDone=submitStart;
   auto since=[](std::chrono::steady_clock::time_point t){return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-t).count();};
   std::lock_guard<std::mutex> guard(mutex);requireLive();
+  auto locked=currentFrame?FrameClock::now():FrameClock::time_point{};if(currentFrame)currentFrame->leaseLock+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(locked-submitStart).count());
   CacheActivity activity{cacheMode==CacheMode::persistent?&cacheActivity:nullptr};
   Translator::Scope cacheScope(artifactCallbacks,artifactCache.available()?&artifactCache:nullptr,ArtifactCache::read,ArtifactCache::write,ArtifactCache::outcome);
   ops.erase(std::remove_if(ops.begin(),ops.end(),[](const Operation &op){
@@ -764,12 +768,12 @@ public:
     !primitiveCount(op.topology,op.vertices);
   }),ops.end());
   // Empty completion participates in the same lock/order, but creates no BO or GPU fence.
-  if(ops.empty()){++emptySubmits;if(scheduled)scheduled();return;}
+  if(ops.empty()){if(currentFrame)currentFrame->backendSubmit+=frameNanos(locked);++emptySubmits;if(scheduled)scheduled();return;}
   bool submitted=false,completed=false;std::vector<VkImageView> sampleViews;std::vector<VkFramebuffer> frames;std::vector<VkRenderPass> emptyRenders;std::vector<Texture *> textures;
   struct TextureState {Texture *texture;VkImageLayout layout;bool defined;uint32_t definedLevels;};std::vector<TextureState> oldTextures;
   size_t diagnosticOp=0;Buffer *neutralBuffer=nullptr,*aliasBuffer=nullptr;size_t aliasBytes=0;
   std::vector<bool> aliasCopies(ops.size(),false);
-  auto cleanup=[&] {destroyUnlocked(aliasBuffer);destroyUnlocked(neutralBuffer);for(auto v:sampleViews)DestroyImageView(device,v,nullptr);for(auto frame:frames)DestroyFramebuffer(device,frame,nullptr);for(auto render:emptyRenders)DestroyRenderPass(device,render,nullptr);};
+  auto cleanup=[&] {if(aliasBuffer!=aliasScratch)destroyUnlocked(aliasBuffer);destroyUnlocked(neutralBuffer);for(auto v:sampleViews)DestroyImageView(device,v,nullptr);for(auto frame:frames)DestroyFramebuffer(device,frame,nullptr);for(auto render:emptyRenders)DestroyRenderPass(device,render,nullptr);};
   // Exclusive prepare phases: object API/cache time is subtracted from recording.
   uint64_t objectNanos=0,descriptorNanos=0;
   struct Measure {uint64_t &total;std::chrono::steady_clock::time_point start=std::chrono::steady_clock::now();~Measure(){total+=(uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();}};
@@ -875,7 +879,16 @@ public:
    size_t neutralSize=0;for(const auto &draw:draws)for(unsigned i=0;i<draw.descriptorCount;++i){const auto &d=draw.descriptors[i];if(d.source==2){
     if((d.type!=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && d.type!=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) || d.offset || !d.range || d.range>maxBufferLength)throw std::runtime_error("planned neutral buffer bounds/type");
     neutralSize=std::max(neutralSize,size_t(d.range));}}
-   if(aliasBytes){Measure measure{objectNanos};aliasBuffer=allocateUnlocked(aliasBytes);addBuffer(aliasBuffer);}
+   if(aliasBytes){Measure measure{objectNanos};
+    // Single synchronous lane: prior fence is complete before scratch is reused.
+    // Larger requests keep the transient path; retained memory is quota charged.
+    if(systemTranslationPolicy().pipelined && aliasBytes<=aliasScratchLimit){
+     if(aliasScratch && aliasScratch->length<aliasBytes){destroyUnlocked(aliasScratch);aliasScratch=nullptr;}
+     if(!aliasScratch)aliasScratch=allocateUnlocked(aliasBytes);
+     aliasBuffer=aliasScratch;
+    }else aliasBuffer=allocateUnlocked(aliasBytes);
+    addBuffer(aliasBuffer);
+   }
    if(neutralSize){Measure measure{objectNanos};neutralBuffer=allocateUnlocked(neutralSize);addBuffer(neutralBuffer);}
    for(auto *t:textures)oldTextures.push_back({t,t->layout,t->defined,t->definedLevels});
    auto flushStart=std::chrono::steady_clock::now();
@@ -970,11 +983,11 @@ public:
      }
      VkRenderPassBeginInfo ri{};ri.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;ri.renderPass=render;ri.framebuffer=frame;
      ri.renderArea={{0,0},{op.areaWidth?op.areaWidth:op.texture->levelWidth(op.dstLevel),op.areaHeight?op.areaHeight:op.texture->levelHeight(op.dstLevel)}};ri.clearValueCount=used;ri.pClearValues=clears;
-     CmdBeginRenderPass(cmd,&ri,VK_SUBPASS_CONTENTS_INLINE);CmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,topologyPipeline(op.pipeline,op.topology));
-     CmdSetViewport(cmd,0,1,&op.viewport);CmdSetScissor(cmd,0,1,&op.scissor);
+     if(currentFrame)++currentFrame->passes;CmdBeginRenderPass(cmd,&ri,VK_SUBPASS_CONTENTS_INLINE);CmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,topologyPipeline(op.pipeline,op.topology));
+     if(currentFrame)++currentFrame->draws;CmdSetViewport(cmd,0,1,&op.viewport);CmdSetScissor(cmd,0,1,&op.scissor);
      if(draw.descriptorCount) {
       VkDescriptorSetAllocateInfo sai{};sai.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;sai.descriptorPool=submitPool;sai.descriptorSetCount=1;sai.pSetLayouts=&op.pipeline->setLayout;
-      VkDescriptorSet set{};{Measure measure{descriptorNanos};check(AllocateDescriptorSets(device,&sai,&set));}
+      VkDescriptorSet set{};{Measure measure{descriptorNanos};check(AllocateDescriptorSets(device,&sai,&set));if(systemTranslationPolicy().frameTrace)++frameCounts.descriptors;}
       for(unsigned i=0;i<draw.descriptorCount;++i){const auto &d=draw.descriptors[i];
        VkWriteDescriptorSet write{};write.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;write.dstSet=set;write.dstBinding=d.binding;write.descriptorCount=1;write.descriptorType=(VkDescriptorType)d.type;
        VkDescriptorImageInfo image{};VkDescriptorBufferInfo buffer{};
@@ -1027,7 +1040,7 @@ public:
      VkFramebuffer frame{};check(CreateFramebuffer(device,&fi,nullptr,&frame));try{frames.push_back(frame);}catch(...){DestroyFramebuffer(device,frame,nullptr);throw;}
      ++reuseCounts.frames;++submitObjectCreates;++submitFrameCreates;
      VkRenderPassBeginInfo ri{};ri.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;ri.renderPass=render;ri.framebuffer=frame;ri.renderArea={{0,0},{op.areaWidth?op.areaWidth:fi.width,op.areaHeight?op.areaHeight:fi.height}};ri.clearValueCount=used;ri.pClearValues=clears;
-     CmdBeginRenderPass(cmd,&ri,VK_SUBPASS_CONTENTS_INLINE);CmdEndRenderPass(cmd);
+     if(currentFrame)++currentFrame->passes;CmdBeginRenderPass(cmd,&ri,VK_SUBPASS_CONTENTS_INLINE);CmdEndRenderPass(cmd);
      for(unsigned i=0;i<op.colorCount;++i){auto c=op.color(i);if(c.texture)c.texture->setDefined(c.level,c.store && (c.load==2 || (c.load==1 && c.texture->isDefined(c.level))));}
     } else if(op.texture && op.clearOnly) {
      for(unsigned i=0;i<op.colorCount;++i){auto c=op.color(i);auto *t=c.texture;if(!t)continue;
@@ -1084,17 +1097,20 @@ public:
 #ifdef FUXI_MTL_HOST_TEST
    if(failQueueAttempt){failQueueAttempt=false;check(VK_ERROR_DEVICE_LOST);}
 #endif
-   check(QueueSubmit(queue,1,&si,fence));if(scheduled)scheduled();// Lavapipe can JIT a generic CA shader on its submission worker. The
+   check(QueueSubmit(queue,1,&si,fence));if(currentFrame)currentFrame->backendSubmit+=frameNanos(locked);if(scheduled)scheduled();
+   auto waitStart=currentFrame?FrameClock::now():FrameClock::time_point{}; // Lavapipe can JIT a generic CA shader on its submission worker. The
    // offline qualifier may extend only its host wait; production stays 2 s.
 #if defined(FUXI_MTL_HOST_TEST) && defined(FUXI_MTL_HOST_FENCE_NS)
    check(WaitForFences(device,1,&fence,VK_TRUE,FUXI_MTL_HOST_FENCE_NS));
 #else
    check(WaitForFences(device,1,&fence,VK_TRUE,2000000000ULL));
 #endif
+   if(currentFrame)currentFrame->gpuWait+=frameNanos(waitStart);
    submitted=false;completed=true;submitWaitNanos+=since(submitQueued);submitDone=std::chrono::steady_clock::now();
    if(timestamps){uint64_t ticks[2]{};check(GetQueryPoolResults(device,timestamps,0,2,sizeof(ticks),ticks,sizeof(uint64_t),VK_QUERY_RESULT_64_BIT));
     uint64_t mask=timestampBits>=64?UINT64_MAX:(uint64_t(1)<<timestampBits)-1;
-    gpuNanos.fetch_add((uint64_t)(double((ticks[1]-ticks[0])&mask)*timestampPeriod));++gpuSamples;
+    uint64_t elapsed=(uint64_t)(double((ticks[1]-ticks[0])&mask)*timestampPeriod);
+    gpuNanos.fetch_add(elapsed);if(currentFrame){currentFrame->gpuExec+=elapsed;++currentFrame->gpuSamples;}++gpuSamples;
    }
    auto invalidateStart=std::chrono::steady_clock::now();
    for(auto *t:textures)if(t->mapped && !coherent(t->memoryType)) {VkMappedMemoryRange r{};r.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;r.memory=t->memory;r.size=VK_WHOLE_SIZE;++invalidateCalls;check(InvalidateMappedMemoryRanges(device,1,&r));}

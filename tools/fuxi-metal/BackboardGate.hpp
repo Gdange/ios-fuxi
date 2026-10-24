@@ -1,6 +1,7 @@
 /* Boot-scoped crash recovery; no signal handler or mid-context CPU replay. */
 #pragma once
 #include "ClientStorage.hpp"
+#include "FrameTrace.hpp"
 #include <chrono>
 #include <atomic>
 #include <mutex>
@@ -10,6 +11,7 @@ class BackboardGate {
  std::mutex mutex;
  int directory=-1,lease=-1;char boot[37]={};unsigned strikes=0;
  std::atomic<bool> active{false},failed{false};bool good=false;
+ FrameTraceWindow frameTrace;
  uint64_t frames=0,late=0,failures=0,gpu=0,lastFrames=0,lastGPU=0;
  double began=0,lastReport=0;
  static double now(){return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();}
@@ -84,9 +86,10 @@ public:
   failed=true;strikes=strikeLimit;bool saved=persistDenied();
   fprintf(stderr,"FUXI MTL: backboardd gate runtime-failure next-respawn=CPU persisted=%u\n",unsigned(saved));
  }
- void completed(uint64_t gpuNanos,double wallMS) {
+ void completed(uint64_t gpuNanos,double wallMS,const FrameSample *sample=nullptr) {
   if(!active.load())return;
   std::lock_guard<std::mutex> guard(mutex);if(!active || failed)return;
+  if(sample)frameTrace.add(*sample);
   ++frames;gpu+=gpuNanos;if(wallMS>1000.0/60.0)++late;
   if(frames==1)fprintf(stderr,"FUXI MTL: backboardd first_frame_ms=%.3f gpu_ms=%.3f\n",(now()-began)*1000,gpuNanos/1e6);
   if(!good && frames>=goodFrames) {
@@ -106,6 +109,7 @@ public:
   fprintf(stderr,"FUXI MTL: backboardd frames=%llu gpu_ms=%.3f late=%llu failures=%llu hz=%.2f window_frames=%llu gpu_busy_est_pct=%.1f\n",
    (unsigned long long)frames,count?(gpu-lastGPU)/1e6/double(count):0.0,(unsigned long long)late,
    (unsigned long long)failures,double(count)/(t-lastReport),(unsigned long long)count,busy);
+  if(systemTranslationPolicy().frameTrace)frameTrace.report();
   lastReport=t;lastFrames=frames;lastGPU=gpu;
  }
  BackboardGate()=default;

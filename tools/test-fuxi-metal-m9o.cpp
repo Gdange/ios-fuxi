@@ -74,7 +74,9 @@ static void lines(fuxi::Backend &b,const char *path){
  auto &tr=fuxi::Translator::get();char error[512]{};void *lib=tr.open(air.data(),air.size(),error,sizeof(error));assert(lib);
  fuxi::CompileOptions options{};options.attributes[0]={29,0,0};options.attributes[1]={29,8,0};options.attributes[2]={9,16,0};options.strides[0]=20;
  options.constantCount[1]=1;options.constants[1][0].type=53;options.constants[1][0].size=1;options.constants[1][0].bytes[0]=1;
- auto *p=b.compilePipeline(lib,"fuxi_layer_vertex",lib,"fuxi_layer_fragment",options);assert(!p->linePipelines[0] && !p->linePipelines[1]);
+ auto pipelineBefore=fuxi::frameCounts.pipelines;
+ auto *p=b.compilePipeline(lib,"fuxi_layer_vertex",lib,"fuxi_layer_fragment",options);
+ if(fuxi::systemTranslationPolicy().frameTrace)assert(fuxi::frameCounts.pipelines>pipelineBefore);assert(!p->linePipelines[0] && !p->linePipelines[1]);
  auto *vertices=b.allocate(sizeof(fuxiM7Vertices)),*ones=b.allocate(16),*indices=b.allocate(16),*out=b.allocate(16*16*4);
  memcpy(vertices->contents,fuxiM7Vertices,sizeof(fuxiM7Vertices));for(unsigned c=0;c<4;++c)((float *)ones->contents)[c]=1;
  // A single horizontal line through the target. UVs and vertex color are white.
@@ -83,7 +85,11 @@ static void lines(fuxi::Backend &b,const char *path){
  auto *target=b.allocateTexture(80,5,16,16);auto *sam=b.allocateSampler(false,false);
  fuxi::Operation draw{};draw.texture=target;draw.pipeline=p;draw.vertices=2;draw.topology=fuxi::Topology::Line;draw.samples[0]=sample;draw.samplers[0]=sam;draw.buffers[0][0]={vertices,0,false};draw.buffers[0][2]={ones,0,true};draw.buffers[1][1]={ones,0,true};draw.viewport={0,16,16,-16,0,1};draw.scissor={{0,0},{16,16}};
  fuxi::Operation read{};read.texture=target;read.dst=out;
- auto render=[&](fuxi::Operation op){b.submit({op,read});auto *bytes=(uint8_t *)out->contents;return std::vector<uint8_t>(bytes,bytes+out->length);};
+ auto render=[&](fuxi::Operation op){
+  fuxi::FrameSample trace;auto descriptors=fuxi::frameCounts.descriptors;
+  {fuxi::FrameTraceScope scope(fuxi::systemTranslationPolicy().frameTrace?&trace:nullptr);b.submit({op,read});}
+  if(fuxi::systemTranslationPolicy().frameTrace)assert(trace.draws==1 && trace.passes==1 && trace.backendSubmit && trace.gpuWait && fuxi::frameCounts.descriptors==descriptors+1);
+  auto *bytes=(uint8_t *)out->contents;return std::vector<uint8_t>(bytes,bytes+out->length);};
  auto expected=render(draw);assert(p->linePipelines[0] && !p->linePipelines[1]);size_t lit=0;for(size_t i=0;i<expected.size();i+=4)if(expected[i+3])++lit;assert(lit>=10 && lit<=16);
  auto list=p->linePipelines[0];auto odd=draw;odd.vertices=3;assert(render(odd)==expected && p->linePipelines[0]==list);
  // The unused trailing index must neither be fetched nor bounds checked.

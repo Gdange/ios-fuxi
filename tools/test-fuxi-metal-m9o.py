@@ -39,5 +39,12 @@ def main():
         assert p.returncode == 0, p.stderr
         assert 'AddressSanitizer' not in p.stderr and 'runtime error:' not in p.stderr
         print(p.stdout, end='')
+        if a.translator:
+            traced = subprocess.run(args, env=dict(env, FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1'),
+                                    text=True, capture_output=True, timeout=60)
+            assert traced.returncode == 0, traced.stderr
+            assert 'AddressSanitizer' not in traced.stderr and 'runtime error:' not in traced.stderr
+            assert traced.stdout == p.stdout
+            print('PASS: traced authored draws retain pixels and count pipelines/descriptors/draws/passes')
 if __name__ == '__main__':
     main()

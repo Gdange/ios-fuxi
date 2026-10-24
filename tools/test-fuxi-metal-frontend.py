@@ -18,7 +18,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         d=Path(tmp);conf=d/'smoke.conf'
         compiler=['xcrun','clang++'] if os.uname().sysname=='Darwin' else ['clang++']
-        for name in ('ClientGateTests','BackboardGateTests','TextureLevelsTests','SurveyTests','ClientSetupTests','NativeSelectionTests','SurfaceLeaseTests','TranslationPolicyTests','CompileBoostTests'):
+        for name in ('ClientGateTests','BackboardGateTests','TextureLevelsTests','SurveyTests','ClientSetupTests','NativeSelectionTests','SurfaceLeaseTests','TranslationPolicyTests','CompileBoostTests','FrameTraceTests'):
             subprocess.run([*compiler,'-std=c++17','-Wall','-Wextra','-Werror','-pthread',
                             '-fsanitize=address,undefined',str(ROOT/'tools/fuxi-metal'/(name+'.cpp')),
                             '-o',str(d/name)],check=True)
@@ -31,7 +31,10 @@ def main():
                                        (' '.join(k+'=invalid' for k in keys), '0000'),
                                        (' '.join('prefix'+k+'=0' for k in keys), '1110'), ('fuxicompileboost=1', '1111'),
                                        ('fuxicompileboost=1 fuxicompileboost=1', '1110'),
-                                       ('fuxicompileboost=invalid', '1110')):
+                                       ('fuxicompileboost=invalid', '1110'),
+                                       ('fuxigpuframetrace=1 fuxigpupipelined=1', '111011'),
+                                       ('fuxigpuframetrace=1 fuxigpuframetrace=1 fuxigpupipelined=bad', '111000'),
+                                       ('fuxigpuframetrace=0 fuxigpupipelined=0', '111000')):
                     subprocess.run([str(d/name), expected], env=dict(enabled, FUXI_MTL_TEST_BOOTARGS=args), check=True, timeout=15)
         if not a.compile_only:
             subprocess.run(['python3',str(ROOT/'tools/test-fuxi-metal-stage.py'),'--policy-storage-only'],check=True)
