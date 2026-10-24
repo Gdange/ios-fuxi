@@ -243,6 +243,15 @@
  
  	su.regs = ml_io_map(reg[0], reg[1]);
  	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+@@ -851,7 +941,7 @@
+ 	 * Stack sampler only, and only on request. sweet_log_start() stays off: it
+ 	 * would write the tail of ufsroot0, which here is the HFS image itself.
+ 	 */
+-	char smp[64];
++	char smp[8];
+ 	if (PE_parse_boot_argn("sweetsample", smp, sizeof(smp)) && smp[0] != '-') {
+ 		sweet_sample_start();
+ 	}
 @@ -985,6 +1075,7 @@
  		int error = 0;
  
