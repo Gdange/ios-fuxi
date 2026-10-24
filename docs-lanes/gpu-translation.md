@@ -330,7 +330,7 @@ mutex is boosted. The existing translation timing fields remain comparable.
   completion. This feature deliberately does not enlarge the thermal budget.
 - Every lease has a **2-second nonrenewable deadline**, at most **16 nested
   enters**, and one global owner. Nested enters cannot restart a cut lease;
-  another thread receives `EBUSY`. Initial thermal/duty denial returns `EAGAIN`.
+  another thread receives `EBUSY`. Initial thermal/duty denial also returns `EBUSY`: XNU's `userland_sysctl()` retries a handler's `EAGAIN` forever, and the first device boot (EAGAIN) spun backboardd in the kernel with no frames.
 - Leave at depth zero drops the vote synchronously and unbinds. Leave without
   a matching entry succeeds with `FC_NONE`. Copyout failure rolls back an enter.
   A thread reference prevents owner-address reuse; worker checks remove dead

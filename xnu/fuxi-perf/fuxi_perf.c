@@ -63,6 +63,8 @@ static uint64_t fp_rate_elapsed;
 static int fp_rate_temp, fp_rate_valid, fp_rate;
 static unsigned fp_enabled, fp_started, fp_ready;
 static thread_call_data_t fp_call;
+/* Refusals are EBUSY, never EAGAIN: userland_sysctl() retries a handler's
+ * EAGAIN in a loop, which spun backboardd in the kernel (observed). */
 /* One lease globally: Backend serializes compiles. No allocations or user
  * supplied task/thread handles. References prevent thread-address reuse. */
 static LCK_GRP_DECLARE(fp_group, "fuxi-perf");
@@ -149,12 +151,12 @@ static int fp_compile_command(int command, struct fuxi_compile_reply *reply)
   } else *reply = (struct fuxi_compile_reply){.version=1,.cpu=-1};
  } else if (fp_compile_thread == self) {
   /* Nested scopes neither renew a cut lease nor extend its deadline. */
-  if (!fp_compile_high) error = EAGAIN;
+  if (!fp_compile_high) error = EBUSY;
   else if (fp_compile_reply.depth == 16) error = EOVERFLOW;
   else { fp_compile_reply.depth++; *reply = fp_compile_reply; }
  } else if (fp_compile_thread != THREAD_NULL) error = EBUSY;
  else if (!fp_ready || !fp_prev_valid || fp_prev_temp > 600 || fp_blocked ||
-     fp_duty_used(now) >= fp_budget || (!fp_boosted && fp_duty_count == 16)) error = EAGAIN;
+     fp_duty_used(now) >= fp_budget || (!fp_boosted && fp_duty_count == 16)) error = EBUSY;
  else {
   int cpu = fuxi_compile_bind((fp_domain_failed[1] ? 0 : 2) | (fp_domain_failed[2] ? 0 : 4));
   if (cpu < 0) error = EBUSY;

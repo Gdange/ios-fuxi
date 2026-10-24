@@ -537,9 +537,9 @@ int main(void) {
  ticks+=199;fp_worker(0,0);assert(fp_compile_high && scheduled==300);
  ticks++;fp_worker(0,0);assert(!fp_compile_high && bound==-1 && !fp_boosted);
  assert(fp_compile_reply.state==FC_DUTY && refs==1);
- assert(fp_compile_command(1,&reply)==EAGAIN);
+ assert(fp_compile_command(1,&reply)==EBUSY);
  assert(!fp_compile_command(0,&reply) && reply.state==FC_DUTY && reply.boosted_ns==200*NSEC_PER_MSEC && !refs);
- assert(fp_compile_command(1,&reply)==EAGAIN); /* no reset by leave */
+ assert(fp_compile_command(1,&reply)==EBUSY); /* no reset by leave */
  ticks+=1000;assert(!fp_compile_command(1,&reply));
  assert(!fp_compile_command(0,&reply));
  /* Timeout independent of duty, even with nested scopes and no leave. */
@@ -574,7 +574,7 @@ int main(void) {
   reset();fp_compile_enabled=1;
   for(unsigned d=0;d<2;d++)for(unsigned n=1;n<=(d?3:15);n++)regs[d+3][(0xa0+4*n)/4]=(1u<<21)|temp;
   int result=fp_compile_command(1,&reply);
-  assert(result==(temp==600?0:EAGAIN));
+  assert(result==(temp==600?0:EBUSY));
   if(!result)assert(!fp_compile_command(0,&reply));
  }
  reset();fp_compile_enabled=1;bind_temp=601;
