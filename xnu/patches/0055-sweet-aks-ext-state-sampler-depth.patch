@@ -61,19 +61,19 @@
   */
  #include <sys/param.h>
  #include <sys/systm.h>
-@@ -66,11 +66,12 @@
- 	if (!PE_parse_boot_argn("sweetsample", sweet_sample_names, sizeof(sweet_sample_names))) {
- 		strlcpy(sweet_sample_names, "SpringBoard,backboardd", sizeof(sweet_sample_names));
- 	}
-+	printf("SMP: armed for [%s]\n", sweet_sample_names);
+@@ -70,11 +70,12 @@
  	if (sweet_sample_names[0] == '-') {
  		return;
  	}
 -	(void)tsleep(&chan, PZERO, "sweetsmp", 90 * hz);
-+	(void)tsleep(&chan, PZERO, "sweetsmp", 30 * hz);
 -	for (int i = 0; i < 10; i++) {
++	printf("SMP: armed for [%s]\n", sweet_sample_names);
++	(void)tsleep(&chan, PZERO, "sweetsmp", 30 * hz);
 +	for (int i = 0; i < 40; i++) {
  		printf("SMP --- sample %d\n", i);
  		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
 -		(void)tsleep(&chan, PZERO, "sweetsmp", 120 * hz);
 +		(void)tsleep(&chan, PZERO, "sweetsmp", 60 * hz);
+ 	}
+ }
+ 
