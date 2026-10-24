@@ -263,3 +263,145 @@ identifies that next limit. If wall time rises for equal keys while process CPU
 time stays flat, investigate scheduling/contention; if both rise, examine CPU
 frequency and shader/cache phase cost. This work does not change the governor,
 cluster scheduling or upstream compiler algorithms.
+
+## Opt-in compile boost (2026-10-24)
+
+### OBSERVED: supplied baseline and host checks
+
+`research/cb/use89.log` records first-use interactive translation stalls around
+0.1–1.6 seconds while the governor normally votes cool. In the cold-cache boot
+`research/cb/stages90.log`, the 45 timing records sum to **15,333.829 ms
+compile_ms + 19,304.510 ms create_ms = 34,638.339 ms**. Their caller-visible
+`total_ms` sum is **35,156.845 ms**, and process CPU sums to **31,605.325 ms**.
+These are sums of per-request intervals, not elapsed boot duration. Stage reuse
+already hits in this log. Both translation and Turnip Vulkan creation matter.
+
+The scheduler is homogeneous SMP. The device tree reserves physical CPU 1 for
+the monitor: physical 0,2,3,4,5,6,7 become XNU logical 0,1,2,3,4,5,6. The new
+helper uses `ml_get_cpu_number(physical << 8)`, rather than binding logical 7.
+Host tests exercise the actual governor and scheduler helper with MMIO,
+thread-reference and runqueue stubs. They establish policy and API sequencing,
+not device migration, actual clocks or a performance improvement.
+
+### Interface and settings
+
+Enable **both `fuxiperf=1 fuxicompileboost=1`** in the kernel command line.
+Absent/off leaves the compile interface unsupported (`ENOTSUP`) and FuxiMetal
+makes no compile-lease calls. FuxiMetal accepts only the exact, unique
+`fuxicompileboost=1` token in `kern.bootargs`; there is no environment override.
+Keep the existing GPU/client admission settings. Rebuild the kernel and
+FuxiMetal; the existing adapter/translator needs no change for this feature.
+
+`sysctlbyname("kern.fuxicompileboost", ...)` takes an exact `int32_t` new value:
+**1 enters, 0 leaves** for the calling thread only. An optional old buffer
+receives the 24-byte version-1 `fuxi_compile_reply` from
+`xnu/fuxi-perf/fuxi_compile_abi.h` (sampled high-vote nanoseconds, physical CPU,
+state and nesting depth). This is an action endpoint, not a readable knob.
+`CTLFLAG_ANYBODY` permits mobile to reach the handler; the handler independently
+requires `proc_selfname()==backboardd` and a platform code signature, following
+patch 0102's GPU gate. Root receives no bypass. No caller-selected CPU, thread,
+task, frequency, duration or user-client connection can authorize another thread.
+
+Admission samples TSENS synchronously through the serialized governor worker,
+then chooses online prime CPU 7, otherwise an online gold CPU 6..3. A failed
+EPSS domain is excluded. Existing bindings and realtime threads are refused.
+Binding uses `thread_bind_internal` with the same scheduler locking as
+`thread_bind`, with eligibility checked under that lock; `thread_block` then
+forces migration outside the governor mutex. The vote raises only the selected
+fast domain to its existing high LUT row (at most 2.4 GHz); silver is unchanged.
+The normal touch vote can independently raise both fast domains.
+
+The FuxiMetal RAII scope starts after an object-cache miss and covers the bridge
+compile (including synchronous vertex/fragment stage compiles), product hashing
+and Vulkan pipeline creation. It ends before object-cache insertion. Runtime
+variants and lazy topology pipeline builds also have scopes; nested scopes share
+one lease and exceptions release it. No lock wait before acquiring the backend
+mutex is boosted. The existing translation timing fields remain comparable.
+
+### Safety limits and lifetime
+
+- Fresh valid CPU sensor quorum is mandatory. No entry above **60.0 C**; the
+  existing predictive/rise guard, **62 C** soft cut, **68 C** maximum ceiling and
+  recovery hysteresis still veto high votes. Lower configured limits still win.
+- Compile and touch **share the existing rolling duty budget**, **200 ms per
+  1000 ms by default** (`fuxiperfbudget` retains its existing 20..500 ms bounds).
+  Compile boost cannot replenish it or extend a touch burst through swaps.
+  Consequently a long compile usually loses its high vote and binding before
+  completion. This feature deliberately does not enlarge the thermal budget.
+- Every lease has a **2-second nonrenewable deadline**, at most **16 nested
+  enters**, and one global owner. Nested enters cannot restart a cut lease;
+  another thread receives `EBUSY`. Initial thermal/duty denial returns `EAGAIN`.
+- Leave at depth zero drops the vote synchronously and unbinds. Leave without
+  a matching entry succeeds with `FC_NONE`. Copyout failure rolls back an enter.
+  A thread reference prevents owner-address reuse; worker checks remove dead
+  owners and release references. Timeout releases even a living hung caller.
+- Thermal/duty cuts and offline/failed domains unbind immediately at the worker
+  sample and retain a bounded reply until leave, death or the lease deadline.
+  Queued threads are removed and reinserted under scheduler locks when unbound.
+  Active high votes use the existing fast sampling period (20 ms default),
+  shortened for remaining duty/deadline. Cleanup without high runs within the
+  normal 100 ms period. These are timer deadlines, subject to scheduler latency,
+  not hard realtime guarantees. Hardware thermal protection remains in control.
+
+### Trace and acceptance experiment (device unverified)
+
+With `fuxigputrace=1`, FuxiMetal adds:
+
+```
+FUXI MTL: compile boost phase=pipeline enter_errno=0 leave_errno=0 cpu=7 state=4 scope_ms=... voted_ms=...
+```
+
+`phase` is pipeline, variant or topology. `scope_ms` measures the compile scope,
+including entry/migration overhead; `voted_ms` is the kernel's sampled high-vote
+wall interval, **not measured frequency or thread CPU time**. A refused entry or
+expired/discarded reply gives `voted_ms=-1` (unknown), never an invented full-scope
+boost. `cpu=-1` means admission failed. Other trace phase times still describe
+all work, including the portion after a cut. Compare them with the unboosted run;
+a single boosted run contains no counterfactual baseline.
+
+Kernel lines are `FUXI PERF: compile enter cpu=... cap_ms=2000 duty_ms=.../1000
+state=...` and `FUXI PERF: compile end cpu=... reason=... voted_us=...`.
+States/reasons: 0 none, 1 active, 2 leave, 3 thermal, 4 duty, 5 timeout, 6 dead,
+7 offline/domain failure. Existing governor stats now include the union of
+compile and touch high intervals. The kernel end line retains the reason/time
+when a subsequent userspace leave can no longer retrieve the reply.
+
+For device acceptance, use the **same newly built kernel, FuxiMetal and adapter**
+in both runs, with stages and trace enabled and async explicitly disabled.
+Keep GPU level, CPU/thermal settings, display, workload and cache state equal:
+
+1. A: `fuxiperf=1 fuxicompileboost=0 fuxigpustages=1 fuxigputrace=1`.
+2. B: identical except `fuxicompileboost=1`. Begin with equivalent cold empty
+   translation and driver caches and a cooled device. Repeat in reversed order.
+3. For cold boot, report pipeline counts, sums of `compile_ms + create_ms`,
+   `total_ms`, process CPU, first-frame time, cache outcomes and scope/voted
+   times. Compare against the **34,638.339 ms / 45** stages90 baseline as well
+   as A; changes in shaders, cache hits or stage hits invalidate a direct ratio.
+4. Repeat the use89 interaction sequence with comparable touch contacts; report
+   median/p95/worst first-use `total_ms` and `wait_ms`, translation/Vulkan phases,
+   stalls above 100/500/1000 ms, immediate repeat-screen behavior, frame Hz and
+   failures. Separate admission refusals and duty/thermal-cut compiles.
+5. Record hottest CPU TSENS, slope/cuts, time above the soft threshold, duty
+   utilization and actual EPSS votes/clocks. Check selected physical core,
+   migration, gold fallback and that leave/death/timeout clear binding and votes.
+   At 58–60 C the existing guards may deny nearly every entry; explicitly report
+   that result. Check visual correctness and run long enough to expose heating.
+
+**GUESS:** moving CPU-bound compile work from silver to a fast core and its high
+LUT row can shorten first-use stalls. The short shared duty budget and existing
+thermal refusal can sharply limit that benefit; worker threads inside an
+external compiler would not inherit a caller's binding. No device result yet
+establishes migration, sandbox permission for mobile's sysctl, high clocks,
+thermal safety under this workload, Turnip worker behavior or any speedup.
+Full Mac kernel/FuxiMetal builds and native Objective-C tests remain unverified
+on this Linux host; CI build routes were checked with `--dry-run` only.
+
+Host validation for this change: 15 kernel/governor suites and 12 FuxiMetal
+suites passed, including `tools/test-fuxi-perf.py` (which runs the scheduler
+helper model), frontend policy/scope tests, software Vulkan backend, cache and
+M9g–M9o controls. The authored-AIR translation test also verified 104 identical
+pipeline product hashes when compile boost is requested against an unsupported
+host kernel, with one refusal trace per pipeline and no redundant topology
+scope. Patch snapshots match; the scheduler hunks apply in order through the
+later idle hooks. Both modified kernel units pass an ARM64 syntax check against
+cached XNU headers. These host checks do not replace the device experiment.

@@ -5,6 +5,7 @@ Supply an ABI-8 host library built from the current Fuxi adapter and pinned
 external translator (test-fuxi-metal-cache.py --source builds one offline).
 """
 import argparse
+import errno
 import json
 import os
 from pathlib import Path
@@ -35,9 +36,10 @@ def main():
         # expose order/noise; no timing threshold is a correctness assertion.
         timings = {False: [], True: []}
         expected = None
-        for reuse in (False, True, True, False):
+        for reuse, boost in ((False, False), (True, False), (True, True), (False, False)):
             p = subprocess.run([str(d/'test'), str(d/'control.bc')], env=dict(env,
-                FUXI_MTL_TEST_BOOTARGS='fuxigpucache=0 fuxigputrace=1 fuxigpustages='+str(int(reuse))),
+                FUXI_MTL_TEST_BOOTARGS='fuxigpucache=0 fuxigputrace=1 fuxigpustages='+str(int(reuse))+
+                    ' fuxicompileboost='+str(int(boost))),
                 capture_output=True, text=True, timeout=180)
             assert p.returncode == 0, p.stderr[-8000:]
             assert 'AddressSanitizer' not in p.stderr and 'runtime error:' not in p.stderr, p.stderr
@@ -48,6 +50,10 @@ def main():
             assert products == expected, 'cached stages changed a compiled product'
             assert len(set(x.split()[-1] for x in products)) > 96
             assert len(re.findall(r'translation timing result=miss', p.stderr)) == 104, p.stderr
+            leases = re.findall(r'compile boost phase=(\w+) enter_errno=(\d+)', p.stderr)
+            # Host kernel has no endpoint. Verify real Backend scopes cover
+            # stages + nested Vulkan builds once each, and denial preserves products.
+            assert leases == ([('pipeline', str(errno.ENOTSUP))]*104 if boost else []), leases
             elapsed = float(re.search(r'elapsed_ms ([\d.]+)', p.stdout)[1])
             timings[reuse].append(elapsed)
             phases = {}
@@ -62,7 +68,7 @@ def main():
                 assert 'translation stage=' not in p.stderr and 'phase=pair-compile' in p.stderr
             stalls = [float(x) for x in re.findall(r'translation timing result=miss .*?total_ms=([\d.]+)', p.stderr)]
             compile_ms = sum(float(x) for x in re.findall(r'translation timing result=miss .*?compile_ms=([\d.]+)', p.stderr))
-            print(json.dumps({'stages': reuse, 'elapsed_ms': elapsed, 'compile_ms': round(compile_ms, 3),
+            print(json.dumps({'stages': reuse, 'compile_boost_unavailable': boost, 'elapsed_ms': elapsed, 'compile_ms': round(compile_ms, 3),
                               'request_ms': round(sum(stalls), 3), 'worst_request_ms': max(stalls),
                               'stage_hits': len(re.findall(r'translation stage=\S+ hit=1', p.stderr)),
                               'stage_misses': len(re.findall(r'translation stage=\S+ hit=0', p.stderr)),

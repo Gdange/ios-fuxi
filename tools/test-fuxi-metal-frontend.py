@@ -18,18 +18,20 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         d=Path(tmp);conf=d/'smoke.conf'
         compiler=['xcrun','clang++'] if os.uname().sysname=='Darwin' else ['clang++']
-        for name in ('ClientGateTests','BackboardGateTests','TextureLevelsTests','SurveyTests','ClientSetupTests','NativeSelectionTests','SurfaceLeaseTests','TranslationPolicyTests'):
+        for name in ('ClientGateTests','BackboardGateTests','TextureLevelsTests','SurveyTests','ClientSetupTests','NativeSelectionTests','SurfaceLeaseTests','TranslationPolicyTests','CompileBoostTests'):
             subprocess.run([*compiler,'-std=c++17','-Wall','-Wextra','-Werror','-pthread',
                             '-fsanitize=address,undefined',str(ROOT/'tools/fuxi-metal'/(name+'.cpp')),
                             '-o',str(d/name)],check=True)
             if not a.compile_only:subprocess.run([str(d/name)],check=True,timeout=15)
             if not a.compile_only and name == 'TranslationPolicyTests':
                 keys = ('fuxigpustages', 'fuxigputrace', 'fuxigpuasync')
-                enabled = dict(os.environ, FUXI_MTL_STAGE_CACHE='1', FUXI_MTL_TRANSLATION_TRACE='1', FUXI_MTL_ASYNC_PIPELINES='1')
-                for args, expected in (('', '111'), (' '.join(k+'=0' for k in keys), '000'),
-                                       (' '.join(k+'=1 '+k+'=1' for k in keys), '000'),
-                                       (' '.join(k+'=invalid' for k in keys), '000'),
-                                       (' '.join('prefix'+k+'=0' for k in keys), '111')):
+                enabled = dict(os.environ, FUXI_MTL_STAGE_CACHE='1', FUXI_MTL_TRANSLATION_TRACE='1', FUXI_MTL_ASYNC_PIPELINES='1', FUXI_MTL_COMPILE_BOOST='1')
+                for args, expected in (('', '1110'), (' '.join(k+'=0' for k in keys), '0000'),
+                                       (' '.join(k+'=1 '+k+'=1' for k in keys), '0000'),
+                                       (' '.join(k+'=invalid' for k in keys), '0000'),
+                                       (' '.join('prefix'+k+'=0' for k in keys), '1110'), ('fuxicompileboost=1', '1111'),
+                                       ('fuxicompileboost=1 fuxicompileboost=1', '1110'),
+                                       ('fuxicompileboost=invalid', '1110')):
                     subprocess.run([str(d/name), expected], env=dict(enabled, FUXI_MTL_TEST_BOOTARGS=args), check=True, timeout=15)
         if not a.compile_only:
             subprocess.run(['python3',str(ROOT/'tools/test-fuxi-metal-stage.py'),'--policy-storage-only'],check=True)

@@ -25,6 +25,7 @@
 #include <stdexcept>
 #include <vector>
 #include "Translator.hpp"
+#include "CompileBoost.hpp"
 #include "PipelineCache.hpp"
 #include "ArtifactCache.hpp"
 #include "BackboardGate.hpp"
@@ -566,6 +567,7 @@ public:
   if(auto *cached=objects.acquire(inputKey)){
    timing.result="object-hit";++pipelineHits;++objectHits;fprintf(stderr,"FUXI MTL: pipeline cache HIT %.3f ms\n",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count());return cached;
   }
+  CompileBoostScope compileBoost("pipeline");
   int ok=tr.compile(v,vn,f,fn,(void *)gipa,(uint64_t)instance,(uint64_t)physical,&enabledOptions,&translated,error,sizeof(error));
   timing.compile=timing.lap();
   double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
@@ -582,6 +584,7 @@ public:
   }
   ++pipelineMisses;++objectMisses;
   auto *p=createPipeline(translated,enabledOptions);timing.create=timing.lap();timing.result="miss";
+  compileBoost.finish();
   try {objects.insert(inputKey,productKey,p,p->retainedBytes,[&](Pipeline *old){destroyPipelineUnlocked(old);});}
   catch(...){destroyPipelineUnlocked(p);throw;}
   fprintf(stderr,"FUXI MTL: pipeline cache MISS %.3f ms\n",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count());
@@ -681,6 +684,7 @@ public:
  // Recipe pointers belong to the retained translation product; inline arrays are copied.
  VkPipeline buildTopologyPipeline(Pipeline *p,Topology topology) {
   requireLive();if(!validTopology(topology))throw std::runtime_error("invalid pipeline topology");
+  CompileBoostScope compileBoost("topology");
   const auto &translated=p->recipe;VkShaderModule modules[2]{};
   auto cleanup=[&]{for(auto m:modules)if(m)DestroyShaderModule(device,m,nullptr);};
   try {
@@ -845,6 +849,7 @@ public:
      auto *original=op.pipeline;auto found=std::find_if(original->variants.begin(),original->variants.end(),[&](const auto &v){return v.first==key;});
      if(found!=original->variants.end())op.pipeline=found->second;
      else {if(original->variants.size()>=8)throw std::runtime_error("runtime variant bound");Translation variant{};
+      CompileBoostScope compileBoost("variant");
       if(!translator.variant(original->translation,&input,&variant,why,sizeof(why)))throw std::runtime_error(why);
       auto *pipeline=createPipeline(variant,original->options);try{original->variants.push_back({key,pipeline});}catch(...){destroyPipelineUnlocked(pipeline);throw;}original->retainedBytes+=pipeline->retainedBytes;objects.reweigh(original,original->retainedBytes,[&](Pipeline *old){destroyPipelineUnlocked(old);});op.pipeline=pipeline;
      }

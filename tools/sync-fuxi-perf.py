@@ -20,7 +20,8 @@ def expected():
     prefix = text[:text.index('--- a/bsd/dev/fuxi_perf.c\n')]
     return prefix + ''.join(sync.new_file('bsd/dev/' + name,
         (ROOT / 'xnu/fuxi-perf' / name).read_text())
-        for name in ('fuxi_perf.c', 'fuxi_perf_logic.h'))
+        for name in ('fuxi_perf.c', 'fuxi_perf_logic.h', 'fuxi_compile_abi.h')) + sync.new_file('osfmk/kern/fuxi_compile_sched.h',
+            (ROOT / 'xnu/fuxi-perf/fuxi_compile_sched.h').read_text())
 
 
 def main():

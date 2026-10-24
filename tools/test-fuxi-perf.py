@@ -16,12 +16,15 @@ spec = importlib.util.spec_from_file_location('submit', ROOT/'tools/test-fuxi-ad
 submit = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(submit)
 actual = (ROOT/'xnu/fuxi-perf/fuxi_perf.c').read_text()
-register_functions = actual[actual.index('static uint64_t fp_duty_used('):
+register_functions = actual[actual.index('static uint64_t fp_duty_used(uint64_t now)'):
                             actual.index('static int fp_thermal_guard(')]
 register_functions += ''.join(submit.function(actual, n) for n in (
     'fp_read','fp_vote','fp_temperature','fp_init_fail','fp_init_report',
     'fp_initialize','fp_try_initialize','fp_update_votes','fp_thermal_guard',
-    'fp_arg','fp_configure','fp_worker','fuxi_perf_input','fuxi_perf_swap'))
+    'fp_arg','fp_configure','fp_worker_locked','fp_worker','fuxi_perf_input','fuxi_perf_swap'))
+register_functions = "static uint64_t fp_duty_used(uint64_t);\nstatic void fp_worker_locked(thread_call_param_t,thread_call_param_t);\n" + ''.join(
+    submit.function(actual, n) for n in ('fp_compile_cut','fp_compile_forget','fp_compile_poll','fp_compile_admitted','fp_compile_command')) + register_functions
+register_functions += actual[actual.index('static int fp_compile_sysctl SYSCTL_HANDLER_ARGS'):actual.index('SYSCTL_PROC(_kern')]
 # Audit the loader's zero-based wire slots and execute the host decoder without
 # importing its USB dependencies. The C model below records the governor reads.
 probe = (ROOT/'shim/fuxi-probe/probe.c').read_text()
@@ -52,6 +55,8 @@ TEST = r'''
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
+#include <errno.h>
+#include "fuxi_compile_abi.h"
 #include "fuxi-epss-0097.h"
 #include "fuxi_perf_logic.h"
 #define R(l,n) ((1u<<30)|((n)<<16)|(l))
@@ -486,7 +491,106 @@ int main(void) {
  reset();assert(fp_thermal_guard(1,550,100,0));
  for(unsigned i=1;i<20;i++)assert(fp_thermal_guard(1,550+i,100+i,1000000));
  assert(!fp_thermal_guard(1,570,120,1000000));
+ /* Raw ABI: disabled/authorization precede payload parsing, exact width,
+  * copy faults, optional reply, and failed copyout rolls back admission. */
+ struct fuxi_compile_reply wire_reply;
+ int32_t command=1;
+ struct sysctl_req req={&command,&wire_reply,sizeof(command),sizeof(wire_reply)};
+ reset();assert(fp_compile_sysctl(&req)==ENOTSUP);
+ fp_compile_enabled=1;platform=0;assert(fp_compile_sysctl(&req)==EPERM);platform=1;
+ req.newptr=0;assert(fp_compile_sysctl(&req)==EINVAL);req.newptr=&command;
+ req.newlen=8;assert(fp_compile_sysctl(&req)==EINVAL);req.newlen=sizeof(command);
+ req.oldlen=1;assert(fp_compile_sysctl(&req)==ENOMEM);req.oldlen=sizeof(wire_reply);
+ copyin_error=EFAULT;assert(fp_compile_sysctl(&req)==EFAULT && !refs);copyin_error=0;
+ copyout_error=EFAULT;assert(fp_compile_sysctl(&req)==EFAULT && !refs && bound==-1);copyout_error=0;
+ assert(!fp_compile_sysctl(&req) && refs==1 && wire_reply.version==1 && wire_reply.cpu==7);
+ command=0;req.oldptr=0;assert(!fp_compile_sysctl(&req) && !refs && bound==-1);
+ /* Compile lease: actual command, shared worker/thermal/duty, current-thread
+  * ownership, balanced references, nested expiry and failed admissions. */
+ struct fuxi_compile_reply reply;
+ reset();assert(fp_compile_command(1,&reply)==ENOTSUP && bound==-1);
+ fp_compile_enabled=1;fp_enabled=0;assert(fp_compile_command(1,&reply)==ENOTSUP);fp_enabled=1;
+ platform=0;assert(fp_compile_command(1,&reply)==EPERM);platform=1;
+ process_name="other";assert(fp_compile_command(1,&reply)==EPERM);process_name="backboardd";
+ proc_present=0;assert(fp_compile_command(1,&reply)==EPERM);proc_present=1;
+ assert(fp_compile_command(2,&reply)==EINVAL);
+ assert(!fp_compile_command(0,&reply) && reply.state==FC_NONE && !refs);
+ assert(!fp_compile_command(1,&reply) && reply.cpu==7 && reply.state==FC_ACTIVE);
+ assert(fp_compile_high && fp_boosted && refs==1 && bound==7 && migrations==1);
+ assert(regs[2][0x320/4]==fp_high[2] && regs[1][0x320/4]==fp_cool[1]);
+ uint64_t original_deadline=fp_compile_deadline;
+ ticks+=50;assert(!fp_compile_command(1,&reply) && reply.depth==2 && fp_compile_deadline==original_deadline);
+ assert(!fp_compile_command(0,&reply) && reply.depth==1 && bound==7);
+ caller=2;assert(fp_compile_command(1,&reply)==EBUSY);
+ assert(!fp_compile_command(0,&reply) && reply.state==FC_NONE && refs==1 && bound==7);caller=1;
+ ticks+=50;assert(!fp_compile_command(0,&reply) && reply.state==FC_LEFT && reply.boosted_ns==100*NSEC_PER_MSEC);
+ assert(!refs && bound==-1 && !fp_boosted && regs[2][0x320/4]==fp_cool[2]);
+ assert(!fp_compile_command(0,&reply) && reply.state==FC_NONE);
+ fuxi_perf_swap();fp_worker(0,0);assert(!fp_boosted); /* compile cannot seed touch's swap extension */
+ reset();fp_compile_enabled=1;fuxi_perf_input();fp_worker(0,0);
+ assert(!fp_compile_command(1,&reply) && fp_touch_high);
+ assert(!fp_compile_command(0,&reply) && fp_boosted && fp_touch_high && bound==-1);
+ assert(regs[1][0x320/4]==fp_high[1] && regs[2][0x320/4]==fp_high[2]);
+ /* Default rolling duty ends the vote and binding at 200 ms, keeps a bounded
+  * reply for leave, and cannot be renewed by a nested enter. */
+ reset();fp_compile_enabled=1;assert(!fp_compile_command(1,&reply));
+ ticks+=199;fp_worker(0,0);assert(fp_compile_high && scheduled==300);
+ ticks++;fp_worker(0,0);assert(!fp_compile_high && bound==-1 && !fp_boosted);
+ assert(fp_compile_reply.state==FC_DUTY && refs==1);
+ assert(fp_compile_command(1,&reply)==EAGAIN);
+ assert(!fp_compile_command(0,&reply) && reply.state==FC_DUTY && reply.boosted_ns==200*NSEC_PER_MSEC && !refs);
+ assert(fp_compile_command(1,&reply)==EAGAIN); /* no reset by leave */
+ ticks+=1000;assert(!fp_compile_command(1,&reply));
+ assert(!fp_compile_command(0,&reply));
+ /* Timeout independent of duty, even with nested scopes and no leave. */
+ reset();fp_compile_enabled=1;fp_budget=10000;
+ assert(!fp_compile_command(1,&reply));
+ for(unsigned i=1;i<16;i++)assert(!fp_compile_command(1,&reply));
+ assert(fp_compile_command(1,&reply)==EOVERFLOW && fp_compile_reply.depth==16);
+ ticks=2099;fp_worker(0,0);assert(bound==7 && scheduled==2100);
+ ticks=2100;fp_worker(0,0);assert(!refs && bound==-1 && !fp_compile_high);
+ assert(!fp_compile_command(0,&reply) && reply.state==FC_NONE);
+ /* Terminated owner is referenced until the worker unbinds/deallocates. */
+ reset();fp_compile_enabled=1;assert(!fp_compile_command(1,&reply));
+ alive=0;ticks+=20;fp_worker(0,0);
+ assert(!refs && !fp_compile_thread && bound==-1 && !fp_compile_high && !fp_boosted);
+ /* Gold fallback when prime EPSS failed; no silver or monitor vote. */
+ reset();fp_compile_enabled=1;fp_domain_failed[2]=1;
+ assert(!fp_compile_command(1,&reply) && reply.cpu==6);
+ assert(regs[1][0x320/4]==fp_high[1] && regs[2][0x320/4]==fp_cool[2]);
+ assert(!fp_compile_command(0,&reply));
+ reset();fp_compile_enabled=1;assert(!fp_compile_command(1,&reply));
+ regs[2][0]=2;ticks+=20;fp_worker(0,0);
+ assert(fp_domain_failed[2] && !fp_compile_high && bound==-1);
+ assert(!fp_compile_command(0,&reply) && reply.state==FC_OFFLINE && !refs);
+ for(unsigned reason=FC_THERMAL;reason<=FC_OFFLINE;reason++) {
+  if(reason!=FC_THERMAL && reason!=FC_OFFLINE)continue;
+  reset();fp_compile_enabled=1;assert(!fp_compile_command(1,&reply));
+  if(reason==FC_THERMAL)regs[3][0xa4/4]=(1u<<21)|620;else online=0;
+  ticks+=20;fp_worker(0,0);assert(bound==-1 && !fp_compile_high);
+  assert(!fp_compile_command(0,&reply) && reply.state==reason && !refs);
+ }
+ for(unsigned temp=600;temp<=601;temp++) {
+  reset();fp_compile_enabled=1;
+  for(unsigned d=0;d<2;d++)for(unsigned n=1;n<=(d?3:15);n++)regs[d+3][(0xa0+4*n)/4]=(1u<<21)|temp;
+  int result=fp_compile_command(1,&reply);
+  assert(result==(temp==600?0:EAGAIN));
+  if(!result)assert(!fp_compile_command(0,&reply));
+ }
+ reset();fp_compile_enabled=1;bind_temp=601;
+ assert(!fp_compile_command(1,&reply) && reply.state==FC_THERMAL && !fp_compile_high && bound==-1);
+ assert(!fp_compile_command(0,&reply) && reply.boosted_ns==0 && !refs); /* fresh pre-vote sample wins */
+ /* Lease overrides idle only in its own domain, and touch still votes both
+  * fast domains. Thermal/quorum veto applies to both sources together. */
+ reset();fp_idle_ms=1000;fp_idle_floor=300000;fp_configure();fp_compile_enabled=1;
+ fp_worker(0,0);fp_swap=100; ticks=1200;fp_worker(0,0);assert(fp_idling);
+ assert(!fp_compile_command(1,&reply) && !fp_idling && fp_compile_high);
+ ticks+=20;fuxi_perf_input();fp_worker(0,0);assert(fp_touch_high && regs[1][0x320/4]==fp_high[1]);
+ for(unsigned n=1;n<=5;n++)regs[3][(0xa0+4*n)/4]=450;
+ ticks+=20;fp_worker(0,0);assert(!fp_boosted && !fp_compile_high && bound==-1);
+ assert(!fp_compile_command(0,&reply) && reply.state==FC_THERMAL && !refs);
 #undef printf
+ puts("PASS: compile gate/default off, prime/gold votes, idle/touch precedence, thermal/quorum/duty cuts, cap, nested limit/no renewal, leave without enter, cross-thread isolation, dead-thread cleanup and balanced references");
  puts("PASS: opt-in idle boundaries, LUT floor/clamp, legacy equivalence, hook wakeups, thermal/duty precedence, stats and transition rate limit");
  puts("PASS: predictive/rise/62C cutoff, 68C ceiling votes within 20ms of 77C step at every phase, sustained ramp, 51-52C load, 500ms hysteresis, rolling 123/200ms duty, boot-arg bounds and actual timer deadlines");
  puts("PASS: observed TRDY=8/48.1 C worker boost/hot cutoff/quorum/stats; exact CPU sensor read masks; actual worker 60s retries/input gating/no-init-votes/domain enable loss and recovery; real 0097 LUTs/init failures/16K mappings/14-of-18 sensor quorum; LUT decode/duplicates/turbo/nonmonotonic selection, legacy eligibility 60/68 boundaries, input-only entry, swap extension, 1500 ms expiry, per-core vote/readback and signed/invalid CPU sensors");
@@ -517,7 +621,39 @@ static int PE_parse_boot_argn(const char *name,void *value,unsigned size) {
  return 0;
 }
 typedef void *thread_call_param_t;
+struct sysctl_req {void *newptr,*oldptr;size_t newlen,oldlen;};
+#define SYSCTL_HANDLER_ARGS (struct sysctl_req *req)
+static int copyin_error,copyout_error;
+static int model_sysctl_in(struct sysctl_req *req,void *out,size_t n){if(copyin_error)return copyin_error;memcpy(out,req->newptr,n);return 0;}
+static int model_sysctl_out(struct sysctl_req *req,const void *in,size_t n){if(copyout_error)return copyout_error;memcpy(req->oldptr,in,n);return 0;}
+#define SYSCTL_IN model_sysctl_in
+#define SYSCTL_OUT model_sysctl_out
 static int fp_call;
+typedef uintptr_t thread_t;
+#define THREAD_NULL 0
+static unsigned fp_compile_enabled,fp_compile_high,fp_compile_voted,fp_touch_high;
+static thread_t fp_compile_thread;
+static uint64_t fp_compile_deadline,fp_compile_cap,fp_compile_start;
+static struct fuxi_compile_reply fp_compile_reply;
+static int fp_lock,locked,platform=1,proc_present=1,alive=1,online=1,bound=-1,refs,migrations,bind_temp;
+static thread_t caller=1;
+static const char *process_name="backboardd";
+typedef int proc_t;
+static void proc_selfname(char *out,unsigned n){snprintf(out,n,"%s",process_name);}
+static proc_t proc_self(void){return proc_present;}
+static int csproc_get_platform_binary(proc_t p){assert(p==1);return platform;}
+static void proc_rele(proc_t p){assert(p==1);}
+static void lck_mtx_lock(int *p){assert(p==&fp_lock && !locked);locked=1;}
+static void lck_mtx_unlock(int *p){assert(p==&fp_lock && locked);locked=0;}
+static thread_t current_thread(void){return caller;}
+static void thread_reference(thread_t t){assert(t);refs++;}
+static void thread_deallocate(thread_t t){assert(t && refs>0);refs--;}
+static int fuxi_compile_alive(thread_t t){assert(t);return alive;}
+static int fuxi_compile_online(int cpu){assert(cpu>=3 && cpu<=7);return online;}
+static int fuxi_compile_bind(unsigned domains){if(!online || bound!=-1 || !domains)return -1;bound=domains&4?7:6;if(bind_temp)regs[3][0xa4/4]=(1u<<21)|bind_temp;return bound;}
+static void fuxi_compile_migrate(void){assert(!locked);migrations++;}
+static void fuxi_compile_unbind(thread_t t,int cpu){assert(t && bound==cpu);bound=-1;}
+
 static uint64_t scheduled;
 #define NSEC_PER_MSEC 1000000ULL
 #define NSEC_PER_SEC 1000000000ULL
@@ -572,6 +708,11 @@ static unsigned fuxi_gpu_access(uintptr_t address,uint64_t *v,unsigned wr,unsign
 }
 static void fp_configure(void);
 static void reset(void) {
+ assert(!refs && !locked);
+ fp_compile_enabled=fp_compile_high=fp_compile_voted=fp_touch_high=0;fp_compile_thread=THREAD_NULL;
+ fp_compile_cap=2000;fp_compile_deadline=fp_compile_start=0;
+ memset(&fp_compile_reply,0,sizeof(fp_compile_reply));
+ platform=proc_present=alive=online=1;bound=-1;caller=1;process_name="backboardd";migrations=bind_temp=0;
  fp_hot=620;fp_limit=680;fp_resume=580;fp_rise=100;fp_fast_ms=20;fp_budget_ms=200;
  fp_idle_ms=fp_idle_floor=fp_idling=0;
  fp_idle_start=fp_idle_entry=fp_idle_time=fp_idle_entries=fp_idle_transitions=0;
@@ -613,10 +754,12 @@ REGISTERS = REGISTERS.replace('POLICY_CAPS', policy_caps)
 TEST = TEST.replace('#define REGISTER_FUNCTIONS', REGISTERS + register_functions)
 # Verify patch snapshots are exact and hooks are present in the final patch.
 patch = (ROOT/'xnu/patches/0097-fuxi-touch-boost.patch').read_text()
-for name in ('fuxi_perf.c','fuxi_perf_logic.h'):
+for name in ('fuxi_perf.c','fuxi_perf_logic.h','fuxi_compile_abi.h'):
     block = re.search(r'^--- a/bsd/dev/'+name+r'\n.*?(?=^--- a/|\Z)',patch,re.M|re.S)[0]
     added = ''.join(l[1:] for l in block.splitlines(True) if l.startswith('+') and not l.startswith('+++'))
     assert added == (ROOT/'xnu/fuxi-perf'/name).read_text()
+assert '#include "fuxi_compile_sched.h"' in patch
+assert 'CTLFLAG_ANYBODY | CTLFLAG_LOCKED' in actual
 assert patch.count('+\tfuxi_perf_input();') == 1 and '+\t\t\t\tfuxi_perf_input();' in patch
 with tempfile.TemporaryDirectory() as d:
     source, exe = Path(d)/'perf.c', Path(d)/'perf'
@@ -624,6 +767,7 @@ with tempfile.TemporaryDirectory() as d:
     subprocess.run(['clang','-std=c11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',
                     '-I',str(ROOT/'xnu/fuxi-perf'),'-I',str(ROOT/'tools/fixtures'),str(source),'-o',str(exe)],check=True)
     subprocess.run([str(exe)],check=True)
+subprocess.run(['python3',str(ROOT/'tools/test-fuxi-compile-sched.py')],check=True)
 
 if args.xnu_tree:
     io_source = (args.xnu_tree/'osfmk/arm/io_map.c').read_text()
