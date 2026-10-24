@@ -3,6 +3,7 @@
 #include <cstddef>
 #include "ConstantLayout.hpp"
 #include "CAState.hpp"
+#include "TranslationPolicy.hpp"
 #include <cstdint>
 #include <dlfcn.h>
 #include <stdexcept>
@@ -52,6 +53,14 @@ public:
  using CacheWrite=void (*)(void *,const uint8_t *,const uint8_t *,size_t);
  using CacheOutcome=void (*)(void *,uint32_t);
  using CacheScope=void (*)(void *,CacheRead,CacheWrite,CacheOutcome);
+ using TranslationScope=void (*)(uint32_t);
+ TranslationScope translationScope{}; // Optional ABI-8 Fuxi adapter extension, thread-local flags.
+ struct OptionsScope {
+  TranslationScope fn;
+  explicit OptionsScope(Translator &tr):fn(tr.translationScope){auto p=systemTranslationPolicy();if(fn)fn((p.stages?1u:0u)|(p.trace?2u:0u));}
+  ~OptionsScope(){if(fn)fn(0);}
+  OptionsScope(const OptionsScope&)=delete;
+ };
  CacheScope artifactScope{}; // Optional ABI-8 extension; synchronous thread-local callbacks.
  struct Scope {
   CacheScope fn;
@@ -79,6 +88,8 @@ public:
   LOAD(open) LOAD(close) LOAD(function) LOAD(compile) LOAD(draw) LOAD(variant) LOAD(sampler) LOAD(identity) LOAD(product_hash) LOAD(free)
 #undef LOAD
   texture_type=(decltype(texture_type))dlsym(dylib,"fuxi_m2v_texture_type");
+  translationScope=(TranslationScope)dlsym(dylib,"fuxi_m2v_translation_scope_v1");
+  auto policy=systemTranslationPolicy();if(policy.stages || policy.trace)fprintf(stderr,"FUXI MTL: translation settings stages=%u trace=%u bridge=%u\n",unsigned(policy.stages),unsigned(policy.trace),unsigned(translationScope!=nullptr));
   artifactScope=(CacheScope)dlsym(dylib,"fuxi_m2v_artifact_scope_v1");
  }
  ~Translator() {if(dylib)dlclose(dylib);}

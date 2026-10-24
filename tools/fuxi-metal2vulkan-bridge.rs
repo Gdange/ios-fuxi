@@ -125,19 +125,97 @@ thread_local! {static ARTIFACT_SCOPE:std::cell::Cell<Option<ArtifactScope>>=cons
 #[no_mangle] pub extern "C" fn fuxi_m2v_artifact_scope_v1(context:*mut c_void,read:Option<CacheRead>,write:Option<CacheWrite>,outcome:Option<CacheOutcome>) {
  ARTIFACT_SCOPE.set(match (context.is_null(),read,write,outcome) {(false,Some(read),Some(write),Some(outcome))=>Some(ArtifactScope{context,read,write,outcome}),_=>None});
 }
-fn cached_render(device:&Device,descriptor:&RenderPipelineDescriptor,variant:&metal2vulkan::cache::VariantKey)->Result<metal2vulkan::pipeline::RenderPipeline,String> {
- let Some(io)=ARTIFACT_SCOPE.get() else {return device.compile_render_variant(descriptor,variant,&Budget::standard()).map_err(|e|e.to_string());};
- let key=device.render_variant_key(descriptor,variant,&Budget::standard(),&metal2vulkan::pipeline::StageEntries::new()).map_err(|e|e.to_string())?.pipeline;
- let mut bytes=std::ptr::null();let n=unsafe{(io.read)(io.context,key.digest().as_ptr(),&mut bytes)};
- if !bytes.is_null() && n>0 && n<=8*1024*1024 {
-  let decoded=catch_unwind(AssertUnwindSafe(||metal2vulkan::pipeline::RenderPipeline::from_bytes_for_key(unsafe{std::slice::from_raw_parts(bytes,n)},&key,device)));
-  if let Ok(Ok(pipeline))=decoded {unsafe{(io.outcome)(io.context,1)};return Ok(pipeline);}
+// Original Fuxi policy and byte-only LRU. No upstream sources or decoded AIR are
+// retained. The upstream function key includes profile, constants and lowering
+// inputs (including variant/fetch/attachment/varying facts), never just a name.
+thread_local! {static TRANSLATION_FLAGS:std::cell::Cell<u32>=const {std::cell::Cell::new(0)};}
+#[no_mangle] pub extern "C" fn fuxi_m2v_translation_scope_v1(flags:u32) {TRANSLATION_FLAGS.set(flags & 3);}
+fn stage_reuse()->bool {TRANSLATION_FLAGS.get() & 1 != 0}
+struct TranslationTimer {phase:&'static str,start:std::time::Instant,enabled:bool}
+impl TranslationTimer {
+ fn new(phase:&'static str)->Self {Self{phase,start:std::time::Instant::now(),enabled:TRANSLATION_FLAGS.get() & 2 != 0}}
+}
+impl Drop for TranslationTimer {fn drop(&mut self){if self.enabled {eprintln!("FUXI MTL: translation detail phase={} ms={:.3}",self.phase,self.start.elapsed().as_secs_f64()*1000.0);}}}
+#[derive(Default)]
+struct StageCache {entries:VecDeque<([u8;32],Vec<u8>)>,bytes:usize,evictions:u64}
+impl StageCache {
+ const MAX_ENTRIES:usize=128;
+ const MAX_BYTES:usize=16*1024*1024;
+ fn get(&mut self,key:&[u8;32])->Option<&[u8]> {
+  let index=self.entries.iter().position(|(k,_)|k==key)?;
+  let e=self.entries.remove(index)?;self.entries.push_back(e);Some(&self.entries.back()?.1)
  }
- unsafe{(io.outcome)(io.context,if n>0 {2}else{0})};
- let pipeline=device.compile_render_variant(descriptor,variant,&Budget::standard()).map_err(|e|e.to_string())?;
- // Cache encoding/IO is optional. Never let it turn a successful compile into
- // a refusal. Upstream's codec includes keys, profile, versions and SHA-256.
- let _=catch_unwind(AssertUnwindSafe(||{let mut bytes=ArtifactBytes(Vec::new());if pipeline.write_to(&mut bytes).is_ok(){unsafe{(io.write)(io.context,key.digest().as_ptr(),bytes.0.as_ptr(),bytes.0.len())};}}));
+ fn put(&mut self,key:[u8;32],bytes:Vec<u8>) {
+  if bytes.is_empty() || bytes.len()>Self::MAX_BYTES {return;}
+  if let Some(index)=self.entries.iter().position(|(k,_)|*k==key){self.bytes-=self.entries.remove(index).unwrap().1.len();}
+  while self.entries.len()>=Self::MAX_ENTRIES || self.bytes+bytes.len()>Self::MAX_BYTES {
+   self.bytes-=self.entries.pop_front().unwrap().1.len();self.evictions+=1;
+  }
+  self.bytes+=bytes.len();self.entries.push_back((key,bytes));
+ }
+}
+static STAGES:OnceLock<Mutex<StageCache>>=OnceLock::new();
+fn reused_stage(device:&Device,function:&FunctionDescriptor,inputs:&metal2vulkan::pipeline::LoweringInputs,key:&metal2vulkan::library::FunctionCompileKey,entries:&metal2vulkan::pipeline::StageEntries,stage:&str)->Result<metal2vulkan::library::CompiledFunction,String> {
+ let read_time=TranslationTimer::new(if stage=="vertex" {"vertex-cache-read"}else{"fragment-cache-read"});
+ let mut hit=None;
+ // Decode while locked: no pointer escapes the LRU's eviction lifetime.
+ if let Ok(mut c)=STAGES.get_or_init(||Mutex::new(StageCache::default())).lock() {
+  if let Some(bytes)=c.get(key.digest()){hit=metal2vulkan::library::CompiledFunction::from_bytes_for_key(bytes,key,device).ok();}
+ }
+ drop(read_time);
+ if let Some(compiled)=hit {if TRANSLATION_FLAGS.get() & 2 != 0 {eprintln!("FUXI MTL: translation stage={} hit=1",stage);}return Ok(compiled);}
+ let compiled={let _time=TranslationTimer::new(if stage=="vertex" {"vertex-lower"}else{"fragment-lower"});
+  device.compile_function_from_entries(function,inputs,&Budget::standard(),entries).map_err(|e|e.to_string())?};
+ if compiled.key()!=key {return Err("function compile key mismatch".into());}
+ // Optional cache encoding must never refuse an otherwise valid pipeline.
+ let _=catch_unwind(AssertUnwindSafe(||{
+  let _time=TranslationTimer::new("stage-cache-write");
+  let bytes=compiled.to_bytes();if let Ok(mut c)=STAGES.get_or_init(||Mutex::new(StageCache::default())).lock(){
+   c.put(*key.digest(),bytes);
+   if TRANSLATION_FLAGS.get() & 2 != 0 {eprintln!("FUXI MTL: translation stage={} hit=0 entries={} bytes={} evictions={}",stage,c.entries.len(),c.bytes,c.evictions);}
+  }
+ }));
+ Ok(compiled)
+}
+fn cached_render(device:&Device,descriptor:&RenderPipelineDescriptor,variant:&metal2vulkan::cache::VariantKey)->Result<metal2vulkan::pipeline::RenderPipeline,String> {
+ let io=ARTIFACT_SCOPE.get();
+ if io.is_none() && !stage_reuse() {let _time=TranslationTimer::new("pair-compile");return device.compile_render_variant(descriptor,variant,&Budget::standard()).map_err(|e|e.to_string());}
+ let entries=metal2vulkan::pipeline::StageEntries::new();
+ let keys={let _time=TranslationTimer::new("keys-specialize");device.render_variant_key(descriptor,variant,&Budget::standard(),&entries).map_err(|e|e.to_string())?};
+ // Preserve the legacy peak lifetime: only the opt-in path keeps decoded
+ // entries through lowering; persistence alone still drops them after keying.
+ let entries=if stage_reuse(){Some(entries)}else{drop(entries);None};
+ let key=&keys.pipeline;
+ if TRANSLATION_FLAGS.get() & 2 != 0 {eprintln!("FUXI MTL: translation keys vertex={:?} fragment={:?}",keys.vertex,keys.fragment);}
+ if let Some(io)=io {
+  let _time=TranslationTimer::new("artifact-read");
+  let mut bytes=std::ptr::null();let n=unsafe{(io.read)(io.context,key.digest().as_ptr(),&mut bytes)};
+  if !bytes.is_null() && n>0 && n<=8*1024*1024 {
+   let decoded=catch_unwind(AssertUnwindSafe(||metal2vulkan::pipeline::RenderPipeline::from_bytes_for_key(unsafe{std::slice::from_raw_parts(bytes,n)},key,device)));
+   if let Ok(Ok(pipeline))=decoded {unsafe{(io.outcome)(io.context,1)};if TRANSLATION_FLAGS.get() & 2 != 0 {eprintln!("FUXI MTL: translation artifact hit=1");}return Ok(pipeline);}
+  }
+  unsafe{(io.outcome)(io.context,if n>0 {2}else{0})};
+  if TRANSLATION_FLAGS.get() & 2 != 0 {eprintln!("FUXI MTL: translation artifact hit=0 rejected={}",u8::from(n>0));}
+ }
+ let pipeline=if stage_reuse() {
+  let entries=entries.as_ref().ok_or("missing stage entries")?;
+  let mut linked=descriptor.clone();
+  if let (StageSource::Function(f),Some(inputs))=(&descriptor.vertex,&keys.vertex_inputs) {
+   linked.vertex=StageSource::Compiled(reused_stage(device,f,inputs,&keys.vertex,entries,"vertex")?);
+  }
+  if let (Some(StageSource::Function(f)),Some(inputs),Some(key))=(&descriptor.fragment,&keys.fragment_inputs,&keys.fragment) {
+   linked.fragment=Some(StageSource::Compiled(reused_stage(device,f,inputs,key,entries,"fragment")?));
+  }
+  let _time=TranslationTimer::new("pair-link");
+  device.compile_render_variant(&linked,variant,&Budget::standard()).map_err(|e|e.to_string())?
+ }else {
+  let _time=TranslationTimer::new("pair-compile");
+  device.compile_render_variant(descriptor,variant,&Budget::standard()).map_err(|e|e.to_string())?
+ };
+ if let Some(io)=io {
+  let _time=TranslationTimer::new("artifact-write");
+  let _=catch_unwind(AssertUnwindSafe(||{let mut bytes=ArtifactBytes(Vec::new());if pipeline.write_to(&mut bytes).is_ok(){unsafe{(io.write)(io.context,key.digest().as_ptr(),bytes.0.as_ptr(),bytes.0.len())};}}));
+ }
  Ok(pipeline)
 }
 // Only these facts may be discharged by the bounded plan/instantiate consumer.
@@ -222,6 +300,7 @@ unsafe fn name<'a>(p:*const c_char)->Result<&'a str,String> {
 #[no_mangle] pub unsafe extern "C" fn fuxi_m2v_open(p:*const u8,n:usize,err:*mut c_char,cap:usize)->*mut c_void {
     attempt(err,cap,|| {
         if p.is_null() || n==0 || n>4*1024*1024{return Err("library outside 1..4 MiB".into());}
+        let _time=TranslationTimer::new("library-open");
         let lib=Library::parse(std::slice::from_raw_parts(p,n)).map_err(|e|e.to_string())?;
         Ok(Box::into_raw(Box::new(lib)).cast())
     }).unwrap_or(std::ptr::null_mut())
@@ -282,15 +361,26 @@ unsafe fn name<'a>(p:*const c_char)->Result<&'a str,String> {
         let vf=(*(v as *const Library)).function(name(vn)?).map_err(|e|e.to_string())?;
         let ff=(*(f as *const Library)).function(name(fn_)?).map_err(|e|e.to_string())?;
         let props=inst.get_physical_device_properties(vk::PhysicalDevice::from_raw(physical));
-        let key=format!("{:?}/{:?}/{:?}/{:?}/{}/{}/{}/{}/{}/{}/{:?}/{:?}",vf.info().air_hash,ff.info().air_hash,
+        let key_time=TranslationTimer::new("product-key");
+        let key=if stage_reuse() {
+            let mut digest=[0u8;32];
+            if fuxi_m2v_identity(v,vn,f,fn_,options,digest.as_mut_ptr(),err,cap)!=1 {return Err("product identity".into());}
+            format!("stages-v1/{digest:?}/{:?}/{:?}/{}/{}/{}/{}/{:?}",vf.info().air_hash,ff.info().air_hash,props.api_version,props.driver_version,props.vendor_id,props.device_id,props.pipeline_cache_uuid)
+        }else {format!("{:?}/{:?}/{:?}/{:?}/{}/{}/{}/{}/{}/{}/{:?}/{:?}",vf.info().air_hash,ff.info().air_hash,
             vf.library().content_hash(),ff.library().content_hash(),name(vn)?,name(fn_)?,props.api_version,props.driver_version,
-            props.vendor_id,props.device_id,props.pipeline_cache_uuid,options);
+            props.vendor_id,props.device_id,props.pipeline_cache_uuid,options)};
+        drop(key_time);
+        let lock_time=TranslationTimer::new("product-lock");
         let mut cache=CACHE.get_or_init(||Mutex::new(VecDeque::new())).lock().map_err(|_|"translation cache poisoned")?;
+        drop(lock_time);
+        let lookup_time=TranslationTimer::new("product-lookup");
         if let Some(index)=cache.iter().position(|(k,p)|k==&product_cache_key(&key,p)) {
             let item=cache.remove(index).unwrap();let product=item.1.clone();cache.push_back(item);
             eprintln!("FUXI MTL: translation cache HIT");output(out,product);return Ok(1);
         }
+        drop(lookup_time);
         eprintln!("FUXI MTL: translation cache MISS");
+        let setup_time=TranslationTimer::new("device-descriptor");
         if options.ordered_color_access>1 {return Err("unknown device enables".into());}
         let mut enabled=EnableSet::new();
         if options.independent_blend>1{return Err("independent blend enable".into());}
@@ -337,6 +427,7 @@ unsafe fn name<'a>(p:*const c_char)->Result<&'a str,String> {
             vd.layouts.insert(a.buffer,metal2vulkan::pipeline::VertexBufferLayoutDescriptor::new(Some(options.strides[a.buffer as usize])));
         }
         descriptor.vertex_descriptor=Some(vd);
+        drop(setup_time);
         let product=make_product(device,descriptor,options,baseline_state(),metal2vulkan::cache::VariantKey::default(),true)?;
         let size=product_size(&product);
         if size<=16*1024*1024 {
@@ -352,6 +443,20 @@ unsafe fn name<'a>(p:*const c_char)->Result<&'a str,String> {
 mod tests {
     use super::*;
     use metal2vulkan::pipeline::SlotRef;
+    #[test]
+    fn stage_byte_lru_bounds_and_recency() {
+        let mut c=StageCache::default();
+        for i in 0..StageCache::MAX_ENTRIES {let mut k=[0;32];k[0]=i as u8;c.put(k,vec![i as u8;4]);}
+        assert_eq!(c.bytes,512);assert_eq!(c.get(&[0;32]),Some(&[0;4][..]));
+        let mut extra=[0;32];extra[1]=1;c.put(extra,vec![9;4]);
+        let mut one=[0;32];one[0]=1;assert!(c.get(&one).is_none());assert!(c.get(&[0;32]).is_some());
+        c.put(extra,vec![8;8]);assert_eq!(c.bytes,516);
+        c.put([255;32],vec![0;StageCache::MAX_BYTES]);
+        assert_eq!(c.entries.len(),1);assert_eq!(c.bytes,StageCache::MAX_BYTES);
+        c.put([254;32],vec![0;StageCache::MAX_BYTES+1]);assert_eq!(c.entries.len(),1);
+        c.put([254;32],vec![]);assert_eq!(c.entries.len(),1);
+        c.put([253;32],vec![1]);assert_eq!(c.bytes,1);assert_eq!(c.entries.len(),1);
+    }
     #[test]
     fn vertex_profile_exact_widths_and_bounds() {
         use metal2vulkan::metal::{VertexFormat,vertex::vk_vertex_format};
@@ -509,6 +614,7 @@ fn reflect_textures(pipeline:&metal2vulkan::pipeline::RenderPipeline,state:&mut 
 }
 fn make_product(device:Device,descriptor:RenderPipelineDescriptor,options:&CompileOptions,mut state:BindState,variant:metal2vulkan::cache::VariantKey,initial:bool)->Result<Product,String> {
         let pipeline=cached_render(&device,&descriptor,&variant)?;
+        let _time=TranslationTimer::new("product-plan");
         // Refuse resources outside the bounded descriptor/vertex/push consumer.
         // Never discard a binding/plan requirement and pretend its SPIR-V is standalone.
         if pipeline.stages.len()!=2 {return Err(format!("M6 stages count={}",pipeline.stages.len()));}

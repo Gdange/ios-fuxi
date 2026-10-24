@@ -42,6 +42,12 @@ extern "C" void _objc_msgForward(void);
 static fuxi::ClientMode clientMode=fuxi::ClientMode::deny;
 static char clientProcess[64]="unknown";
 static bool gpuScanout=false;
+// One worker avoids a compile stampede. Blocks own device, descriptor snapshot
+// and handler until completion; the backend still serializes Vulkan/cache use.
+static dispatch_queue_t pipelineCompilationQueue() {
+ static dispatch_queue_t queue=dispatch_queue_create("org.fuxi.metal.pipelines",DISPATCH_QUEUE_SERIAL);return queue;
+}
+
 static int lockScanoutSurface(uintptr_t p) {return IOSurfaceLock((IOSurfaceRef)p,0,nullptr);}
 static void unlockScanoutSurface(uintptr_t p) {(void)IOSurfaceUnlock((IOSurfaceRef)p,0,nullptr);}
 static fuxi::MetalBackend selectedBackend=fuxi::MetalBackend::fuxi;
@@ -1560,7 +1566,7 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
  const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);
  if(!mapped)return metalError(error,"map library failed");
  FuxiLibrary *lib=[FuxiLibrary new];lib->_device=[self retain];char why[2048]{};
- try {lib->_library=fuxi::Translator::get().open((const uint8_t *)bytes,size,why,sizeof(why));}
+ try {auto &tr=fuxi::Translator::get();fuxi::Translator::OptionsScope scope(tr);lib->_library=tr.open((const uint8_t *)bytes,size,why,sizeof(why));}
  catch(const std::exception &e) {dispatch_release(mapped);[lib release];return metalError(error,e.what());}
  dispatch_release(mapped);if(!lib->_library) {[lib release];return metalError(error,why);}return lib;
 }
@@ -1679,13 +1685,29 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
 - (id)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(MTLPipelineOption)options reflection:(MTLComputePipelineReflection **)reflection error:(NSError **)error {CENSUS();
  return [self newComputePipelineStateWithFunction:d.computeFunction options:options reflection:reflection error:error];
 }
-// Deliberately inline: RenderBox/CI can observe handler side effects on return.
+// Default remains inline for the existing RenderBox/CI compatibility path.
+// Opt-in asynchronous render APIs snapshot input before returning.
 // Balance the synchronous new-method ownership after the handler has seen it.
 - (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d completionHandler:(MTLNewRenderPipelineStateCompletionHandler)handler {CENSUS();
+ if(fuxi::systemTranslationPolicy().async) {
+  MTLRenderPipelineDescriptor *snapshot=[d copy];
+  dispatch_async(pipelineCompilationQueue(),^{@autoreleasepool {
+   NSError *error=nil;id state=[self newRenderPipelineStateWithDescriptor:snapshot error:&error];
+   @try {if(handler)handler((id<MTLRenderPipelineState>)state,error);}@finally{[state release];}
+  }});[snapshot release];return;
+ }
  NSError *error=nil;id state=[self newRenderPipelineStateWithDescriptor:d error:&error];
  @try {if(handler)handler((id<MTLRenderPipelineState>)state,error);}@finally{[state release];}
 }
 - (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d options:(MTLPipelineOption)options completionHandler:(MTLNewRenderPipelineStateWithReflectionCompletionHandler)handler {CENSUS();
+ if(fuxi::systemTranslationPolicy().async) {
+  MTLRenderPipelineDescriptor *snapshot=[d copy];
+  dispatch_async(pipelineCompilationQueue(),^{@autoreleasepool {
+   NSError *error=nil;MTLRenderPipelineReflection *reflection=nil;
+   id state=[self newRenderPipelineStateWithDescriptor:snapshot options:options reflection:&reflection error:&error];
+   @try {if(handler)handler((id<MTLRenderPipelineState>)state,reflection,error);}@finally{[state release];}
+  }});[snapshot release];return;
+ }
  NSError *error=nil;MTLRenderPipelineReflection *reflection=nil;id state=[self newRenderPipelineStateWithDescriptor:d options:options reflection:&reflection error:&error];
  @try {if(handler)handler((id<MTLRenderPipelineState>)state,reflection,error);}@finally{[state release];}
 }

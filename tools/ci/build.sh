@@ -233,6 +233,9 @@ mesa_source() {
 }
 
 metal() {
+    # CPU-only frontend/ownership/policy tests also cover opt-in async pipelines.
+    # NativeMetal's independent adapter keeps its existing build route.
+    if [[ $target == metal ]]; then python3 tools/test-fuxi-metal-frontend.py; fi
     mesa_source # Vulkan headers from the same pinned Mesa include/ tree.
     source_checkout metal2vulkan https://github.com/steelbrain/metal2vulkan.git "$M2V_SHA" "$work/metal2vulkan"
     command -v rustup >/dev/null || die 'install rustup before building metal'

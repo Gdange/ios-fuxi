@@ -14,6 +14,7 @@
 #include <chrono>
 #include <thread>
 #include <condition_variable>
+#include <sys/resource.h>
 #include "ResourceLimits.hpp"
 #include "ClientSetup.hpp"
 #include "DrawSafety.hpp"
@@ -536,31 +537,51 @@ public:
  bool supportsOrderedColorAccess() const {return orderedColorAccess;}
  bool requiresSampling(const Pipeline *p) const {return std::any_of(p->descriptors.begin(),p->descriptors.end(),[](const Descriptor &d){return d.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || d.type==VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;});}
  Pipeline *compilePipeline(void *v,const char *vn,void *f,const char *fn,const CompileOptions &options=CompileOptions{}) {
-  std::unique_lock<std::mutex> guard(mutex);requireLive();Translation translated{};auto &tr=Translator::get();char error[2048]{};
+  auto requested=std::chrono::steady_clock::now();
+  std::unique_lock<std::mutex> guard(mutex);auto acquired=std::chrono::steady_clock::now();requireLive();Translation translated{};auto &tr=Translator::get();char error[2048]{};
   CacheActivity activity{cacheMode==CacheMode::persistent?&cacheActivity:nullptr};
+  Translator::OptionsScope translationScope(tr);
   Translator::Scope cacheScope(artifactCallbacks,artifactCache.available()?&artifactCache:nullptr,ArtifactCache::read,ArtifactCache::write,ArtifactCache::outcome);
   auto start=std::chrono::steady_clock::now();
+  struct Timing {
+   bool enabled;decltype(start) requested,acquired,last;const char *result="fail";
+   double identity=0,compile=0,hash=0,create=0;struct rusage cpu{};
+   static double cpuMs(const struct rusage &r){return (r.ru_utime.tv_sec+r.ru_stime.tv_sec)*1000.0+(r.ru_utime.tv_usec+r.ru_stime.tv_usec)/1000.0;}
+   double lap(){auto now=std::chrono::steady_clock::now();double ms=std::chrono::duration<double,std::milli>(now-last).count();last=now;return ms;}
+   ~Timing(){if(enabled){struct rusage end{};getrusage(RUSAGE_SELF,&end);
+#ifdef __APPLE__
+    auto rss=end.ru_maxrss/1024;
+#else
+    auto rss=end.ru_maxrss;
+#endif
+    fprintf(stderr,"FUXI MTL: translation timing result=%s wait_ms=%.3f identity_ms=%.3f compile_ms=%.3f hash_ms=%.3f create_ms=%.3f total_ms=%.3f process_cpu_ms=%.3f peak_rss_kib=%ld\n",result,std::chrono::duration<double,std::milli>(acquired-requested).count(),identity,compile,hash,create,std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-requested).count(),cpuMs(end)-cpuMs(cpu),long(rss));}}
+  } timing{systemTranslationPolicy().trace,requested,acquired,start};
+  if(timing.enabled)getrusage(RUSAGE_SELF,&timing.cpu);
   auto enabledOptions=options;enabledOptions.orderedColorAccess=orderedColorAccess;enabledOptions.independentBlend=independentBlend;
   uint8_t identity[32]{};
   if(!tr.identity(v,vn,f,fn,&enabledOptions,identity,error,sizeof(error)))throw std::runtime_error(error);
+  timing.identity=timing.lap();
+  if(timing.enabled)fprintf(stderr,"FUXI MTL: translation request id=%02x%02x%02x%02x vertex=%.96s fragment=%.96s objects=%zu\n",identity[0],identity[1],identity[2],identity[3],vn,fn,objects.count());
   std::string inputKey((const char *)identity,32);
   if(auto *cached=objects.acquire(inputKey)){
-   ++pipelineHits;++objectHits;fprintf(stderr,"FUXI MTL: pipeline cache HIT %.3f ms\n",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count());return cached;
+   timing.result="object-hit";++pipelineHits;++objectHits;fprintf(stderr,"FUXI MTL: pipeline cache HIT %.3f ms\n",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count());return cached;
   }
   int ok=tr.compile(v,vn,f,fn,(void *)gipa,(uint64_t)instance,(uint64_t)physical,&enabledOptions,&translated,error,sizeof(error));
+  timing.compile=timing.lap();
   double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
   if(ok)fprintf(stderr,"FUXI MTL: translation PASS %.3f ms (bounded translator cache)\n",ms);
   else fprintf(stderr,"FUXI MTL: translation FAIL %.160s\n",error);
   if(!ok)throw std::runtime_error(error[0]?error:"translation failed");
   uint8_t hash[32]{};
   if(!tr.product_hash(translated.handle,hash)){tr.free(translated.handle);throw std::runtime_error("pipeline product hash");}
+  timing.hash=timing.lap();
   std::string productKey=inputKey+std::string((const char *)hash,32);
   if(auto *cached=objects.acquire(productKey,true)){
-   tr.free(translated.handle);++pipelineHits;++objectHits;
+   timing.result="product-hit";tr.free(translated.handle);++pipelineHits;++objectHits;
    fprintf(stderr,"FUXI MTL: pipeline cache HIT %.3f ms\n",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count());return cached;
   }
   ++pipelineMisses;++objectMisses;
-  auto *p=createPipeline(translated,enabledOptions);
+  auto *p=createPipeline(translated,enabledOptions);timing.create=timing.lap();timing.result="miss";
   try {objects.insert(inputKey,productKey,p,p->retainedBytes,[&](Pipeline *old){destroyPipelineUnlocked(old);});}
   catch(...){destroyPipelineUnlocked(p);throw;}
   fprintf(stderr,"FUXI MTL: pipeline cache MISS %.3f ms\n",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count());
@@ -817,6 +838,7 @@ public:
      if(sam){input.filters[i]=sam->filters;input.lodMin[i]=sam->lodMin;input.lodMax[i]=sam->lodMax;}
     }
     char why[512]{};auto &translator=Translator::get();
+    Translator::OptionsScope translationScope(translator);
     if(!translator.draw(op.pipeline->translation,&input,&draws[n],why,sizeof(why))){
      if(strcmp(why,"draw requires runtime variant") && strcmp(why,"draw requires different specialization"))throw std::runtime_error(why);
      std::string key;for(unsigned i=0;i<resourceSlots;++i){key+=std::to_string(input.formats[i])+","+std::to_string(input.filters[i])+",";key.append((const char *)&input.lodMin[i],sizeof(float));key.append((const char *)&input.lodMax[i],sizeof(float));for(auto &stage:input.buffers)key+=std::to_string(stage[i].length!=0)+":"+std::to_string(stage[i].bytes)+",";}
