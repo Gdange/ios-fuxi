@@ -892,3 +892,20 @@ CI dry runs, CI shell syntax and diff whitespace. The documented XML parses
 as a plist with the stated integer values. No kernel source or generated patch
 changed, so no new kernel-gate host test is applicable. No kernel link, device
 experiment, root edit or performance acceptance result is claimed.
+
+## Kernel auto-lock (`fuxiautolock=S`)
+
+The kernel side of auto-lock lives in `xnu/fuxi-h1/fuxi_keys.c`. After the
+first display off, a one-second thread presses Power (the same click the
+key script injects) once the display has been on for `S` seconds
+(10–3600) without a key or touch report, so iOS locks through its normal
+Power path. The backlight service is not needed.
+
+**OBSERVED** (no backlight service, `fuxiautolock=60 fuxikeyscript=300
+fuxikeyscriptn=1`): `autolock press 1` about 60 s after SpringBoard's
+display on, then `SWEET FB: display off`. The scripted Power at 300 s woke
+the display, and `autolock press 2` locked it again 60 s later. The first
+frame came at 9.0 s, compared with 12.4–13.3 s with `fuxibacklight=1`.
+Recommended: `fuxiautolock=30` without `fuxibacklight`. It also locks
+while a video plays with no input, because it does not see iOS idle-timer
+assertions.
