@@ -299,3 +299,15 @@ refused as "thermal" at 54.5-54.9 C, and the 500 ms recovery kept restarting.
 GUESS: the same latch caused the touch-boost vetoes seen at 58-60 C. The slope now
 uses a 200 ms window (a single step is 20 dC/s). Absolute hot/limit checks still
 run on every sample. `fuxiperfrate` takes `fuxiperffast`..1000 ms.
+
+## Recommended cores (`fuxicores=MASK`)
+
+OBSERVED (use95, user interacting): average CPU load was only 6-13 %, and most of
+it ran on logical CPUs 0-1 (Cortex-A510), while CoreAnimation produced 5-20 fps.
+Frames took 5 ms in backboardd. The clutch scheduler is homogeneous here and has
+no edge (AMP) policy. `fuxicores=0x7c` calls
+`sched_perfcontrol_update_recommended_cores(0x7c)` once the governor is ready.
+Normal threads then run only on logical 2-6 (gold and prime). The A510s keep
+interrupts and bound threads. The mask must not set bits above 6 and must keep
+at least two of logical 2-6, otherwise it is ignored. GUESS: UI latency drops;
+heat and power impact are unmeasured.

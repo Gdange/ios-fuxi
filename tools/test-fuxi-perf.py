@@ -20,7 +20,7 @@ register_functions = actual[actual.index('static uint64_t fp_duty_used(uint64_t 
                             actual.index('static int fp_thermal_guard(')]
 register_functions += ''.join(submit.function(actual, n) for n in (
     'fp_read','fp_vote','fp_temperature','fp_init_fail','fp_init_report',
-    'fp_initialize','fp_try_initialize','fp_update_votes','fp_thermal_guard',
+    'fp_apply_cores','fp_initialize','fp_try_initialize','fp_update_votes','fp_thermal_guard',
     'fp_arg','fp_configure','fp_worker_locked','fp_worker','fuxi_perf_input','fuxi_perf_swap'))
 register_functions = "static uint64_t fp_duty_used(uint64_t);\nstatic void fp_worker_locked(thread_call_param_t,thread_call_param_t);\n" + ''.join(
     submit.function(actual, n) for n in ('fp_compile_domain','fp_compile_failed','fp_compile_cut','fp_compile_forget','fp_compile_poll','fp_compile_admitted','fp_compile_command')) + register_functions
@@ -491,6 +491,9 @@ int main(void) {
  reset();assert(fp_thermal_guard(1,550,100,0));
  for(unsigned i=1;i<20;i++)assert(fp_thermal_guard(1,550+i,100+i,1000000));
  assert(!fp_thermal_guard(1,570,120,1000000));
+ /* fuxicores: applied once at ready, only when parsed as a valid mask. */
+ recommend_calls=0;fp_recommend=0;fp_apply_cores();assert(!recommend_calls);
+ fp_recommend=0x7c;fp_apply_cores();assert(recommend_calls==1 && recommended==0x7c);fp_recommend=0;
  /* Default 200 ms slope window: one 0.4 C TSENS step at 56 C never trips,
   * a sustained 1 C/s rise above 55 C still does. */
  reset();fp_rate_ms=200;assert(fp_thermal_guard(1,560,100,0));
@@ -666,6 +669,8 @@ static int fuxi_compile_alive(thread_t t){assert(t);return alive;}
 static int fuxi_compile_online(int cpu){assert(cpu>=3 && cpu<=7);return online;}
 static int fuxi_compile_bind(unsigned domains){if(realtime)return -2;if(!online || bound!=-1 || !domains)return -1;bound=domains&4?7:6;if(bind_temp)regs[3][0xa4/4]=(1u<<21)|bind_temp;return bound;}
 static void fuxi_compile_migrate(void){assert(!locked);migrations++;}
+static unsigned fp_recommend,recommended,recommend_calls;
+static void sched_perfcontrol_update_recommended_cores(uint32_t m){recommended=m;recommend_calls++;}
 static void fuxi_compile_unbind(thread_t t,int cpu){assert(t && bound==cpu);bound=-1;}
 
 static uint64_t scheduled;

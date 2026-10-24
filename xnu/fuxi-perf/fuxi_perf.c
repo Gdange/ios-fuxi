@@ -77,6 +77,17 @@ static unsigned fp_compile_refusals;
 static thread_t fp_compile_thread;
 static uint64_t fp_compile_deadline, fp_compile_cap, fp_compile_start;
 static struct fuxi_compile_reply fp_compile_reply;
+extern void sched_perfcontrol_update_recommended_cores(uint32_t);
+/* fuxicores=MASK (logical CPUs): the clutch scheduler is homogeneous and
+ * put UI threads mostly on the A510s (logical 0-1, observed). Unrecommended
+ * cores keep interrupts and bound threads only. Applied once when ready. */
+static unsigned fp_recommend;
+static void fp_apply_cores(void)
+{
+ if (!fp_recommend) return;
+ sched_perfcontrol_update_recommended_cores(fp_recommend);
+ printf("FUXI PERF: recommended cores 0x%x\n",fp_recommend);
+}
 extern int fuxi_compile_bind(unsigned);
 extern void fuxi_compile_migrate(void);
 extern void fuxi_compile_unbind(thread_t, int);
@@ -366,6 +377,7 @@ static int fp_try_initialize(uint64_t now)
  if (fp_initialize()) {
   fp_ready = 1;
   fp_idle_start = now;
+  fp_apply_cores();
   printf("FUXI PERF: ready, LUT cool %u/%u/%u kHz high %u/%u/%u kHz, hold 1500 ms after %u retries\n",
       fp_cool_khz[0],fp_cool_khz[1],fp_cool_khz[2],fp_high_khz[0],fp_high_khz[1],fp_high_khz[2],fp_retries);
   if (fp_idle_after)
@@ -615,6 +627,9 @@ void fuxi_perf_start(void)
  fp_started = 1;
  (void)PE_parse_boot_argn("fuxicompileboost",&fp_compile_enabled,sizeof(fp_compile_enabled));
  fp_compile_enabled = fp_compile_enabled == 1;
+ /* Keep at least two of logical 2-6 (gold/prime); otherwise ignore. */
+ if (!PE_parse_boot_argn("fuxicores",&fp_recommend,sizeof(fp_recommend)) ||
+     (fp_recommend & ~0x7fu) || __builtin_popcount(fp_recommend & 0x7cu) < 2) fp_recommend = 0;
  nanoseconds_to_absolutetime(2000ULL*NSEC_PER_MSEC,&fp_compile_cap);
  fp_configure();
  nanoseconds_to_absolutetime(1500ULL*NSEC_PER_MSEC,&fp_hold);
