@@ -491,6 +491,13 @@ int main(void) {
  reset();assert(fp_thermal_guard(1,550,100,0));
  for(unsigned i=1;i<20;i++)assert(fp_thermal_guard(1,550+i,100+i,1000000));
  assert(!fp_thermal_guard(1,570,120,1000000));
+ /* Default 200 ms slope window: one 0.4 C TSENS step at 56 C never trips,
+  * a sustained 1 C/s rise above 55 C still does. */
+ reset();fp_rate_ms=200;assert(fp_thermal_guard(1,560,100,0));
+ for(unsigned i=1;i<=10;i++)assert(fp_thermal_guard(1,i<5?560:564,100+20*i,20000000));
+ assert(fp_rate==20 && !fp_blocked);
+ for(unsigned i=1;i<=10;i++)fp_thermal_guard(1,564+2*i,300+20*i,20000000);
+ assert(fp_rate==100 && fp_blocked);
  /* Raw ABI: disabled/authorization precede payload parsing, exact width,
   * copy faults, optional reply, and failed copyout rolls back admission. */
  struct fuxi_compile_reply wire_reply;
@@ -720,7 +727,7 @@ static void reset(void) {
  fp_compile_cap=2000;fp_compile_deadline=fp_compile_start=0;
  memset(&fp_compile_reply,0,sizeof(fp_compile_reply));
  platform=proc_present=alive=online=1;bound=-1;caller=1;process_name="backboardd";migrations=bind_temp=0;
- fp_hot=620;fp_limit=680;fp_resume=580;fp_rise=100;fp_fast_ms=20;fp_budget_ms=200;
+ fp_hot=620;fp_limit=680;fp_resume=580;fp_rise=100;fp_fast_ms=20;fp_rate_ms=20;fp_budget_ms=200;
  fp_idle_ms=fp_idle_floor=fp_idling=0;
  fp_idle_start=fp_idle_entry=fp_idle_time=fp_idle_entries=fp_idle_transitions=0;
  arg_name=0;fp_configure();

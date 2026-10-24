@@ -54,6 +54,9 @@ static int fp_max_temp, fp_boosted;
  * history and votes. The 68 C ceiling can be lowered, never raised. */
 static unsigned fp_hot = 620, fp_limit = 680, fp_resume = 580;
 static unsigned fp_rise = 100, fp_fast_ms = 20, fp_budget_ms = 200;
+/* Slope window. TSENS reports 0.4 C steps: one step in 20 ms is 200 dC/s and
+ * latched the rise guard above 55 C on every tick (observed 54.5 C refusals). */
+static unsigned fp_rate_ms = 200;
 static uint64_t fp_budget, fp_duty_window, fp_recovery;
 static uint64_t fp_recover_since, fp_above_time, fp_cuts, fp_active_start;
 static uint64_t fp_duty_begin[16], fp_duty_end[16];
@@ -450,7 +453,7 @@ static int fp_thermal_guard(int valid, int temp, uint64_t now, uint64_t elapsed_
   fp_rate = 0;
  } else {
   fp_rate_elapsed += elapsed_ns;
-  if (fp_rate_elapsed >= (uint64_t)fp_fast_ms*NSEC_PER_MSEC) {
+  if (fp_rate_elapsed >= (uint64_t)fp_rate_ms*NSEC_PER_MSEC) {
    uint64_t slope = temp > fp_rate_temp ?
        (uint64_t)(temp-fp_rate_temp)*NSEC_PER_SEC/fp_rate_elapsed : 0;
    fp_rate = slope > 1000000 ? 1000000 : (int)slope;
@@ -497,12 +500,13 @@ static void fp_configure(void)
  if (fp_resume > fp_hot-10) fp_resume = fp_hot-10;
  fp_arg("fuxiperfrise",&fp_rise,10,1000);
  fp_arg("fuxiperffast",&fp_fast_ms,5,25);
+ fp_arg("fuxiperfrate",&fp_rate_ms,fp_fast_ms,1000);
  fp_arg("fuxiperfbudget",&fp_budget_ms,20,500);
  nanoseconds_to_absolutetime((uint64_t)fp_budget_ms*NSEC_PER_MSEC,&fp_budget);
  nanoseconds_to_absolutetime(NSEC_PER_SEC,&fp_duty_window);
  nanoseconds_to_absolutetime(500ULL*NSEC_PER_MSEC,&fp_recovery);
- printf("FUXI PERF: thermal hot %u limit %u resume %u dC rise %u dC/s fast %u ms duty %u/1000 ms recovery 500 ms predict 100 ms\n",
-     fp_hot,fp_limit,fp_resume,fp_rise,fp_fast_ms,fp_budget_ms);
+ printf("FUXI PERF: thermal hot %u limit %u resume %u dC rise %u dC/s fast %u ms slope %u ms duty %u/1000 ms recovery 500 ms predict 100 ms\n",
+     fp_hot,fp_limit,fp_resume,fp_rise,fp_fast_ms,fp_rate_ms,fp_budget_ms);
 }
 static void fp_worker_locked(thread_call_param_t arg, thread_call_param_t result)
 {

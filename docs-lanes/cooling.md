@@ -289,3 +289,13 @@ same ADT and command line as the current boot plus the args named per run.
 Host tests: `tools/test-launchd-on-demand.py`, `tools/test-fuxi-idle.py`,
 `tools/test-fuxi-thermal-summary.py`, `tools/fuxi-metal/ClientGateTests.cpp`
 and the policy checks in `tools/test-fuxi-metal-stage.py`.
+
+## Thermal slope window (`fuxiperfrate=MS`, default 200)
+
+OBSERVED: the CPU TSENS readings move in 0.4 C steps. The rise guard trips above
+55 C at 100 dC/s or more. While the slope came from 20 ms windows, a single
+sensor step (200 dC/s) latched `fp_blocked`. Then every compile-boost enter was
+refused as "thermal" at 54.5-54.9 C, and the 500 ms recovery kept restarting.
+GUESS: the same latch caused the touch-boost vetoes seen at 58-60 C. The slope now
+uses a 200 ms window (a single step is 20 dC/s). Absolute hot/limit checks still
+run on every sample. `fuxiperfrate` takes `fuxiperffast`..1000 ms.
