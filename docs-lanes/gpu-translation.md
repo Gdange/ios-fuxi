@@ -586,3 +586,197 @@ backboardd are unmeasured. No asynchronous commit change is justified by the
 host evidence alone. macOS Objective-C++ build, target register values, Turnip
 performance, actual frame percentiles and perceived UI improvement remain
 unverified; no device or hosted execution was performed.
+
+## Translation cache hits and capacity
+
+### OBSERVED: supplied device logs and code attribution
+
+In `research/ac/use95.log` (interaction), 52 artifact hits total **3,986.742 ms
+compile + 1,264.411 ms initial mutex wait + 389.900 ms product hash + 185.137 ms
+Vulkan creation**. That is 76.668 ms of translation per hit, before those other
+costs. The 27 artifact misses total **5,713.941 ms compile + 7,009.517 ms create**.
+`boost94.log` is boot-only: its 45 artifact hits total 2,301.242 ms compile,
+232.481 ms hash and 98.091 ms create. These are per-request sums, not elapsed
+session times or an interaction FPS measurement. The old 32 MiB byte cap, rather
+than its 256-entry count cap, explains the reported 48 surviving pipelines.
+
+The supplied logs truncate Rust detail lines to `phase=` and cannot attribute
+all 77 ms to individual functions. Reading the pinned code establishes:
+
+- Even a persistent hit first called `render_variant_key`, with fresh
+  `StageEntries`. This can decode/specialize AIR to derive exact stage keys.
+  It is not merely hashing the persisted artifact's index key.
+- `from_bytes_for_key` checked the upstream frame SHA-256, decoded every word
+  through its generic codec and performed a linear SPIR-V header/instruction
+  length scan. It did **not** run the compiler's owned verifier or spirv-val.
+- Product construction rebuilt bounded reflection and binding plans, hashed
+  constant blobs and copied SPIR-V/blob vectors already owned by the pipeline.
+  `product_cache_key` also allocated strings while searching retained products.
+- The separately reported product hash formatted the entire compile-options
+  structure, including unused constant slots, and fed executable words to SHA
+  one at a time. The pinned `sha2` recipe selects software SHA on ARM64 without
+  its optional `asm` feature; this change needs no new dependency or feature.
+- Rust held its global product-cache mutex across translation. Stage-cache
+  deserialization held another global mutex. Backend held its device/queue
+  mutex across all translation, hashing, Vulkan creation and cache maintenance.
+
+The disk encoder stored each stage's SPIR-V and constant blob once, plus typed
+metadata. AIR/library inputs and the Product's duplicate vectors were not disk
+payloads. The pinned SPIR-V serializer does not emit the OpName/OpLine debug
+instruction family. The authored two-stage host control had **11,544 bytes
+SPIR-V, zero blob bytes and zero debug bytes**; its first old artifact occupied
+14,279 bytes. The supplied logs contain no actual device artifact payload, so
+these observations do not establish the byte breakdown of a 700 KB CA artifact.
+New trace lines report `translation sizes stored=... spirv=... blobs=... debug=...`
+to make that breakdown measurable without logging executable bytes.
+
+### Implemented behavior and integrity
+
+These changes are default-on within the existing persistent-cache setting
+`fuxigpucache=1`. Stage reuse retains its existing opt-in policy. No shader
+instruction, constant blob, reflection field or bind requirement is removed.
+
+A baseline persistent lookup now uses the full Fuxi input identity (library
+content hashes, function names, typed constants and all bounded options) plus
+upstream device-profile fingerprint. A hit skips AIR key specialization and the
+stage cache. Runtime variants still derive their upstream exact keys. Product
+lookups compare a precomputed input key; immutable executable/blob allocations
+are shared with `Arc`. Product/module/blob digests are memoized, and product
+hashing uses typed options rather than formatting unused constant slots. The
+internal product-hash version changes; it is not a shader-output change.
+
+The bridge's storage envelope contains small upstream metadata, bulk SPIR-V and
+blob bytes, and their digests. Its original bounded lossless byte codec uses
+literal and backward-copy tokens; incompressible bodies are stored verbatim.
+Bulk bytes appear once. Metadata encodes placeholder SPIR-V headers only during
+storage, then the decoder replaces them with the exact scanned executable bytes
+before a Product can escape. Upstream metadata decoding/profile checks remain.
+There is no debug stripping and no Mesa/translator dependency change.
+
+The optional ABI-8 `artifact_scope_v2` / `artifact_verify_v2` handshake avoids
+repeated large SHA operations:
+
+1. Load checks private directory/file ownership, exact modes, regular-file and
+   link count, no-follow opens, identity, bounded lengths, unique keys, exact
+   record coverage and whole-file CRC. It verifies each bridge envelope's full
+   SHA-256, including its request key, compressed body and stored digests, using
+   at most one entry-sized scratch allocation. No index becomes visible until
+   the whole file has passed its outer checks.
+2. The index retains each entry's CRC and verified status. Every lazy `pread`
+   recomputes that CRC before returning bytes and the verified flag. This detects
+   in-place modification or truncation after load. Atomic replacement cannot
+   invalidate a reader: shared descriptors pin the old inode.
+3. A verified hit skips the large envelope SHA, bounds every decompression token
+   and allocation, checks the request identity, decodes/checks the small upstream
+   metadata frame, and scans each real SPIR-V module's header, word counts and
+   ID bound. Saved module/blob hashes are covered by the verified envelope.
+4. A v1 callback, or an envelope that failed verification, takes the full SHA
+   check on read. A repaired outer CRC cannot conceal a bad inner envelope.
+   Cache errors become misses; malformed data never reaches Vulkan.
+
+As before, checksums provide integrity and identity, not authentication against
+an attacker able to rewrite the private cache and recompute every checksum.
+
+Rust product/stage locks now protect lookup and insertion only; pinned immutable
+values are decoded/cloned outside them. Baseline translation runs outside the
+Backend mutex and rechecks device liveness after reacquiring it. Exceptions
+reacquire the lock before backend activity bookkeeping is destroyed. The new
+`relock_ms` timing field records that second acquisition separately. Translation
+checkpoint IO also runs outside the Backend mutex; store snapshot IO and payload
+reads/writes run outside its index lock. **Vulkan creation and Vulkan cache
+maintenance still serialize with the device/queue.** A hit can still wait there.
+
+### Capacity and resident memory
+
+The outer v1 snapshot format remains readable: **256 entries / 256 MiB**, with
+an **8 MiB single-entry limit** including the storage envelope. Files larger than
+these limits or malformed old files are safely discarded. Updating the bridge
+changes its existing source identity, so an old adapter's snapshot is normally
+discarded once; an unchanged older adapter can still use the v1 callback path.
+
+Only keys, offsets, lengths, CRCs, verification bits and shared file descriptors
+remain resident, about 20 KiB for 256 entries. Payloads are read on demand into a
+per-call buffer and released with its scope. Dirty products append to an
+immediately unlinked private spool, capped at 256 MiB; if compaction cannot make
+space, optional writes are skipped. No collection of dirty artifact vectors
+accumulates in backboardd. Checkpoint streams 64 KiB chunks to an exclusive
+private temporary file, checks source CRCs again, fsyncs, renames and fsyncs the
+directory. Writer leasing and orphan replacement are retained. Concurrent writes
+remain dirty and survive snapshot remapping; hits alone do not dirty a snapshot.
+
+Load scratch is at most 8 MiB plus a 64 KiB chunk; checkpoint scratch is 64 KiB
+plus small index copies. Each concurrent decode has bounded entry/raw/module
+buffers, and live products retain the executable data they need. Existing
+process, stage and Vulkan-object caches keep their separate entry/byte budgets;
+these numbers are not a bound on total backboardd RSS or the OS file cache.
+
+### OBSERVED: host checks and measurements
+
+Linux x86-64 Xeon E5-2680 v4, optimized Rust/C++, pinned external dependency,
+locally authored AIR and lavapipe; no device access or Apple inputs. Timings are
+host wall times, with trace on for replay. They are not phone estimates.
+
+| Measurement | Before | After |
+| --- | ---: | ---: |
+| Warm authored replay, 104 artifact hits: mean `compile_ms` | 2.314 ms | 1.324 ms |
+| Same replay: mean backend `hash_ms` | 2.252 ms | 0.010 ms |
+| Same replay: all persisted records, 103 unique requests | 1,543,743 B | 985,673 B |
+| First authored record | 14,279 B | 9,149 B |
+| Synthetic 717,873 B upstream artifact decode + scan | 5.546 ms | 0.562 ms verified bulk path |
+
+The warm replay has zero key-specialization/lowering/stage-read phases in the new
+path. Its small metadata decode totals 6.189 ms, reflection/product-plan 12.614 ms
+and device-description setup 74.208 ms across 104 requests. In the old path,
+key specialization alone totals 104.562 ms. The control has one repeated input
+after earlier products leave the process/object caches, hence 103 unique disk
+records and one legitimate artifact hit during the cold 104-request pass.
+
+The synthetic 700 KiB SPIR-V scaling case appends OpNop words and is never
+executed. Full SHA alone took 4.119 ms and copying 0.048 ms. The verified bulk
+path includes decompression, small metadata SHA/decode and the real module scan;
+it reuses verified module hashes. It stored 18,777 B. A separate 700 KiB constant
+blob case took 0.145 ms and stored 17,356 B, with exact decoded bytes and digests.
+These deliberately repetitive cases **do not predict CA compression ratios**.
+The real authored replay's total snapshot shrank about 36%.
+
+The production store also round-tripped **256 uncompressed 700 KiB records**:
+183,510,144 B including headers, roughly 0.3 s index validation, about 0.6 ms
+per `pread` plus CRC, and no additional peak RSS at the host's KiB measurement
+resolution during index load. This tests capacity independently of compression.
+Tests exercise pinned old snapshots, concurrent read/save/write generations and
+post-load corruption. A paused real artifact miss allows another object hit and
+another backend's Rust product hit to finish before that miss is released.
+
+Validation includes the existing 12 translation/cache/frontend/backend and
+M9g–M9o host suites, ten normal bridge Rust tests plus the explicit large-artifact
+benchmark, sanitizer cache/security and concurrency controls, and the new
+`test-fuxi-metal-cache-hits.py` replay/capacity runner. Native Objective-C tests
+are skipped on Linux. Reproduce without downloads using cached inputs:
+
+```sh
+python3 tools/test-fuxi-metal-cache.py --source "$M2V_SOURCE" --build "$BRIDGE_BUILD"
+python3 tools/test-fuxi-metal-cache-hits.py --translator "$HOST_TRANSLATOR"
+# Optional --baseline "$OLD_HOST_TRANSLATOR" compares the preceding adapter.
+FUXI_MTL_BENCH_AIR="$AUTHORED_AIR" FUXI_MTL_BENCH_PROFILE="$CACHED_PROFILE" \
+  cargo +1.98.0 test --offline --release --manifest-path "$BRIDGE_BUILD/Cargo.toml" \
+  benchmark_large_artifact -- --ignored --nocapture
+```
+
+### GUESS and remaining acceptance work
+
+The device artifacts are likely dominated by executable SPIR-V and/or constant
+blobs, rather than removable debug instructions or duplicate encoded AIR. Their
+actual breakdown and compression ratio remain unmeasured. The supplied logs
+cannot prove which old phase dominated 77 ms; code and host measurements show
+that key specialization, large software SHA, option formatting and lock scope
+were all avoidable contributors. Reflection and small device setup remain.
+
+The **under-5-ms phone hit target is unverified**, as are phone RSS, startup
+validation time, UI latency, storage latency, Turnip worker contention and real
+interaction FPS. Mac/iOS builds and native Objective-C execution are also
+unverified. Compare newly rebuilt artifacts on device when independently
+permitted, using the same interaction sequence with trace on for attribution and
+then off for latency. Include `relock_ms`, remaining Vulkan waits, integrity
+rejections, size traces and peak RSS. New translations still lower shaders and
+create Vulkan pipelines synchronously; this change does not make those stalls
+disappear.

@@ -50,9 +50,13 @@ class Translator {
  void *dylib{};
 public:
  using CacheRead=size_t (*)(void *,const uint8_t *,const uint8_t **);
+ using CacheReadVerified=size_t (*)(void *,const uint8_t *,const uint8_t **,uint32_t *);
+ using CacheVerify=int (*)(const uint8_t *,const uint8_t *,size_t);
  using CacheWrite=void (*)(void *,const uint8_t *,const uint8_t *,size_t);
  using CacheOutcome=void (*)(void *,uint32_t);
  using CacheScope=void (*)(void *,CacheRead,CacheWrite,CacheOutcome);
+ using CacheScopeVerified=void (*)(void *,CacheReadVerified,CacheWrite,CacheOutcome);
+ CacheScopeVerified artifactScopeVerified{};CacheVerify artifactVerify{};
  using TranslationScope=void (*)(uint32_t);
  TranslationScope translationScope{}; // Optional ABI-8 Fuxi adapter extension, thread-local flags.
  struct OptionsScope {
@@ -63,9 +67,9 @@ public:
  };
  CacheScope artifactScope{}; // Optional ABI-8 extension; synchronous thread-local callbacks.
  struct Scope {
-  CacheScope fn;
-  Scope(CacheScope callback,void *context,CacheRead read,CacheWrite write,CacheOutcome outcome):fn(callback){if(fn)fn(context,read,write,outcome);}
-  ~Scope(){if(fn)fn(nullptr,nullptr,nullptr,nullptr);}
+  CacheScope fn;CacheScopeVerified verified;
+  Scope(CacheScope callback,void *context,CacheRead read,CacheWrite write,CacheOutcome outcome,CacheScopeVerified v2=nullptr,CacheReadVerified readVerified=nullptr):fn(callback),verified(v2){if(verified)verified(context,readVerified,write,outcome);else if(fn)fn(context,read,write,outcome);}
+  ~Scope(){if(verified)verified(nullptr,nullptr,nullptr,nullptr);else if(fn)fn(nullptr,nullptr,nullptr,nullptr);}
   Scope(const Scope&)=delete;
  };
  void *(*open)(const uint8_t *,size_t,char *,size_t){};
@@ -91,6 +95,9 @@ public:
   translationScope=(TranslationScope)dlsym(dylib,"fuxi_m2v_translation_scope_v1");
   auto policy=systemTranslationPolicy();if(policy.stages || policy.trace)fprintf(stderr,"FUXI MTL: translation settings stages=%u trace=%u bridge=%u\n",unsigned(policy.stages),unsigned(policy.trace),unsigned(translationScope!=nullptr));
   artifactScope=(CacheScope)dlsym(dylib,"fuxi_m2v_artifact_scope_v1");
+  artifactScopeVerified=(CacheScopeVerified)dlsym(dylib,"fuxi_m2v_artifact_scope_v2");
+  artifactVerify=(CacheVerify)dlsym(dylib,"fuxi_m2v_artifact_verify_v2");
+  if(!artifactVerify)artifactScopeVerified=nullptr;
  }
  ~Translator() {if(dylib)dlclose(dylib);}
  Translator(const Translator&)=delete;Translator& operator=(const Translator&)=delete;

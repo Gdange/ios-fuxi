@@ -5,7 +5,7 @@
 #include <iterator>
 int main(int argc,char **argv){
  assert(argc==2);std::ifstream in(argv[1],std::ios::binary);std::vector<uint8_t> air{std::istreambuf_iterator<char>(in),{}};
- auto &tr=fuxi::Translator::get();char error[2048]{};void *lib=tr.open(air.data(),air.size(),error,sizeof(error));assert(lib);
+ auto &tr=fuxi::Translator::get();if(getenv("FUXI_MTL_TEST_CACHE_V1"))tr.artifactScopeVerified=nullptr;char error[2048]{};void *lib=tr.open(air.data(),air.size(),error,sizeof(error));assert(lib);
  {
  fuxi::Backend b;fuxi::CompileOptions base{};
  base.attributes[0]={29,0,0};base.attributes[1]={29,8,0};base.attributes[2]={9,16,0};base.strides[0]=20;

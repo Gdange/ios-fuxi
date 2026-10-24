@@ -98,28 +98,29 @@ class Backend {
  bool independentBlend=false;uint32_t maxColorAttachments=1;
  PipelineCache pipelineCache;
  ArtifactCache artifactCache;CacheMode cacheMode=systemCacheMode();
- Translator::CacheScope artifactCallbacks{};
+ Translator::CacheScope artifactCallbacks{};Translator::CacheScopeVerified artifactCallbacksVerified{};
  bool creationFeedback=false,cacheStopping=false;
  std::thread cacheWorker;std::condition_variable cacheWake;
  using CacheClock=std::chrono::steady_clock;
  CacheClock::time_point cacheActivity{},cacheCheckpoint=CacheClock::now();
  struct CacheActivity {CacheClock::time_point *last;~CacheActivity(){if(last)*last=CacheClock::now();}};
  uint64_t driverHits=0,driverMisses=0,driverUnknown=0,objectHits=0,objectMisses=0;
- void cachePeriodUnlocked(bool closing=false) noexcept {
-  if(cacheMode!=CacheMode::persistent || !device || poisoned || backboardGate.blocked())return;
+ bool cachePeriodUnlocked(bool closing=false) noexcept {
+  if(cacheMode!=CacheMode::persistent || !device || poisoned || backboardGate.blocked())return false;
   auto now=CacheClock::now();
   // Prefer a quiet render lane. Continuous animation still gets a bounded
-  // checkpoint every 30s; all cache/device access remains serialized.
+  // checkpoint every 30s; Vulkan cache access remains serialized.
+  bool checkpoint=false;
   if(closing || now-cacheActivity>=std::chrono::milliseconds(250) || now-cacheCheckpoint>=std::chrono::seconds(30)){
    pipelineCache.checkpoint();
-   if(backboardGate.blocked())return;
-   artifactCache.checkpoint();cacheCheckpoint=CacheClock::now();
+   if(backboardGate.blocked())return false;
+   checkpoint=true;cacheCheckpoint=CacheClock::now();
   }
   artifactCache.report();
   fprintf(stderr,"FUXI MTL: cache period driver hits=%llu misses=%llu unknown=%llu objects hits=%llu misses=%llu\n",
    (unsigned long long)driverHits,(unsigned long long)driverMisses,(unsigned long long)driverUnknown,
    (unsigned long long)objectHits,(unsigned long long)objectMisses);
-  driverHits=driverMisses=driverUnknown=objectHits=objectMisses=0;
+  driverHits=driverMisses=driverUnknown=objectHits=objectMisses=0;return checkpoint;
  }
  ObjectCache<Pipeline> objects;ResourceLimits limits;
  // One synchronous lane, protected by mutex; never reset while GPU ownership is uncertain.
@@ -274,6 +275,8 @@ public:
    pipelineCache.open(device,CreatePipelineCache,DestroyPipelineCache,GetPipelineCacheData,props,driver,id,identified?translator:nullptr,client,cacheMode);
    if(cacheMode==CacheMode::persistent){
     if(identified)artifactCallbacks=Translator::get().artifactScope;
+    artifactCallbacksVerified=Translator::get().artifactScopeVerified;
+    if(artifactCallbacksVerified)artifactCache.setVerifier(Translator::get().artifactVerify);
     if(artifactCallbacks)artifactCache.open(props,driver,id,translator,client);
     else fprintf(stderr,"FUXI MTL: translation cache unavailable (bridge capability)\n");
     fprintf(stderr,"FUXI MTL: persistent caches enabled period=5s driver_feedback=%u\n",unsigned(creationFeedback));
@@ -282,7 +285,9 @@ public:
    GetDeviceQueue(device,family,0,&queue);if(!queue) throw std::runtime_error("null queue");
    if(cacheMode==CacheMode::persistent)try {
     cacheWorker=std::thread([this]{std::unique_lock<std::mutex> lock(mutex);
-     while(!cacheWake.wait_for(lock,std::chrono::seconds(5),[this]{return cacheStopping;}))cachePeriodUnlocked();});
+     while(!cacheWake.wait_for(lock,std::chrono::seconds(5),[this]{return cacheStopping;})){
+      bool checkpoint=cachePeriodUnlocked();lock.unlock();if(checkpoint)artifactCache.checkpoint();lock.lock();
+     }});
    }catch(...){fprintf(stderr,"FUXI MTL: cache timer unavailable; shutdown checkpoints only\n");}
   } catch(...) {close();throw;}
  }
@@ -292,6 +297,7 @@ public:
   if(cacheWorker.joinable()){{std::lock_guard<std::mutex> guard(mutex);cacheStopping=true;}cacheWake.notify_all();cacheWorker.join();}
   if(poisoned) return; // Unknown GPU ownership: leave reclamation to process death/KMD containment.
   cachePeriodUnlocked(true);
+  if(!backboardGate.blocked())artifactCache.checkpoint();
   artifactCache.close();
   clearSubmitObjects();clearFrames();clearViews();destroyUnlocked(aliasScratch);aliasScratch=nullptr;
   objects.clear([&](Pipeline *p){destroyPipelineUnlocked(p);});
@@ -542,13 +548,15 @@ public:
  Pipeline *compilePipeline(void *v,const char *vn,void *f,const char *fn,const CompileOptions &options=CompileOptions{}) {
   auto requested=std::chrono::steady_clock::now();
   std::unique_lock<std::mutex> guard(mutex);auto acquired=std::chrono::steady_clock::now();requireLive();Translation translated{};auto &tr=Translator::get();char error[2048]{};
+  // This scope is destroyed while the backend lock is held, including failures.
   CacheActivity activity{cacheMode==CacheMode::persistent?&cacheActivity:nullptr};
   Translator::OptionsScope translationScope(tr);
-  Translator::Scope cacheScope(artifactCallbacks,artifactCache.available()?&artifactCache:nullptr,ArtifactCache::read,ArtifactCache::write,ArtifactCache::outcome);
+  ArtifactCache::Access artifactAccess(artifactCache);
+  Translator::Scope cacheScope(artifactCallbacks,artifactCache.available()?&artifactAccess:nullptr,ArtifactCache::read,ArtifactCache::write,ArtifactCache::outcome,artifactCallbacksVerified,ArtifactCache::readVerified);
   auto start=std::chrono::steady_clock::now();
   struct Timing {
    bool enabled;decltype(start) requested,acquired,last;const char *result="fail";
-   double identity=0,compile=0,hash=0,create=0;struct rusage cpu{};
+   double identity=0,compile=0,hash=0,create=0,relock=0;struct rusage cpu{};
    static double cpuMs(const struct rusage &r){return (r.ru_utime.tv_sec+r.ru_stime.tv_sec)*1000.0+(r.ru_utime.tv_usec+r.ru_stime.tv_usec)/1000.0;}
    double lap(){auto now=std::chrono::steady_clock::now();double ms=std::chrono::duration<double,std::milli>(now-last).count();last=now;return ms;}
    ~Timing(){if(enabled){struct rusage end{};getrusage(RUSAGE_SELF,&end);
@@ -557,7 +565,7 @@ public:
 #else
     auto rss=end.ru_maxrss;
 #endif
-    fprintf(stderr,"FUXI MTL: translation timing result=%s wait_ms=%.3f identity_ms=%.3f compile_ms=%.3f hash_ms=%.3f create_ms=%.3f total_ms=%.3f process_cpu_ms=%.3f peak_rss_kib=%ld\n",result,std::chrono::duration<double,std::milli>(acquired-requested).count(),identity,compile,hash,create,std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-requested).count(),cpuMs(end)-cpuMs(cpu),long(rss));}}
+    fprintf(stderr,"FUXI MTL: translation timing result=%s wait_ms=%.3f identity_ms=%.3f compile_ms=%.3f hash_ms=%.3f create_ms=%.3f total_ms=%.3f process_cpu_ms=%.3f peak_rss_kib=%ld relock_ms=%.3f\n",result,std::chrono::duration<double,std::milli>(acquired-requested).count(),identity,compile,hash,create,std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-requested).count(),cpuMs(end)-cpuMs(cpu),long(rss),relock);}}
   } timing{systemTranslationPolicy().trace,requested,acquired,start};
   if(timing.enabled)getrusage(RUSAGE_SELF,&timing.cpu);
   auto enabledOptions=options;enabledOptions.orderedColorAccess=orderedColorAccess;enabledOptions.independentBlend=independentBlend;
@@ -570,8 +578,18 @@ public:
    timing.result="object-hit";++pipelineHits;++objectHits;fprintf(stderr,"FUXI MTL: pipeline cache HIT %.3f ms\n",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count());return cached;
   }
   CompileBoostScope compileBoost("pipeline");
-  int ok=tr.compile(v,vn,f,fn,(void *)gipa,(uint64_t)instance,(uint64_t)physical,&enabledOptions,&translated,error,sizeof(error));
-  timing.compile=timing.lap();
+  int ok;
+  { // Immutable library/options and instance queries need no device/queue lock.
+   // Caller owns Backend/library lifetime for the duration of this method.
+   guard.unlock();
+   struct Relock {std::unique_lock<std::mutex> &lock;~Relock(){lock.lock();}} relock{guard};
+   ok=tr.compile(v,vn,f,fn,(void *)gipa,(uint64_t)instance,(uint64_t)physical,&enabledOptions,&translated,error,sizeof(error));
+   timing.compile=timing.lap();
+  }
+  timing.relock=timing.lap();
+  // A submission may poison the backend while translation runs. Never leak the
+  // returned product or pass it to Vulkan after a concurrent fault.
+  try {requireLive();}catch(...){if(translated.handle)tr.free(translated.handle);throw;}
   double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
   if(ok)fprintf(stderr,"FUXI MTL: translation PASS %.3f ms (bounded translator cache)\n",ms);
   else fprintf(stderr,"FUXI MTL: translation FAIL %.160s\n",error);
@@ -758,7 +776,8 @@ public:
   std::lock_guard<std::mutex> guard(mutex);requireLive();
   auto locked=currentFrame?FrameClock::now():FrameClock::time_point{};if(currentFrame)currentFrame->leaseLock+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(locked-submitStart).count());
   CacheActivity activity{cacheMode==CacheMode::persistent?&cacheActivity:nullptr};
-  Translator::Scope cacheScope(artifactCallbacks,artifactCache.available()?&artifactCache:nullptr,ArtifactCache::read,ArtifactCache::write,ArtifactCache::outcome);
+  ArtifactCache::Access artifactAccess(artifactCache);
+  Translator::Scope cacheScope(artifactCallbacks,artifactCache.available()?&artifactAccess:nullptr,ArtifactCache::read,ArtifactCache::write,ArtifactCache::outcome,artifactCallbacksVerified,ArtifactCache::readVerified);
   ops.erase(std::remove_if(ops.begin(),ops.end(),[](const Operation &op){
    bool missing=op.pipeline?(!op.pipeline->translation || !op.pipeline->pipeline || (op.topology==Topology::TriangleStrip && !op.pipeline->stripPipeline)):op.renderDraw;
    if(missing)dropPipelineDraw();return missing;
