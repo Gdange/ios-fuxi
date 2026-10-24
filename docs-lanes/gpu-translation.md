@@ -405,3 +405,16 @@ host kernel, with one refusal trace per pipeline and no redundant topology
 scope. Patch snapshots match; the scheduler hunks apply in order through the
 later idle hooks. Both modified kernel units pass an ARM64 syntax check against
 cached XNU headers. These host checks do not replace the device experiment.
+
+### Compile boost device results
+
+- OBSERVED, first boot (refusals returned `EAGAIN`): no frames. XNU's
+  `userland_sysctl()` retries `EAGAIN`, so backboardd spun in the kernel.
+- OBSERVED, second boot (`EBUSY`): renders, first frame 7.3 s, but all 49
+  enters were refused with `cpu=-1`. The governor was ready and below 60 C.
+- GUESS: the compiling thread is CoreAnimation's realtime render thread, and
+  `fuxi_compile_bind()` refuses realtime threads. Such a caller now gets an
+  unbound lease (`cpu=-1`, `state=1`) that votes high on gold and prime without
+  migrating the thread. Refusals log
+  `FUXI PERF: compile refused reason=N` (1 busy, 2 not ready, 3 thermal,
+  4 duty, 5 no online fast core).

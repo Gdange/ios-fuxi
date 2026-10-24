@@ -23,7 +23,7 @@ register_functions += ''.join(submit.function(actual, n) for n in (
     'fp_initialize','fp_try_initialize','fp_update_votes','fp_thermal_guard',
     'fp_arg','fp_configure','fp_worker_locked','fp_worker','fuxi_perf_input','fuxi_perf_swap'))
 register_functions = "static uint64_t fp_duty_used(uint64_t);\nstatic void fp_worker_locked(thread_call_param_t,thread_call_param_t);\n" + ''.join(
-    submit.function(actual, n) for n in ('fp_compile_cut','fp_compile_forget','fp_compile_poll','fp_compile_admitted','fp_compile_command')) + register_functions
+    submit.function(actual, n) for n in ('fp_compile_domain','fp_compile_failed','fp_compile_cut','fp_compile_forget','fp_compile_poll','fp_compile_admitted','fp_compile_command')) + register_functions
 register_functions += actual[actual.index('static int fp_compile_sysctl SYSCTL_HANDLER_ARGS'):actual.index('SYSCTL_PROC(_kern')]
 # Audit the loader's zero-based wire slots and execute the host decoder without
 # importing its USB dependencies. The C model below records the governor reads.
@@ -526,6 +526,13 @@ int main(void) {
  ticks+=50;assert(!fp_compile_command(0,&reply) && reply.state==FC_LEFT && reply.boosted_ns==100*NSEC_PER_MSEC);
  assert(!refs && bound==-1 && !fp_boosted && regs[2][0x320/4]==fp_cool[2]);
  assert(!fp_compile_command(0,&reply) && reply.state==FC_NONE);
+ /* Realtime caller (the CA render thread): unbound lease, no migration,
+  * high on both gold and prime; leave never unbinds. */
+ realtime=1;assert(!fp_compile_command(1,&reply) && reply.cpu==-1 && reply.state==FC_ACTIVE);
+ assert(fp_compile_high && refs==1 && bound==-1 && migrations==1);
+ assert(regs[2][0x320/4]==fp_high[2] && regs[1][0x320/4]==fp_high[1]);
+ ticks+=50;assert(!fp_compile_command(0,&reply) && reply.state==FC_LEFT && !refs && bound==-1);
+ assert(regs[2][0x320/4]==fp_cool[2] && regs[1][0x320/4]==fp_cool[1]);realtime=0;
  fuxi_perf_swap();fp_worker(0,0);assert(!fp_boosted); /* compile cannot seed touch's swap extension */
  reset();fp_compile_enabled=1;fuxi_perf_input();fp_worker(0,0);
  assert(!fp_compile_command(1,&reply) && fp_touch_high);
@@ -631,11 +638,11 @@ static int model_sysctl_out(struct sysctl_req *req,const void *in,size_t n){if(c
 static int fp_call;
 typedef uintptr_t thread_t;
 #define THREAD_NULL 0
-static unsigned fp_compile_enabled,fp_compile_high,fp_compile_voted,fp_touch_high;
+static unsigned fp_compile_enabled,fp_compile_high,fp_compile_voted,fp_touch_high,fp_compile_refusals;
 static thread_t fp_compile_thread;
 static uint64_t fp_compile_deadline,fp_compile_cap,fp_compile_start;
 static struct fuxi_compile_reply fp_compile_reply;
-static int fp_lock,locked,platform=1,proc_present=1,alive=1,online=1,bound=-1,refs,migrations,bind_temp;
+static int fp_lock,locked,platform=1,proc_present=1,alive=1,online=1,bound=-1,refs,migrations,bind_temp,realtime;
 static thread_t caller=1;
 static const char *process_name="backboardd";
 typedef int proc_t;
@@ -650,7 +657,7 @@ static void thread_reference(thread_t t){assert(t);refs++;}
 static void thread_deallocate(thread_t t){assert(t && refs>0);refs--;}
 static int fuxi_compile_alive(thread_t t){assert(t);return alive;}
 static int fuxi_compile_online(int cpu){assert(cpu>=3 && cpu<=7);return online;}
-static int fuxi_compile_bind(unsigned domains){if(!online || bound!=-1 || !domains)return -1;bound=domains&4?7:6;if(bind_temp)regs[3][0xa4/4]=(1u<<21)|bind_temp;return bound;}
+static int fuxi_compile_bind(unsigned domains){if(realtime)return -2;if(!online || bound!=-1 || !domains)return -1;bound=domains&4?7:6;if(bind_temp)regs[3][0xa4/4]=(1u<<21)|bind_temp;return bound;}
 static void fuxi_compile_migrate(void){assert(!locked);migrations++;}
 static void fuxi_compile_unbind(thread_t t,int cpu){assert(t && bound==cpu);bound=-1;}
 

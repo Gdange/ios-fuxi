@@ -40,7 +40,7 @@ fuxi_compile_bind(unsigned domains)
    (void)thread_bind_internal(self,cpu_to_processor(ml_get_cpu_number((uint32_t)physical << 8)));
   thread_unlock(self);
   splx(s);
-  if (!eligible) return -1;
+  if (!eligible) return -2; /* realtime or already bound: lease unbound */
   return physical;
  }
  return -1;

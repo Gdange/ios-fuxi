@@ -48,7 +48,7 @@ int main(void){
  assert(!fuxi_compile_online(1) && !fuxi_compile_online(8));
  assert(fuxi_compile_bind(6)==7 && self.bound_processor==&cpus[6] && !blocks);
  fuxi_compile_migrate();assert(blocks==1); /* migration is separate, unlocked */
- assert(fuxi_compile_bind(6)==-1); /* never replace another binding */
+ assert(fuxi_compile_bind(6)==-2); /* never replace another binding */
  fuxi_compile_unbind(&self,6);assert(self.bound_processor==&cpus[6]);
  self.queued=1;fuxi_compile_unbind(&self,7);
  assert(!self.bound_processor && self.queued && removed==1 && reinserted==1);self.queued=0;
@@ -60,7 +60,7 @@ int main(void){
  assert(fuxi_compile_bind(2)==6);fuxi_compile_unbind(&self,6);
  assert(fuxi_compile_bind(4)==7);fuxi_compile_unbind(&self,7);
  assert(fuxi_compile_bind(0)==-1);
- self.sched_pri=96;assert(fuxi_compile_bind(6)==-1);self.sched_pri=50;
+ self.sched_pri=96;assert(fuxi_compile_bind(6)==-2);self.sched_pri=50;
  assert(fuxi_compile_bind(6)==7);self.sched_pri=96;self.queued=1;
  fuxi_compile_unbind(&self,7);assert(!self.bound_processor && self.queued);self.queued=0;
  assert(fuxi_compile_alive(&self));self.active=0;assert(!fuxi_compile_alive(&self));

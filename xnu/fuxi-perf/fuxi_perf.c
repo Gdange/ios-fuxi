@@ -70,6 +70,7 @@ static thread_call_data_t fp_call;
 static LCK_GRP_DECLARE(fp_group, "fuxi-perf");
 static LCK_MTX_DECLARE(fp_lock, &fp_group);
 static unsigned fp_compile_enabled, fp_compile_high, fp_compile_voted, fp_touch_high;
+static unsigned fp_compile_refusals;
 static thread_t fp_compile_thread;
 static uint64_t fp_compile_deadline, fp_compile_cap, fp_compile_start;
 static struct fuxi_compile_reply fp_compile_reply;
@@ -81,6 +82,19 @@ extern int fuxi_compile_online(int);
 static void fp_worker_locked(thread_call_param_t, thread_call_param_t);
 static uint64_t fp_duty_used(uint64_t);
 
+/* cpu -1: realtime/prebound callers (the CA render thread) are not bound;
+ * their lease votes high on both gold and prime instead. */
+static int fp_compile_domain(unsigned d)
+{
+ int cpu = fp_compile_reply.cpu;
+ return cpu < 0 ? d == 1 || d == 2 : d == (cpu == 7 ? 2u : 1u);
+}
+static int fp_compile_failed(void)
+{
+ int cpu = fp_compile_reply.cpu;
+ return cpu < 0 ? fp_domain_failed[1] && fp_domain_failed[2] :
+     fp_domain_failed[cpu == 7 ? 2 : 1] || !fuxi_compile_online(cpu);
+}
 static void fp_compile_cut(unsigned reason, uint64_t now)
 {
  if (fp_compile_high) {
@@ -89,7 +103,8 @@ static void fp_compile_cut(unsigned reason, uint64_t now)
   fp_compile_high = 0;
   fp_compile_voted = 0;
   fp_compile_reply.state = reason;
-  fuxi_compile_unbind(fp_compile_thread,fp_compile_reply.cpu);
+  if (fp_compile_reply.cpu >= 0)
+   fuxi_compile_unbind(fp_compile_thread,fp_compile_reply.cpu);
   printf("FUXI PERF: compile end cpu=%d reason=%u voted_us=%llu\n",
       fp_compile_reply.cpu,reason,fp_compile_reply.boosted_ns/1000);
  }
@@ -108,8 +123,7 @@ static void fp_compile_poll(uint64_t now, int safe, int duty_ok)
   fp_compile_cut(dead ? FC_DEAD : FC_TIMEOUT,now);
   fp_compile_forget();
  } else if (!safe || (!fp_compile_voted && fp_prev_temp > 600) ||
-     !duty_ok || fp_domain_failed[fp_compile_reply.cpu == 7 ? 2 : 1] ||
-     !fuxi_compile_online(fp_compile_reply.cpu)) {
+     !duty_ok || fp_compile_failed()) {
   fp_compile_cut(!safe || (!fp_compile_voted && fp_prev_temp > 600) ?
       FC_THERMAL : !duty_ok ? FC_DUTY : FC_OFFLINE,now);
  }
@@ -130,7 +144,7 @@ static int fp_compile_admitted(void)
 }
 static int fp_compile_command(int command, struct fuxi_compile_reply *reply)
 {
- int error = 0, migrate = 0;
+ int error = 0, migrate = 0, refused = 0;
  if (!fp_compile_enabled || !__atomic_load_n(&fp_enabled,__ATOMIC_ACQUIRE)) return ENOTSUP;
  if (!fp_compile_admitted()) return EPERM;
  if (command != 0 && command != 1) return EINVAL;
@@ -154,13 +168,15 @@ static int fp_compile_command(int command, struct fuxi_compile_reply *reply)
   if (!fp_compile_high) error = EBUSY;
   else if (fp_compile_reply.depth == 16) error = EOVERFLOW;
   else { fp_compile_reply.depth++; *reply = fp_compile_reply; }
- } else if (fp_compile_thread != THREAD_NULL) error = EBUSY;
- else if (!fp_ready || !fp_prev_valid || fp_prev_temp > 600 || fp_blocked ||
-     fp_duty_used(now) >= fp_budget || (!fp_boosted && fp_duty_count == 16)) error = EBUSY;
+ } else if (fp_compile_thread != THREAD_NULL) refused = 1;
+ else if (!fp_ready || !fp_prev_valid) refused = 2;
+ else if (fp_prev_temp > 600 || fp_blocked) refused = 3;
+ else if (fp_duty_used(now) >= fp_budget || (!fp_boosted && fp_duty_count == 16)) refused = 4;
  else {
   int cpu = fuxi_compile_bind((fp_domain_failed[1] ? 0 : 2) | (fp_domain_failed[2] ? 0 : 4));
-  if (cpu < 0) error = EBUSY;
+  if (cpu == -1) refused = 5;
   else {
+   if (cpu < 0) cpu = -1;
    thread_reference(self);
    fp_compile_thread = self;
    fp_compile_start = now;
@@ -169,10 +185,17 @@ static int fp_compile_command(int command, struct fuxi_compile_reply *reply)
    fp_compile_high = 1;
    fp_worker_locked(NULL,NULL); /* Apply high with fresh thermal veto. */
    *reply = fp_compile_reply;
-   migrate = 1;
+   migrate = cpu >= 0;
    printf("FUXI PERF: compile enter cpu=%d cap_ms=2000 duty_ms=%u/1000 state=%u\n",
        cpu,fp_budget_ms,reply->state);
   }
+ }
+ if (refused) {
+  /* 1 busy, 2 not ready, 3 thermal, 4 duty, 5 no online fast core. */
+  error = EBUSY;
+  if (++fp_compile_refusals <= 16 || !(fp_compile_refusals & 63))
+   printf("FUXI PERF: compile refused reason=%d temp=%d dC count=%u\n",
+       refused,fp_prev_temp,fp_compile_refusals);
  }
  lck_mtx_unlock(&fp_lock);
  if (migrate) fuxi_compile_migrate();
@@ -369,7 +392,7 @@ static void fp_update_votes(int state)
    fp_domain_failed[d] = 1;
    fp_applied_valid[d] = 0;
   } else {
-   int compile = fp_compile_high && d == (fp_compile_reply.cpu == 7 ? 2u : 1u);
+   int compile = fp_compile_high && fp_compile_domain(d);
    unsigned level = (state == FP_HIGH || compile) && !failed ? fp_high[d] :
        state == FP_IDLE ? fp_idle[d] : fp_cool[d];
    if (!fp_applied_valid[d] || fp_applied[d] != level) {
@@ -518,7 +541,7 @@ static void fp_worker_locked(thread_call_param_t arg, thread_call_param_t result
  int boost = fp_touch_high || fp_compile_high;
  /* First sample also establishes cool votes. No boost without fresh TSENS. */
  fp_update_votes(state);
- if (fp_compile_high && fp_domain_failed[fp_compile_reply.cpu == 7 ? 2 : 1]) {
+ if (fp_compile_high && fp_compile_failed()) {
   fp_compile_cut(FC_OFFLINE,now);
   boost = fp_touch_high;
   fp_update_votes(state);
