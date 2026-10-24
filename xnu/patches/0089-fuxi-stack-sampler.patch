@@ -10,7 +10,7 @@
 +	 * Stack sampler only, and only on request. sweet_log_start() stays off: it
 +	 * would write the tail of ufsroot0, which here is the HFS image itself.
 +	 */
-+	char smp[8];
++	char smp[64];
 +	if (PE_parse_boot_argn("sweetsample", smp, sizeof(smp)) && smp[0] != '-') {
 +		sweet_sample_start();
 +	}
