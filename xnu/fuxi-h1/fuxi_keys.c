@@ -398,6 +398,63 @@ fk_script(void *arg, wait_result_t wr)
 	thread_block(THREAD_CONTINUE_NULL);
 }
 
+/*
+ * fuxiautolock=S (10..3600): iOS turns the display off ~30 s after boot but
+ * never again after a Power wake (docs-lanes/backlight.md). Once the display
+ * has gone off and on at least once, press Power when it has been on for S
+ * seconds with no key or touch report, so iOS locks through its normal path.
+ * Opt-in: this also ends playback that holds the screen awake without input.
+ */
+extern int sweet_fb_display_off;       /* iokit/Kernel/arm/SweetFramebuffer.cpp */
+extern uint64_t sweet_hid_last_input;  /* iokit/Kernel/arm/SweetHID.cpp */
+static int fk_autolock_chan;
+
+static void
+fk_autolock(void *arg, wait_result_t wr)
+{
+	(void)wr;
+	unsigned secs = (unsigned)(uintptr_t)arg;
+	uint64_t limit, on_since = 0, now;
+	bool armed = false, was_off = false;
+	unsigned presses = 0;
+	clock_interval_to_absolutetime_interval(secs, NSEC_PER_SEC, &limit);
+	printf("FUXI KEYS: autolock after %u s without input (armed after the first display off)\n", secs);
+	for (;;) {
+		uint64_t deadline;
+		clock_interval_to_deadline(1000, NSEC_PER_MSEC, &deadline);
+		(void)assert_wait_deadline(&fk_autolock_chan, THREAD_UNINT, deadline);
+		thread_block(THREAD_CONTINUE_NULL);
+		now = mach_absolute_time();
+		bool off = __atomic_load_n(&sweet_fb_display_off, __ATOMIC_RELAXED) != 0;
+		if (off) {
+			armed = was_off = true;
+			continue;
+		}
+		if (was_off) {
+			was_off = false;
+			on_since = now;
+		}
+		if (!armed) {
+			continue;
+		}
+		uint64_t last = __atomic_load_n(&sweet_hid_last_input, __ATOMIC_RELAXED);
+		if (last < on_since) {
+			last = on_since;
+		}
+		if (now - last < limit) {
+			continue;
+		}
+		struct fuxi_key_inject cmd = {0, FUXI_KEY_INJECT_CLICK, 120};
+		presses++;
+		if (presses <= 16 || (presses % 64) == 0) {
+			printf("FUXI KEYS: autolock press %u after %u s without input\n", presses, secs);
+		}
+		(void)fk_inject(&cmd);
+		/* The click is itself input; wait a full period before trying again. */
+		on_since = mach_absolute_time();
+	}
+}
+
 void
 fuxi_keys_init(void)
 {
@@ -416,6 +473,14 @@ fuxi_keys_init(void)
 		thread_deallocate(thread);
 	} else {
 		printf("FUXI KEYS: kernel_thread_start failed\n");
+	}
+	unsigned autolock = 0;
+	if (PE_parse_boot_argn("fuxiautolock", &autolock, sizeof(autolock)) && autolock >= 10 && autolock <= 3600) {
+		if (kernel_thread_start(fk_autolock, (void *)(uintptr_t)autolock, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+		} else {
+			printf("FUXI KEYS: autolock thread_start failed\n");
+		}
 	}
 	unsigned script = 0;
 	if (PE_parse_boot_argn("fuxikeyscript", &script, sizeof(script)) && script > 0 && script < 3600) {

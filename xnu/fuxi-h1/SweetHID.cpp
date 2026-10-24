@@ -600,10 +600,15 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
 	collection->release();
 }
 
+/* Time of the latest key or touch report, read by the fuxiautolock thread
+ * in bsd/dev/fuxi_keys.c. */
+extern "C" { uint64_t sweet_hid_last_input; }
+
 /* key: 0 power (side button), 1 volume up, 2 volume down, 3 home */
 extern "C" void
 sweet_hid_key_at(int key, int down, uint64_t timestamp)
 {
+	__atomic_store_n(&sweet_hid_last_input, mach_absolute_time(), __ATOMIC_RELAXED);
 	static const UInt32 usages[] = {
 		kHIDUsage_Csmr_Power, kHIDUsage_Csmr_VolumeIncrement,
 		kHIDUsage_Csmr_VolumeDecrement, kHIDUsage_Csmr_Menu,
@@ -629,6 +634,7 @@ sweet_hid_touch_mode(void)
 extern "C" void
 sweet_hid_touch(int finger, int down, int x, int y)
 {
+	__atomic_store_n(&sweet_hid_last_input, mach_absolute_time(), __ATOMIC_RELAXED);
 	if (gSweetTouch) {
 		gSweetTouch->touch(finger, down != 0, x, y);
 	}
