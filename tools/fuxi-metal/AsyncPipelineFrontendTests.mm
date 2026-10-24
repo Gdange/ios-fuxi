@@ -24,7 +24,8 @@ int main(){@autoreleasepool {
  }];
  // Mutations and releases immediately after return must not change the request.
  d.vertexFunction=nil;assert(!called);[d release];[v release];[f release];[library release];
- [device newRenderPipelineStateWithDescriptor:nil options:MTLPipelineOptionArgumentInfo completionHandler:^(id<MTLRenderPipelineState> p,MTLRenderPipelineReflection *r,NSError *error){
+ MTLRenderPipelineDescriptor *missing=nil; /* a variable: -Wnonnull rejects a literal nil */
+ [device newRenderPipelineStateWithDescriptor:missing options:MTLPipelineOptionNone completionHandler:^(id<MTLRenderPipelineState> p,MTLRenderPipelineReflection *r,NSError *error){
   assert(!p && !r && error);++called;dispatch_semaphore_signal(done);
  }];
  [device release];dispatch_resume(q);
